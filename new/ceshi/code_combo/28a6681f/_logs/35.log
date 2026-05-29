@@ -1,0 +1,2420 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019e4fde-b160-7b11-a4df-e94111b684c8
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: 28a6681f
+    **摘要**: 蓝色水像素在重力作用下沿背景格流动，通过垂直下落、对角线滑动和水平滑动沉入底部锚定的盆地结构中，支持盆地间溢流
+
+    ## 要实现的融合组合
+    - **组合名称**: 多guide+多水源汇聚+BFS扩散
+    - **combo_spec**: D1/3+D10/1+D22/2
+
+    ### 融合描述（实现规格）
+
+    2-3个guide从不同边缘引入水流（多水源），水以BFS方式扩散而非重力模拟。每个guide出口成为一个BFS扩散源，多股扩散波在盆地区域相遇和融合。解题者需要追踪多个BFS扩散源的扩散前沿及其相遇时的分界。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D1/3** — 流动路径规则 (`path`)
+  - 当前值: gravity + flow——水像素优先垂直下落，被阻挡时通过唯一开放侧的对角线滑动，支撑后沿水平方向滑向最近可落点
+  - 改为: BFS洪水填充式扩散 — 水不按逐像素模拟移动，而是从源位置开始BFS扩散——每一步所有水的边界同时向所有相邻背景格扩展，直到水的总量用完。这改变了水的最终分布（更均匀扩散而非沉到底部），解题者需要理解广度优先的扩散逻辑。
+  - 来源: flood_fill（参考任务: b9e38dc0）
+- **D10/1** — guide/引导结构 (`obstacle`)
+  - 当前值: 可选的上部guide/斜坡，从网格左或右边缘进入，单斜臂或双臂漏斗形，4-连通，引导小量水进入目标盆地
+  - 改为: 多个guide（从不同方向引入水流） — 允许2-3个guide同时存在，分别从网格的不同边缘引入水流。多个水流在盆地中汇合或分流到不同盆地。这增加了空间布局的复杂度和水的来源追踪难度。
+  - 来源: creative（参考任务: None）
+- **D22/2** — 水源与盆地的空间关系 (`meta`)
+  - 当前值: 水源位于盆地上方或侧面，通过guide或直接的路径连接到盆地区域
+  - 改为: 水源在盆地间共享（many:few） — 多个分散的水源（3-5个）最终汇入1-2个盆地。不同水源的水在同一盆地中混合。解题者需要追踪多个水源的路径并确定它们各自汇入哪个盆地。
+  - 来源: creative（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/28a6681f.py`
+
+    ```python
+    from __future__ import annotations
+import numpy as np
+from collections.abc import Iterator
+import itertools
+import random
+
+def main(grid: np.ndarray, check_input: bool = True, check_output: bool = True) -> np.ndarray:
+    """
+    Simulate water pixels falling under gravity into basins formed by colored obstacles.
+
+    Input structure:
+    - bg = 0. Water pixels = color 1 (blue).
+    - Other colors form static solid structures (walls, steps, containers).
+    - Water starts in unstable positions above or beside basins.
+
+    Rule:
+    - Each water pixel falls straight down through bg cells.
+    - When blocked below, it slides diagonally through the unique open side cell.
+    - When resting on a surface, it slides horizontally toward the nearest gap where it can fall again.
+    - Process repeats until no water pixel moves.
+
+    Key insight: Water seeks the deepest reachable basin via diagonal and horizontal sliding, not just vertical fall.
+    """
+    g = np.array(grid, dtype=int).copy()
+    H, W = g.shape
+    bg = 0
+    water = 1
+
+    if check_input:
+        for r, c in np.argwhere(g == int(water)):
+            rr = int(r)
+            cc = int(c)
+            assert rr == H - 1 or int(g[rr + 1, cc]) != int(bg), "input water must be supported"
+            left_bg = cc > 0 and int(g[rr, cc - 1]) == int(bg)
+            right_bg = cc + 1 < W and int(g[rr, cc + 1]) == int(bg)
+            assert not (left_bg and right_bg), "input water cannot have bg on both horizontal sides"
+
+    def component_count(points: set[tuple[int, int]], use_diagonal: bool) -> int:
+        remaining = set(points)
+        if use_diagonal:
+            neighbors = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if (dr, dc) != (0, 0)]
+        else:
+            neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        count = 0
+        while remaining:
+            count += 1
+            stack = [remaining.pop()]
+            while stack:
+                r, c = stack.pop()
+                for dr, dc in neighbors:
+                    nxt = (int(r + dr), int(c + dc))
+                    if nxt in remaining:
+                        remaining.remove(nxt)
+                        stack.append(nxt)
+        return count
+
+    bottom_colors = set(map(int, g[H - 1]))
+    for color in sorted(set(map(int, g[:7].flatten())) - {bg, water} - bottom_colors):
+        pts = {(int(r), int(c)) for r, c in np.argwhere(g[:7] == int(color))}
+        diag_links = sum(1 for r, c in pts if (r + 1, c - 1) in pts or (r + 1, c + 1) in pts)
+        if diag_links >= 3:
+            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+            assert component_count(pts, False) == component_count(pts, True), "guide must be 4-connected"
+
+    def settle(r: int, c: int) -> tuple[int, int]:
+        rr = int(r)
+        cc = int(c)
+        for _ in range(H * W):
+            # Down
+            if rr + 1 < H and int(g[rr + 1, cc]) == int(bg):
+                rr += 1
+                continue
+
+            # Diagonal movement cannot pass through a blocked side cell.
+            opts = []
+            if (
+                rr + 1 < H
+                and cc - 1 >= 0
+                and int(g[rr, cc - 1]) == int(bg)
+                and int(g[rr + 1, cc - 1]) == int(bg)
+            ):
+                opts.append((int(rr + 1), int(cc - 1)))
+            if (
+                rr + 1 < H
+                and cc + 1 < W
+                and int(g[rr, cc + 1]) == int(bg)
+                and int(g[rr + 1, cc + 1]) == int(bg)
+            ):
+                opts.append((int(rr + 1), int(cc + 1)))
+            if opts:
+                assert len(opts) == 1, f"ambiguous diagonal moves: {opts}"
+                rr, cc = opts[0]
+                continue
+
+            # Horizontal slide only when supported.
+            if rr + 1 < H and int(g[rr + 1, cc]) != int(bg):
+                # Empty run [L,R] in this row
+                L = int(cc)
+                while L - 1 >= 0 and int(g[rr, L - 1]) == int(bg):
+                    L -= 1
+                R = int(cc)
+                while R + 1 < W and int(g[rr, R + 1]) == int(bg):
+                    R += 1
+
+                # Candidate drop columns within the run.
+                drops = [int(x) for x in range(int(L), int(R) + 1) if int(g[rr + 1, int(x)]) == int(bg)]
+                if not drops:
+                    break
+
+                min_dist = min(abs(int(x - cc)) for x in drops)
+                nearest = [int(x) for x in drops if abs(int(x - cc)) == int(min_dist)]
+                assert len(nearest) == 1, f"ambiguous nearest drop columns: {nearest}"
+                best = nearest[0]
+                assert best != int(cc)
+                step = -1 if best < int(cc) else 1
+                nx = int(cc + step)
+                assert int(g[rr, nx]) == int(bg)
+                cc = nx
+                continue
+
+            break
+        else:
+            raise AssertionError("water pixel did not settle")
+        return int(rr), int(cc)
+
+    for _pass in range(H * W):
+        moved = False
+        pts = sorted([(int(r), int(c)) for r, c in np.argwhere(g == int(water))], reverse=True)
+        for r, c in pts:
+            if int(g[int(r), int(c)]) != int(water):
+                continue
+            g[int(r), int(c)] = int(bg)
+            rr, cc = settle(int(r), int(c))
+            moved = bool(moved or ((int(rr), int(cc)) != (int(r), int(c))))
+            g[int(rr), int(cc)] = int(water)
+        if not moved:
+            break
+    else:
+        raise AssertionError("water simulation did not converge")
+
+    if check_output:
+        for r, c in np.argwhere(g == int(water)):
+            rr = int(r)
+            cc = int(c)
+            assert cc == 0 or int(g[rr, cc - 1]) != int(bg)
+            assert rr == H - 1 or int(g[rr + 1, cc]) != int(bg)
+            assert cc == W - 1 or int(g[rr, cc + 1]) != int(bg)
+
+    return g
+
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 10x10
+  colors: water is 1; use 2-3 other colors for solid structures
+  basin_walls:
+    count: 2-3 bottom-anchored structures
+    shape: adjacent lower basins/grooves with varied walls: U-like, L-like, staircase, or single vertical edge
+    style: prefer organic variation; neighboring basins and U arms may have varying heights
+    relation: neighboring basins are arranged so water can pass or overflow between them, not as isolated independent cups
+    base: combined bottom bases cover most but not all columns, leaving some edge background
+  guide:
+    count: 0 or 1
+    shape: optional upper guide/ramp entering from a left or right grid edge; each arm is 4-connected
+    variants: one sloped arm or a two-arm bottom-open funnel
+    role: directs a small supported source-water run into a target basin so it can settle or overflow onward
+  water:
+    color: 1
+    count: guide samples usually have 3-10 water pixels; no-guide samples usually have 10-25
+    input: every water pixel is supported from below; no water pixel has bg on both horizontal sides
+    source_shapes: guide samples use small guide-adjacent runs; no-guide samples use larger side reservoirs or ragged sheets packed against an edge or wall
+    stable_carryover: input may optionally retain a small portion of already-stable basin water while all the other source water moves
+  overflow:
+    pattern: water is poured into one primary basin/reservoir until it fills enough to spill into a neighbor
+    frequency: ~50% examples should visibly use overflow between neighboring basins
+    levels: final neighboring water levels may be equal or unequal, both as natural results of overflow
+  transformation:
+    rule: local water simulation
+    details: water falls through bg; if blocked, it may move diagonally only through an open side cell; when supported, it slides along the row toward a unique reachable drop
+    invariant: structure pixels unchanged and water count conserved
+    output: water ends in stable basin cells; output water has non-bg or grid edge to left, below, and right
+
+generation_strategy:
+  approach: output-first
+  steps:
+    - Draw bottom-anchored basin walls with varied shapes and colors.
+    - Optionally add an open edge-entering guide aimed toward the basin area.
+    - Get output by forward-pouring water one pixel at a time from the guide-adjacent source area or from a side reservoir, often filling one basin first and letting it overflow to a neighbor. (Implement each pour step by inserting one water pixel into a source cell and calling the solver as `main(grid, check_input=False, check_output=False)` rather than reimplementing the water physics.)
+    - Reverse-move some output water back to a supported input source, then validate by running the solver forward.
+    - Sample both overflow and non-overflow cases; overflow should be a core pattern, not an accidental side effect.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+## 已有单变体参考代码
+
+以下组成项已有单变体实现，可作为融合时的参考：
+
+            ### 参考代码: D1/3
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/3/code.py`
+
+            ```python
+            # Variant of 28a6681f
+# Dimension: D1 — 流动路径规则 (path)
+# Change: gravity + flow——水像素优先垂直下落，被阻挡时通过唯一开放侧的对角线滑动，支撑后沿水平方向滑向最近可落点... → BFS洪水填充式扩散
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+
+DESIGN_ANALYSIS = """
+Variant design analysis
+=======================
+
+a) Concrete behavior and trace
+- 保留原题的核心可见对象：`0` 是背景，`1` 是水，其余 2-3 种颜色仍是静态导流/盆地结构；底部依旧是相邻、可互相溢连的盆地。
+- 为了让 BFS 扩散与原重力沉降产生稳定可见差异，生成器把水源做成贴边的“已装满小水仓”，只留一个侧向出口进入盆地区域。
+- 新 solver 不再把每个蓝像素当作一个单独掉落的小球，而是把所有输入水像素只解释成：
+  1. 水的总量；
+  2. BFS 的发源前沿。
+- 具体追踪一个小例子：
+  原逻辑：右上角水仓的水会逐像素从出口掉入右盆地底部，填高后再越过较矮隔墙流入左侧盆地。
+  变体逻辑：先把输入水仓清空，再从出口开始做 4 邻域、整层同步的 BFS 扩散；离出口最近的上层走廊、侧袋和盆口会先被占据，只有水量足够时才向更深处扩展。
+  差异：原题输出集中在低处、且全部“有支撑”；变体输出会保留明显的高位水块和悬空水块，形成更均匀的扩散前沿。
+
+b) Complexity calibration
+- 只改 D1：静态结构还是底部锚定盆地与上方导流件，不引入新的颜色语义，也不引入额外标记。
+- 为避免 BFS 退化成“把整片天空都染满”，生成器提高了上方导流/封顶结构的使用频率，把可达背景限制在盆地网络附近。
+- 水量限制在 8 或 10 个像素，既能跨过 2-3 层 BFS 前沿，看出“同步扩散”，又不会把整个可达腔体全部填满。
+
+c) Hidden assumptions in the original main() that must change
+- 原 `settle()` 逐像素模拟“下落/对角滑动/水平找落点”，隐含前提是每个水像素总能被视为独立粒子；变体中这一前提失效。
+- 原外层多轮迭代依赖“局部移动直到全局稳定”；BFS 版本不再追求局部稳定，而是一次性按距离层数分配全部水量。
+- 原输出检查要求每个水像素左/下/右都有支撑；这正是旧重力行为的结果。变体中高位和悬空水是正常现象，所以该检查必须删除。
+- 原输入检查中的“水必须被支撑”仍然保留，因为生成器仍把输入画成靠边水仓/导流件上的稳定水源，这有助于维持原题视觉语义。
+
+d) Placement legality
+- 生成器固定使用 10x10 画布，并只在网格内部放置导流顶棚、隔墙、底部基座和水仓支撑。
+- 右侧模板先构造一个 2x(4 或 5) 的满水仓，出口左侧只留单格开口；随后在下方放置 2 或 3 个底部相邻盆地。
+- 再以 50% 概率做左右镜像，得到左侧来水版本；镜像不会破坏“唯一出口”“底部锚定”“相邻盆地”的合法性。
+- 生成后会同时运行新 solver 和旧重力基线。若新 solver 水量不守恒、旧基线在该布局上报错、或场景越界/重叠，样本直接丢弃重采。
+
+e) Visual observability
+- 解题者能直接看到：输入里蓝色块贴在边缘导流仓内；输出里蓝色优先铺开在离出口最近的上层通道和盆口，而不是全部沉到最底部。
+- 为了避免靠不可见 tie-break 学规则，生成器要求样本至少有 3 层 BFS 前沿，并且新旧输出差异足够大；这样即使最后一层偶尔是部分填充，人眼仍能从主体形状看出“按距离扩散”。
+
+f) Visual cleanliness
+- 结构层数保持简单：背景、蓝水、上方导流色、底部盆地色，偶尔再加一个强调色给某根隔墙。
+- 盆地和导流件始终分布在固定的大区域：水仓在一侧上方，盆地在下半部，避免对象相互遮挡导致画面杂乱。
+
+g) Color inference
+- 颜色不参与排序或映射推理；只有可见几何关系起作用。
+- 所有非 0/1 颜色都只是“不可穿透固体”，解题关键完全是 BFS 距离，而不是颜色 id。
+
+h) Quantified anti-degeneration checks used by the generator
+- `delta_vs_gravity`: 新 BFS 输出与旧重力基线输出不同的像素数，要求至少为 6。
+- `unsupported_water`: 新输出中下方仍是背景的水像素数，要求至少为 2；旧重力版理论上该值为 0。
+- `height_gap`: 旧重力输出的平均行号减去新输出的平均行号，要求至少为 1.0，确保 BFS 水整体更“高”。
+- `layer_count`: 真实被填充的 BFS 层数，要求至少为 3。
+
+i) New solver assumptions and generator guarantees
+- 新 solver 假设输入水只是“总量 + 发源位置”，最终输出水只会落在原背景格，不会保留在输入水仓里；生成器始终按这个语义构造样本。
+- 新 solver 假设至少有一个背景出口与水源 4 邻接；生成器通过单出口水仓保证这一点。
+- 新 solver 假设可达背景格数量不少于输入水量；生成器运行后验验证，若不满足就重采。
+"""
+
+
+BG = 0
+WATER = 1
+GRID_SHAPE = (10, 10)
+GEN_RETRIES = 400
+
+
+def _neighbors4(r: int, c: int, h: int, w: int) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    if r > 0:
+        out.append((r - 1, c))
+    if r + 1 < h:
+        out.append((r + 1, c))
+    if c > 0:
+        out.append((r, c - 1))
+    if c + 1 < w:
+        out.append((r, c + 1))
+    return out
+
+
+def _water_positions(grid: np.ndarray) -> list[tuple[int, int]]:
+    return [(int(r), int(c)) for r, c in np.argwhere(np.asarray(grid) == WATER)]
+
+
+def _diffusion_plan(grid: np.ndarray) -> tuple[list[tuple[int, int]], list[list[tuple[int, int]]], bool, int]:
+    g = np.asarray(grid, dtype=int)
+    h, w = g.shape
+    sources = _water_positions(g)
+    remaining = len(sources)
+
+    seen = np.zeros((h, w), dtype=bool)
+    frontier = sorted(sources)
+    for r, c in frontier:
+        seen[r, c] = True
+
+    filled: list[tuple[int, int]] = []
+    layers: list[list[tuple[int, int]]] = []
+    partial_last_layer = False
+
+    while frontier and remaining > 0:
+        layer: set[tuple[int, int]] = set()
+        for r, c in frontier:
+            for rr, cc in _neighbors4(r, c, h, w):
+                if seen[rr, cc]:
+                    continue
+                if int(g[rr, cc]) != BG:
+                    continue
+                seen[rr, cc] = True
+                layer.add((rr, cc))
+
+        if not layer:
+            break
+
+        ordered = sorted(layer)
+        if remaining >= len(ordered):
+            chosen = ordered
+            frontier = ordered
+            remaining -= len(ordered)
+        else:
+            chosen = ordered[:remaining]
+            frontier = []
+            remaining = 0
+            partial_last_layer = True
+
+        layers.append(chosen)
+        filled.extend(chosen)
+
+    return filled, layers, partial_last_layer, remaining
+
+
+def main(grid: np.ndarray, check_input: bool = True, check_output: bool = True) -> np.ndarray:
+    """
+    Redistribute source water by breadth-first diffusion through the basin network.
+
+    Input structure:
+    - bg = 0. Water pixels = color 1 (blue).
+    - Other colors remain static solid walls, basin rims, and optional upper guides.
+    - Water starts as a supported source block against an edge or guide-adjacent pocket above neighboring basins.
+
+    Rule:
+    - Treat every input water pixel as one unit of available water and as a BFS source location.
+    - Remove the source block, then expand a 4-neighbor wave through background cells only.
+    - Each full BFS layer fills simultaneously; if the last layer is only partly needed, use reading order within that layer to keep the result deterministic.
+
+    Key insight: Water no longer hunts for the deepest stable resting place. The output is the nearest reachable background prefix around the source opening, so upper shelves and side pockets fill before distant lower cells.
+    """
+    g = np.array(grid, dtype=int).copy()
+    h, w = g.shape
+    assert (h, w) == GRID_SHAPE, f"expected {GRID_SHAPE}, got {(h, w)}"
+
+    sources = _water_positions(g)
+    if check_input:
+        assert sources, "expected at least one water source"
+        for r, c in sources:
+            assert r == h - 1 or int(g[r + 1, c]) != BG, "input water must be supported"
+        assert any(
+            int(g[rr, cc]) == BG
+            for r, c in sources
+            for rr, cc in _neighbors4(r, c, h, w)
+        ), "source water must touch background through at least one side"
+
+    source_count = len(sources)
+    out = g.copy()
+    out[out == WATER] = BG
+
+    filled, _layers, _partial_last_layer, remaining = _diffusion_plan(g)
+    assert remaining == 0, "not enough reachable background cells for BFS diffusion"
+
+    for r, c in filled:
+        out[r, c] = WATER
+
+    if check_output:
+        assert int(np.sum(out == WATER)) == source_count, "water count must be conserved"
+        solid_mask = (g != BG) & (g != WATER)
+        assert np.array_equal(out[solid_mask], g[solid_mask]), "solid structure must stay unchanged"
+        for r, c in np.argwhere(out == WATER):
+            assert int(g[int(r), int(c)]) == BG, "output water must occupy former background cells"
+
+    return out
+
+
+def _gravity_baseline(grid: np.ndarray) -> np.ndarray:
+    g = np.array(grid, dtype=int).copy()
+    h, w = g.shape
+
+    def settle(r: int, c: int) -> tuple[int, int]:
+        rr = int(r)
+        cc = int(c)
+        for _ in range(h * w):
+            if rr + 1 < h and int(g[rr + 1, cc]) == BG:
+                rr += 1
+                continue
+
+            opts: list[tuple[int, int]] = []
+            if (
+                rr + 1 < h
+                and cc - 1 >= 0
+                and int(g[rr, cc - 1]) == BG
+                and int(g[rr + 1, cc - 1]) == BG
+            ):
+                opts.append((rr + 1, cc - 1))
+            if (
+                rr + 1 < h
+                and cc + 1 < w
+                and int(g[rr, cc + 1]) == BG
+                and int(g[rr + 1, cc + 1]) == BG
+            ):
+                opts.append((rr + 1, cc + 1))
+            if opts:
+                if len(opts) != 1:
+                    raise AssertionError(f"ambiguous diagonal moves: {opts}")
+                rr, cc = opts[0]
+                continue
+
+            if rr + 1 < h and int(g[rr + 1, cc]) != BG:
+                left = cc
+                while left - 1 >= 0 and int(g[rr, left - 1]) == BG:
+                    left -= 1
+                right = cc
+                while right + 1 < w and int(g[rr, right + 1]) == BG:
+                    right += 1
+
+                drops = [x for x in range(left, right + 1) if int(g[rr + 1, x]) == BG]
+                if not drops:
+                    break
+
+                min_dist = min(abs(x - cc) for x in drops)
+                nearest = [x for x in drops if abs(x - cc) == min_dist]
+                if len(nearest) != 1:
+                    raise AssertionError(f"ambiguous nearest drop columns: {nearest}")
+                best = nearest[0]
+                step = -1 if best < cc else 1
+                nx = cc + step
+                if int(g[rr, nx]) != BG:
+                    raise AssertionError("horizontal slide blocked")
+                cc = nx
+                continue
+
+            break
+        else:
+            raise AssertionError("water pixel did not settle")
+        return rr, cc
+
+    for _pass in range(h * w):
+        moved = False
+        pts = sorted(_water_positions(g), reverse=True)
+        for r, c in pts:
+            if int(g[r, c]) != WATER:
+                continue
+            g[r, c] = BG
+            rr, cc = settle(r, c)
+            moved = bool(moved or ((rr, cc) != (r, c)))
+            g[rr, cc] = WATER
+        if not moved:
+            break
+    else:
+        raise AssertionError("water simulation did not converge")
+
+    return g
+
+
+def _build_candidate() -> np.ndarray:
+    g = np.zeros(GRID_SHAPE, dtype=int)
+    palette = random.sample([2, 3, 4, 5, 6, 7, 8, 9], random.choice([2, 3]))
+    guide_color = palette[0]
+    wall_color = palette[1]
+    accent_color = palette[2] if len(palette) == 3 else wall_color
+
+    entry_r = random.choice([3, 4])
+    left_wall = random.choice([1, 2])
+    config = random.choice(["two", "three"])
+    right_wall = 8
+
+    if config == "two":
+        inner_cols = [random.choice([4, 5])]
+        inner_tops = [random.choice([entry_r + 2, entry_r + 3])]
+    else:
+        left_wall = 1
+        inner_cols = [4, 6]
+        inner_tops = [random.choice([entry_r + 2, entry_r + 3]), random.choice([entry_r + 1, entry_r + 2])]
+
+    # Upper guide/roof: keeps the diffusion local so the D1 change is visually readable.
+    g[entry_r - 1, left_wall:8] = guide_color
+    g[:entry_r, 7] = guide_color
+    if entry_r == 4 and random.random() < 0.5:
+        g[0:2, 6] = guide_color
+
+    # Filled side reservoir. It is fully occupied in the input, so the new solver can use it
+    # as water amount + source frontier without immediately refilling the reservoir cells.
+    g[: entry_r + 1, 8:10] = WATER
+    g[entry_r + 1, 8:10] = guide_color
+
+    # Bottom-anchored basin network.
+    g[9, left_wall : right_wall + 1] = wall_color
+    g[entry_r:10, left_wall] = wall_color
+    g[entry_r + 1 : 10, right_wall] = accent_color
+
+    for idx, col in enumerate(inner_cols):
+        color = wall_color if idx == 0 else accent_color
+        g[inner_tops[idx] : 10, col] = color
+
+    # Optional small support nub for organic variation without changing the core path rule.
+    if config == "two" and random.random() < 0.5:
+        nub_col = inner_cols[0] - 1 if inner_cols[0] - left_wall >= 2 else inner_cols[0] + 1
+        if left_wall < nub_col < right_wall:
+            g[8, nub_col] = accent_color
+
+    if random.random() < 0.5:
+        g = np.fliplr(g)
+
+    return g
+
+
+def _count_unsupported(out: np.ndarray) -> int:
+    h, _w = out.shape
+    count = 0
+    for r, c in _water_positions(out):
+        if r + 1 < h and int(out[r + 1, c]) == BG:
+            count += 1
+    return count
+
+
+def _behavior_metrics(grid: np.ndarray) -> dict[str, float | int | bool]:
+    new_out = main(grid)
+    old_out = _gravity_baseline(grid)
+    filled, layers, partial_last_layer, remaining = _diffusion_plan(grid)
+    assert remaining == 0
+
+    new_rows = [r for r, _c in _water_positions(new_out)]
+    old_rows = [r for r, _c in _water_positions(old_out)]
+
+    return {
+        "delta_vs_gravity": int(np.sum(new_out != old_out)),
+        "unsupported_water": int(_count_unsupported(new_out)),
+        "height_gap": float(np.mean(old_rows) - np.mean(new_rows)),
+        "layer_count": int(len(layers)),
+        "partial_last_layer": bool(partial_last_layer),
+        "filled_cells": int(len(filled)),
+    }
+
+
+def generate_input() -> np.ndarray:
+    last_error: Exception | None = None
+    for _ in range(GEN_RETRIES):
+        candidate = _build_candidate()
+        try:
+            metrics = _behavior_metrics(candidate)
+        except Exception as exc:
+            last_error = exc
+            continue
+
+        if metrics["delta_vs_gravity"] < 6:
+            continue
+        if metrics["unsupported_water"] < 2:
+            continue
+        if metrics["height_gap"] < 1.0:
+            continue
+        if metrics["layer_count"] < 3:
+            continue
+        if metrics["partial_last_layer"]:
+            continue
+
+        return candidate
+
+    if last_error is not None:
+        raise RuntimeError(f"failed to generate a valid BFS-diffusion sample: {last_error}")
+    raise RuntimeError("failed to generate a valid BFS-diffusion sample")
+
+            ```
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/28a6681f/35/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/28a6681f.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/28a6681f/35/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of 28a6681f (index 35)
+    # combo_spec: D1/3+D10/1+D22/2
+    # Name: 多guide+多水源汇聚+BFS扩散
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/28a6681f/35` 存在（如不存在则创建）。
+codex
+我会先读取原始 solver、参考单变体实现和目标目录现状，确认原题约束与已有 BFS 版本的生成策略，再据此设计融合规则并落到代码。
+exec
+/bin/bash -lc "sed -n '1,360p' /home/lixinyu/snap/new/ceshi/code/28a6681f/D1/3/code.py" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/28a6681f.py" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc 'pwd && ls -la /home/lixinyu/snap/new/arc2_solver_select && ls -la /home/lixinyu/snap/new/ceshi/code/28a6681f/D1/3 && ls -la /home/lixinyu/snap/new/ceshi/code_combo/28a6681f' in /home/lixinyu/snap/new
+ succeeded in 302ms:
+# Variant of 28a6681f
+# Dimension: D1 — 流动路径规则 (path)
+# Change: gravity + flow——水像素优先垂直下落，被阻挡时通过唯一开放侧的对角线滑动，支撑后沿水平方向滑向最近可落点... → BFS洪水填充式扩散
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+
+DESIGN_ANALYSIS = """
+Variant design analysis
+=======================
+
+a) Concrete behavior and trace
+- 保留原题的核心可见对象：`0` 是背景，`1` 是水，其余 2-3 种颜色仍是静态导流/盆地结构；底部依旧是相邻、可互相溢连的盆地。
+- 为了让 BFS 扩散与原重力沉降产生稳定可见差异，生成器把水源做成贴边的“已装满小水仓”，只留一个侧向出口进入盆地区域。
+- 新 solver 不再把每个蓝像素当作一个单独掉落的小球，而是把所有输入水像素只解释成：
+  1. 水的总量；
+  2. BFS 的发源前沿。
+- 具体追踪一个小例子：
+  原逻辑：右上角水仓的水会逐像素从出口掉入右盆地底部，填高后再越过较矮隔墙流入左侧盆地。
+  变体逻辑：先把输入水仓清空，再从出口开始做 4 邻域、整层同步的 BFS 扩散；离出口最近的上层走廊、侧袋和盆口会先被占据，只有水量足够时才向更深处扩展。
+  差异：原题输出集中在低处、且全部“有支撑”；变体输出会保留明显的高位水块和悬空水块，形成更均匀的扩散前沿。
+
+b) Complexity calibration
+- 只改 D1：静态结构还是底部锚定盆地与上方导流件，不引入新的颜色语义，也不引入额外标记。
+- 为避免 BFS 退化成“把整片天空都染满”，生成器提高了上方导流/封顶结构的使用频率，把可达背景限制在盆地网络附近。
+- 水量限制在 8 或 10 个像素，既能跨过 2-3 层 BFS 前沿，看出“同步扩散”，又不会把整个可达腔体全部填满。
+
+c) Hidden assumptions in the original main() that must change
+- 原 `settle()` 逐像素模拟“下落/对角滑动/水平找落点”，隐含前提是每个水像素总能被视为独立粒子；变体中这一前提失效。
+- 原外层多轮迭代依赖“局部移动直到全局稳定”；BFS 版本不再追求局部稳定，而是一次性按距离层数分配全部水量。
+- 原输出检查要求每个水像素左/下/右都有支撑；这正是旧重力行为的结果。变体中高位和悬空水是正常现象，所以该检查必须删除。
+- 原输入检查中的“水必须被支撑”仍然保留，因为生成器仍把输入画成靠边水仓/导流件上的稳定水源，这有助于维持原题视觉语义。
+
+d) Placement legality
+- 生成器固定使用 10x10 画布，并只在网格内部放置导流顶棚、隔墙、底部基座和水仓支撑。
+- 右侧模板先构造一个 2x(4 或 5) 的满水仓，出口左侧只留单格开口；随后在下方放置 2 或 3 个底部相邻盆地。
+- 再以 50% 概率做左右镜像，得到左侧来水版本；镜像不会破坏“唯一出口”“底部锚定”“相邻盆地”的合法性。
+- 生成后会同时运行新 solver 和旧重力基线。若新 solver 水量不守恒、旧基线在该布局上报错、或场景越界/重叠，样本直接丢弃重采。
+
+e) Visual observability
+- 解题者能直接看到：输入里蓝色块贴在边缘导流仓内；输出里蓝色优先铺开在离出口最近的上层通道和盆口，而不是全部沉到最底部。
+- 为了避免靠不可见 tie-break 学规则，生成器要求样本至少有 3 层 BFS 前沿，并且新旧输出差异足够大；这样即使最后一层偶尔是部分填充，人眼仍能从主体形状看出“按距离扩散”。
+
+f) Visual cleanliness
+- 结构层数保持简单：背景、蓝水、上方导流色、底部盆地色，偶尔再加一个强调色给某根隔墙。
+- 盆地和导流件始终分布在固定的大区域：水仓在一侧上方，盆地在下半部，避免对象相互遮挡导致画面杂乱。
+
+g) Color inference
+- 颜色不参与排序或映射推理；只有可见几何关系起作用。
+- 所有非 0/1 颜色都只是“不可穿透固体”，解题关键完全是 BFS 距离，而不是颜色 id。
+
+h) Quantified anti-degeneration checks used by the generator
+- `delta_vs_gravity`: 新 BFS 输出与旧重力基线输出不同的像素数，要求至少为 6。
+- `unsupported_water`: 新输出中下方仍是背景的水像素数，要求至少为 2；旧重力版理论上该值为 0。
+- `height_gap`: 旧重力输出的平均行号减去新输出的平均行号，要求至少为 1.0，确保 BFS 水整体更“高”。
+- `layer_count`: 真实被填充的 BFS 层数，要求至少为 3。
+
+i) New solver assumptions and generator guarantees
+- 新 solver 假设输入水只是“总量 + 发源位置”，最终输出水只会落在原背景格，不会保留在输入水仓里；生成器始终按这个语义构造样本。
+- 新 solver 假设至少有一个背景出口与水源 4 邻接；生成器通过单出口水仓保证这一点。
+- 新 solver 假设可达背景格数量不少于输入水量；生成器运行后验验证，若不满足就重采。
+"""
+
+
+BG = 0
+WATER = 1
+GRID_SHAPE = (10, 10)
+GEN_RETRIES = 400
+
+
+def _neighbors4(r: int, c: int, h: int, w: int) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    if r > 0:
+        out.append((r - 1, c))
+    if r + 1 < h:
+        out.append((r + 1, c))
+    if c > 0:
+        out.append((r, c - 1))
+    if c + 1 < w:
+        out.append((r, c + 1))
+    return out
+
+
+def _water_positions(grid: np.ndarray) -> list[tuple[int, int]]:
+    return [(int(r), int(c)) for r, c in np.argwhere(np.asarray(grid) == WATER)]
+
+
+def _diffusion_plan(grid: np.ndarray) -> tuple[list[tuple[int, int]], list[list[tuple[int, int]]], bool, int]:
+    g = np.asarray(grid, dtype=int)
+    h, w = g.shape
+    sources = _water_positions(g)
+    remaining = len(sources)
+
+    seen = np.zeros((h, w), dtype=bool)
+    frontier = sorted(sources)
+    for r, c in frontier:
+        seen[r, c] = True
+
+    filled: list[tuple[int, int]] = []
+    layers: list[list[tuple[int, int]]] = []
+    partial_last_layer = False
+
+    while frontier and remaining > 0:
+        layer: set[tuple[int, int]] = set()
+        for r, c in frontier:
+            for rr, cc in _neighbors4(r, c, h, w):
+                if seen[rr, cc]:
+                    continue
+                if int(g[rr, cc]) != BG:
+                    continue
+                seen[rr, cc] = True
+                layer.add((rr, cc))
+
+        if not layer:
+            break
+
+        ordered = sorted(layer)
+        if remaining >= len(ordered):
+            chosen = ordered
+            frontier = ordered
+            remaining -= len(ordered)
+        else:
+            chosen = ordered[:remaining]
+            frontier = []
+            remaining = 0
+            partial_last_layer = True
+
+        layers.append(chosen)
+        filled.extend(chosen)
+
+    return filled, layers, partial_last_layer, remaining
+
+
+def main(grid: np.ndarray, check_input: bool = True, check_output: bool = True) -> np.ndarray:
+    """
+    Redistribute source water by breadth-first diffusion through the basin network.
+
+    Input structure:
+    - bg = 0. Water pixels = color 1 (blue).
+    - Other colors remain static solid walls, basin rims, and optional upper guides.
+    - Water starts as a supported source block against an edge or guide-adjacent pocket above neighboring basins.
+
+    Rule:
+    - Treat every input water pixel as one unit of available water and as a BFS source location.
+    - Remove the source block, then expand a 4-neighbor wave through background cells only.
+    - Each full BFS layer fills simultaneously; if the last layer is only partly needed, use reading order within that layer to keep the result deterministic.
+
+    Key insight: Water no longer hunts for the deepest stable resting place. The output is the nearest reachable background prefix around the source opening, so upper shelves and side pockets fill before distant lower cells.
+    """
+    g = np.array(grid, dtype=int).copy()
+    h, w = g.shape
+    assert (h, w) == GRID_SHAPE, f"expected {GRID_SHAPE}, got {(h, w)}"
+
+    sources = _water_positions(g)
+    if check_input:
+        assert sources, "expected at least one water source"
+        for r, c in sources:
+            assert r == h - 1 or int(g[r + 1, c]) != BG, "input water must be supported"
+        assert any(
+            int(g[rr, cc]) == BG
+            for r, c in sources
+            for rr, cc in _neighbors4(r, c, h, w)
+        ), "source water must touch background through at least one side"
+
+    source_count = len(sources)
+    out = g.copy()
+    out[out == WATER] = BG
+
+    filled, _layers, _partial_last_layer, remaining = _diffusion_plan(g)
+    assert remaining == 0, "not enough reachable background cells for BFS diffusion"
+
+    for r, c in filled:
+        out[r, c] = WATER
+
+    if check_output:
+        assert int(np.sum(out == WATER)) == source_count, "water count must be conserved"
+        solid_mask = (g != BG) & (g != WATER)
+        assert np.array_equal(out[solid_mask], g[solid_mask]), "solid structure must stay unchanged"
+        for r, c in np.argwhere(out == WATER):
+            assert int(g[int(r), int(c)]) == BG, "output water must occupy former background cells"
+
+    return out
+
+
+def _gravity_baseline(grid: np.ndarray) -> np.ndarray:
+    g = np.array(grid, dtype=int).copy()
+    h, w = g.shape
+
+    def settle(r: int, c: int) -> tuple[int, int]:
+        rr = int(r)
+        cc = int(c)
+        for _ in range(h * w):
+            if rr + 1 < h and int(g[rr + 1, cc]) == BG:
+                rr += 1
+                continue
+
+            opts: list[tuple[int, int]] = []
+            if (
+                rr + 1 < h
+                and cc - 1 >= 0
+                and int(g[rr, cc - 1]) == BG
+                and int(g[rr + 1, cc - 1]) == BG
+            ):
+                opts.append((rr + 1, cc - 1))
+            if (
+                rr + 1 < h
+                and cc + 1 < w
+                and int(g[rr, cc + 1]) == BG
+                and int(g[rr + 1, cc + 1]) == BG
+            ):
+                opts.append((rr + 1, cc + 1))
+            if opts:
+                if len(opts) != 1:
+                    raise AssertionError(f"ambiguous diagonal moves: {opts}")
+                rr, cc = opts[0]
+                continue
+
+            if rr + 1 < h and int(g[rr + 1, cc]) != BG:
+                left = cc
+                while left - 1 >= 0 and int(g[rr, left - 1]) == BG:
+                    left -= 1
+                right = cc
+                while right + 1 < w and int(g[rr, right + 1]) == BG:
+                    right += 1
+
+                drops = [x for x in range(left, right + 1) if int(g[rr + 1, x]) == BG]
+                if not drops:
+                    break
+
+                min_dist = min(abs(x - cc) for x in drops)
+                nearest = [x for x in drops if abs(x - cc) == min_dist]
+                if len(nearest) != 1:
+                    raise AssertionError(f"ambiguous nearest drop columns: {nearest}")
+                best = nearest[0]
+                step = -1 if best < cc else 1
+                nx = cc + step
+                if int(g[rr, nx]) != BG:
+                    raise AssertionError("horizontal slide blocked")
+                cc = nx
+                continue
+
+            break
+        else:
+            raise AssertionError("water pixel did not settle")
+        return rr, cc
+
+    for _pass in range(h * w):
+        moved = False
+        pts = sorted(_water_positions(g), reverse=True)
+        for r, c in pts:
+            if int(g[r, c]) != WATER:
+                continue
+            g[r, c] = BG
+            rr, cc = settle(r, c)
+            moved = bool(moved or ((rr, cc) != (r, c)))
+            g[rr, cc] = WATER
+        if not moved:
+            break
+    else:
+        raise AssertionError("water simulation did not converge")
+
+    return g
+
+
+def _build_candidate() -> np.ndarray:
+    g = np.zeros(GRID_SHAPE, dtype=int)
+    palette = random.sample([2, 3, 4, 5, 6, 7, 8, 9], random.choice([2, 3]))
+    guide_color = palette[0]
+    wall_color = palette[1]
+    accent_color = palette[2] if len(palette) == 3 else wall_color
+
+    entry_r = random.choice([3, 4])
+    left_wall = random.choice([1, 2])
+    config = random.choice(["two", "three"])
+    right_wall = 8
+
+    if config == "two":
+        inner_cols = [random.choice([4, 5])]
+        inner_tops = [random.choice([entry_r + 2, entry_r + 3])]
+    else:
+        left_wall = 1
+        inner_cols = [4, 6]
+        inner_tops = [random.choice([entry_r + 2, entry_r + 3]), random.choice([entry_r + 1, entry_r + 2])]
+
+    # Upper guide/roof: keeps the diffusion local so the D1 change is visually readable.
+    g[entry_r - 1, left_wall:8] = guide_color
+    g[:entry_r, 7] = guide_color
+    if entry_r == 4 and random.random() < 0.5:
+        g[0:2, 6] = guide_color
+
+    # Filled side reservoir. It is fully occupied in the input, so the new solver can use it
+    # as water amount + source frontier without immediately refilling the reservoir cells.
+    g[: entry_r + 1, 8:10] = WATER
+    g[entry_r + 1, 8:10] = guide_color
+
+    # Bottom-anchored basin network.
+    g[9, left_wall : right_wall + 1] = wall_color
+    g[entry_r:10, left_wall] = wall_color
+    g[entry_r + 1 : 10, right_wall] = accent_color
+
+    for idx, col in enumerate(inner_cols):
+        color = wall_color if idx == 0 else accent_color
+        g[inner_tops[idx] : 10, col] = color
+
+    # Optional small support nub for organic variation without changing the core path rule.
+    if config == "two" and random.random() < 0.5:
+        nub_col = inner_cols[0] - 1 if inner_cols[0] - left_wall >= 2 else inner_cols[0] + 1
+        if left_wall < nub_col < right_wall:
+            g[8, nub_col] = accent_color
+
+    if random.random() < 0.5:
+        g = np.fliplr(g)
+
+    return g
+
+
+def _count_unsupported(out: np.ndarray) -> int:
+    h, _w = out.shape
+    count = 0
+    for r, c in _water_positions(out):
+        if r + 1 < h and int(out[r + 1, c]) == BG:
+            count += 1
+    return count
+
+
+def _behavior_metrics(grid: np.ndarray) -> dict[str, float | int | bool]:
+    new_out = main(grid)
+    old_out = _gravity_baseline(grid)
+    filled, layers, partial_last_layer, remaining = _diffusion_plan(grid)
+    assert remaining == 0
+
+    new_rows = [r for r, _c in _water_positions(new_out)]
+    old_rows = [r for r, _c in _water_positions(old_out)]
+
+    return {
+        "delta_vs_gravity": int(np.sum(new_out != old_out)),
+        "unsupported_water": int(_count_unsupported(new_out)),
+        "height_gap": float(np.mean(old_rows) - np.mean(new_rows)),
+        "layer_count": int(len(layers)),
+        "partial_last_layer": bool(partial_last_layer),
+        "filled_cells": int(len(filled)),
+    }
+
+
+def generate_input() -> np.ndarray:
+    last_error: Exception | None = None
+    for _ in range(GEN_RETRIES):
+        candidate = _build_candidate()
+        try:
+            metrics = _behavior_metrics(candidate)
+        except Exception as exc:
+            last_error = exc
+            continue
+
+        if metrics["delta_vs_gravity"] < 6:
+            continue
+
+ succeeded in 404ms:
+/home/lixinyu/snap/new
+total 76
+drwxrwxrwx+  3 lixinyu lixinyu  4096 May 22 07:23 .
+drwxrwxrwx+ 18 lixinyu lixinyu  4096 May 22 07:20 ..
+-rw-rw-rw-+  1 lixinyu lixinyu  5890 May 22 07:20 28a6681f.py
+drwxrwxrwx+  2 lixinyu lixinyu  4096 May 22 07:23 __pycache__
+-rw-rwxr--+  1 lixinyu lixinyu 54577 May 22 07:23 arc_utils.py
+total 28
+drwxrwxr-x+ 3 lixinyu lixinyu  4096 May 22 07:42 .
+drwxrwxr-x+ 6 lixinyu lixinyu  4096 May 22 07:29 ..
+drwxrwxr-x+ 2 lixinyu lixinyu  4096 May 22 07:43 __pycache__
+-rw-rw-r--+ 1 lixinyu lixinyu 15744 May 22 07:43 code.py
+total 216
+drwxrwxr-x+  54 lixinyu lixinyu 4096 May 17 04:42 .
+drwxrwxr-x+ 117 lixinyu lixinyu 4096 May 17 05:30 ..
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 1
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 10
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 11
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 12
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 13
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 14
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 15
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 16
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 17
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 18
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 19
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 2
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 20
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 21
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 22
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 23
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 24
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 25
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 26
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 27
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 28
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 29
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 3
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 30
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 31
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 32
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 33
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 34
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 35
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 36
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 37
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 38
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:11 39
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 4
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:14 40
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:24 41
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:27 42
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:28 43
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:24 44
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:35 45
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:34 46
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:36 47
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:34 48
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:41 49
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 5
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:43 50
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:44 51
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 6
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 7
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 8
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 22 09:26 9
+drwxrwxr-x+   2 lixinyu lixinyu 4096 May 22 09:27 _logs
+
+ succeeded in 507ms:
+from __future__ import annotations
+import numpy as np
+from collections.abc import Iterator
+import itertools
+import random
+
+def main(grid: np.ndarray, check_input: bool = True, check_output: bool = True) -> np.ndarray:
+    """
+    Simulate water pixels falling under gravity into basins formed by colored obstacles.
+
+    Input structure:
+    - bg = 0. Water pixels = color 1 (blue).
+    - Other colors form static solid structures (walls, steps, containers).
+    - Water starts in unstable positions above or beside basins.
+
+    Rule:
+    - Each water pixel falls straight down through bg cells.
+    - When blocked below, it slides diagonally through the unique open side cell.
+    - When resting on a surface, it slides horizontally toward the nearest gap where it can fall again.
+    - Process repeats until no water pixel moves.
+
+    Key insight: Water seeks the deepest reachable basin via diagonal and horizontal sliding, not just vertical fall.
+    """
+    g = np.array(grid, dtype=int).copy()
+    H, W = g.shape
+    bg = 0
+    water = 1
+
+    if check_input:
+        for r, c in np.argwhere(g == int(water)):
+            rr = int(r)
+            cc = int(c)
+            assert rr == H - 1 or int(g[rr + 1, cc]) != int(bg), "input water must be supported"
+            left_bg = cc > 0 and int(g[rr, cc - 1]) == int(bg)
+            right_bg = cc + 1 < W and int(g[rr, cc + 1]) == int(bg)
+            assert not (left_bg and right_bg), "input water cannot have bg on both horizontal sides"
+
+    def component_count(points: set[tuple[int, int]], use_diagonal: bool) -> int:
+        remaining = set(points)
+        if use_diagonal:
+            neighbors = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if (dr, dc) != (0, 0)]
+        else:
+            neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        count = 0
+        while remaining:
+            count += 1
+            stack = [remaining.pop()]
+            while stack:
+                r, c = stack.pop()
+                for dr, dc in neighbors:
+                    nxt = (int(r + dr), int(c + dc))
+                    if nxt in remaining:
+                        remaining.remove(nxt)
+                        stack.append(nxt)
+        return count
+
+    bottom_colors = set(map(int, g[H - 1]))
+    for color in sorted(set(map(int, g[:7].flatten())) - {bg, water} - bottom_colors):
+        pts = {(int(r), int(c)) for r, c in np.argwhere(g[:7] == int(color))}
+        diag_links = sum(1 for r, c in pts if (r + 1, c - 1) in pts or (r + 1, c + 1) in pts)
+        if diag_links >= 3:
+            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+            assert component_count(pts, False) == component_count(pts, True), "guide must be 4-connected"
+
+    def settle(r: int, c: int) -> tuple[int, int]:
+        rr = int(r)
+        cc = int(c)
+        for _ in range(H * W):
+            # Down
+            if rr + 1 < H and int(g[rr + 1, cc]) == int(bg):
+                rr += 1
+                continue
+
+            # Diagonal movement cannot pass through a blocked side cell.
+            opts = []
+            if (
+                rr + 1 < H
+                and cc - 1 >= 0
+                and int(g[rr, cc - 1]) == int(bg)
+                and int(g[rr + 1, cc - 1]) == int(bg)
+            ):
+                opts.append((int(rr + 1), int(cc - 1)))
+            if (
+                rr + 1 < H
+                and cc + 1 < W
+                and int(g[rr, cc + 1]) == int(bg)
+                and int(g[rr + 1, cc + 1]) == int(bg)
+            ):
+                opts.append((int(rr + 1), int(cc + 1)))
+            if opts:
+                assert len(opts) == 1, f"ambiguous diagonal moves: {opts}"
+                rr, cc = opts[0]
+                continue
+
+            # Horizontal slide only when supported.
+            if rr + 1 < H and int(g[rr + 1, cc]) != int(bg):
+                # Empty run [L,R] in this row
+                L = int(cc)
+                while L - 1 >= 0 and int(g[rr, L - 1]) == int(bg):
+                    L -= 1
+                R = int(cc)
+                while R + 1 < W and int(g[rr, R + 1]) == int(bg):
+                    R += 1
+
+                # Candidate drop columns within the run.
+                drops = [int(x) for x in range(int(L), int(R) + 1) if int(g[rr + 1, int(x)]) == int(bg)]
+                if not drops:
+                    break
+
+                min_dist = min(abs(int(x - cc)) for x in drops)
+                nearest = [int(x) for x in drops if abs(int(x - cc)) == int(min_dist)]
+                assert len(nearest) == 1, f"ambiguous nearest drop columns: {nearest}"
+                best = nearest[0]
+                assert best != int(cc)
+                step = -1 if best < int(cc) else 1
+                nx = int(cc + step)
+                assert int(g[rr, nx]) == int(bg)
+                cc = nx
+                continue
+
+            break
+        else:
+            raise AssertionError("water pixel did not settle")
+        return int(rr), int(cc)
+
+    for _pass in range(H * W):
+        moved = False
+        pts = sorted([(int(r), int(c)) for r, c in np.argwhere(g == int(water))], reverse=True)
+        for r, c in pts:
+            if int(g[int(r), int(c)]) != int(water):
+                continue
+            g[int(r), int(c)] = int(bg)
+            rr, cc = settle(int(r), int(c))
+            moved = bool(moved or ((int(rr), int(cc)) != (int(r), int(c))))
+            g[int(rr), int(cc)] = int(water)
+        if not moved:
+            break
+    else:
+        raise AssertionError("water simulation did not converge")
+
+    if check_output:
+        for r, c in np.argwhere(g == int(water)):
+            rr = int(r)
+            cc = int(c)
+            assert cc == 0 or int(g[rr, cc - 1]) != int(bg)
+            assert rr == H - 1 or int(g[rr + 1, cc]) != int(bg)
+            assert cc == W - 1 or int(g[rr, cc + 1]) != int(bg)
+
+    return g
+
+
+codex
+我已经确认原始代码很短，D1 单变体主要提供了 BFS 扩散和反退化指标。下一步会补读原题样例，并搜索是否已有与多 guide 或多水源相关的其它实现可借鉴布局约束。
+exec
+/bin/bash -lc "python - <<'PY'
+import json, numpy as np
+path='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/28a6681f.json'
+obj=json.load(open(path))
+print('train', len(obj['train']), 'test', len(obj['test']))
+for split in ['train','test']:
+    for i,pair in enumerate(obj[split]):
+        inp=np.array(pair['input'])
+        out=np.array(pair['output']) if 'output' in pair else None
+        print(split, i, 'input shape', inp.shape, 'colors', sorted(set(inp.flatten())))
+        if out is not None:
+            print(' out colors', sorted(set(out.flatten())))
+            print(' input water', int((inp==1).sum()), 'output water', int((out==1).sum()))
+            print(inp)
+            print(out)
+PY" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "rg -n \"D10|D22|guide|multi\" /home/lixinyu/snap/new/ceshi/code/28a6681f -g 'code.py'" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '1,220p' /home/lixinyu/snap/new/ceshi/code_combo/28a6681f/35/code.py" in /home/lixinyu/snap/new
+ succeeded in 1560ms:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:3:# Change: 蓝色像素——guide样本使用guide旁的小水柱（3-10像素），无guide样本使用边缘侧的大水库或不规则片状水体（10-25像素） → 控制像素标记的水源量
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:15:# - 画面仍是 10x10、背景 0、蓝色水 1，底部盆地/guide 的水物理不改。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:33:# - guide 样例保持小水量 3-10；无 guide 样例保持大水量 10-21。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:34:#   这延续原题“guide 小、reservoir 大”的整体视觉分层，只把可见水体换成控制标记。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:41:# - 原 guide 检测会扫描上半区的非背景色。D5 中顶边新增控制色 6/7/8；如果不排除，
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:42:#   单像素控制标记会被混入“上半区彩色对象”集合。虽然它们通常不会触发对角 guide 断言，
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:43:#   但这是脆弱写法，所以显式把控制色从 guide 候选中排除。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:48:#   这样盆地结构、guide 形态、可溢流关系都严格落在原题分布内。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:49:# - 控制像素只放在模板顶边原本是背景的位置；不会与 guide 或实心结构重叠。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:58:# - 因为旧题的盆地和 guide 仍然保留，人类能把变化聚焦到 source 形态，而不是重新学习整个任务。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:110:def _validate_guides(g: np.ndarray) -> None:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:116:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:117:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:136:    _validate_guides(g)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:267:    - Bottom-anchored colored obstacles form the same basins, steps, and optional edge-entering guide as in the base task.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:306:        "guide": False,
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:325:        "guide": False,
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:344:        "guide": True,
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:362:        "name": "left_guide_to_right_basin",
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:363:        "guide": True,
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:392:GUIDE_TEMPLATES = tuple(template for template in ALL_TEMPLATES if bool(template["guide"]))
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:393:NO_GUIDE_TEMPLATES = tuple(template for template in ALL_TEMPLATES if not bool(template["guide"]))
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:430:    "left_guide_to_right_basin": [
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:461:def _gen_attempt(rng: random.Random, want_guide: bool) -> np.ndarray | None:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:462:    template_pool = GUIDE_TEMPLATE_POOL if want_guide else NO_GUIDE_TEMPLATE_POOL
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:485:    if bool(template["guide"]):
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:491:        want_multibasin = bool(rng.random() < 0.6)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:492:        if want_multibasin and _water_component_count(out) < 2:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:500:    want_guide = bool(rng.random() < 0.4)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D5/2/code.py:502:        attempt = _gen_attempt(rng, want_guide=want_guide)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D9/0/code.py:16:#       - guide cases show a small supported top-edge run that follows a staircase/ramp into the basin area, with the traversed cells preserved as trail.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D9/0/code.py:29:#     - Generator still uses the original basin vocabulary: adjacent lower basins, occasional top guide, supported source water, and frequent overflow-like spreading.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D9/0/code.py:40:#     - Guide samples use a 4-connected staircase entering from an edge, matching the original guide constraints.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D9/0/code.py:43:#     - Mirror choices, multiple basin profiles, and both guide / no-guide families provide repeated evidence that gray means traversed path rather than "another object".
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D9/0/code.py:115:            assert any(c in (0, w - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D9/0/code.py:116:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D9/0/code.py:218:    - Other colors form fixed basin walls, steps, and optional edge-entering guides.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D9/0/code.py:219:    - Water begins in supported source reservoirs or short guide-adjacent runs above the basin system.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D9/0/code.py:325:def _guide_case(rng: random.Random) -> np.ndarray:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D9/0/code.py:326:    guide_color, basin_color_a, basin_color_b = rng.sample(STRUCTURE_PALETTE, 3)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D9/0/code.py:329:        g[r, c] = int(guide_color)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D9/0/code.py:356:    builder = rng.choices((_edge_case, _guide_case), weights=(3, 2))[0]
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/0/code.py:46:#    appear on the bottom row, so the original guide-color validation remains satisfied.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/0/code.py:236:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/0/code.py:237:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/0/code.py:271:    - Other colors are rigid basin pieces, shelves, dividers, and optional upper guides.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/1/code.py:32:#     - 模板坐标是手工验证过的 10x10 布局；guide、divider、井壁、源区、carryover 水互不重叠。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/1/code.py:39:#     - 颜色仅三种结构色：井壁/底座、斜面 divider、上方 guide。水只用蓝色 1。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/1/code.py:40:#     - carryover 水只放进单像素宽井槽内，不会和 guide/斜面重叠。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/1/code.py:46:#     - guide 仍需从边缘进入且 4-connected；模板里的 guide 全满足原题约束。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/1/code.py:124:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/1/code.py:125:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/1/code.py:265:    - Other colors form bottom-anchored wells plus an optional edge-entering stair guide.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/1/code.py:296:    base_color, slope_color, guide_color = map(int, colors)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/1/code.py:309:        guide_cells = [(2, 0), (2, 1), (3, 1), (3, 2), (4, 2), (4, 3), (4, 4)]
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/1/code.py:312:        guide_cells = [(2, 0), (2, 1), (3, 1), (4, 1), (4, 2), (4, 3), (4, 4)]
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/1/code.py:318:    for r, c in guide_cells:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D23/1/code.py:319:        g[r, c] = guide_color
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D2/0/code.py:135:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D2/0/code.py:136:            assert component_count(pts, False) == component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D2/1/code.py:41:#     - 颜色只区分结构部件，不参与控制流排序；guide 颜色始终与底部颜色不同以保持上方部件可辨。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D2/1/code.py:243:                assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D2/1/code.py:244:                assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D2/1/code.py:278:    - Other colors are rigid basin walls, shelves, or optional upper guides.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D2/1/code.py:303:    guide_color: int,
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D2/1/code.py:308:    # Upper guide that visibly enters from the left edge and supports the source column.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D2/1/code.py:309:    g[0, 0:4] = int(guide_color)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D2/1/code.py:310:    g[0:3, 3] = int(guide_color)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D2/1/code.py:347:        left_color, right_color, guide_color = random.sample([2, 3, 4, 5, 6, 7, 8, 9], 3)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D2/1/code.py:354:            guide_color=int(guide_color),
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/1/code.py:38:#    - `bottom_colors` / guide 检查原本会对顶部斜坡导流件做合法性断言。嵌套盆地全由水平/垂直墙构成，
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/1/code.py:39:#      对角相邻计数不会达到 guide 的阈值，因此不会被误判成导流件。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/1/code.py:53:#    - 为了让这一点稳定可见，这里不混入 guide、颜色排序、镜像规则等额外变化，只保留左右平移、墙高和颜色变化。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/1/code.py:190:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/1/code.py:191:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/3/code.py:35:#     - Old logic assumed notable non-bottom shapes near the top could be special guides; in this variant those
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/3/code.py:42:#     - The old "upper non-bottom component with many diagonals is a guide" check depends on bottom-anchored
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/3/code.py:90:    Key insight: The physics stays local, but the obstacle geometry changes the story: stacked midair trays create visible multi-stage cascades instead of only bottom-fed basins.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/2/code.py:47:#      competition between multiple drops.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/2/code.py:52:#    - Guide validation in main() is unchanged; this generator simply omits guide pieces.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/2/code.py:72:#    colors for the bottom-anchored structures. There are no extra markers, no guides,
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/2/code.py:141:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D7/2/code.py:142:            assert component_count(pts, False) == component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D22/0/code.py:2:# Dimension: D22 — 水源与盆地的空间关系 (meta)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D22/0/code.py:3:# Change: 水源位于盆地上方或侧面，通过guide或直接的路径连接到盆地区域... → 水源位于盆地内部（需排出）
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D22/0/code.py:12:# Design analysis for the D22 inversion
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D22/0/code.py:38:#     - The original guide-validation block depends on upper edge-entering ramps.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D22/0/code.py:39:#       This variant has no guide object, so that check is dropped.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D22/0/code.py:267:    raise RuntimeError("failed to generate a draining D22 sample")
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D22/1/code.py:2:# Dimension: D22 — 水源与盆地的空间关系 (meta)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D22/1/code.py:3:# Change: 水源位于盆地上方或侧面，通过guide或直接的路径连接到盆地区域... → 多个水源对应多个盆地（映射关系）
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D22/1/code.py:13:# Design analysis for D22/1
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D22/1/code.py:201:    raise RuntimeError("failed to generate D22/1 mapped source sample")
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:19:#     new: blue pixels are emitted along one straight ray determined by an upper guide, and they stop only when the
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:22:#     guide:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:25:#       its interior endpoint is the nozzle tip; the ray direction is the guide direction continued forward
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:27:#       a contiguous run of blue pixels starts immediately after the guide tip on the same line
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:34:#       guide: (2,0)-(3,1)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:40:#       the key motion is no longer "find a lower basin"; it is "continue the visible guide as a straight ray"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:48:#       the guide always encodes one unambiguous unit step from {right, down-right, left, down-left}
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:54:#       branches assumes vertical descent is meaningful, so the whole routine is replaced by guide parsing + ray march
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:56:#       exactly one guide color is present in the upper half and absent from the bottom row
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:57:#       the guide is a single straight chain with one border endpoint
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:60:#       bottom structures use only bottom colors, so guide detection by "upper non-bottom color" is reliable
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:63:#     guide and source are chosen from one lattice line fully inside bounds
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:68:#     humans can read the direction directly from the colored guide
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:70:#     overlapping layers are avoided: guide, source, travel corridor, and basin walls occupy disjoint cells in input
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:113:def _guide_info(grid: np.ndarray, bg: int, water: int) -> tuple[int, list[tuple[int, int]], tuple[int, int], tuple[int, int]]:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:171:    assert len(valid) == 1, f"expected exactly one guide candidate, found {[item[0] for item in valid]}"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:189:    Move blue source pixels along a guide-defined straight ray until they pack against the first collision wall.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:194:      straight guide entering from the left or right edge.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:195:    - A contiguous source run of water begins immediately after the guide tip on the same lattice line.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:198:    - Read the guide orientation from its border endpoint toward its interior tip.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:203:    Key insight: The changing part is no longer gravity or overflow; the guide acts as a nozzle, so the output is a
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:211:    _guide_color, guide_pts, tip, step = _guide_info(g, bg, water)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:213:    assert source, "expected water source immediately after guide tip"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:270:    guide_color, wall_color, extra_color = rng.sample(palette, 3)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:288:    for guide_len in (2, 3):
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:291:                hit_t = int(guide_len + 2 * source_len + gap)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:293:                    params.append((guide_len, source_len, gap, hit_t))
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:297:    guide_len, source_len, gap, hit_t = rng.choice(params)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:298:    source_ts = list(range(int(guide_len), int(guide_len + source_len)))
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:304:    guide_pts = [_point(start, step, t) for t in range(int(guide_len))]
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:307:    travel_pts = [_point(start, step, t) for t in range(int(guide_len + source_len), int(hit_t))]
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:309:    for r, c in guide_pts:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:310:        grid[int(r), int(c)] = int(guide_color)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:314:    forbidden_before_hit = set(guide_pts) | set(source_pts) | set(travel_pts)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/0/code.py:354:    if guide_color in set(map(int, grid[h - 1])):
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/1/code.py:47:#    - Only bottom-anchored structure is eligible for deletion. Upper guide pixels stay unchanged,
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/1/code.py:48:#      which keeps the scene readable instead of erasing multiple unrelated layers at once.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/1/code.py:98:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/1/code.py:99:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/1/code.py:237:    - Non-water solids form bottom-anchored basins and spillways; some inputs also include an upper guide.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/1/code.py:238:    - Water begins as a supported side reservoir or guide-fed source, not yet in its final resting basin.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/1/code.py:330:    guide_colors = [int(c) for c in structure_colors if int(c) not in set(bottom_colors)]
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/1/code.py:340:    guide_targets = random.sample(remaining, len(guide_colors))
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/1/code.py:341:    for old, new in zip(guide_colors, guide_targets):
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/0/code.py:34:#    - Samples are rejected unless the output contains multiple wet pixels. This
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/0/code.py:166:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/0/code.py:167:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D20/0/code.py:278:    - Other colors form static solid basin walls and optional upper support guides.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D14/2/code.py:51:    - the original guide-color scan would misread tap pixels as guide fragments, so that logic is intentionally removed
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D13/0/code.py:2:# Dimension: D13 — 水像素处理顺序 (multi_step)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D13/0/code.py:18:#   changed mechanism: only the outer multi-step pass order changes. In the original
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D13/0/code.py:49:#     upper diagonal guide objects, so these assertions stay dormant and safe.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D13/0/code.py:136:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D13/0/code.py:137:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:2:# Dimension: D10 — 变换规则 (transform)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:87:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:88:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:190:    - bg = 0 and water = 1, with the other colors forming fixed basin walls and edge-entering guide rails.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:191:    - Source water is initially supported on ledges or guide starts, typically near the left or right border.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:210:def _paint_left_guide(g: np.ndarray, color: int, length: int) -> None:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:216:def _paint_right_guide(g: np.ndarray, color: int, length: int) -> None:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:237:        left_color, right_color, guide_color = rng.sample(colors, 3)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:240:        guide_sides = ["left", "right"] if rng.random() < 0.7 else [rng.choice(["left", "right"])]
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:243:        for side in guide_sides:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:244:            max_len = 4 if len(guide_sides) == 1 else 3
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:248:                _paint_left_guide(g, guide_color, length)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:251:                _paint_right_guide(g, guide_color, length)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:255:            side = rng.choice(guide_sides)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py:287:    raise RuntimeError("failed to generate a valid D10 variant sample")
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D6/1/code.py:33:#     edge-entering guides. That relies on the old invariant "upper solids are guides, not basin walls".
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D6/2/code.py:44:#    - Use one source rectangle, one basin strip, and 2-3 structure colors. No guides or floating markers
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D18/1/code.py:46:#      two-cell center basin; they do not need hidden multiplicity tracking.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D18/1/code.py:58:#      upper structure color also appears on the bottom row so the original guide
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D18/1/code.py:146:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D18/1/code.py:147:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/3/code.py:144:    - Other colors remain static solid walls, basin rims, and optional upper guides.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/3/code.py:145:    - Water starts as a supported source block against an edge or guide-adjacent pocket above neighboring basins.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/3/code.py:272:    guide_color = palette[0]
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/3/code.py:289:    # Upper guide/roof: keeps the diffusion local so the D1 change is visually readable.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/3/code.py:290:    g[entry_r - 1, left_wall:8] = guide_color
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/3/code.py:291:    g[:entry_r, 7] = guide_color
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/3/code.py:293:        g[0:2, 6] = guide_color
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/3/code.py:298:    g[entry_r + 1, 8:10] = guide_color
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D16/0/code.py:17:#      nearest drop is still allowed. Color 4 is a neutral guide shelf used only to
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D16/0/code.py:20:#      bottom-anchored terrace system on rows 7-9. The source spans both guide cells
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D16/0/code.py:28:#    - The friction signal is binary and repeated: every sample contains multiple rough
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D16/0/code.py:29:#      support cells and multiple smooth support cells. The rule is visible without
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D16/0/code.py:44:#      vertically supported by water or a solid guide/terrace tile.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D16/0/code.py:60:#      smooth, and color 4 is only a guide shelf. No invisible ordering of color ids is
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D16/0/code.py:264:    - Color 2 marks rough basin tiles, color 3 marks smooth basin tiles, and color 4 may appear as a guide shelf.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D11/1/code.py:28:#      cropped result is usually a non-rectangular or multi-lobed silhouette, not a
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D11/1/code.py:46:#      present on the bottom row, which avoids triggering the original guide-only
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D11/1/code.py:111:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D11/1/code.py:112:            assert component_count(pts, False) == component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D12/2/code.py:102:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D12/2/code.py:103:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D18/0/code.py:15:#    shape where one moving water pixel can see multiple legal continuations.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D18/0/code.py:41:#    The upper guide/shelf uses one color, and the lower basin is split into left/right
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D18/0/code.py:48:#    keeps the upper guide color off the bottom row, so the inherited guide sanity checks
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D18/0/code.py:147:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D18/0/code.py:148:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D18/0/code.py:247:    - Non-water colors are fixed solids: a small upper shelf/guide and lower basin walls.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D18/0/code.py:268:    guide_color, left_color, right_color = rng.sample(palette, 3)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D18/0/code.py:277:                out[r, c] = int(guide_color)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/2/code.py:2:# Dimension: D10 — guide/引导结构 (obstacle)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/2/code.py:3:# Change: 可选的上部guide/斜坡，从网格左或右边缘进入，单斜臂或双臂漏斗形，4-连通，引导小量水进入目标盆地... → 内部管道式guide
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/2/code.py:12:# Design analysis for the D10 internal-pipe variant.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/2/code.py:23:#    - Original D10 guide samples used an exposed diagonal arm entering from column 0 or 9.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/2/code.py:29:#    - The visible difference is not a hidden color code; it is that the guide is now a closed
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/2/code.py:32:#    - The basin system stays at two adjacent basins, which is enough for overflow and keeps D10
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/2/code.py:38:#    - The original guide check depended on many diagonal links and on touching a grid edge.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/2/code.py:54:#    - The source water is visibly enclosed by a roofed shell, which makes the D10 change clear
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/2/code.py:148:    Settle blue water that starts inside a covered internal guide and then drains into lower basins.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/2/code.py:157:    - The new guide does not move water by teleportation; it only constrains those same motions inside a covered cavity until the outlet releases the water.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D10/2/code.py:183:            assert r0 <= 1 and r1 == 5, "pipe should occupy the upper guide band and end above the basins"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/2/code.py:78:def _multi_source_dist(mask: np.ndarray, sources: list[tuple[int, int]]) -> np.ndarray:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/2/code.py:117:    water_dist = _multi_source_dist(mask, water_cells)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/2/code.py:252:    dist = _multi_source_dist(mask, source_cells)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D1/2/code.py:303:    dist = _multi_source_dist(mask, source_cells)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D3/0/code.py:53:#   row, so the original guide checks remain valid.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D3/0/code.py:104:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D3/0/code.py:105:            assert component_count(pts, False) == component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D4/0/code.py:81:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D4/0/code.py:82:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D4/0/code.py:246:    - bg = 0. Input water starts as color 1, while all other nonzero colors are fixed walls, steps, or guides.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D3/1/code.py:56:#   original guide-validation logic remains legal even though this generator does
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D3/1/code.py:57:#   not place a separate upper guide object.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D3/1/code.py:100:        "multi_drop_decisions": 0,
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D3/1/code.py:118:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D3/1/code.py:119:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D3/1/code.py:177:                    stats["multi_drop_decisions"] += 1
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D4/1/code.py:37:# - `set(... ) - {bg, water}`：旧版从上部颜色集合里排除单一水色；变体下要排除全部水色，否则会把红水误判成 guide。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D4/1/code.py:52:# - 静态结构只保留底边、竖墙和少量颜色分段，不加上部 guide，避免和两色水叠得过乱。
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D4/1/code.py:63:    Simulate multi-colored water pixels settling into basin chains under the original gravity rules.
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D4/1/code.py:116:    guide_candidates = sorted(set(map(int, g[:7].flatten())) - {BG} - water_colors - bottom_colors)
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D4/1/code.py:117:    for color in guide_candidates:
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D4/1/code.py:121:            assert any(c in (0, w - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D4/1/code.py:122:            assert component_count(pts, False) == component_count(pts, True), "guide must be 4-connected"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D4/1/code.py:329:    raise AssertionError("failed to generate a valid multi-color sample")
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D3/2/code.py:94:            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+/home/lixinyu/snap/new/ceshi/code/28a6681f/D3/2/code.py:95:            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+
+ exited 2 in 1701ms:
+sed: can't read /home/lixinyu/snap/new/ceshi/code_combo/28a6681f/35/code.py: No such file or directory
+
+ succeeded in 1835ms:
+train 3 test 1
+train 0 input shape (10, 10) colors [0, 1, 2, 3]
+ out colors [0, 1, 2, 3]
+ input water 20 output water 20
+[[0 0 0 0 0 0 0 0 1 1]
+ [0 0 0 0 0 0 0 0 1 1]
+ [0 0 0 0 0 0 0 3 1 1]
+ [0 0 0 0 0 0 0 3 1 1]
+ [0 0 0 0 0 0 0 3 1 1]
+ [0 0 0 0 0 3 0 3 1 1]
+ [0 0 0 0 0 3 0 3 1 1]
+ [0 0 0 0 2 3 0 3 1 1]
+ [0 0 0 0 2 3 0 3 1 1]
+ [0 2 2 2 2 3 3 3 1 1]]
+[[0 0 0 0 0 0 0 0 0 0]
+ [0 0 0 0 0 0 0 0 0 0]
+ [0 0 0 0 0 0 0 3 1 1]
+ [0 0 0 0 0 0 0 3 1 1]
+ [0 0 0 0 0 0 0 3 1 1]
+ [0 0 0 0 0 3 1 3 1 1]
+ [0 0 0 0 0 3 1 3 1 1]
+ [0 0 0 0 2 3 1 3 1 1]
+ [0 0 0 0 2 3 1 3 1 1]
+ [0 2 2 2 2 3 3 3 1 1]]
+train 1 input shape (10, 10) colors [0, 1, 3, 5]
+ out colors [0, 1, 3, 5]
+ input water 25 output water 25
+[[0 0 3 0 0 0 0 0 0 0]
+ [0 0 3 0 0 0 0 0 0 1]
+ [0 0 3 0 0 0 0 1 1 1]
+ [0 0 3 0 0 0 0 1 1 1]
+ [0 0 3 0 0 0 1 1 1 1]
+ [0 0 3 0 0 3 1 1 1 1]
+ [0 0 3 0 0 3 5 1 1 5]
+ [0 0 3 1 1 3 5 1 1 5]
+ [0 0 3 1 1 3 5 1 1 5]
+ [0 0 3 3 3 3 5 5 5 5]]
+[[0 0 3 0 0 0 0 0 0 0]
+ [0 0 3 0 0 0 0 0 0 0]
+ [0 0 3 0 0 0 0 0 0 0]
+ [0 0 3 0 0 0 0 0 0 0]
+ [0 0 3 1 1 1 1 1 1 1]
+ [0 0 3 1 1 3 1 1 1 1]
+ [0 0 3 1 1 3 5 1 1 5]
+ [0 0 3 1 1 3 5 1 1 5]
+ [0 0 3 1 1 3 5 1 1 5]
+ [0 0 3 3 3 3 5 5 5 5]]
+train 2 input shape (10, 10) colors [0, 1, 2, 4, 9]
+ out colors [0, 1, 2, 4, 9]
+ input water 3 output water 3
+[[0 0 0 0 0 0 0 0 0 0]
+ [9 9 1 1 0 0 0 0 9 9]
+ [0 9 9 1 0 0 0 9 9 0]
+ [0 0 9 9 0 0 0 9 0 0]
+ [0 0 0 9 0 0 9 9 0 0]
+ [0 0 0 0 0 9 9 0 0 0]
+ [0 0 0 0 0 4 0 0 0 0]
+ [2 0 0 4 0 4 0 0 0 0]
+ [2 0 2 4 0 4 0 0 0 0]
+ [2 2 2 4 4 4 0 0 0 0]]
+[[0 0 0 0 0 0 0 0 0 0]
+ [9 9 0 0 0 0 0 0 9 9]
+ [0 9 9 0 0 0 0 9 9 0]
+ [0 0 9 9 0 0 0 9 0 0]
+ [0 0 0 9 0 0 9 9 0 0]
+ [0 0 0 0 0 9 9 0 0 0]
+ [0 0 0 0 0 4 0 0 0 0]
+ [2 0 0 4 1 4 0 0 0 0]
+ [2 1 2 4 1 4 0 0 0 0]
+ [2 2 2 4 4 4 0 0 0 0]]
+test 0 input shape (10, 10) colors [0, 1, 3, 5, 9]
+ out colors [0, 1, 3, 5, 9]
+ input water 5 output water 5
+[[1 1 0 0 0 0 0 0 0 0]
+ [9 9 1 1 0 0 0 0 0 0]
+ [0 9 9 1 0 0 0 0 0 0]
+ [0 0 9 9 9 0 0 0 0 5]
+ [0 0 0 0 9 9 9 0 0 5]
+ [0 0 0 0 0 0 0 5 0 5]
+ [3 0 0 0 0 0 0 0 0 5]
+ [3 3 0 0 0 0 5 5 0 5]
+ [3 3 3 0 0 5 5 5 0 5]
+ [3 3 3 3 5 5 5 5 0 5]]
+[[0 0 0 0 0 0 0 0 0 0]
+ [9 9 0 0 0 0 0 0 0 0]
+ [0 9 9 0 0 0 0 0 0 0]
+ [0 0 9 9 9 0 0 0 0 5]
+ [0 0 0 0 9 9 9 0 0 5]
+ [0 0 0 0 0 0 0 5 0 5]
+ [3 0 0 0 0 0 0 0 0 5]
+ [3 3 0 0 0 0 5 5 1 5]
+ [3 3 3 1 1 5 5 5 1 5]
+ [3 3 3 3 5 5 5 5 1 5]]
+
+codex
+目前还没有目标文件，目录存在但 `code.py` 缺失。接下来我会读 `D10/0` 和 `D22/1` 的实现思路，再结合 `D1/2` 里现成的 multi-source BFS 距离函数，避免把三个维度只是硬拼在一起。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/ceshi/code/28a6681f/D10/0/code.py" in /home/lixinyu/snap/new
+ succeeded in 139ms:
+# Variant of 28a6681f
+# Dimension: D10 — 变换规则 (transform)
+# Change: 结构像素不变，水像素守恒（数量不变），水从不稳定的输入位置流到稳定的输出位置... → 水量增殖
+
+from __future__ import annotations
+
+import random
+import numpy as np
+
+# Design analysis
+# a) 具体化与行为追踪:
+#    - 仍然使用 10x10 网格、黑底(0)、蓝水(1)、其余颜色作为静态障碍。
+#    - 保留原任务的“边缘导轨 + 底部盆地”视觉骨架，但把上方导轨做成 4-connected 的锯齿楼梯。
+#    - 水滴从导轨起点出发时，会连续执行若干次唯一的对角滑动；每执行一次对角滑动，
+#      就在“对角起点”留下一个额外蓝像素，主水滴继续往下运动并最终落入底部盆地。
+#    - 小例子: 原规则里 `(1,0)->(2,1)->(3,2)` 最终只留下终点水；新规则里会额外保留
+#      `(1,0)` 和 `(2,1)` 两个蓝点，因此输出会出现沿楼梯的蓝色残迹，且总水量增加。
+# b) 复杂度校准:
+#    - 不引入多种复制条件，唯一的增殖触发器就是“发生对角滑动”。
+#    - 每个样例只放 1-2 条边缘导轨，每条导轨长度 2-4，保证视觉上能看出重复的复制模式，
+#      但不会因为对象过多而变乱。
+# c) 隐式假设审查:
+#    - 原 solver 依赖“水量守恒”，因此多轮反复处理整张图是安全的；新规则下若把新生成的水继续
+#      当成可移动源，会导致规则语义膨胀甚至循环。这里改成: 只有输入中的原始水像素是移动源，
+#      对角复制留下的像素是静态残迹。
+#    - 原输出检查要求左右下都非背景，这对新残迹过强；新版本只要求每个输出水像素下方受支撑。
+# d) 放置合法性:
+#    - 导轨固定贴左/右边界，长度受限，行列范围始终在 10x10 内。
+#    - 盆地只占底部 4 行，与上方导轨分离；生成器先放结构再放水，并用 solver 自检。
+# e) 视觉可观察性:
+#    - 输入里蓝水很少，输出里会出现“沿斜坡逐级留下蓝点”的稳定图案；这正是人类可见的规则差异。
+#    - 同时用不对称盆地承接最终落水，让输出既有残迹也有汇聚结果，避免退化成简单复制。
+# f) 可视化整洁度:
+#    - 结构只有上方导轨和下方盆地两层，不做重叠标记。
+#    - 颜色数控制在 3 种以内（蓝水 + 2 个结构色），保证残迹最醒目。
+# g) 颜色变化可推断性:
+#    - 变体不依赖颜色映射；结构颜色仅用于区分障碍分段，不参与任何隐藏排序或条件判断。
+
+
+def _component_count(points: set[tuple[int, int]], use_diagonal: bool) -> int:
+    remaining = set(points)
+    if use_diagonal:
+        neighbors = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if (dr, dc) != (0, 0)]
+    else:
+        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    count = 0
+    while remaining:
+        count += 1
+        stack = [remaining.pop()]
+        while stack:
+            r, c = stack.pop()
+            for dr, dc in neighbors:
+                nxt = (int(r + dr), int(c + dc))
+                if nxt in remaining:
+                    remaining.remove(nxt)
+                    stack.append(nxt)
+    return count
+
+
+def _simulate(
+    grid: np.ndarray,
+    *,
+    check_input: bool,
+    check_output: bool,
+    split_on_diagonal: bool,
+    return_stats: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, int]]:
+    g = np.array(grid, dtype=int).copy()
+    H, W = g.shape
+    bg = 0
+    water = 1
+
+    if check_input:
+        for r, c in np.argwhere(g == int(water)):
+            rr = int(r)
+            cc = int(c)
+            assert rr == H - 1 or int(g[rr + 1, cc]) != int(bg), "input water must be supported"
+            left_bg = cc > 0 and int(g[rr, cc - 1]) == int(bg)
+            right_bg = cc + 1 < W and int(g[rr, cc + 1]) == int(bg)
+            assert not (left_bg and right_bg), "input water cannot have bg on both horizontal sides"
+
+    bottom_colors = set(map(int, g[H - 1]))
+    for color in sorted(set(map(int, g[:7].flatten())) - {bg, water} - bottom_colors):
+        pts = {(int(r), int(c)) for r, c in np.argwhere(g[:7] == int(color))}
+        diag_links = sum(1 for r, c in pts if (r + 1, c - 1) in pts or (r + 1, c + 1) in pts)
+        if diag_links >= 3:
+            assert any(c in (0, W - 1) for _r, c in pts), "guide must enter from a grid edge"
+            assert _component_count(pts, False) == _component_count(pts, True), "guide must be 4-connected"
+
+    def settle(r: int, c: int) -> tuple[int, int, list[tuple[int, int]]]:
+        rr = int(r)
+        cc = int(c)
+        leaves: list[tuple[int, int]] = []
+        for _ in range(H * W):
+            if rr + 1 < H and int(g[rr + 1, cc]) == int(bg):
+                rr += 1
+                continue
+
+            opts = []
+            if (
+                rr + 1 < H
+                and cc - 1 >= 0
+                and int(g[rr, cc - 1]) == int(bg)
+                and int(g[rr + 1, cc - 1]) == int(bg)
+            ):
+                opts.append((int(rr + 1), int(cc - 1)))
+            if (
+                rr + 1 < H
+                and cc + 1 < W
+                and int(g[rr, cc + 1]) == int(bg)
+                and int(g[rr + 1, cc + 1]) == int(bg)
+            ):
+                opts.append((int(rr + 1), int(cc + 1)))
+            if opts:
+                assert len(opts) == 1, f"ambiguous diagonal moves: {opts}"
+                if split_on_diagonal:
+                    leaves.append((int(rr), int(cc)))
+                rr, cc = opts[0]
+                continue
+
+            if rr + 1 < H and int(g[rr + 1, cc]) != int(bg):
+                L = int(cc)
+                while L - 1 >= 0 and int(g[rr, L - 1]) == int(bg):
+                    L -= 1
+                R = int(cc)
+                while R + 1 < W and int(g[rr, R + 1]) == int(bg):
+                    R += 1
+
+                drops = [int(x) for x in range(int(L), int(R) + 1) if int(g[rr + 1, int(x)]) == int(bg)]
+                if not drops:
+                    break
+
+                min_dist = min(abs(int(x - cc)) for x in drops)
+                nearest = [int(x) for x in drops if abs(int(x - cc)) == int(min_dist)]
+                assert len(nearest) == 1, f"ambiguous nearest drop columns: {nearest}"
+                best = nearest[0]
+                assert best != int(cc)
+                step = -1 if best < int(cc) else 1
+                nx = int(cc + step)
+                assert int(g[rr, nx]) == int(bg)
+                cc = nx
+                continue
+
+            break
+        else:
+            raise AssertionError("water pixel did not settle")
+        return int(rr), int(cc), leaves
+
+    initial_sources = sorted([(int(r), int(c)) for r, c in np.argwhere(g == int(water))], reverse=True)
+    split_events = 0
+    moved = False
+    created = 0
+
+    for r, c in initial_sources:
+        if int(g[r, c]) != int(water):
+            continue
+        g[r, c] = int(bg)
+        rr, cc, leaves = settle(int(r), int(c))
+        moved = bool(moved or leaves or ((int(rr), int(cc)) != (int(r), int(c))))
+        g[rr, cc] = int(water)
+        for lr, lc in leaves:
+            if int(g[lr, lc]) == int(bg):
+                g[lr, lc] = int(water)
+                created += 1
+        split_events += len(leaves)
+
+    if check_output:
+        for r, c in np.argwhere(g == int(water)):
+            rr = int(r)
+            cc = int(c)
+            assert rr == H - 1 or int(g[rr + 1, cc]) != int(bg), "output water must be supported"
+
+    stats = {
+        "input_water": len(initial_sources),
+        "output_water": int(np.sum(g == int(water))),
+        "split_events": int(split_events),
+        "created_water": int(created),
+        "moved": int(bool(moved)),
+    }
+    if return_stats:
+        return g, stats
+    return g
+
+
+def main(grid: np.ndarray, check_input: bool = True, check_output: bool = True) -> np.ndarray:
+    """
+    Simulate branching water that slides into basins while duplicating on diagonal turns.
+
+    Input structure:
+    - bg = 0 and water = 1, with the other colors forming fixed basin walls and edge-entering guide rails.
+    - Source water is initially supported on ledges or guide starts, typically near the left or right border.
+    - The static solids keep the original basin geometry; only the water behavior changes in this variant.
+
+    Rule:
+    - Water still falls straight down through background, then uses the same unique diagonal and horizontal slides as before.
+    - Whenever a moving water pixel takes a diagonal step, it leaves behind an extra water pixel at the diagonal takeoff cell.
+    - The moving pixel continues until it settles, while the copied trail pixels remain where they were created.
+
+    Key insight: The output is not count-preserving anymore; each diagonal turn acts like a splitter, so the final blue pattern is the settled basin water plus a visible staircase trail of extra pixels.
+    """
+    return _simulate(
+        grid,
+        check_input=check_input,
+        check_output=check_output,
+        split_on_diagonal=True,
+        return_stats=False,
+    )
+
+
+def _paint_left_guide(g: np.ndarray, color: int, length: int) -> None:
+    for i in range(length):
+        g[2 + i, i] = int(color)
+        g[3 + i, i] = int(color)
+
+
+def _paint_right_guide(g: np.ndarray, color: int, length: int) -> None:
+    for i in range(length):
+        g[2 + i, 9 - i] = int(color)
+        g[3 + i, 9 - i] = int(color)
+
+
+def _paint_basin(g: np.ndarray, left_color: int, right_color: int, rng: random.Random) -> None:
+    g[9, 2:5] = int(left_color)
+    g[9, 5:8] = int(right_color)
+    g[6:9, 2] = int(left_color)
+    g[6:9, 7] = int(right_color)
+    if rng.random() < 0.6:
+        g[8, 5] = int(right_color)
+
+
+def generate_input() -> np.ndarray:
+    rng = random.Random()
+    colors = [2, 3, 4, 5, 6, 7, 8, 9]
+
+    for _ in range(400):
+        g = np.zeros((10, 10), dtype=int)
+        left_color, right_color, guide_color = rng.sample(colors, 3)
+        _paint_basin(g, left_color, right_color, rng)
+
+        guide_sides = ["left", "right"] if rng.random() < 0.7 else [rng.choice(["left", "right"])]
+        split_target = 0
+
+        for side in guide_sides:
+            max_len = 4 if len(guide_sides) == 1 else 3
+            length = rng.randint(2, max_len)
+            split_target += length
+            if side == "left":
+                _paint_left_guide(g, guide_color, length)
+                g[1, 0] = 1
+            else:
+                _paint_right_guide(g, guide_color, length)
+                g[1, 9] = 1
+
+        if rng.random() < 0.35:
+            side = rng.choice(guide_sides)
+            if side == "left" and g[0, 0] == 0:
+                g[0, 0] = 1
+            elif side == "right" and g[0, 9] == 0:
+                g[0, 9] = 1
+
+
+exec
+/bin/bash -lc "sed -n '1,280p' /home/lixinyu/snap/new/ceshi/code/28a6681f/D22/1/code.py" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/ceshi/code/28a6681f/D1/2/code.py" in /home/lixinyu/snap/new
+ succeeded in 206ms:
+# Variant of 28a6681f
+# Dimension: D1 — 水流路径机制 (path)
+# Change: 重力驱动的水流模拟：水像素先向下直落，被阻挡时通过唯一开放侧的对角方向下滑，支撑后水平滑向最近可落点... → 通道跟踪路径
+
+from __future__ import annotations
+
+from collections import deque
+import random
+import numpy as np
+
+
+# Design analysis for the D1 variant
+# a) Concrete behavior:
+#    The original task moved blue water through open black space by gravity. That assumption
+#    made lateral motion a secondary effect after vertical falling. In this variant the open
+#    "air" is no longer the transport medium. Instead, color 8 marks a narrow pipe network.
+#    Blue water starts packed at the source-side mouth of that pipe, and the output shows the
+#    same amount of water translated to the farthest reachable pipe cells, usually in 2-3
+#    lower terminal chambers. A concrete trace:
+#    - Original: a blue pixel above a basin first drops, then maybe diagonally slides.
+#    - Variant: the same blue pixel may move horizontally first, may turn upward inside the
+#      network, and cannot leave color-8 cells at all.
+#    - Difference: the relevant structure is the 4-connected channel topology, not the
+#      vertical emptiness beneath the water.
+# b) Complexity calibration:
+#    A single straight pipe would make the change visually weak. Each generated sample uses
+#    one source reservoir, one trunk, and 2 or 3 lower branches ending in wider chambers.
+#    This keeps the rule visible while avoiding too many branch types. Width varies between
+#    the source reservoir, trunk, and chambers, so "channel width determines flow capacity"
+#    remains observable.
+# c) Implicit assumption audit against the old main():
+#    - Old input checks required supported water and forbade bg on both horizontal sides.
+#      Those assumptions are invalid here because water can sit in a top-edge source mouth.
+#    - Old settle() assumed motion choices came from local gravity, diagonal, and slide
+#      rules. That entire mechanism must be replaced by graph traversal over corridor cells.
+#    - Old output checks assumed stable water must be blocked on left/right/below. That is
+#      also invalid because a pipe chamber may have empty pipe cells beside filled pipe cells.
+#    New assumptions are explicit instead: water lies on the pipe network, the pipe component
+#    touches at least one non-bottom edge cell, and generator construction guarantees that
+#    only one such source mouth exists.
+# d) Placement legality:
+#    The generator creates the corridor first as a tree-shaped set of in-bounds coordinates,
+#    then paints solid blocks only onto non-corridor cells. Source mouths touch only one of
+#    top/left/right edges; terminal chambers are kept away from left/right edges to avoid
+#    ambiguity with the source detector. No rectangles overlap because every paint step skips
+#    existing corridor cells.
+# e) Visual observability:
+#    Humans can infer the rule from 2-4 examples because the orange pipe color is explicit
+#    and the water packet always relocates from the edge source into remote bottom chambers,
+#    often through long horizontal segments where gravity alone would not explain the motion.
+#    Branch count and source side vary, but the underlying transformation is always "follow
+#    the same pipe graph away from the source".
+# f) Visual cleanliness:
+#    The grid stays 10x10 like the original. Corridor cells use a single dedicated color,
+#    water never overlaps solids, and wall colors are confined mostly to the lower third so
+#    the pipe network remains legible.
+# g) Color inferability:
+#    Only four semantic roles exist: bg=0, water=1, pipe=8, plus two solid wall colors.
+#    No hidden ordering depends on color id; color 8 is always the traversable channel and
+#    blue is always the movable fluid.
+
+
+BG = 0
+WATER = 1
+PIPE = 8
+
+
+def _neighbors4(r: int, c: int, h: int, w: int) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        rr = int(r + dr)
+        cc = int(c + dc)
+        if 0 <= rr < h and 0 <= cc < w:
+            out.append((rr, cc))
+    return out
+
+
+def _multi_source_dist(mask: np.ndarray, sources: list[tuple[int, int]]) -> np.ndarray:
+    h, w = mask.shape
+    dist = -np.ones((h, w), dtype=int)
+    q: deque[tuple[int, int]] = deque()
+    for r, c in sources:
+        if bool(mask[r, c]) and int(dist[r, c]) == -1:
+            dist[r, c] = 0
+            q.append((r, c))
+    while q:
+        r, c = q.popleft()
+        for rr, cc in _neighbors4(r, c, h, w):
+            if bool(mask[rr, cc]) and int(dist[rr, cc]) == -1:
+                dist[rr, cc] = int(dist[r, c] + 1)
+                q.append((rr, cc))
+    return dist
+
+
+def _rank_cells(
+    cells: list[tuple[int, int]],
+    dist: np.ndarray,
+    reverse: bool,
+) -> list[tuple[int, int]]:
+    if reverse:
+        return sorted(cells, key=lambda p: (int(dist[p]), int(p[0]), int(p[1])), reverse=True)
+    return sorted(cells, key=lambda p: (int(dist[p]), int(p[0]), int(p[1])))
+
+
+def _detect_source_cells(mask: np.ndarray, water_mask: np.ndarray) -> list[tuple[int, int]]:
+    h, w = mask.shape
+    edge_cells = [
+        (int(r), int(c))
+        for r, c in np.argwhere(mask)
+        if (int(r) == 0 or int(c) == 0 or int(c) == w - 1) and int(r) != h - 1
+    ]
+    if not edge_cells:
+        return []
+    water_cells = [(int(r), int(c)) for r, c in np.argwhere(water_mask)]
+    if not water_cells:
+        return edge_cells
+    water_dist = _multi_source_dist(mask, water_cells)
+    best = min(int(water_dist[r, c]) for r, c in edge_cells if int(water_dist[r, c]) >= 0)
+    return [(r, c) for r, c in edge_cells if int(water_dist[r, c]) == best]
+
+
+def _paint_rect(
+    grid: np.ndarray,
+    r0: int,
+    c0: int,
+    h: int,
+    w: int,
+    color: int,
+    forbidden: set[tuple[int, int]],
+) -> None:
+    rr0 = max(0, int(r0))
+    cc0 = max(0, int(c0))
+    rr1 = min(grid.shape[0], int(r0 + h))
+    cc1 = min(grid.shape[1], int(c0 + w))
+    for r in range(rr0, rr1):
+        for c in range(cc0, cc1):
+            if (r, c) not in forbidden:
+                grid[r, c] = int(color)
+
+
+def _add_hline(cells: set[tuple[int, int]], r: int, c0: int, c1: int) -> None:
+    for c in range(min(c0, c1), max(c0, c1) + 1):
+        cells.add((int(r), int(c)))
+
+
+def _add_vline(cells: set[tuple[int, int]], c: int, r0: int, r1: int) -> None:
+    for r in range(min(r0, r1), max(r0, r1) + 1):
+        cells.add((int(r), int(c)))
+
+
+def _build_corridor() -> tuple[set[tuple[int, int]], list[tuple[int, int]]]:
+    source_side = random.choice(["top", "left", "right"])
+    split_r = random.choice([4, 5])
+    split_c = random.choice([4, 5])
+    corridor: set[tuple[int, int]] = set()
+
+    chamber_specs = [
+        (8, 1, 2, random.choice([2, 3])),
+        (7, 4, 3, 2),
+        (8, 7, 2, 2),
+    ]
+    random.shuffle(chamber_specs)
+    chamber_specs = sorted(chamber_specs[: random.choice([2, 3])], key=lambda x: x[1])
+
+    if source_side == "top":
+        src_w = random.choice([2, 3])
+        src_c0 = random.choice([1, 2, 5, 6])
+        outlet_c = int(src_c0 + src_w // 2)
+        for r in range(0, 2):
+            for c in range(src_c0, src_c0 + src_w):
+                corridor.add((r, c))
+        _add_vline(corridor, outlet_c, 1, split_r)
+        _add_hline(corridor, split_r, outlet_c, split_c)
+    elif source_side == "left":
+        src_h = random.choice([2, 3])
+        src_r0 = random.choice([1, 2])
+        outlet_r = int(src_r0 + src_h // 2)
+        for r in range(src_r0, src_r0 + src_h):
+            for c in range(0, 2):
+                corridor.add((r, c))
+        _add_hline(corridor, outlet_r, 1, split_c)
+        _add_vline(corridor, split_c, outlet_r, split_r)
+    else:
+        src_h = random.choice([2, 3])
+        src_r0 = random.choice([1, 2])
+        outlet_r = int(src_r0 + src_h // 2)
+        for r in range(src_r0, src_r0 + src_h):
+            for c in range(8, 10):
+                corridor.add((r, c))
+        _add_hline(corridor, outlet_r, split_c, 8)
+        _add_vline(corridor, split_c, outlet_r, split_r)
+
+    for r0, c0, h, w in chamber_specs:
+        entry_c = int(c0 + w // 2)
+        _add_hline(corridor, split_r, split_c, entry_c)
+        _add_vline(corridor, entry_c, split_r, r0)
+        for r in range(r0, r0 + h):
+            for c in range(c0, c0 + w):
+                corridor.add((r, c))
+
+    # Add one small width-2 bulge on the trunk or on a branch so width is visible.
+    widen_candidates = [
+        (r, c)
+        for r, c in corridor
+        if 1 <= r <= 7 and 2 <= c <= 7 and (r + 1, c) in corridor and (r, c + 1) not in corridor
+    ]
+    random.shuffle(widen_candidates)
+    for r, c in widen_candidates[:2]:
+        corridor.add((r, c + 1))
+
+    source_cells = []
+    for r, c in sorted(corridor):
+        if r == 0 or c == 0 or c == 9:
+            if r != 9:
+                source_cells.append((r, c))
+    assert source_cells
+    return corridor, source_cells
+
+
+def _decorate_solids(
+    corridor: set[tuple[int, int]],
+    wall_left: int,
+    wall_right: int,
+) -> np.ndarray:
+    grid = np.zeros((10, 10), dtype=int)
+    for r, c in corridor:
+        grid[r, c] = PIPE
+
+    # Bottom masses preserve the original "basin area" look without changing the new path rule.
+    _paint_rect(grid, 7, 0, 3, 4, wall_left, corridor)
+    _paint_rect(grid, 8, 3, 2, 3, wall_left, corridor)
+    _paint_rect(grid, 7, 6, 3, 4, wall_right, corridor)
+    _paint_rect(grid, 8, 4, 2, 3, wall_right, corridor)
+
+    # A few mid-level supports make the pipe appear embedded rather than floating.
+    for r, c in sorted(corridor):
+        if r >= 6:
+            continue
+        if c + 1 < 10 and (r, c + 1) not in corridor and grid[r, c + 1] == BG and random.random() < 0.18:
+            grid[r, c + 1] = wall_right
+        if c - 1 >= 0 and (r, c - 1) not in corridor and grid[r, c - 1] == BG and random.random() < 0.18:
+            grid[r, c - 1] = wall_left
+    return grid
+
+
+def _make_example() -> tuple[np.ndarray, np.ndarray]:
+    wall_colors = random.sample([2, 3, 4, 5, 6, 7, 9], 2)
+    corridor, source_cells = _build_corridor()
+    base = _decorate_solids(corridor, wall_colors[0], wall_colors[1])
+
+    mask = (base == PIPE)
+    dist = _multi_source_dist(mask, source_cells)
+    all_cells = [(int(r), int(c)) for r, c in np.argwhere(mask)]
+    assert all(int(dist[r, c]) >= 0 for r, c in all_cells)
+
+    near = _rank_cells(all_cells, dist, reverse=False)
+    far = _rank_cells(all_cells, dist, reverse=True)
+
+    max_k = min(10, len(all_cells) - 3)
+    min_k = min(5, max_k)
+
+ succeeded in 221ms:
+# Variant of 28a6681f
+# Dimension: D22 — 水源与盆地的空间关系 (meta)
+# Change: 水源位于盆地上方或侧面，通过guide或直接的路径连接到盆地区域... → 多个水源对应多个盆地（映射关系）
+
+from __future__ import annotations
+
+from collections import defaultdict, deque
+import random
+
+import numpy as np
+
+
+# Design analysis for D22/1
+# -------------------------
+# This variant turns the task from a single local water simulation into a visible
+# source-to-basin mapping problem.  Each upper source has blue water resting on a
+# colored shelf and below a same-colored tag.  The bottom half contains one U
+# basin of each tag color.  Source positions are deliberately permuted relative
+# to basin positions, so a solver must match by visible color equality and then
+# place that source's water into the matching basin.
+#
+# ARC suitability:
+# - The mapping cue is direct color equality, not numeric color ordering.
+# - Only 2-3 source/basin colors appear in a sample.
+# - All basins are clean U shapes; fill cells are visually obvious and filled
+#   bottom-up, so the transformation is easy to check from 2-4 examples.
+# - The generator validates every sampled grid with main() and forces at least
+#   one non-vertical mapping, preventing degeneration into the original layout.
+
+
+BG = 0
+WATER = 1
+
+
+def _components(points: set[tuple[int, int]]) -> list[set[tuple[int, int]]]:
+    remaining = set(points)
+    comps: list[set[tuple[int, int]]] = []
+    while remaining:
+        start = remaining.pop()
+        comp = {start}
+        q: deque[tuple[int, int]] = deque([start])
+        while q:
+            r, c = q.popleft()
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nxt = (int(r + dr), int(c + dc))
+                if nxt in remaining:
+                    remaining.remove(nxt)
+                    comp.add(nxt)
+                    q.append(nxt)
+        comps.append(comp)
+    return comps
+
+
+def _source_counts(grid: np.ndarray) -> dict[int, int]:
+    H, _W = grid.shape
+    counts: dict[int, int] = defaultdict(int)
+    for r, c in np.argwhere(grid == WATER):
+        rr = int(r)
+        cc = int(c)
+        if rr >= H // 2:
+            continue
+        support = int(grid[rr + 1, cc]) if rr + 1 < H else BG
+        tag = int(grid[rr - 1, cc]) if rr - 1 >= 0 else BG
+        candidates = [v for v in (support, tag) if v not in (BG, WATER)]
+        assert candidates, "upper water must have a visible colored source tag"
+        assert len(set(candidates)) == 1, "source tag and support must agree"
+        counts[int(candidates[0])] += 1
+    assert counts, "at least one upper source is required"
+    return dict(counts)
+
+
+def _basin_fill_cells(grid: np.ndarray, color: int) -> list[tuple[int, int]]:
+    H, _W = grid.shape
+    pts = {(int(r), int(c)) for r, c in np.argwhere(grid == int(color))}
+    lower_comps = [comp for comp in _components(pts) if max(r for r, _c in comp) == H - 1]
+    assert len(lower_comps) == 1, f"expected one bottom basin for color {color}"
+    comp = lower_comps[0]
+    rows = [r for r, _c in comp]
+    cols = [c for _r, c in comp]
+    r0, r1 = min(rows), max(rows)
+    c0, c1 = min(cols), max(cols)
+    assert r1 == H - 1 and c1 - c0 >= 2, "basin must be a bottom-anchored U"
+
+    cells: list[tuple[int, int]] = []
+    for r in range(r1 - 1, r0 - 1, -1):
+        for c in range(c0 + 1, c1):
+            if int(grid[r, c]) in (BG, WATER):
+                cells.append((int(r), int(c)))
+    assert cells, f"basin for color {color} has no interior"
+    return cells
+
+
+def main(grid: np.ndarray, check_input: bool = True, check_output: bool = True) -> np.ndarray:
+    """
+    Route several visible water sources into their matching colored basins.
+
+    Input structure:
+    - bg = 0. Water pixels = color 1.
+    - The top half contains 2-3 separate blue source runs, each with a colored tag and support shelf.
+    - The bottom half contains one bottom-anchored U basin for each source tag color.
+
+    Rule:
+    - Count the blue pixels in each tagged upper source.
+    - Match that source to the bottom U basin with the same visible color.
+    - Remove the upper source water and fill the matched basin bottom-up with the same number of blue pixels.
+
+    Key insight: Source position no longer determines the destination; the colored tag gives a 1:1 source-to-basin mapping.
+    """
+    g = np.array(grid, dtype=int)
+    assert g.ndim == 2
+    out = g.copy()
+    counts = _source_counts(g)
+
+    if check_input:
+        assert len(counts) in (2, 3), "variant expects 2 or 3 mapped sources"
+        for color, count in counts.items():
+            assert count >= 2, "each source should contain a visible run of at least two water pixels"
+            assert len(_basin_fill_cells(g, int(color))) >= count, "matched basin capacity is too small"
+
+    for r, c in np.argwhere(g == WATER):
+        if int(r) < g.shape[0] // 2:
+            out[int(r), int(c)] = BG
+
+    for color, count in counts.items():
+        cells = _basin_fill_cells(g, int(color))
+        assert len(cells) >= count, f"not enough basin cells for color {color}"
+        for r, c in cells[: int(count)]:
+            out[int(r), int(c)] = WATER
+
+    if check_output:
+        assert int(np.sum(g == WATER)) == int(np.sum(out == WATER)), "water count must be conserved"
+        assert not np.any(out[: g.shape[0] // 2] == WATER), "all source water must move into basins"
+        for color, count in counts.items():
+            filled = sum(1 for r, c in _basin_fill_cells(g, int(color)) if int(out[r, c]) == WATER)
+            assert filled == count, f"basin {color} received the wrong amount of water"
+
+    return out
+
+
+def _draw_basin(grid: np.ndarray, color: int, c0: int, c1: int, top: int = 6) -> None:
+    H, _W = grid.shape
+    grid[top:H, c0] = int(color)
+    grid[top:H, c1] = int(color)
+    grid[H - 1, c0 : c1 + 1] = int(color)
+
+
+def _draw_source(grid: np.ndarray, color: int, start: int, count: int) -> None:
+    water_row = 1
+    tag_row = 0
+    support_row = 2
+    grid[tag_row, start : start + count] = int(color)
+    grid[water_row, start : start + count] = WATER
+    grid[support_row, start : start + count] = int(color)
+
+
+def _mapping_is_nontrivial(source_colors: list[int], basin_colors: list[int]) -> bool:
+    return any(src != dst for src, dst in zip(source_colors, basin_colors))
+
+
+def generate_input() -> np.ndarray:
+    rng = random.Random()
+    for _ in range(200):
+        n = rng.choice([2, 3])
+        colors = rng.sample([2, 3, 4, 5, 6, 7, 8, 9], n)
+        g = np.zeros((10, 10), dtype=int)
+
+        if n == 2:
+            basins = [(0, 3), (6, 9)]
+            source_starts = [1, 6]
+            counts_by_slot = [rng.randint(2, 3), rng.randint(2, 3)]
+        else:
+            basins = [(0, 2), (4, 6), (7, 9)]
+            source_starts = [0, 4, 7]
+            counts_by_slot = [rng.randint(2, 3), rng.randint(2, 3), rng.randint(2, 3)]
+
+        for color, (c0, c1) in zip(colors, basins):
+            _draw_basin(g, int(color), int(c0), int(c1))
+
+        source_colors = list(colors)
+        rng.shuffle(source_colors)
+        if not _mapping_is_nontrivial(source_colors, colors):
+            source_colors = source_colors[1:] + source_colors[:1]
+
+        for color, start, count in zip(source_colors, source_starts, counts_by_slot):
+            _draw_source(g, int(color), int(start), int(count))
+
+        try:
+            out = main(g)
+        except AssertionError:
+            continue
+
+        source_counts = _source_counts(g)
+        moved_to_lower = int(np.sum(out[5:] == WATER))
+        if (
+            len(source_counts) == n
+            and moved_to_lower == int(np.sum(g == WATER))
+            and _mapping_is_nontrivial(source_colors, colors)
+        ):
+            return g
+
+    raise RuntimeError("failed to generate D22/1 mapped source sample")
+
+codex
+设计已经比较清楚了：solver 需要把“所有输入水像素”降级成“总水量”，再把 2-3 个 guide 的出口识别成真正的 BFS 源，并按多源最短距离层同步扩散。生成器则要反过来构造多个贴边水仓/guide，把这些出口汇入同一个下半部盆地网络，并用定量指标筛掉看不出“多源汇聚”的退化样本。
+
+计划：
+1. 完成融合设计并明确 solver 新假设与生成器对应保证
+2. 实现新 `code.py`，包含设计分析注释、multi-guide 检测、出口提取、多源 BFS 与生成器
+3. 运行 50 次压力测试并修正失败
+4. 统计融合行为指标，确认样本确实体现多源 BFS 汇聚而非退化回原题
+Implementing a fused ARC variant with multi-guide source extraction, multi-source BFS filling, and generator anti-degeneration checks.
+  ✓ Analyze original task and relevant single-variant references to define fused solver/generator behavior
+  → Implement fused variant code with design analysis, solver, generator, and metrics in code_combo/28a6681f/35/code.py
+  • Run validation script, debug failures, and iterate until success rate is at least 80%
+  • Measure anti-degeneration metrics on generated samples and confirm solver assumptions are guaranteed by generator
+ERROR: Reconnecting... 2/5
+ERROR: Reconnecting... 3/5
+ERROR: Reconnecting... 4/5
+ERROR: Reconnecting... 5/5

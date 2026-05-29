@@ -1,0 +1,3857 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: high
+reasoning summaries: none
+session id: 019e3512-5412-7e20-b03a-411a31ab7d67
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: dd6b8c4b
+    **摘要**: 通过橙色背景从绿色方块进行flood-fill可达性检测，收集可达的栗色像素，按距离排序后以行优先顺序填入绿色方块内部
+
+    ## 要实现的融合组合
+    - **组合名称**: 最短路径长度约束+逐步收集
+    - **combo_spec**: D1/1+D15/0
+
+    ### 融合描述（实现规格）
+
+    可达性要求最短路径不超过阈值（D1/1），每次只收集最近的一个像素后重新判定可达性（D15/0）。逐步收集改变了网格状态，可能使原本超过阈值的像素在某些中间像素消失后变为可达（路径变短）。两者产生动态的可达性变化。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D1/1** — 可达性判定方式 (`path`)
+  - 当前值: flood_fill——从绿色方块出发，通过橙色背景像素进行4连通flood-fill扩散，判断栗色像素是否可达
+  - 改为: 最短路径长度约束 — 不仅要求连通可达，还要求从绿色方块到栗色像素的最短路径长度不超过某个阈值（如方块边长的2倍）。距离过远的栗色像素即使连通也不被收集。解题者需要估算路径距离。
+  - 来源: shortest_path（参考任务: 7b0280bc）
+- **D15/0** — 多步处理与迭代 (`multi_step`)
+  - 当前值: 单步处理——一次性flood-fill判定可达性，收集所有可达像素，排序后填入
+  - 改为: 逐步收集（每步收集最近的一个） — 每次只收集距离最近的一个栗色像素，收集后该像素消失，然后重新进行flood-fill判定可达性（可能因为某个像素消失而打开新路径），再收集下一个。迭代直到无可达像素。
+  - 来源: multi_step（参考任务: 271d71e2）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/dd6b8c4b.py`
+
+    ```python
+    import numpy as np
+
+from arc_utils import neighbors4
+import random
+from collections import deque
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Move the closest reachable maroon pixels into the 3×3 block around the unique red center.
+
+    Input structure:
+    - bg = orange floor, magenta walls, scattered maroon (9) pixels.
+    - A unique red (2) pixel marks the center of a 3×3 destination block.
+
+    Rule:
+    - Maroon pixels connected to the destination through floor/maroon cells (not blocked by walls) are candidates.
+    - Rank candidates by distance to the destination; the closest ones fill the block in row-major order.
+    - Moved maroons are erased (replaced with floor color).
+
+    Key insight: Wall barriers restrict connectivity — only maroon pixels reachable via flood-fill through the floor qualify, so proximity alone isn't enough.
+    """
+
+    grid = np.asarray(grid, dtype=int)
+    h, w = grid.shape
+    out = grid.copy()
+
+    centers = np.argwhere(grid == 2)
+    assert len(centers) == 1, "grid must have exactly one red (2) center pixel"
+    cr, cc = map(int, centers[0])
+
+    # Destination = 3x3 block around the center.
+    dest_cells: list[tuple[int, int]] = []
+    for r in range(cr - 1, cr + 2):
+        for c in range(cc - 1, cc + 2):
+            if 0 <= r < h and 0 <= c < w:
+                dest_cells.append((r, c))
+    dest_cells.sort()
+    dest_set = set(dest_cells)
+
+    # Infer floor color from the ring around the destination.
+    ring_colors: list[int] = []
+    for r, c in dest_cells:
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and (rr, cc2) not in dest_set:
+                ring_colors.append(int(grid[rr, cc2]))
+
+    cand_ring = [x for x in ring_colors if x not in (2, 3, 9)]
+    assert cand_ring, "ring around destination must contain passable (non-maroon, non-red, non-wall) cells to infer floor color"
+    _vals, _cnts = np.unique(cand_ring, return_counts=True)
+    ring_blocker = int(_vals[_cnts.argmax()])
+    other = [int(x) for x in np.unique(grid) if int(x) not in (2, 3, 9, ring_blocker)]
+    floor = other[0] if len(other) == 1 else (max(other, key=lambda c: int((grid == c).sum())) if other else None)
+    if floor is None:
+        floor = ring_blocker
+
+    passable = {floor, 9}
+
+    # BFS start = passable cells adjacent to the destination.
+    starts: list[tuple[int, int]] = []
+    seen = set()
+    for r, c in dest_cells:
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and int(grid[rr, cc2]) in passable:
+                if (rr, cc2) not in seen:
+                    seen.add((rr, cc2))
+                    starts.append((rr, cc2))
+    assert starts, "there must be at least one passable cell adjacent to the destination block to begin BFS"
+
+    INF = 10**9
+    dist = np.full((h, w), INF, dtype=int)
+    q = list(starts)
+    for r, c in starts:
+        dist[r, c] = 0
+
+    qi = 0
+    while qi < len(q):
+        r, c = q[qi]
+        qi += 1
+        d = dist[r, c]
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and int(grid[rr, cc2]) in passable and dist[rr, cc2] == INF:
+                dist[rr, cc2] = d + 1
+                q.append((rr, cc2))
+
+    maroons = [(int(dist[r, c]), int(r), int(c)) for r, c in np.argwhere(grid == 9)]
+    maroons = [t for t in maroons if t[0] < INF]
+    maroons.sort()  # by distance then row then col
+
+    k = min(len(dest_cells), len(maroons))
+    chosen = {(r, c) for _, r, c in maroons[:k]}
+
+    for r, c in chosen:
+        out[r, c] = floor
+
+    for r, c in dest_cells[:k]:
+        out[r, c] = 9
+
+    return out
+
+# --------------- generator (c) ---------------
+
+# ---- CFG: tunable generation parameters ----
+GRID_H, GRID_W = 11, 11          # canvas size (fixed per spec)
+CENTER_R, CENTER_C = 5, 5        # dest block center
+FLOOR_COLOR, WALL_COLOR = 7, 6   # orange floor, magenta wall
+DEST_COLOR, RED_CENTER = 3, 2    # green ring, red center
+MAROON = 9
+
+WALL_PROB = 0.75                  # probability of placing walls
+RING_GAP_RANGE = (1, 4)          # number of corridor openings in wall ring
+WALL_STYLES = ['arms', 'frame', 'mixed']
+
+# Wall extension parameters per style
+ARM_EXTEND_PROB = 0.5             # per-cell chance of extending an arm (arms style)
+ARM_LENGTH_RANGE = (1, 5)         # arm extension length (arms style)
+FRAME_DIST_RANGE = (3, 4)        # outer frame distance from center
+FRAME_CONNECT_PROB = 0.4          # chance of connecting inner ring to outer frame
+FRAME_GAP_REMOVE_PROB = 0.3       # chance of removing an outer frame cell
+MIXED_EXTEND_PROB = 0.6           # per-cell chance of extending (mixed style)
+
+FILL_K_RANGE = (2, 9)            # how many maroon fill the dest block
+DISTRACTOR_MAX = 10               # max unreachable distractor maroons
+TOTAL_MAROON_RANGE = (4, 16)     # total maroon count bounds
+MIN_REACHABLE = 2                 # minimum reachable floor cells to accept layout
+GEN_RETRIES = 300                 # max generation attempts
+
+
+def _bfs_reachable(grid, dest_set):
+    """BFS from floor cells adjacent to dest through floor cells. Returns set of reachable (r,c)."""
+    visited = set()
+    queue = deque()
+    for dr, dc in dest_set:
+        for nr, nc in neighbors4(dr, dc):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                if grid[nr, nc] == FLOOR_COLOR and (nr, nc) not in visited:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+    while queue:
+        r, c = queue.popleft()
+        for nr, nc in neighbors4(r, c):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in visited:
+                if grid[nr, nc] == FLOOR_COLOR and (nr, nc) not in dest_set:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+    return visited
+
+
+def _outward_dirs(r, c):
+    """Return directions pointing away from center for a ring cell."""
+    dirs = []
+    if r < CENTER_R: dirs.append((-1, 0))
+    if r > CENTER_R: dirs.append((1, 0))
+    if c < CENTER_C: dirs.append((0, -1))
+    if c > CENTER_C: dirs.append((0, 1))
+    return dirs
+
+
+def _extend_arm(wall_cells, dest_set, r, c, max_len):
+    """Extend a wall arm outward from (r,c) in a random outward direction, up to max_len cells."""
+    dirs = _outward_dirs(r, c)
+    if not dirs:
+        return
+    dr, dc = random.choice(dirs)
+    length = random.randint(1, max_len)
+    nr, nc = r, c
+    for _ in range(length):
+        nr, nc = nr + dr, nc + dc
+        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+            wall_cells.add((nr, nc))
+        else:
+            break
+
+
+def _build_walls(grid, dest_set):
+    """Build wall barrier around dest with corridor openings, extending outward."""
+    # Ring = cells 4-adjacent to dest but not in dest
+    ring = set()
+    for dr, dc in dest_set:
+        for nr, nc in neighbors4(dr, dc):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                ring.add((nr, nc))
+    ring = sorted(ring)
+
+    # Choose gaps as corridor openings
+    num_gaps = random.randint(*RING_GAP_RANGE)
+    gap_cells = set(random.sample(ring, num_gaps))
+    wall_ring = [cell for cell in ring if cell not in gap_cells]
+    wall_cells = set(wall_ring)
+
+    style = random.choice(WALL_STYLES)
+
+    if style == 'arms':
+        for r, c in wall_ring:
+            if random.random() < ARM_EXTEND_PROB:
+                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
+
+    elif style == 'frame':
+        # Outer frame at distance 3-4 from center
+        dist2 = random.randint(*FRAME_DIST_RANGE)
+        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
+            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
+                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
+                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
+                        wall_cells.add((r, c))
+        # Connect inner ring to outer frame
+        for r, c in wall_ring:
+            dirs = _outward_dirs(r, c)
+            if dirs and random.random() < FRAME_CONNECT_PROB:
+                dr, dc = random.choice(dirs)
+                nr, nc = r + dr, c + dc
+                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                    wall_cells.add((nr, nc))
+                    nr, nc = nr + dr, nc + dc
+        # Remove some outer frame cells for gaps
+        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
+        if outer_frame:
+            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
+            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
+                if random.random() < FRAME_GAP_REMOVE_PROB:
+                    wall_cells.discard(rc)
+
+    else:  # mixed
+        for r, c in wall_ring:
+            if random.random() < MIXED_EXTEND_PROB:
+                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
+                _extend_arm(wall_cells, dest_set, r, c, max_len)
+
+    for r, c in wall_cells:
+        grid[r, c] = WALL_COLOR
+
+
+def _gen_attempt():
+    """Build a candidate input grid; returns the grid or None on failure."""
+    dest_cells = [(r, c) for r in range(CENTER_R - 1, CENTER_R + 2)
+                  for c in range(CENTER_C - 1, CENTER_C + 2)]
+    dest_set = set(dest_cells)
+
+    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
+    for r, c in dest_cells:
+        grid[r, c] = DEST_COLOR
+    grid[CENTER_R, CENTER_C] = RED_CENTER
+
+    if random.random() < WALL_PROB:
+        _build_walls(grid, dest_set)
+
+    reachable_floor = _bfs_reachable(grid, dest_set)
+    if len(reachable_floor) < MIN_REACHABLE:
+        return None
+
+    all_floor = {(r, c) for r in range(GRID_H) for c in range(GRID_W)
+                 if grid[r, c] == FLOOR_COLOR and (r, c) not in dest_set}
+    unreachable_floor = all_floor - reachable_floor
+
+    # Choose fill count k
+    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
+    if max_k < FILL_K_RANGE[0]:
+        return None
+    k = random.randint(FILL_K_RANGE[0], max_k)
+
+    # Choose distractor count
+    max_dist = min(DISTRACTOR_MAX, len(unreachable_floor))
+    num_distractors = random.randint(0, max_dist) if max_dist > 0 else 0
+
+    # Enforce total maroon count within bounds
+    total = k + num_distractors
+    if total < TOTAL_MAROON_RANGE[0]:
+        needed = TOTAL_MAROON_RANGE[0] - total
+        if len(unreachable_floor) >= num_distractors + needed:
+            num_distractors += needed
+        elif max_k >= k + needed:
+            k += needed
+        else:
+            return None
+    if k + num_distractors > TOTAL_MAROON_RANGE[1]:
+        num_distractors = max(0, TOTAL_MAROON_RANGE[1] - k)
+
+    source_cells = random.sample(list(reachable_floor), k)
+    distractor_cells = random.sample(list(unreachable_floor), num_distractors)
+
+    # Build INPUT: dest is green+red, maroon on source and distractor positions
+    inp = grid.copy()
+    for r, c in source_cells + distractor_cells:
+        inp[r, c] = MAROON
+
+    # Build expected OUTPUT: first k dest cells (row-major) become maroon, sources erased
+    out = grid.copy()
+    for r, c in dest_cells[:k]:
+        out[r, c] = MAROON
+    for r, c in distractor_cells:
+        out[r, c] = MAROON
+
+    # Validate with solver
+    try:
+        result = main(inp)
+        if np.array_equal(result, out):
+            return inp
+    except Exception:
+        pass
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        result = _gen_attempt()
+        if result is not None:
+            return result
+    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 11x11, always
+  colors: floor=orange(7), wall=magenta(6) or absent, dest_ring=green(3), center=red(2), tokens=maroon(9)
+  dest_block:
+    shape: 3x3 centered at (5,5), always
+    content: 8 green cells surrounding 1 red center
+  walls:
+    presence: 0-1 wall colors; 4/5 examples have walls [observed]
+    role: wall cells adjacent to dest block restrict BFS; partitions floor into connected components
+    structure: single connected or multi-component wall forming corridors/barriers around dest
+    wall_surrounds_dest: wall occupies most of the 16-cell ring at distance 2 from center, with 1-4 floor gaps serving as corridor openings
+  maroon_tokens:
+    count: 4-16
+    placement: scattered on floor cells, never inside dest block, never on wall
+    reachable: 2-15 tokens reachable via 4-connected BFS through floor+maroon from dest openings
+    unreachable: 0-10 tokens in walled-off floor regions (distractors)
+    reachable_fill_range: 2-9 (min of 9 and reachable count); varies to show partial and full fills
+  transformation:
+    rule: BFS from passable cells adjacent to dest block through floor+maroon; rank reachable maroon by distance (ties broken by row then col); closest k fill dest in row-major order; moved maroon erased to floor
+    conservation: total maroon count preserved (moved, not created/destroyed)
+    dest_fill: first k cells in row-major order become maroon(9), rest keep green(3)/red(2)
+
+generation_strategy:
+  approach: output-first
+  steps:
+    1. Fix grid 11x11, dest block at rows 4-6 cols 4-6 (green ring + red center).
+    2. Decide fill count k in 2-9. Place k maroon in dest row-major; remaining dest cells keep green/red.
+    3. Decide if walls exist (yes/no). If yes, pick wall=6 floor=7 (or swap roles).
+    4. If walls, build wall barrier around dest with 1-4 floor gaps as corridor openings. Wall forms connected or near-connected frame at ~distance 2 from center, extending outward as corridor arms.
+    5. Place k maroon tokens on floor cells reachable from dest openings via BFS, at varied distances. These are the sources that will be erased in output.
+    6. Optionally place 0-10 additional maroon tokens in unreachable floor regions (walled off from dest) as distractors.
+    7. Derive input: copy output grid, move maroon from dest back to source positions (restore dest to green/red), place erased maroon back on floor.
+    8. Validate: run solver on input and confirm output matches.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/18/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dd6b8c4b.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/18/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of dd6b8c4b (index 18)
+    # combo_spec: D1/1+D15/0
+    # Name: 最短路径长度约束+逐步收集
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/18` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/7b0280bc.py` — 参考任务 7b0280bc 的 solver（D1/1 的灵感来源）
+    - `/home/lixinyu/snap/new/arc2_solver_select/271d71e2.py` — 参考任务 271d71e2 的 solver（D15/0 的灵感来源）
+
+codex
+我会先读原题 solver/generator、两个参考变体和原始样例，明确哪些隐式假设会被最短路径阈值与逐步收集打破，然后再落到实现和生成约束上。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/dd6b8c4b.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+import numpy as np
+
+from arc_utils import neighbors4
+import random
+from collections import deque
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Move the closest reachable maroon pixels into the 3×3 block around the unique red center.
+
+    Input structure:
+    - bg = orange floor, magenta walls, scattered maroon (9) pixels.
+    - A unique red (2) pixel marks the center of a 3×3 destination block.
+
+    Rule:
+    - Maroon pixels connected to the destination through floor/maroon cells (not blocked by walls) are candidates.
+    - Rank candidates by distance to the destination; the closest ones fill the block in row-major order.
+    - Moved maroons are erased (replaced with floor color).
+
+    Key insight: Wall barriers restrict connectivity — only maroon pixels reachable via flood-fill through the floor qualify, so proximity alone isn't enough.
+    """
+
+    grid = np.asarray(grid, dtype=int)
+    h, w = grid.shape
+    out = grid.copy()
+
+    centers = np.argwhere(grid == 2)
+    assert len(centers) == 1, "grid must have exactly one red (2) center pixel"
+    cr, cc = map(int, centers[0])
+
+    # Destination = 3x3 block around the center.
+    dest_cells: list[tuple[int, int]] = []
+    for r in range(cr - 1, cr + 2):
+        for c in range(cc - 1, cc + 2):
+            if 0 <= r < h and 0 <= c < w:
+                dest_cells.append((r, c))
+    dest_cells.sort()
+    dest_set = set(dest_cells)
+
+    # Infer floor color from the ring around the destination.
+    ring_colors: list[int] = []
+    for r, c in dest_cells:
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and (rr, cc2) not in dest_set:
+                ring_colors.append(int(grid[rr, cc2]))
+
+    cand_ring = [x for x in ring_colors if x not in (2, 3, 9)]
+    assert cand_ring, "ring around destination must contain passable (non-maroon, non-red, non-wall) cells to infer floor color"
+    _vals, _cnts = np.unique(cand_ring, return_counts=True)
+    ring_blocker = int(_vals[_cnts.argmax()])
+    other = [int(x) for x in np.unique(grid) if int(x) not in (2, 3, 9, ring_blocker)]
+    floor = other[0] if len(other) == 1 else (max(other, key=lambda c: int((grid == c).sum())) if other else None)
+    if floor is None:
+        floor = ring_blocker
+
+    passable = {floor, 9}
+
+    # BFS start = passable cells adjacent to the destination.
+    starts: list[tuple[int, int]] = []
+    seen = set()
+    for r, c in dest_cells:
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and int(grid[rr, cc2]) in passable:
+                if (rr, cc2) not in seen:
+                    seen.add((rr, cc2))
+                    starts.append((rr, cc2))
+    assert starts, "there must be at least one passable cell adjacent to the destination block to begin BFS"
+
+    INF = 10**9
+    dist = np.full((h, w), INF, dtype=int)
+    q = list(starts)
+    for r, c in starts:
+        dist[r, c] = 0
+
+    qi = 0
+    while qi < len(q):
+        r, c = q[qi]
+        qi += 1
+        d = dist[r, c]
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and int(grid[rr, cc2]) in passable and dist[rr, cc2] == INF:
+                dist[rr, cc2] = d + 1
+                q.append((rr, cc2))
+
+    maroons = [(int(dist[r, c]), int(r), int(c)) for r, c in np.argwhere(grid == 9)]
+    maroons = [t for t in maroons if t[0] < INF]
+    maroons.sort()  # by distance then row then col
+
+    k = min(len(dest_cells), len(maroons))
+    chosen = {(r, c) for _, r, c in maroons[:k]}
+
+    for r, c in chosen:
+        out[r, c] = floor
+
+    for r, c in dest_cells[:k]:
+        out[r, c] = 9
+
+    return out
+
+# --------------- generator (c) ---------------
+
+# ---- CFG: tunable generation parameters ----
+GRID_H, GRID_W = 11, 11          # canvas size (fixed per spec)
+CENTER_R, CENTER_C = 5, 5        # dest block center
+FLOOR_COLOR, WALL_COLOR = 7, 6   # orange floor, magenta wall
+DEST_COLOR, RED_CENTER = 3, 2    # green ring, red center
+MAROON = 9
+
+WALL_PROB = 0.75                  # probability of placing walls
+RING_GAP_RANGE = (1, 4)          # number of corridor openings in wall ring
+WALL_STYLES = ['arms', 'frame', 'mixed']
+
+# Wall extension parameters per style
+ARM_EXTEND_PROB = 0.5             # per-cell chance of extending an arm (arms style)
+ARM_LENGTH_RANGE = (1, 5)         # arm extension length (arms style)
+FRAME_DIST_RANGE = (3, 4)        # outer frame distance from center
+FRAME_CONNECT_PROB = 0.4          # chance of connecting inner ring to outer frame
+FRAME_GAP_REMOVE_PROB = 0.3       # chance of removing an outer frame cell
+MIXED_EXTEND_PROB = 0.6           # per-cell chance of extending (mixed style)
+
+FILL_K_RANGE = (2, 9)            # how many maroon fill the dest block
+DISTRACTOR_MAX = 10               # max unreachable distractor maroons
+TOTAL_MAROON_RANGE = (4, 16)     # total maroon count bounds
+MIN_REACHABLE = 2                 # minimum reachable floor cells to accept layout
+GEN_RETRIES = 300                 # max generation attempts
+
+
+def _bfs_reachable(grid, dest_set):
+    """BFS from floor cells adjacent to dest through floor cells. Returns set of reachable (r,c)."""
+    visited = set()
+    queue = deque()
+    for dr, dc in dest_set:
+        for nr, nc in neighbors4(dr, dc):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                if grid[nr, nc] == FLOOR_COLOR and (nr, nc) not in visited:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+    while queue:
+        r, c = queue.popleft()
+        for nr, nc in neighbors4(r, c):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in visited:
+                if grid[nr, nc] == FLOOR_COLOR and (nr, nc) not in dest_set:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+    return visited
+
+
+def _outward_dirs(r, c):
+    """Return directions pointing away from center for a ring cell."""
+    dirs = []
+    if r < CENTER_R: dirs.append((-1, 0))
+    if r > CENTER_R: dirs.append((1, 0))
+    if c < CENTER_C: dirs.append((0, -1))
+    if c > CENTER_C: dirs.append((0, 1))
+    return dirs
+
+
+def _extend_arm(wall_cells, dest_set, r, c, max_len):
+    """Extend a wall arm outward from (r,c) in a random outward direction, up to max_len cells."""
+    dirs = _outward_dirs(r, c)
+    if not dirs:
+        return
+    dr, dc = random.choice(dirs)
+    length = random.randint(1, max_len)
+    nr, nc = r, c
+    for _ in range(length):
+        nr, nc = nr + dr, nc + dc
+        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+            wall_cells.add((nr, nc))
+        else:
+            break
+
+
+def _build_walls(grid, dest_set):
+    """Build wall barrier around dest with corridor openings, extending outward."""
+    # Ring = cells 4-adjacent to dest but not in dest
+    ring = set()
+    for dr, dc in dest_set:
+        for nr, nc in neighbors4(dr, dc):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                ring.add((nr, nc))
+    ring = sorted(ring)
+
+    # Choose gaps as corridor openings
+    num_gaps = random.randint(*RING_GAP_RANGE)
+    gap_cells = set(random.sample(ring, num_gaps))
+    wall_ring = [cell for cell in ring if cell not in gap_cells]
+    wall_cells = set(wall_ring)
+
+    style = random.choice(WALL_STYLES)
+
+    if style == 'arms':
+        for r, c in wall_ring:
+            if random.random() < ARM_EXTEND_PROB:
+                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
+
+    elif style == 'frame':
+        # Outer frame at distance 3-4 from center
+        dist2 = random.randint(*FRAME_DIST_RANGE)
+        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
+            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
+                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
+                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
+                        wall_cells.add((r, c))
+        # Connect inner ring to outer frame
+        for r, c in wall_ring:
+            dirs = _outward_dirs(r, c)
+            if dirs and random.random() < FRAME_CONNECT_PROB:
+                dr, dc = random.choice(dirs)
+                nr, nc = r + dr, c + dc
+                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                    wall_cells.add((nr, nc))
+                    nr, nc = nr + dr, nc + dc
+        # Remove some outer frame cells for gaps
+        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
+        if outer_frame:
+            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
+            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
+                if random.random() < FRAME_GAP_REMOVE_PROB:
+                    wall_cells.discard(rc)
+
+    else:  # mixed
+        for r, c in wall_ring:
+            if random.random() < MIXED_EXTEND_PROB:
+                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
+                _extend_arm(wall_cells, dest_set, r, c, max_len)
+
+    for r, c in wall_cells:
+        grid[r, c] = WALL_COLOR
+
+
+def _gen_attempt():
+    """Build a candidate input grid; returns the grid or None on failure."""
+    dest_cells = [(r, c) for r in range(CENTER_R - 1, CENTER_R + 2)
+                  for c in range(CENTER_C - 1, CENTER_C + 2)]
+    dest_set = set(dest_cells)
+
+    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
+    for r, c in dest_cells:
+        grid[r, c] = DEST_COLOR
+    grid[CENTER_R, CENTER_C] = RED_CENTER
+
+    if random.random() < WALL_PROB:
+        _build_walls(grid, dest_set)
+
+    reachable_floor = _bfs_reachable(grid, dest_set)
+    if len(reachable_floor) < MIN_REACHABLE:
+        return None
+
+    all_floor = {(r, c) for r in range(GRID_H) for c in range(GRID_W)
+                 if grid[r, c] == FLOOR_COLOR and (r, c) not in dest_set}
+    unreachable_floor = all_floor - reachable_floor
+
+    # Choose fill count k
+    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
+    if max_k < FILL_K_RANGE[0]:
+        return None
+    k = random.randint(FILL_K_RANGE[0], max_k)
+
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/7b0280bc.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+from collections import Counter, defaultdict, deque
+import numpy as np
+from arc_utils import Color, components_mask, colors_present, get_bg, neighbors8
+import random
+from collections import deque
+
+
+def find_solid_squares(
+    grid: np.ndarray,
+    *,
+    bg: int | None = None,
+    min_size: int = 2,
+    connectivity: int = 8,
+) -> list[dict]:
+    """
+    Local helper (only used by this solver): find solid monochrome NxN squares (N>=min_size).
+
+    Returns list of dicts:
+    - color: int
+    - size: int (N)
+    - bbox: (r0,c0,r1,c1)
+    - coords: np.ndarray of (r,c)
+    """
+    if bg is None:
+        bg = get_bg(grid)
+    bg = int(bg)
+
+    out: list[dict] = []
+    for col in colors_present(grid, exclude={bg}):
+        for coords in components_mask(grid == int(col), connectivity=int(connectivity)):
+            if coords.size == 0:
+                continue
+            r0, c0 = coords.min(axis=0)
+            r1, c1 = coords.max(axis=0)
+            h = int(r1 - r0 + 1)
+            w = int(c1 - c0 + 1)
+            if h < int(min_size) or h != w:
+                continue
+            if int(coords.shape[0]) != int(h * w):
+                continue
+            out.append(
+                {
+                    "color": int(col),
+                    "size": int(h),
+                    "bbox": (int(r0), int(c0), int(r1), int(c1)),
+                    "coords": coords,
+                }
+            )
+    return out
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Recolor the shortest path between two terminal squares in a square-and-track graph.
+
+    Input structure:
+    - bg = most common color.
+    - Two non-bg colors form solid NxN squares (N>=2): one color marks exactly 2 terminals, the other marks stations.
+    - A third non-bg color forms 1-cell-wide track segments connecting pairs of squares (graph edges).
+
+    Rule:
+    - Find the shortest path (fewest edges) between the two terminal squares.
+    - Recolor every station square on that path to green.
+    - Recolor every track segment along that path to grey.
+    - Everything else unchanged.
+
+    Key insight: The grid encodes a graph where squares are nodes and tracks are edges; the task is graph shortest-path, not spatial proximity.
+    """
+    g = np.array(grid, dtype=int)
+    bg = int(get_bg(g))
+
+    # --- detect solid squares (nodes) and infer the dominant size N ---
+    square_cands = find_solid_squares(g, bg=bg, min_size=2, connectivity=8)
+    assert not (not square_cands)
+
+    size_counts = Counter([int(d["size"]) for d in square_cands])
+    N = int(max(size_counts.items(), key=lambda kv: (int(kv[1]), int(kv[0])))[0])
+    nodes_raw = [d for d in square_cands if int(d["size"]) == int(N)]
+
+    nodes: list[dict] = []
+    for i, d in enumerate(nodes_raw):
+        pts = {(int(r), int(c)) for r, c in d["coords"]}
+        nodes.append({"id": int(i), "color": int(d["color"]), "pts": pts})
+
+    nodes_by_color: dict[int, list[int]] = defaultdict(list)
+    for nd in nodes:
+        nodes_by_color[int(nd["color"])].append(int(nd["id"]))
+
+    node_colors = sorted(nodes_by_color.keys())
+    assert not (len(node_colors) < 2)
+
+    terminal_color = None
+    station_color = None
+    for col in node_colors:
+        if len(nodes_by_color[int(col)]) == 2:
+            terminal_color = int(col)
+        else:
+            station_color = int(col)
+    assert not (terminal_color is None or station_color is None)
+    term_ids = list(map(int, nodes_by_color[int(terminal_color)]))
+
+    # Track color is the remaining non-bg color (not a node color).
+    non_bg_colors = colors_present(g, exclude={bg})
+    track_candidates = [c for c in non_bg_colors if int(c) not in (int(terminal_color), int(station_color))]
+    assert not (not track_candidates)
+    track_color = int(max(track_candidates, key=lambda c: int((g == int(c)).sum())))
+
+    # --- build node lookup ---
+    pix2node: dict[tuple[int, int], int] = {}
+    id2pts: dict[int, set[tuple[int, int]]] = {}
+    for nd in nodes:
+        nid = int(nd["id"])
+        pts = set(nd["pts"])
+        id2pts[nid] = pts
+        for p in pts:
+            pix2node[p] = nid
+
+    # --- build edges from track components that touch exactly 2 nodes (8-adjacency) ---
+    track_comps = components_mask(g == int(track_color), connectivity=8)
+    track_comp_pts: dict[int, list[tuple[int, int]]] = {}
+    adj: dict[int, list[tuple[int, int]]] = defaultdict(list)  # node -> [(neighbor, edge_id)]
+
+    for edge_id, coords in enumerate(track_comps, start=1):
+        pts = [(int(r), int(c)) for r, c in coords]
+        if not pts:
+            continue
+        touched: set[int] = set()
+        for r, c in pts:
+            for rr, cc in neighbors8(int(r), int(c)):
+                nid = pix2node.get((int(rr), int(cc)))
+                if nid is not None:
+                    touched.add(int(nid))
+        if len(touched) != 2:
+            continue
+        a, b = sorted(touched)
+        track_comp_pts[int(edge_id)] = pts
+        adj[int(a)].append((int(b), int(edge_id)))
+        adj[int(b)].append((int(a), int(edge_id)))
+
+    # --- shortest path between terminals (BFS by edge count) ---
+    start, goal = int(term_ids[0]), int(term_ids[1])
+    q = deque([start])
+    prev: dict[int, int | None] = {start: None}
+    prev_edge: dict[int, int | None] = {start: None}
+
+    while q:
+        u = int(q.popleft())
+        if u == goal:
+            break
+        for v, eid in adj.get(u, []):
+            if int(v) in prev:
+                continue
+            prev[int(v)] = int(u)
+            prev_edge[int(v)] = int(eid)
+            q.append(int(v))
+
+    assert not (goal not in prev)
+
+    node_path: list[int] = []
+    edge_path: list[int] = []
+    cur = int(goal)
+    while cur is not None:
+        node_path.append(int(cur))
+        e = prev_edge.get(int(cur))
+        if e is not None:
+            edge_path.append(int(e))
+        cur2 = prev.get(int(cur))
+        cur = int(cur2) if cur2 is not None else None
+    node_path.reverse()
+    edge_path.reverse()
+
+    # --- apply recolors in-place ---
+    out = g.copy()
+
+    term_set = set(map(int, term_ids))
+    for nid in node_path:
+        if int(nid) in term_set:
+            continue
+        for r, c in id2pts[int(nid)]:
+            out[int(r), int(c)] = int(Color.GREEN)
+
+    for eid in edge_path:
+        for r, c in track_comp_pts.get(int(eid), []):
+            out[int(r), int(c)] = int(Color.GREY)
+
+    return out
+
+# --------------- generator (Claude attempt 1) ---------------
+
+# ── CFG: tunable generation parameters ──────────────────────────────────────
+NODE_SIZE_CHOICES = [2, 3]               # N for NxN node squares
+NODE_COUNT_RANGE = (7, 10)               # V = total graph nodes (2 terminal + rest station)
+CYCLE_COUNT_CHOICES = [1, 2]             # independent cycles in the graph
+PATH_LEN_CHOICES = [2, 3]               # shortest-path edge count between terminals
+GAP_CHOICES = [2, 3]                     # gap between node square edge and cell boundary
+CELL_GRID_DIMS = (3, 4, 5)              # candidate Kr, Kc values for the cell grid
+GRID_SIZE_RANGE = (15, 30)               # canvas side length S bounds
+COLOR_POOL = [0, 1, 2, 4, 6, 7, 8, 9]   # eligible colors (excludes green=3, grey=5)
+CELL_PICK_RETRIES = 50                   # retries for _pick_cells connectivity check
+GEN_ATTEMPT_RETRIES = 300                # outer retry limit in generate_input
+
+
+def _compute_adjacency(picked: set[tuple[int, int]], use_diagonal: bool, allow_skip: bool):
+    """
+    Compute valid undirected edges between picked cells on a grid.
+
+    Always includes cardinal distance-1 neighbors.  Optionally includes:
+    - allow_skip: cardinal distance-2 when the intermediate cell is empty.
+    - use_diagonal: diagonal distance-1 when both perpendicular cells are empty.
+    """
+    edges = set()
+    for (i, j) in picked:
+        for (di, dj) in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            n = (i + di, j + dj)
+            if n in picked:
+                edges.add(tuple(sorted([(i, j), n])))
+        if allow_skip:
+            for (di, dj) in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
+                mid = (i + di // 2, j + dj // 2)
+                far = (i + di, j + dj)
+                if far in picked and mid not in picked:
+                    edges.add(tuple(sorted([(i, j), far])))
+        if use_diagonal:
+            for (di, dj) in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                n = (i + di, j + dj)
+                corner1 = (i + di, j); corner2 = (i, j + dj)
+                if n in picked and corner1 not in picked and corner2 not in picked:
+                    edges.add(tuple(sorted([(i, j), n])))
+    return edges
+
+
+def _pick_cells(Kr: int, Kc: int, V: int, rng: random.Random,
+                use_diagonal: bool, allow_skip: bool):
+    """Pick V cells on a Kr x Kc grid ensuring the induced adjacency graph is connected."""
+    cells = [(i, j) for i in range(Kr) for j in range(Kc)]
+    if len(cells) < V:
+        return None
+    for _ in range(CELL_PICK_RETRIES):
+        rng.shuffle(cells)
+        picked = set(cells[:V])
+        edges = _compute_adjacency(picked, use_diagonal=use_diagonal, allow_skip=allow_skip)
+        adj = {c: [] for c in picked}
+        for (a, b) in edges:
+            adj[a].append(b); adj[b].append(a)
+        root = next(iter(picked))
+        seen = {root}; stack = [root]
+        while stack:
+            u = stack.pop()
+            for v in adj[u]:
+                if v not in seen:
+                    seen.add(v); stack.append(v)
+        if len(seen) == V:
+            return picked
+    return None
+
+
+def _bfs_with_counts(src: int, allowed: set, V: int):
+    """BFS from src over allowed edges.  Returns (dist, count, adj_list) dicts.
+
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/271d71e2.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+from collections import Counter, defaultdict
+import numpy as np
+from scipy.ndimage import label
+from arc_utils import STRUCT4, bbox_coords, colors_present, components_mask, paste
+import random
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Move bordered containers toward same-colored destination markers, charging gray cells to orange.
+
+    Input structure:
+    - bg = 6 (magenta). Black-bordered (0) rectangles with gray (5) / orange (7) interiors.
+    - A head sprite (9) sits adjacent to one container edge; a matching destination sprite lies along the movement axis.
+
+    Rule:
+    - Each container translates toward its destination along the head-to-dest axis.
+    - Steps = min(head-to-dest distance, number of gray interior cells).
+    - Gray cells become orange from the head-facing side inward, one per step.
+
+    Key insight: Gray cell count caps movement — a container stops short if it runs out of gray cells to charge.
+    """
+    g = np.array(grid, dtype=int)
+    H, W = g.shape
+
+    BORDER = 0
+    GREY = 5
+    FILL = 7
+    DIR4 = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    # True background is dominant non-border color (border can dominate in some cases).
+    cnt = Counter(map(int, g.flatten()))
+    bg = int(max((c for c in cnt.keys() if int(c) != int(BORDER)), key=lambda c: int(cnt[int(c)])))
+
+    def rect_border_coords(r0: int, c0: int, r1: int, c1: int):
+        for c in range(c0, c1 + 1):
+            yield (r0, c)
+            yield (r1, c)
+        for r in range(r0 + 1, r1):
+            yield (r, c0)
+            yield (r, c1)
+
+    # --- detect containers as rectangles enclosing GREY/FILL with BORDER frame ---
+    containers = []
+    for pts in components_mask((g == GREY) | (g == FILL), connectivity=4):
+        if pts.size == 0:
+            continue
+        ir0, ic0, ir1, ic1 = bbox_coords(pts)
+        r0, c0, r1, c1 = int(ir0 - 1), int(ic0 - 1), int(ir1 + 1), int(ic1 + 1)
+        if r0 < 0 or c0 < 0 or r1 >= H or c1 >= W:
+            continue
+        if any(int(g[r, c]) != BORDER for r, c in rect_border_coords(r0, c0, r1, c1)):
+            continue
+        inner = g[r0 + 1 : r1, c0 + 1 : c1]
+        if inner.size == 0 or not bool(np.isin(inner, [GREY, FILL]).all()):
+            continue
+        containers.append({"box": (r0, c0, r1, c1)})
+
+    assert not (not containers)
+
+    # head + destination are in some non-bg, non-border color (not GREY/FILL)
+    out = g.copy()
+
+    all_head_colors = [c for c in colors_present(g, exclude={bg, BORDER, GREY, FILL})]
+
+    # Precompute components for each head color.
+    comp_by_color: dict[int, list[dict]] = defaultdict(list)
+    for col in all_head_colors:
+        labc, nc = label(g == int(col), structure=STRUCT4)
+        for k in range(1, int(nc) + 1):
+            coords = np.argwhere(labc == int(k))
+            if coords.size == 0:
+                continue
+            r0, c0, r1, c1 = bbox_coords(coords)
+            pts = {(int(r), int(c)) for r, c in coords}
+            shape = {(int(r - r0), int(c - c0)) for r, c in pts}
+            comp_by_color[int(col)].append({"pts": pts, "shape": shape, "tl": (int(r0), int(c0))})
+
+    def pick_head_for_container(box_):
+        r0, c0, r1, c1 = box_
+        head_seeds = []
+        for r, c in rect_border_coords(r0, c0, r1, c1):
+            for dr, dc in DIR4:
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < H and 0 <= cc < W:
+                    val = int(g[rr, cc])
+                    if val not in (int(bg), int(BORDER), int(GREY), int(FILL)):
+                        head_seeds.append((rr, cc, val))
+        if not head_seeds:
+            return None
+
+        hc = int(Counter(val for _r, _c, val in head_seeds).most_common(1)[0][0])
+        seed_pts = {(r, c) for r, c, val in head_seeds if int(val) == int(hc)}
+        cands = comp_by_color.get(hc, [])
+        comp0 = None
+        for comp in cands:
+            if comp["pts"] & seed_pts:
+                comp0 = comp
+                break
+        if comp0 is None:
+            return None
+
+        # Split head vs destination even if same-color pixels touch:
+        # head pixels are those with minimal manhattan distance to this container border.
+        border_pts = list(rect_border_coords(r0, c0, r1, c1))
+        best_d = None
+        dist = {}
+        for pr, pc in comp0["pts"]:
+            d = min(abs(int(pr - br)) + abs(int(pc - bc)) for br, bc in border_pts)
+            dist[(int(pr), int(pc))] = int(d)
+            if best_d is None or d < best_d:
+                best_d = int(d)
+        if best_d is None:
+            return None
+        head_pts = {p for p, d in dist.items() if int(d) == int(best_d)}
+
+        # direction from head bbox relative to container box
+        coords = np.array(list(head_pts), dtype=int)
+        hr0, hc0, hr1, hc1 = bbox_coords(coords)
+        if hc1 < c0:
+            direction = (0, -1)
+        elif hc0 > c1:
+            direction = (0, 1)
+        elif hr1 < r0:
+            direction = (-1, 0)
+        elif hr0 > r1:
+            direction = (1, 0)
+        else:
+            direction = (0, 0)
+
+        # normalized head shape + top-left
+        r00, c00 = int(hr0), int(hc0)
+        head_shape = {(int(r - r00), int(c - c00)) for r, c in head_pts}
+        return {
+            "color": hc,
+            "head_pts": head_pts,
+            "head_shape": head_shape,
+            "head_tl": (r00, c00),
+            "comp_pts": set(comp0["pts"]),
+            "dir": direction,
+        }
+
+    for cont in containers:
+        box_ = cont["box"]
+        r0, c0, r1, c1 = box_
+
+        head_info = pick_head_for_container(box_)
+        if head_info is None:
+            continue
+        hc = int(head_info["color"])
+        head_pts = set(head_info["head_pts"])
+        head_shape = head_info["head_shape"]
+        head_tl = head_info["head_tl"]
+        comp_pts = set(head_info["comp_pts"])
+        direction = head_info["dir"]
+        if direction == (0, 0):
+            continue
+
+        # destination candidates
+        dests = []
+        for d in comp_by_color.get(hc, []):
+            if d["shape"] != head_shape:
+                continue
+            if d["pts"] == comp_pts:
+                continue
+            dests.append(d)
+
+        # add split-from-same-component destinations (when dest touches head by color)
+        rem = comp_pts - head_pts
+        if rem:
+            mask_rem = np.zeros((H, W), dtype=bool)
+            for rr, cc in rem:
+                mask_rem[int(rr), int(cc)] = True
+            labr, nr = label(mask_rem, structure=STRUCT4)
+            for k in range(1, int(nr) + 1):
+                pts = {(int(r), int(c)) for r, c in np.argwhere(labr == int(k))}
+                if not pts:
+                    continue
+                # reject if adjacent to BORDER
+                adj = False
+                for r, c in pts:
+                    for dr, dc in DIR4:
+                        rr, cc = int(r + dr), int(c + dc)
+                        if 0 <= rr < H and 0 <= cc < W and int(g[rr, cc]) == int(BORDER):
+                            adj = True
+                            break
+                    if adj:
+                        break
+                if adj:
+                    continue
+                rs = [r for r, _c in pts]
+                cs = [c for _r, c in pts]
+                r00, c00 = int(min(rs)), int(min(cs))
+                shp = {(int(r - r00), int(c - c00)) for r, c in pts}
+                if shp != head_shape:
+                    continue
+                dests.append({"pts": pts, "shape": shp, "tl": (r00, c00)})
+
+        if not dests:
+            continue
+
+        best = None
+        best_dest = None
+        for d in dests:
+            tr0 = int(d["tl"][0] - head_tl[0])
+            tc0 = int(d["tl"][1] - head_tl[1])
+            if direction[0] != 0 and tc0 != 0:
+                continue
+            if direction[1] != 0 and tr0 != 0:
+                continue
+            if direction[0] == 1 and tr0 <= 0:
+                continue
+            if direction[0] == -1 and tr0 >= 0:
+                continue
+            if direction[1] == 1 and tc0 <= 0:
+                continue
+            if direction[1] == -1 and tc0 >= 0:
+                continue
+            dist = abs(tr0) + abs(tc0)
+            if best is None or dist < best:
+                best = dist
+                best_dest = d
+        if best_dest is None:
+            continue
+
+        # translation to overlap head onto destination, capped by number of GREY cells
+        tr0 = int(best_dest["tl"][0] - head_tl[0])
+        tc0 = int(best_dest["tl"][1] - head_tl[1])
+        steps = abs(tr0) + abs(tc0)
+
+        inner = g[r0 + 1 : r1, c0 + 1 : c1]
+        grey_coords = [
+            (int(r0 + 1 + rr), int(c0 + 1 + cc))
+            for rr in range(inner.shape[0])
+            for cc in range(inner.shape[1])
+            if int(inner[rr, cc]) == GREY
+        ]
+        steps = min(int(steps), int(len(grey_coords)))
+
+        dr, dc = direction
+        tr = int(dr * steps)
+        tc = int(dc * steps)
+
+        # choose which greys to fill in order from head side inward
+        if direction == (0, 1):
+            order = sorted(grey_coords, key=lambda p: (-p[1], p[0]))
+        elif direction == (0, -1):
+            order = sorted(grey_coords, key=lambda p: (p[1], -p[0]))
+        elif direction == (1, 0):
+            order = sorted(grey_coords, key=lambda p: (-p[0], -p[1]))
+        else:  # (-1,0)
+            order = sorted(grey_coords, key=lambda p: (p[0], p[1]))
+        to_fill = set(order[:steps])
+
+        # erase original container rect and original head pixels (destination stays)
+        out[r0 : r1 + 1, c0 : c1 + 1] = int(bg)
+        for r, c in head_pts:
+            if int(out[int(r), int(c)]) == int(hc):
+                out[int(r), int(c)] = int(bg)
+
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+path='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dd6b8c4b.json'
+with open(path) as f:
+    data=json.load(f)
+print('train', len(data['train']), 'test', len(data['test']))
+for split in ('train','test'):
+    for i,ex in enumerate(data[split]):
+        inp=ex['input']; out=ex['output']
+        print(split, i, len(inp), len(inp[0]), '->', len(out), len(out[0]))
+        for row in inp: print(''.join(map(str,row)))
+        print('out')
+        for row in out: print(''.join(map(str,row)))
+        print()
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+train 3 test 2
+train 0 11 11 -> 11 11
+77777777777
+76666666997
+76997776997
+76666666777
+77763336777
+77763236797
+79763336777
+99766766667
+77767779967
+77766666667
+77777777777
+out
+77777777777
+76666666997
+76997776997
+76666666777
+77769936777
+77763236797
+79763336777
+99766766667
+77767777767
+77766666667
+77777777777
+
+train 1 11 11 -> 11 11
+77777799977
+77777799779
+77777777779
+97766666666
+77763336977
+77963236777
+77763336797
+77767776777
+79767976777
+77967976777
+77777777777
+out
+77777799977
+77777779779
+77777777779
+77766666666
+77769996777
+77769996777
+77769996777
+77767776777
+77767776777
+77767776777
+77777777777
+
+train 2 11 11 -> 11 11
+77777777777
+77777777797
+77977777779
+77777777777
+77773337777
+77773237777
+77773337777
+77777777777
+77777777777
+77777777977
+77777777777
+out
+77777777777
+77777777777
+77777777777
+77777777777
+77779997777
+77779237777
+77773337777
+77777777777
+77777777777
+77777777777
+77777777777
+
+test 0 11 11 -> 11 11
+66977777966
+66666666666
+96977777967
+76766766769
+76763336767
+76773237769
+76763336767
+76766766769
+76977977967
+76666666766
+77777777766
+out
+66977777966
+66666666666
+76777777767
+76766766769
+76769996767
+76779997769
+76763336767
+76766766769
+76777777767
+76666666766
+77777777766
+
+test 1 11 11 -> 11 11
+77769796777
+77966666779
+77777777777
+66966766669
+77763336777
+76663236766
+77763336777
+66966676669
+77767776777
+76667666766
+99969796999
+out
+77769796777
+77766666777
+77777777777
+66766766667
+77769996777
+76669996766
+77769996777
+66766676667
+77767776777
+76667666766
+79967776999
+
+
+codex
+原题里 `9` 同时是“候选物体”和“可通行地面”，这和“逐步拿走一个后路径变短”是冲突的；我现在在重构规则定义，核心是把“被收集的栗色像素”改成终点可踏入、但其余栗色默认阻塞，这样逐步消失才会真的打开更短路径。
+codex
+设计已经定下来了：用一个可旋转的“单开口短走廊 + 上/下绕行长走廊”模板生成样例，阈值固定为 `3`。这样首个栗色像素先被拿走，第二和第三个像素才会因为近路打开而降到 `<=3`，第四个像素即使最终连通也仍然是 `4` 步，能同时证明“逐步重算”和“长度阈值”都在起作用。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/18' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+codex
+我现在把 solver 和 generator 一起落成一个自包含文件，并把设计分析写进文件头注释里；之后会直接跑 50 次压力测试，再补一轮行为统计，确认它没有退化回原题。
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/18/code.py
+diff --git a/ceshi/code_combo/dd6b8c4b/18/code.py b/ceshi/code_combo/dd6b8c4b/18/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0945308f3d2f7f762343a0b77378f40541308401
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/18/code.py
+@@ -0,0 +1,318 @@
++# Combo variant of dd6b8c4b (index 18)
++# combo_spec: D1/1+D15/0
++# Name: 最短路径长度约束+逐步收集
++#
++# Design analysis for the fused rule:
++# - Concrete behavior:
++#   A canonical corridor sits beside the 3x3 destination block. The first maroon is within
++#   3 floor-steps, the second and third are initially too far because only a detour reaches
++#   them, and the fourth remains at distance 4 even after earlier maroons disappear. This
++#   makes the shortest-path cap and the step-by-step recomputation both visible.
++# - Complexity calibration:
++#   The generator uses one dominant one-cell-wide chamber plus a few distractors. That keeps
++#   the visual story legible: a short lane, a longer detour, and one leftover over-limit token.
++# - Broken original assumptions:
++#   In the base task maroon cells were globally passable, so deleting one could not shorten any
++#   route. Here only orange floor is traversable; a maroon may be used only as the final target
++#   cell. Therefore distances must be recomputed after every single move.
++# - Placement legality:
++#   The chamber is defined in local coordinates around the fixed center and then rotated /
++#   mirrored. All transformed cells stay inside the 11x11 canvas, never overlap the destination,
++#   and the ring openings are explicitly carved.
++# - Visual observability:
++#   Walls isolate one narrow chamber, so a human can see the front maroon disappear first,
++#   then notice that deeper maroons become newly available one by one. The untouched fourth
++#   maroon demonstrates the path-length threshold.
++# - Generator guarantees:
++#   Each accepted sample must satisfy:
++#   1. at least one maroon is collected by the fused solver,
++#   2. at least two collected maroons were not initially eligible under the threshold,
++#   3. an iterative solver without the threshold would collect strictly more maroons.
++
++import random
++from collections import deque
++
++import numpy as np
++
++from arc_utils import neighbors4
++
++
++GRID_H, GRID_W = 11, 11
++CENTER_R, CENTER_C = 5, 5
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++MAROON = 9
++DEST_SIDE = 3
++PATH_LIMIT = 3
++GEN_RETRIES = 300
++DISTRACTOR_RANGE = (1, 4)
++
++
++# Canonical west-facing chamber.
++CANONICAL_BOX = {(dr, dc) for dr in range(-3, 3) for dc in range(-5, -1)}
++CANONICAL_FLOOR = {
++    (0, -2),
++    (-1, -2),
++    (-2, -2),
++    (-2, -3),
++    (-2, -4),
++    (-1, -4),
++    (-1, -5),
++}
++CANONICAL_CHAIN = [
++    (0, -3),
++    (0, -4),
++    (0, -5),
++    (1, -5),
++]
++
++
++def _transform(dr: int, dc: int, rot: int, mirror: bool) -> tuple[int, int]:
++    if mirror:
++        dr = -dr
++    for _ in range(rot % 4):
++        dr, dc = dc, -dr
++    return int(dr), int(dc)
++
++
++def _to_abs(coords, rot: int, mirror: bool) -> set[tuple[int, int]]:
++    out = set()
++    for dr, dc in coords:
++        tr, tc = _transform(int(dr), int(dc), rot, mirror)
++        out.add((CENTER_R + tr, CENTER_C + tc))
++    return out
++
++
++def _chain_abs(rot: int, mirror: bool) -> list[tuple[int, int]]:
++    out = []
++    for dr, dc in CANONICAL_CHAIN:
++        tr, tc = _transform(int(dr), int(dc), rot, mirror)
++        out.append((CENTER_R + tr, CENTER_C + tc))
++    return out
++
++
++def _dest_cells(center_r: int, center_c: int, h: int, w: int) -> list[tuple[int, int]]:
++    cells = []
++    for r in range(center_r - 1, center_r + 2):
++        for c in range(center_c - 1, center_c + 2):
++            if 0 <= r < h and 0 <= c < w:
++                cells.append((r, c))
++    cells.sort()
++    return cells
++
++
++def _ring_cells(dest_set: set[tuple[int, int]], h: int, w: int) -> set[tuple[int, int]]:
++    ring = set()
++    for r, c in dest_set:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
++                ring.add((rr, cc))
++    return ring
++
++
++def _floor_starts(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> list[tuple[int, int]]:
++    h, w = grid.shape
++    starts = []
++    seen = set()
++    for r, c in dest_set:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set and int(grid[rr, cc]) == FLOOR_COLOR:
++                if (rr, cc) not in seen:
++                    seen.add((rr, cc))
++                    starts.append((rr, cc))
++    return starts
++
++
++def _floor_distances(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> np.ndarray:
++    h, w = grid.shape
++    inf = 10**9
++    dist = np.full((h, w), inf, dtype=int)
++    q = deque()
++    for r, c in _floor_starts(grid, dest_set):
++        dist[r, c] = 0
++        q.append((r, c))
++
++    while q:
++        r, c = q.popleft()
++        d = int(dist[r, c])
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR and dist[rr, cc] == inf:
++                dist[rr, cc] = d + 1
++                q.append((rr, cc))
++    return dist
++
++
++def _eligible_tokens(grid: np.ndarray, dest_set: set[tuple[int, int]], path_limit: int) -> list[tuple[int, int, int]]:
++    dist = _floor_distances(grid, dest_set)
++    h, w = grid.shape
++    inf = 10**9
++    cands = []
++    for r, c in np.argwhere(grid == MAROON):
++        r = int(r)
++        c = int(c)
++        if (r, c) in dest_set:
++            continue
++        best = inf
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR:
++                best = min(best, int(dist[rr, cc]) + 1)
++        if best <= path_limit:
++            cands.append((int(best), r, c))
++    cands.sort()
++    return cands
++
++
++def _simulate(
++    grid: np.ndarray,
++    *,
++    path_limit: int,
++    iterative: bool,
++) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
++    out = np.array(grid, dtype=int).copy()
++    h, w = out.shape
++    centers = np.argwhere(out == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center"
++    cr, cc = map(int, centers[0])
++    dest_cells = _dest_cells(cr, cc, h, w)
++    dest_set = set(dest_cells)
++
++    history: list[tuple[int, int, int]] = []
++    fill_idx = 0
++    while fill_idx < len(dest_cells):
++        cands = _eligible_tokens(out, dest_set, path_limit)
++        if not cands:
++            break
++        chosen = cands[:1] if iterative else cands[: len(dest_cells) - fill_idx]
++        for dist, r, c in chosen:
++            out[r, c] = FLOOR_COLOR
++            dr, dc = dest_cells[fill_idx]
++            out[dr, dc] = MAROON
++            history.append((int(dist), int(r), int(c)))
++            fill_idx += 1
++            if fill_idx >= len(dest_cells):
++                break
++        if not iterative:
++            break
++    return out, history
++
++
++def _make_base_grid() -> np.ndarray:
++    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W):
++        grid[r, c] = DEST_COLOR
++    grid[CENTER_R, CENTER_C] = RED_CENTER
++    return grid
++
++
++def _apply_chamber(grid: np.ndarray, rot: int, mirror: bool) -> tuple[list[tuple[int, int]], set[tuple[int, int]]]:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    ring = _ring_cells(dest_set, GRID_H, GRID_W)
++    floor_cells = _to_abs(CANONICAL_FLOOR, rot, mirror)
++    box_cells = _to_abs(CANONICAL_BOX, rot, mirror)
++    chain_cells = _chain_abs(rot, mirror)
++    openings = floor_cells & ring
++
++    for r, c in ring - openings:
++        grid[r, c] = WALL_COLOR
++
++    carved = floor_cells | set(chain_cells)
++    for r, c in box_cells:
++        grid[r, c] = FLOOR_COLOR if (r, c) in carved else WALL_COLOR
++
++    return chain_cells, box_cells | ring
++
++
++def _reachable_floor(grid: np.ndarray) -> set[tuple[int, int]]:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    seen = set()
++    q = deque(_floor_starts(grid, dest_set))
++    for cell in q:
++        seen.add(cell)
++    while q:
++        r, c = q.popleft()
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < GRID_H and 0 <= cc < GRID_W and int(grid[rr, cc]) == FLOOR_COLOR and (rr, cc) not in seen:
++                seen.add((rr, cc))
++                q.append((rr, cc))
++    return seen
++
++
++def _build_candidate() -> np.ndarray:
++    grid = _make_base_grid()
++    rot = random.randrange(4)
++    mirror = bool(random.randrange(2))
++    chain_cells, reserved = _apply_chamber(grid, rot, mirror)
++
++    inp = grid.copy()
++    for r, c in chain_cells:
++        inp[r, c] = MAROON
++
++    reachable_floor = _reachable_floor(grid)
++    distractor_pool = [
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if int(inp[r, c]) == FLOOR_COLOR and (r, c) not in reachable_floor and (r, c) not in reserved
++    ]
++    random.shuffle(distractor_pool)
++    distractor_count = min(len(distractor_pool), random.randint(*DISTRACTOR_RANGE))
++    for r, c in distractor_pool[:distractor_count]:
++        inp[r, c] = MAROON
++
++    return inp
++
++
++def _is_good_variant(inp: np.ndarray) -> bool:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    initial = _eligible_tokens(inp, dest_set, PATH_LIMIT)
++    fused_out, fused_hist = _simulate(inp, path_limit=PATH_LIMIT, iterative=True)
++    no_limit_out, no_limit_hist = _simulate(inp, path_limit=GRID_H * GRID_W, iterative=True)
++
++    initial_set = {(r, c) for _d, r, c in initial}
++    later_only = [(r, c) for _d, r, c in fused_hist if (r, c) not in initial_set]
++
++    if not fused_hist:
++        return False
++    if len(later_only) < 2:
++        return False
++    if len(no_limit_hist) <= len(fused_hist):
++        return False
++    if not np.array_equal(main(inp), fused_out):
++        return False
++    if np.array_equal(no_limit_out, fused_out):
++        return False
++    return True
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Pull maroon pixels into the 3x3 block around the unique red center, one shortest-path step at a time.
++
++    Input structure:
++    - The board is an 11x11 orange floor with a fixed green 3x3 destination around one red center.
++    - Magenta walls form narrow corridors near the destination.
++    - Maroon pixels sit on floor cells outside the block; some are near the opening, others are deeper in the corridor.
++
++    Rule:
++    - Repeatedly recompute which maroon pixel is reachable from the destination through orange floor cells.
++    - A maroon qualifies only if its current shortest path length is at most 3, where the last step may enter the maroon but other maroons are not traversable.
++    - On each iteration, move only the single nearest qualifying maroon into the next destination cell in row-major order, erase its source to floor, then recompute from the updated grid.
++    - Stop when the block is full or no maroon remains within the path-length limit.
++
++    Key insight:
++    - Removing one maroon can open a shorter route to deeper maroons, so the reachable set is dynamic; however the 3-step cap still prevents some connected maroons from ever being collected.
++    """
++
++    out, _history = _simulate(np.asarray(grid, dtype=int), path_limit=PATH_LIMIT, iterative=True)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        inp = _build_candidate()
++        try:
++            if _is_good_variant(inp):
++                return inp
++        except Exception:
++            pass
++    raise RuntimeError(f"Failed to generate valid combo sample after {GEN_RETRIES} attempts")
+
+diff --git a/ceshi/code_combo/dd6b8c4b/18/code.py b/ceshi/code_combo/dd6b8c4b/18/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0945308f3d2f7f762343a0b77378f40541308401
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/18/code.py
+@@ -0,0 +1,318 @@
++# Combo variant of dd6b8c4b (index 18)
++# combo_spec: D1/1+D15/0
++# Name: 最短路径长度约束+逐步收集
++#
++# Design analysis for the fused rule:
++# - Concrete behavior:
++#   A canonical corridor sits beside the 3x3 destination block. The first maroon is within
++#   3 floor-steps, the second and third are initially too far because only a detour reaches
++#   them, and the fourth remains at distance 4 even after earlier maroons disappear. This
++#   makes the shortest-path cap and the step-by-step recomputation both visible.
++# - Complexity calibration:
++#   The generator uses one dominant one-cell-wide chamber plus a few distractors. That keeps
++#   the visual story legible: a short lane, a longer detour, and one leftover over-limit token.
++# - Broken original assumptions:
++#   In the base task maroon cells were globally passable, so deleting one could not shorten any
++#   route. Here only orange floor is traversable; a maroon may be used only as the final target
++#   cell. Therefore distances must be recomputed after every single move.
++# - Placement legality:
++#   The chamber is defined in local coordinates around the fixed center and then rotated /
++#   mirrored. All transformed cells stay inside the 11x11 canvas, never overlap the destination,
++#   and the ring openings are explicitly carved.
++# - Visual observability:
++#   Walls isolate one narrow chamber, so a human can see the front maroon disappear first,
++#   then notice that deeper maroons become newly available one by one. The untouched fourth
++#   maroon demonstrates the path-length threshold.
++# - Generator guarantees:
++#   Each accepted sample must satisfy:
++#   1. at least one maroon is collected by the fused solver,
++#   2. at least two collected maroons were not initially eligible under the threshold,
++#   3. an iterative solver without the threshold would collect strictly more maroons.
++
++import random
++from collections import deque
++
++import numpy as np
++
++from arc_utils import neighbors4
++
++
++GRID_H, GRID_W = 11, 11
++CENTER_R, CENTER_C = 5, 5
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++MAROON = 9
++DEST_SIDE = 3
++PATH_LIMIT = 3
++GEN_RETRIES = 300
++DISTRACTOR_RANGE = (1, 4)
++
++
++# Canonical west-facing chamber.
++CANONICAL_BOX = {(dr, dc) for dr in range(-3, 3) for dc in range(-5, -1)}
++CANONICAL_FLOOR = {
++    (0, -2),
++    (-1, -2),
++    (-2, -2),
++    (-2, -3),
++    (-2, -4),
++    (-1, -4),
++    (-1, -5),
++}
++CANONICAL_CHAIN = [
++    (0, -3),
++    (0, -4),
++    (0, -5),
++    (1, -5),
++]
++
++
++def _transform(dr: int, dc: int, rot: int, mirror: bool) -> tuple[int, int]:
++    if mirror:
++        dr = -dr
++    for _ in range(rot % 4):
++        dr, dc = dc, -dr
++    return int(dr), int(dc)
++
++
++def _to_abs(coords, rot: int, mirror: bool) -> set[tuple[int, int]]:
++    out = set()
++    for dr, dc in coords:
++        tr, tc = _transform(int(dr), int(dc), rot, mirror)
++        out.add((CENTER_R + tr, CENTER_C + tc))
++    return out
++
++
++def _chain_abs(rot: int, mirror: bool) -> list[tuple[int, int]]:
++    out = []
++    for dr, dc in CANONICAL_CHAIN:
++        tr, tc = _transform(int(dr), int(dc), rot, mirror)
++        out.append((CENTER_R + tr, CENTER_C + tc))
++    return out
++
++
++def _dest_cells(center_r: int, center_c: int, h: int, w: int) -> list[tuple[int, int]]:
++    cells = []
++    for r in range(center_r - 1, center_r + 2):
++        for c in range(center_c - 1, center_c + 2):
++            if 0 <= r < h and 0 <= c < w:
++                cells.append((r, c))
++    cells.sort()
++    return cells
++
++
++def _ring_cells(dest_set: set[tuple[int, int]], h: int, w: int) -> set[tuple[int, int]]:
++    ring = set()
++    for r, c in dest_set:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
++                ring.add((rr, cc))
++    return ring
++
++
++def _floor_starts(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> list[tuple[int, int]]:
++    h, w = grid.shape
++    starts = []
++    seen = set()
++    for r, c in dest_set:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set and int(grid[rr, cc]) == FLOOR_COLOR:
++                if (rr, cc) not in seen:
++                    seen.add((rr, cc))
++                    starts.append((rr, cc))
++    return starts
++
++
++def _floor_distances(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> np.ndarray:
++    h, w = grid.shape
++    inf = 10**9
++    dist = np.full((h, w), inf, dtype=int)
++    q = deque()
++    for r, c in _floor_starts(grid, dest_set):
++        dist[r, c] = 0
++        q.append((r, c))
++
++    while q:
++        r, c = q.popleft()
++        d = int(dist[r, c])
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR and dist[rr, cc] == inf:
++                dist[rr, cc] = d + 1
++                q.append((rr, cc))
++    return dist
++
++
++def _eligible_tokens(grid: np.ndarray, dest_set: set[tuple[int, int]], path_limit: int) -> list[tuple[int, int, int]]:
++    dist = _floor_distances(grid, dest_set)
++    h, w = grid.shape
++    inf = 10**9
++    cands = []
++    for r, c in np.argwhere(grid == MAROON):
++        r = int(r)
++        c = int(c)
++        if (r, c) in dest_set:
++            continue
++        best = inf
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR:
++                best = min(best, int(dist[rr, cc]) + 1)
++        if best <= path_limit:
++            cands.append((int(best), r, c))
++    cands.sort()
++    return cands
++
++
++def _simulate(
++    grid: np.ndarray,
++    *,
++    path_limit: int,
++    iterative: bool,
++) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
++    out = np.array(grid, dtype=int).copy()
++    h, w = out.shape
++    centers = np.argwhere(out == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center"
++    cr, cc = map(int, centers[0])
++    dest_cells = _dest_cells(cr, cc, h, w)
++    dest_set = set(dest_cells)
++
++    history: list[tuple[int, int, int]] = []
++    fill_idx = 0
++    while fill_idx < len(dest_cells):
++        cands = _eligible_tokens(out, dest_set, path_limit)
++        if not cands:
++            break
++        chosen = cands[:1] if iterative else cands[: len(dest_cells) - fill_idx]
++        for dist, r, c in chosen:
++            out[r, c] = FLOOR_COLOR
++            dr, dc = dest_cells[fill_idx]
++            out[dr, dc] = MAROON
++            history.append((int(dist), int(r), int(c)))
++            fill_idx += 1
++            if fill_idx >= len(dest_cells):
++                break
++        if not iterative:
++            break
++    return out, history
++
++
++def _make_base_grid() -> np.ndarray:
++    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W):
++        grid[r, c] = DEST_COLOR
++    grid[CENTER_R, CENTER_C] = RED_CENTER
++    return grid
++
++
++def _apply_chamber(grid: np.ndarray, rot: int, mirror: bool) -> tuple[list[tuple[int, int]], set[tuple[int, int]]]:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    ring = _ring_cells(dest_set, GRID_H, GRID_W)
++    floor_cells = _to_abs(CANONICAL_FLOOR, rot, mirror)
++    box_cells = _to_abs(CANONICAL_BOX, rot, mirror)
++    chain_cells = _chain_abs(rot, mirror)
++    openings = floor_cells & ring
++
++    for r, c in ring - openings:
++        grid[r, c] = WALL_COLOR
++
++    carved = floor_cells | set(chain_cells)
++    for r, c in box_cells:
++        grid[r, c] = FLOOR_COLOR if (r, c) in carved else WALL_COLOR
++
++    return chain_cells, box_cells | ring
++
++
++def _reachable_floor(grid: np.ndarray) -> set[tuple[int, int]]:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    seen = set()
++    q = deque(_floor_starts(grid, dest_set))
++    for cell in q:
++        seen.add(cell)
++    while q:
++        r, c = q.popleft()
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < GRID_H and 0 <= cc < GRID_W and int(grid[rr, cc]) == FLOOR_COLOR and (rr, cc) not in seen:
++                seen.add((rr, cc))
++                q.append((rr, cc))
++    return seen
++
++
++def _build_candidate() -> np.ndarray:
++    grid = _make_base_grid()
++    rot = random.randrange(4)
++    mirror = bool(random.randrange(2))
++    chain_cells, reserved = _apply_chamber(grid, rot, mirror)
++
++    inp = grid.copy()
++    for r, c in chain_cells:
++        inp[r, c] = MAROON
++
++    reachable_floor = _reachable_floor(grid)
++    distractor_pool = [
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if int(inp[r, c]) == FLOOR_COLOR and (r, c) not in reachable_floor and (r, c) not in reserved
++    ]
++    random.shuffle(distractor_pool)
++    distractor_count = min(len(distractor_pool), random.randint(*DISTRACTOR_RANGE))
++    for r, c in distractor_pool[:distractor_count]:
++        inp[r, c] = MAROON
++
++    return inp
++
++
++def _is_good_variant(inp: np.ndarray) -> bool:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    initial = _eligible_tokens(inp, dest_set, PATH_LIMIT)
++    fused_out, fused_hist = _simulate(inp, path_limit=PATH_LIMIT, iterative=True)
++    no_limit_out, no_limit_hist = _simulate(inp, path_limit=GRID_H * GRID_W, iterative=True)
++
++    initial_set = {(r, c) for _d, r, c in initial}
++    later_only = [(r, c) for _d, r, c in fused_hist if (r, c) not in initial_set]
++
++    if not fused_hist:
++        return False
++    if len(later_only) < 2:
++        return False
++    if len(no_limit_hist) <= len(fused_hist):
++        return False
++    if not np.array_equal(main(inp), fused_out):
++        return False
++    if np.array_equal(no_limit_out, fused_out):
++        return False
++    return True
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Pull maroon pixels into the 3x3 block around the unique red center, one shortest-path step at a time.
++
++    Input structure:
++    - The board is an 11x11 orange floor with a fixed green 3x3 destination around one red center.
++    - Magenta walls form narrow corridors near the destination.
++    - Maroon pixels sit on floor cells outside the block; some are near the opening, others are deeper in the corridor.
++
++    Rule:
++    - Repeatedly recompute which maroon pixel is reachable from the destination through orange floor cells.
++    - A maroon qualifies only if its current shortest path length is at most 3, where the last step may enter the maroon but other maroons are not traversable.
++    - On each iteration, move only the single nearest qualifying maroon into the next destination cell in row-major order, erase its source to floor, then recompute from the updated grid.
++    - Stop when the block is full or no maroon remains within the path-length limit.
++
++    Key insight:
++    - Removing one maroon can open a shorter route to deeper maroons, so the reachable set is dynamic; however the 3-step cap still prevents some connected maroons from ever being collected.
++    """
++
++    out, _history = _simulate(np.asarray(grid, dtype=int), path_limit=PATH_LIMIT, iterative=True)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        inp = _build_candidate()
++        try:
++            if _is_good_variant(inp):
++                return inp
++        except Exception:
++            pass
++    raise RuntimeError(f"Failed to generate valid combo sample after {GEN_RETRIES} attempts")
+
+exec
+/bin/bash -lc "sed -n '1,320p' /home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/18/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Combo variant of dd6b8c4b (index 18)
+# combo_spec: D1/1+D15/0
+# Name: 最短路径长度约束+逐步收集
+#
+# Design analysis for the fused rule:
+# - Concrete behavior:
+#   A canonical corridor sits beside the 3x3 destination block. The first maroon is within
+#   3 floor-steps, the second and third are initially too far because only a detour reaches
+#   them, and the fourth remains at distance 4 even after earlier maroons disappear. This
+#   makes the shortest-path cap and the step-by-step recomputation both visible.
+# - Complexity calibration:
+#   The generator uses one dominant one-cell-wide chamber plus a few distractors. That keeps
+#   the visual story legible: a short lane, a longer detour, and one leftover over-limit token.
+# - Broken original assumptions:
+#   In the base task maroon cells were globally passable, so deleting one could not shorten any
+#   route. Here only orange floor is traversable; a maroon may be used only as the final target
+#   cell. Therefore distances must be recomputed after every single move.
+# - Placement legality:
+#   The chamber is defined in local coordinates around the fixed center and then rotated /
+#   mirrored. All transformed cells stay inside the 11x11 canvas, never overlap the destination,
+#   and the ring openings are explicitly carved.
+# - Visual observability:
+#   Walls isolate one narrow chamber, so a human can see the front maroon disappear first,
+#   then notice that deeper maroons become newly available one by one. The untouched fourth
+#   maroon demonstrates the path-length threshold.
+# - Generator guarantees:
+#   Each accepted sample must satisfy:
+#   1. at least one maroon is collected by the fused solver,
+#   2. at least two collected maroons were not initially eligible under the threshold,
+#   3. an iterative solver without the threshold would collect strictly more maroons.
+
+import random
+from collections import deque
+
+import numpy as np
+
+from arc_utils import neighbors4
+
+
+GRID_H, GRID_W = 11, 11
+CENTER_R, CENTER_C = 5, 5
+FLOOR_COLOR, WALL_COLOR = 7, 6
+DEST_COLOR, RED_CENTER = 3, 2
+MAROON = 9
+DEST_SIDE = 3
+PATH_LIMIT = 3
+GEN_RETRIES = 300
+DISTRACTOR_RANGE = (1, 4)
+
+
+# Canonical west-facing chamber.
+CANONICAL_BOX = {(dr, dc) for dr in range(-3, 3) for dc in range(-5, -1)}
+CANONICAL_FLOOR = {
+    (0, -2),
+    (-1, -2),
+    (-2, -2),
+    (-2, -3),
+    (-2, -4),
+    (-1, -4),
+    (-1, -5),
+}
+CANONICAL_CHAIN = [
+    (0, -3),
+    (0, -4),
+    (0, -5),
+    (1, -5),
+]
+
+
+def _transform(dr: int, dc: int, rot: int, mirror: bool) -> tuple[int, int]:
+    if mirror:
+        dr = -dr
+    for _ in range(rot % 4):
+        dr, dc = dc, -dr
+    return int(dr), int(dc)
+
+
+def _to_abs(coords, rot: int, mirror: bool) -> set[tuple[int, int]]:
+    out = set()
+    for dr, dc in coords:
+        tr, tc = _transform(int(dr), int(dc), rot, mirror)
+        out.add((CENTER_R + tr, CENTER_C + tc))
+    return out
+
+
+def _chain_abs(rot: int, mirror: bool) -> list[tuple[int, int]]:
+    out = []
+    for dr, dc in CANONICAL_CHAIN:
+        tr, tc = _transform(int(dr), int(dc), rot, mirror)
+        out.append((CENTER_R + tr, CENTER_C + tc))
+    return out
+
+
+def _dest_cells(center_r: int, center_c: int, h: int, w: int) -> list[tuple[int, int]]:
+    cells = []
+    for r in range(center_r - 1, center_r + 2):
+        for c in range(center_c - 1, center_c + 2):
+            if 0 <= r < h and 0 <= c < w:
+                cells.append((r, c))
+    cells.sort()
+    return cells
+
+
+def _ring_cells(dest_set: set[tuple[int, int]], h: int, w: int) -> set[tuple[int, int]]:
+    ring = set()
+    for r, c in dest_set:
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
+                ring.add((rr, cc))
+    return ring
+
+
+def _floor_starts(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> list[tuple[int, int]]:
+    h, w = grid.shape
+    starts = []
+    seen = set()
+    for r, c in dest_set:
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set and int(grid[rr, cc]) == FLOOR_COLOR:
+                if (rr, cc) not in seen:
+                    seen.add((rr, cc))
+                    starts.append((rr, cc))
+    return starts
+
+
+def _floor_distances(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> np.ndarray:
+    h, w = grid.shape
+    inf = 10**9
+    dist = np.full((h, w), inf, dtype=int)
+    q = deque()
+    for r, c in _floor_starts(grid, dest_set):
+        dist[r, c] = 0
+        q.append((r, c))
+
+    while q:
+        r, c = q.popleft()
+        d = int(dist[r, c])
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR and dist[rr, cc] == inf:
+                dist[rr, cc] = d + 1
+                q.append((rr, cc))
+    return dist
+
+
+def _eligible_tokens(grid: np.ndarray, dest_set: set[tuple[int, int]], path_limit: int) -> list[tuple[int, int, int]]:
+    dist = _floor_distances(grid, dest_set)
+    h, w = grid.shape
+    inf = 10**9
+    cands = []
+    for r, c in np.argwhere(grid == MAROON):
+        r = int(r)
+        c = int(c)
+        if (r, c) in dest_set:
+            continue
+        best = inf
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR:
+                best = min(best, int(dist[rr, cc]) + 1)
+        if best <= path_limit:
+            cands.append((int(best), r, c))
+    cands.sort()
+    return cands
+
+
+def _simulate(
+    grid: np.ndarray,
+    *,
+    path_limit: int,
+    iterative: bool,
+) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
+    out = np.array(grid, dtype=int).copy()
+    h, w = out.shape
+    centers = np.argwhere(out == RED_CENTER)
+    assert len(centers) == 1, "grid must have exactly one red center"
+    cr, cc = map(int, centers[0])
+    dest_cells = _dest_cells(cr, cc, h, w)
+    dest_set = set(dest_cells)
+
+    history: list[tuple[int, int, int]] = []
+    fill_idx = 0
+    while fill_idx < len(dest_cells):
+        cands = _eligible_tokens(out, dest_set, path_limit)
+        if not cands:
+            break
+        chosen = cands[:1] if iterative else cands[: len(dest_cells) - fill_idx]
+        for dist, r, c in chosen:
+            out[r, c] = FLOOR_COLOR
+            dr, dc = dest_cells[fill_idx]
+            out[dr, dc] = MAROON
+            history.append((int(dist), int(r), int(c)))
+            fill_idx += 1
+            if fill_idx >= len(dest_cells):
+                break
+        if not iterative:
+            break
+    return out, history
+
+
+def _make_base_grid() -> np.ndarray:
+    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
+    for r, c in _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W):
+        grid[r, c] = DEST_COLOR
+    grid[CENTER_R, CENTER_C] = RED_CENTER
+    return grid
+
+
+def _apply_chamber(grid: np.ndarray, rot: int, mirror: bool) -> tuple[list[tuple[int, int]], set[tuple[int, int]]]:
+    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
+    ring = _ring_cells(dest_set, GRID_H, GRID_W)
+    floor_cells = _to_abs(CANONICAL_FLOOR, rot, mirror)
+    box_cells = _to_abs(CANONICAL_BOX, rot, mirror)
+    chain_cells = _chain_abs(rot, mirror)
+    openings = floor_cells & ring
+
+    for r, c in ring - openings:
+        grid[r, c] = WALL_COLOR
+
+    carved = floor_cells | set(chain_cells)
+    for r, c in box_cells:
+        grid[r, c] = FLOOR_COLOR if (r, c) in carved else WALL_COLOR
+
+    return chain_cells, box_cells | ring
+
+
+def _reachable_floor(grid: np.ndarray) -> set[tuple[int, int]]:
+    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
+    seen = set()
+    q = deque(_floor_starts(grid, dest_set))
+    for cell in q:
+        seen.add(cell)
+    while q:
+        r, c = q.popleft()
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < GRID_H and 0 <= cc < GRID_W and int(grid[rr, cc]) == FLOOR_COLOR and (rr, cc) not in seen:
+                seen.add((rr, cc))
+                q.append((rr, cc))
+    return seen
+
+
+def _build_candidate() -> np.ndarray:
+    grid = _make_base_grid()
+    rot = random.randrange(4)
+    mirror = bool(random.randrange(2))
+    chain_cells, reserved = _apply_chamber(grid, rot, mirror)
+
+    inp = grid.copy()
+    for r, c in chain_cells:
+        inp[r, c] = MAROON
+
+    reachable_floor = _reachable_floor(grid)
+    distractor_pool = [
+        (r, c)
+        for r in range(GRID_H)
+        for c in range(GRID_W)
+        if int(inp[r, c]) == FLOOR_COLOR and (r, c) not in reachable_floor and (r, c) not in reserved
+    ]
+    random.shuffle(distractor_pool)
+    distractor_count = min(len(distractor_pool), random.randint(*DISTRACTOR_RANGE))
+    for r, c in distractor_pool[:distractor_count]:
+        inp[r, c] = MAROON
+
+    return inp
+
+
+def _is_good_variant(inp: np.ndarray) -> bool:
+    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
+    initial = _eligible_tokens(inp, dest_set, PATH_LIMIT)
+    fused_out, fused_hist = _simulate(inp, path_limit=PATH_LIMIT, iterative=True)
+    no_limit_out, no_limit_hist = _simulate(inp, path_limit=GRID_H * GRID_W, iterative=True)
+
+    initial_set = {(r, c) for _d, r, c in initial}
+    later_only = [(r, c) for _d, r, c in fused_hist if (r, c) not in initial_set]
+
+    if not fused_hist:
+        return False
+    if len(later_only) < 2:
+        return False
+    if len(no_limit_hist) <= len(fused_hist):
+        return False
+    if not np.array_equal(main(inp), fused_out):
+        return False
+    if np.array_equal(no_limit_out, fused_out):
+        return False
+    return True
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Pull maroon pixels into the 3x3 block around the unique red center, one shortest-path step at a time.
+
+    Input structure:
+    - The board is an 11x11 orange floor with a fixed green 3x3 destination around one red center.
+    - Magenta walls form narrow corridors near the destination.
+    - Maroon pixels sit on floor cells outside the block; some are near the opening, others are deeper in the corridor.
+
+    Rule:
+    - Repeatedly recompute which maroon pixel is reachable from the destination through orange floor cells.
+    - A maroon qualifies only if its current shortest path length is at most 3, where the last step may enter the maroon but other maroons are not traversable.
+    - On each iteration, move only the single nearest qualifying maroon into the next destination cell in row-major order, erase its source to floor, then recompute from the updated grid.
+    - Stop when the block is full or no maroon remains within the path-length limit.
+
+    Key insight:
+    - Removing one maroon can open a shorter route to deeper maroons, so the reachable set is dynamic; however the 3-step cap still prevents some connected maroons from ever being collected.
+    """
+
+    out, _history = _simulate(np.asarray(grid, dtype=int), path_limit=PATH_LIMIT, iterative=True)
+    return out
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        inp = _build_candidate()
+        try:
+            if _is_good_variant(inp):
+                return inp
+        except Exception:
+            pass
+    raise RuntimeError(f"Failed to generate valid combo sample after {GEN_RETRIES} attempts")
+
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/18/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dd6b8c4b/18/code.py b/ceshi/code_combo/dd6b8c4b/18/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0945308f3d2f7f762343a0b77378f40541308401
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/18/code.py
+@@ -0,0 +1,318 @@
++# Combo variant of dd6b8c4b (index 18)
++# combo_spec: D1/1+D15/0
++# Name: 最短路径长度约束+逐步收集
++#
++# Design analysis for the fused rule:
++# - Concrete behavior:
++#   A canonical corridor sits beside the 3x3 destination block. The first maroon is within
++#   3 floor-steps, the second and third are initially too far because only a detour reaches
++#   them, and the fourth remains at distance 4 even after earlier maroons disappear. This
++#   makes the shortest-path cap and the step-by-step recomputation both visible.
++# - Complexity calibration:
++#   The generator uses one dominant one-cell-wide chamber plus a few distractors. That keeps
++#   the visual story legible: a short lane, a longer detour, and one leftover over-limit token.
++# - Broken original assumptions:
++#   In the base task maroon cells were globally passable, so deleting one could not shorten any
++#   route. Here only orange floor is traversable; a maroon may be used only as the final target
++#   cell. Therefore distances must be recomputed after every single move.
++# - Placement legality:
++#   The chamber is defined in local coordinates around the fixed center and then rotated /
++#   mirrored. All transformed cells stay inside the 11x11 canvas, never overlap the destination,
++#   and the ring openings are explicitly carved.
++# - Visual observability:
++#   Walls isolate one narrow chamber, so a human can see the front maroon disappear first,
++#   then notice that deeper maroons become newly available one by one. The untouched fourth
++#   maroon demonstrates the path-length threshold.
++# - Generator guarantees:
++#   Each accepted sample must satisfy:
++#   1. at least one maroon is collected by the fused solver,
++#   2. at least two collected maroons were not initially eligible under the threshold,
++#   3. an iterative solver without the threshold would collect strictly more maroons.
++
++import random
++from collections import deque
++
++import numpy as np
++
++from arc_utils import neighbors4
++
++
++GRID_H, GRID_W = 11, 11
++CENTER_R, CENTER_C = 5, 5
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++MAROON = 9
++DEST_SIDE = 3
++PATH_LIMIT = 3
++GEN_RETRIES = 300
++DISTRACTOR_RANGE = (1, 4)
++
++
++# Canonical west-facing chamber.
++CANONICAL_BOX = {(dr, dc) for dr in range(-3, 3) for dc in range(-5, -1)}
++CANONICAL_FLOOR = {
++    (0, -2),
++    (-1, -2),
++    (-2, -2),
++    (-2, -3),
++    (-2, -4),
++    (-1, -4),
++    (-1, -5),
++}
++CANONICAL_CHAIN = [
++    (0, -3),
++    (0, -4),
++    (0, -5),
++    (1, -5),
++]
++
++
++def _transform(dr: int, dc: int, rot: int, mirror: bool) -> tuple[int, int]:
++    if mirror:
++        dr = -dr
++    for _ in range(rot % 4):
++        dr, dc = dc, -dr
++    return int(dr), int(dc)
++
++
++def _to_abs(coords, rot: int, mirror: bool) -> set[tuple[int, int]]:
++    out = set()
++    for dr, dc in coords:
++        tr, tc = _transform(int(dr), int(dc), rot, mirror)
++        out.add((CENTER_R + tr, CENTER_C + tc))
++    return out
++
++
++def _chain_abs(rot: int, mirror: bool) -> list[tuple[int, int]]:
++    out = []
++    for dr, dc in CANONICAL_CHAIN:
++        tr, tc = _transform(int(dr), int(dc), rot, mirror)
++        out.append((CENTER_R + tr, CENTER_C + tc))
++    return out
++
++
++def _dest_cells(center_r: int, center_c: int, h: int, w: int) -> list[tuple[int, int]]:
++    cells = []
++    for r in range(center_r - 1, center_r + 2):
++        for c in range(center_c - 1, center_c + 2):
++            if 0 <= r < h and 0 <= c < w:
++                cells.append((r, c))
++    cells.sort()
++    return cells
++
++
++def _ring_cells(dest_set: set[tuple[int, int]], h: int, w: int) -> set[tuple[int, int]]:
++    ring = set()
++    for r, c in dest_set:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
++                ring.add((rr, cc))
++    return ring
++
++
++def _floor_starts(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> list[tuple[int, int]]:
++    h, w = grid.shape
++    starts = []
++    seen = set()
++    for r, c in dest_set:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set and int(grid[rr, cc]) == FLOOR_COLOR:
++                if (rr, cc) not in seen:
++                    seen.add((rr, cc))
++                    starts.append((rr, cc))
++    return starts
++
++
++def _floor_distances(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> np.ndarray:
++    h, w = grid.shape
++    inf = 10**9
++    dist = np.full((h, w), inf, dtype=int)
++    q = deque()
++    for r, c in _floor_starts(grid, dest_set):
++        dist[r, c] = 0
++        q.append((r, c))
++
++    while q:
++        r, c = q.popleft()
++        d = int(dist[r, c])
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR and dist[rr, cc] == inf:
++                dist[rr, cc] = d + 1
++                q.append((rr, cc))
++    return dist
++
++
++def _eligible_tokens(grid: np.ndarray, dest_set: set[tuple[int, int]], path_limit: int) -> list[tuple[int, int, int]]:
++    dist = _floor_distances(grid, dest_set)
++    h, w = grid.shape
++    inf = 10**9
++    cands = []
++    for r, c in np.argwhere(grid == MAROON):
++        r = int(r)
++        c = int(c)
++        if (r, c) in dest_set:
++            continue
++        best = inf
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR:
++                best = min(best, int(dist[rr, cc]) + 1)
++        if best <= path_limit:
++            cands.append((int(best), r, c))
++    cands.sort()
++    return cands
++
++
++def _simulate(
++    grid: np.ndarray,
++    *,
++    path_limit: int,
++    iterative: bool,
++) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
++    out = np.array(grid, dtype=int).copy()
++    h, w = out.shape
++    centers = np.argwhere(out == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center"
++    cr, cc = map(int, centers[0])
++    dest_cells = _dest_cells(cr, cc, h, w)
++    dest_set = set(dest_cells)
++
++    history: list[tuple[int, int, int]] = []
++    fill_idx = 0
++    while fill_idx < len(dest_cells):
++        cands = _eligible_tokens(out, dest_set, path_limit)
++        if not cands:
++            break
++        chosen = cands[:1] if iterative else cands[: len(dest_cells) - fill_idx]
++        for dist, r, c in chosen:
++            out[r, c] = FLOOR_COLOR
++            dr, dc = dest_cells[fill_idx]
++            out[dr, dc] = MAROON
++            history.append((int(dist), int(r), int(c)))
++            fill_idx += 1
++            if fill_idx >= len(dest_cells):
++                break
++        if not iterative:
++            break
++    return out, history
++
++
++def _make_base_grid() -> np.ndarray:
++    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W):
++        grid[r, c] = DEST_COLOR
++    grid[CENTER_R, CENTER_C] = RED_CENTER
++    return grid
++
++
++def _apply_chamber(grid: np.ndarray, rot: int, mirror: bool) -> tuple[list[tuple[int, int]], set[tuple[int, int]]]:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    ring = _ring_cells(dest_set, GRID_H, GRID_W)
++    floor_cells = _to_abs(CANONICAL_FLOOR, rot, mirror)
++    box_cells = _to_abs(CANONICAL_BOX, rot, mirror)
++    chain_cells = _chain_abs(rot, mirror)
++    openings = floor_cells & ring
++
++    for r, c in ring - openings:
++        grid[r, c] = WALL_COLOR
++
++    carved = floor_cells | set(chain_cells)
++    for r, c in box_cells:
++        grid[r, c] = FLOOR_COLOR if (r, c) in carved else WALL_COLOR
++
++    return chain_cells, box_cells | ring
++
++
++def _reachable_floor(grid: np.ndarray) -> set[tuple[int, int]]:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    seen = set()
++    q = deque(_floor_starts(grid, dest_set))
++    for cell in q:
++        seen.add(cell)
++    while q:
++        r, c = q.popleft()
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < GRID_H and 0 <= cc < GRID_W and int(grid[rr, cc]) == FLOOR_COLOR and (rr, cc) not in seen:
++                seen.add((rr, cc))
++                q.append((rr, cc))
++    return seen
++
++
++def _build_candidate() -> np.ndarray:
++    grid = _make_base_grid()
++    rot = random.randrange(4)
++    mirror = bool(random.randrange(2))
++    chain_cells, reserved = _apply_chamber(grid, rot, mirror)
++
++    inp = grid.copy()
++    for r, c in chain_cells:
++        inp[r, c] = MAROON
++
++    reachable_floor = _reachable_floor(grid)
++    distractor_pool = [
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if int(inp[r, c]) == FLOOR_COLOR and (r, c) not in reachable_floor and (r, c) not in reserved
++    ]
++    random.shuffle(distractor_pool)
++    distractor_count = min(len(distractor_pool), random.randint(*DISTRACTOR_RANGE))
++    for r, c in distractor_pool[:distractor_count]:
++        inp[r, c] = MAROON
++
++    return inp
++
++
++def _is_good_variant(inp: np.ndarray) -> bool:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    initial = _eligible_tokens(inp, dest_set, PATH_LIMIT)
++    fused_out, fused_hist = _simulate(inp, path_limit=PATH_LIMIT, iterative=True)
++    no_limit_out, no_limit_hist = _simulate(inp, path_limit=GRID_H * GRID_W, iterative=True)
++
++    initial_set = {(r, c) for _d, r, c in initial}
++    later_only = [(r, c) for _d, r, c in fused_hist if (r, c) not in initial_set]
++
++    if not fused_hist:
++        return False
++    if len(later_only) < 2:
++        return False
++    if len(no_limit_hist) <= len(fused_hist):
++        return False
++    if not np.array_equal(main(inp), fused_out):
++        return False
++    if np.array_equal(no_limit_out, fused_out):
++        return False
++    return True
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Pull maroon pixels into the 3x3 block around the unique red center, one shortest-path step at a time.
++
++    Input structure:
++    - The board is an 11x11 orange floor with a fixed green 3x3 destination around one red center.
++    - Magenta walls form narrow corridors near the destination.
++    - Maroon pixels sit on floor cells outside the block; some are near the opening, others are deeper in the corridor.
++
++    Rule:
++    - Repeatedly recompute which maroon pixel is reachable from the destination through orange floor cells.
++    - A maroon qualifies only if its current shortest path length is at most 3, where the last step may enter the maroon but other maroons are not traversable.
++    - On each iteration, move only the single nearest qualifying maroon into the next destination cell in row-major order, erase its source to floor, then recompute from the updated grid.
++    - Stop when the block is full or no maroon remains within the path-length limit.
++
++    Key insight:
++    - Removing one maroon can open a shorter route to deeper maroons, so the reachable set is dynamic; however the 3-step cap still prevents some connected maroons from ever being collected.
++    """
++
++    out, _history = _simulate(np.asarray(grid, dtype=int), path_limit=PATH_LIMIT, iterative=True)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        inp = _build_candidate()
++        try:
++            if _is_good_variant(inp):
++                return inp
++        except Exception:
++            pass
++    raise RuntimeError(f"Failed to generate valid combo sample after {GEN_RETRIES} attempts")
+
+ succeeded in 353ms:
+Success: 50/50, Time: 0.1s (2ms/call)
+
+codex
+基础正确性已经过了 `50/50`。接下来我在跑一组行为统计，不是看“会不会崩”，而是看样本是否真的满足融合条件：是否存在“初始不合格、后来被收集”的像素，以及“去掉阈值后会多收集”的像素。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util
+from collections import Counter
+import numpy as np
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/18/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+later_counts = []
+fused_counts = []
+initial_counts = []
+no_limit_counts = []
+rot_examples = []
+for i in range(120):
+    inp = mod.generate_input()
+    dest_set = set(mod._dest_cells(mod.CENTER_R, mod.CENTER_C, mod.GRID_H, mod.GRID_W))
+    initial = mod._eligible_tokens(inp, dest_set, mod.PATH_LIMIT)
+    fused_out, fused_hist = mod._simulate(inp, path_limit=mod.PATH_LIMIT, iterative=True)
+    _nl_out, nl_hist = mod._simulate(inp, path_limit=mod.GRID_H * mod.GRID_W, iterative=True)
+    initial_set = {(r, c) for _d, r, c in initial}
+    later_only = [(r, c) for _d, r, c in fused_hist if (r, c) not in initial_set]
+    initial_counts.append(len(initial))
+    fused_counts.append(len(fused_hist))
+    later_counts.append(len(later_only))
+    no_limit_counts.append(len(nl_hist))
+print('initial eligible distribution', Counter(initial_counts))
+print('fused collected distribution', Counter(fused_counts))
+print('later-only collected distribution', Counter(later_counts))
+print('no-limit iterative distribution', Counter(no_limit_counts))
+print('avg extra unlocked', sum(later_counts)/len(later_counts))
+print('avg threshold-blocked', sum(nl - fu for nl, fu in zip(no_limit_counts, fused_counts))/len(fused_counts))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dd6b8c4b/18/code.py b/ceshi/code_combo/dd6b8c4b/18/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0945308f3d2f7f762343a0b77378f40541308401
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/18/code.py
+@@ -0,0 +1,318 @@
++# Combo variant of dd6b8c4b (index 18)
++# combo_spec: D1/1+D15/0
++# Name: 最短路径长度约束+逐步收集
++#
++# Design analysis for the fused rule:
++# - Concrete behavior:
++#   A canonical corridor sits beside the 3x3 destination block. The first maroon is within
++#   3 floor-steps, the second and third are initially too far because only a detour reaches
++#   them, and the fourth remains at distance 4 even after earlier maroons disappear. This
++#   makes the shortest-path cap and the step-by-step recomputation both visible.
++# - Complexity calibration:
++#   The generator uses one dominant one-cell-wide chamber plus a few distractors. That keeps
++#   the visual story legible: a short lane, a longer detour, and one leftover over-limit token.
++# - Broken original assumptions:
++#   In the base task maroon cells were globally passable, so deleting one could not shorten any
++#   route. Here only orange floor is traversable; a maroon may be used only as the final target
++#   cell. Therefore distances must be recomputed after every single move.
++# - Placement legality:
++#   The chamber is defined in local coordinates around the fixed center and then rotated /
++#   mirrored. All transformed cells stay inside the 11x11 canvas, never overlap the destination,
++#   and the ring openings are explicitly carved.
++# - Visual observability:
++#   Walls isolate one narrow chamber, so a human can see the front maroon disappear first,
++#   then notice that deeper maroons become newly available one by one. The untouched fourth
++#   maroon demonstrates the path-length threshold.
++# - Generator guarantees:
++#   Each accepted sample must satisfy:
++#   1. at least one maroon is collected by the fused solver,
++#   2. at least two collected maroons were not initially eligible under the threshold,
++#   3. an iterative solver without the threshold would collect strictly more maroons.
++
++import random
++from collections import deque
++
++import numpy as np
++
++from arc_utils import neighbors4
++
++
++GRID_H, GRID_W = 11, 11
++CENTER_R, CENTER_C = 5, 5
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++MAROON = 9
++DEST_SIDE = 3
++PATH_LIMIT = 3
++GEN_RETRIES = 300
++DISTRACTOR_RANGE = (1, 4)
++
++
++# Canonical west-facing chamber.
++CANONICAL_BOX = {(dr, dc) for dr in range(-3, 3) for dc in range(-5, -1)}
++CANONICAL_FLOOR = {
++    (0, -2),
++    (-1, -2),
++    (-2, -2),
++    (-2, -3),
++    (-2, -4),
++    (-1, -4),
++    (-1, -5),
++}
++CANONICAL_CHAIN = [
++    (0, -3),
++    (0, -4),
++    (0, -5),
++    (1, -5),
++]
++
++
++def _transform(dr: int, dc: int, rot: int, mirror: bool) -> tuple[int, int]:
++    if mirror:
++        dr = -dr
++    for _ in range(rot % 4):
++        dr, dc = dc, -dr
++    return int(dr), int(dc)
++
++
++def _to_abs(coords, rot: int, mirror: bool) -> set[tuple[int, int]]:
++    out = set()
++    for dr, dc in coords:
++        tr, tc = _transform(int(dr), int(dc), rot, mirror)
++        out.add((CENTER_R + tr, CENTER_C + tc))
++    return out
++
++
++def _chain_abs(rot: int, mirror: bool) -> list[tuple[int, int]]:
++    out = []
++    for dr, dc in CANONICAL_CHAIN:
++        tr, tc = _transform(int(dr), int(dc), rot, mirror)
++        out.append((CENTER_R + tr, CENTER_C + tc))
++    return out
++
++
++def _dest_cells(center_r: int, center_c: int, h: int, w: int) -> list[tuple[int, int]]:
++    cells = []
++    for r in range(center_r - 1, center_r + 2):
++        for c in range(center_c - 1, center_c + 2):
++            if 0 <= r < h and 0 <= c < w:
++                cells.append((r, c))
++    cells.sort()
++    return cells
++
++
++def _ring_cells(dest_set: set[tuple[int, int]], h: int, w: int) -> set[tuple[int, int]]:
++    ring = set()
++    for r, c in dest_set:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
++                ring.add((rr, cc))
++    return ring
++
++
++def _floor_starts(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> list[tuple[int, int]]:
++    h, w = grid.shape
++    starts = []
++    seen = set()
++    for r, c in dest_set:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set and int(grid[rr, cc]) == FLOOR_COLOR:
++                if (rr, cc) not in seen:
++                    seen.add((rr, cc))
++                    starts.append((rr, cc))
++    return starts
++
++
++def _floor_distances(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> np.ndarray:
++    h, w = grid.shape
++    inf = 10**9
++    dist = np.full((h, w), inf, dtype=int)
++    q = deque()
++    for r, c in _floor_starts(grid, dest_set):
++        dist[r, c] = 0
++        q.append((r, c))
++
++    while q:
++        r, c = q.popleft()
++        d = int(dist[r, c])
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR and dist[rr, cc] == inf:
++                dist[rr, cc] = d + 1
++                q.append((rr, cc))
++    return dist
++
++
++def _eligible_tokens(grid: np.ndarray, dest_set: set[tuple[int, int]], path_limit: int) -> list[tuple[int, int, int]]:
++    dist = _floor_distances(grid, dest_set)
++    h, w = grid.shape
++    inf = 10**9
++    cands = []
++    for r, c in np.argwhere(grid == MAROON):
++        r = int(r)
++        c = int(c)
++        if (r, c) in dest_set:
++            continue
++        best = inf
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR:
++                best = min(best, int(dist[rr, cc]) + 1)
++        if best <= path_limit:
++            cands.append((int(best), r, c))
++    cands.sort()
++    return cands
++
++
++def _simulate(
++    grid: np.ndarray,
++    *,
++    path_limit: int,
++    iterative: bool,
++) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
++    out = np.array(grid, dtype=int).copy()
++    h, w = out.shape
++    centers = np.argwhere(out == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center"
++    cr, cc = map(int, centers[0])
++    dest_cells = _dest_cells(cr, cc, h, w)
++    dest_set = set(dest_cells)
++
++    history: list[tuple[int, int, int]] = []
++    fill_idx = 0
++    while fill_idx < len(dest_cells):
++        cands = _eligible_tokens(out, dest_set, path_limit)
++        if not cands:
++            break
++        chosen = cands[:1] if iterative else cands[: len(dest_cells) - fill_idx]
++        for dist, r, c in chosen:
++            out[r, c] = FLOOR_COLOR
++            dr, dc = dest_cells[fill_idx]
++            out[dr, dc] = MAROON
++            history.append((int(dist), int(r), int(c)))
++            fill_idx += 1
++            if fill_idx >= len(dest_cells):
++                break
++        if not iterative:
++            break
++    return out, history
++
++
++def _make_base_grid() -> np.ndarray:
++    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W):
++        grid[r, c] = DEST_COLOR
++    grid[CENTER_R, CENTER_C] = RED_CENTER
++    return grid
++
++
++def _apply_chamber(grid: np.ndarray, rot: int, mirror: bool) -> tuple[list[tuple[int, int]], set[tuple[int, int]]]:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    ring = _ring_cells(dest_set, GRID_H, GRID_W)
++    floor_cells = _to_abs(CANONICAL_FLOOR, rot, mirror)
++    box_cells = _to_abs(CANONICAL_BOX, rot, mirror)
++    chain_cells = _chain_abs(rot, mirror)
++    openings = floor_cells & ring
++
++    for r, c in ring - openings:
++        grid[r, c] = WALL_COLOR
++
++    carved = floor_cells | set(chain_cells)
++    for r, c in box_cells:
++        grid[r, c] = FLOOR_COLOR if (r, c) in carved else WALL_COLOR
++
++    return chain_cells, box_cells | ring
++
++
++def _reachable_floor(grid: np.ndarray) -> set[tuple[int, int]]:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    seen = set()
++    q = deque(_floor_starts(grid, dest_set))
++    for cell in q:
++        seen.add(cell)
++    while q:
++        r, c = q.popleft()
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < GRID_H and 0 <= cc < GRID_W and int(grid[rr, cc]) == FLOOR_COLOR and (rr, cc) not in seen:
++                seen.add((rr, cc))
++                q.append((rr, cc))
++    return seen
++
++
++def _build_candidate() -> np.ndarray:
++    grid = _make_base_grid()
++    rot = random.randrange(4)
++    mirror = bool(random.randrange(2))
++    chain_cells, reserved = _apply_chamber(grid, rot, mirror)
++
++    inp = grid.copy()
++    for r, c in chain_cells:
++        inp[r, c] = MAROON
++
++    reachable_floor = _reachable_floor(grid)
++    distractor_pool = [
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if int(inp[r, c]) == FLOOR_COLOR and (r, c) not in reachable_floor and (r, c) not in reserved
++    ]
++    random.shuffle(distractor_pool)
++    distractor_count = min(len(distractor_pool), random.randint(*DISTRACTOR_RANGE))
++    for r, c in distractor_pool[:distractor_count]:
++        inp[r, c] = MAROON
++
++    return inp
++
++
++def _is_good_variant(inp: np.ndarray) -> bool:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    initial = _eligible_tokens(inp, dest_set, PATH_LIMIT)
++    fused_out, fused_hist = _simulate(inp, path_limit=PATH_LIMIT, iterative=True)
++    no_limit_out, no_limit_hist = _simulate(inp, path_limit=GRID_H * GRID_W, iterative=True)
++
++    initial_set = {(r, c) for _d, r, c in initial}
++    later_only = [(r, c) for _d, r, c in fused_hist if (r, c) not in initial_set]
++
++    if not fused_hist:
++        return False
++    if len(later_only) < 2:
++        return False
++    if len(no_limit_hist) <= len(fused_hist):
++        return False
++    if not np.array_equal(main(inp), fused_out):
++        return False
++    if np.array_equal(no_limit_out, fused_out):
++        return False
++    return True
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Pull maroon pixels into the 3x3 block around the unique red center, one shortest-path step at a time.
++
++    Input structure:
++    - The board is an 11x11 orange floor with a fixed green 3x3 destination around one red center.
++    - Magenta walls form narrow corridors near the destination.
++    - Maroon pixels sit on floor cells outside the block; some are near the opening, others are deeper in the corridor.
++
++    Rule:
++    - Repeatedly recompute which maroon pixel is reachable from the destination through orange floor cells.
++    - A maroon qualifies only if its current shortest path length is at most 3, where the last step may enter the maroon but other maroons are not traversable.
++    - On each iteration, move only the single nearest qualifying maroon into the next destination cell in row-major order, erase its source to floor, then recompute from the updated grid.
++    - Stop when the block is full or no maroon remains within the path-length limit.
++
++    Key insight:
++    - Removing one maroon can open a shorter route to deeper maroons, so the reachable set is dynamic; however the 3-step cap still prevents some connected maroons from ever being collected.
++    """
++
++    out, _history = _simulate(np.asarray(grid, dtype=int), path_limit=PATH_LIMIT, iterative=True)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        inp = _build_candidate()
++        try:
++            if _is_good_variant(inp):
++                return inp
++        except Exception:
++            pass
++    raise RuntimeError(f"Failed to generate valid combo sample after {GEN_RETRIES} attempts")
+
+ succeeded in 548ms:
+initial eligible distribution Counter({1: 120})
+fused collected distribution Counter({3: 120})
+later-only collected distribution Counter({2: 120})
+no-limit iterative distribution Counter({4: 120})
+avg extra unlocked 2.0
+avg threshold-blocked 1.0
+
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/18/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+inp = mod.generate_input()
+out = mod.main(inp)
+print('input')
+for row in inp: print(''.join(map(str,row)))
+print('output')
+for row in out: print(''.join(map(str,row)))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dd6b8c4b/18/code.py b/ceshi/code_combo/dd6b8c4b/18/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0945308f3d2f7f762343a0b77378f40541308401
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/18/code.py
+@@ -0,0 +1,318 @@
++# Combo variant of dd6b8c4b (index 18)
++# combo_spec: D1/1+D15/0
++# Name: 最短路径长度约束+逐步收集
++#
++# Design analysis for the fused rule:
++# - Concrete behavior:
++#   A canonical corridor sits beside the 3x3 destination block. The first maroon is within
++#   3 floor-steps, the second and third are initially too far because only a detour reaches
++#   them, and the fourth remains at distance 4 even after earlier maroons disappear. This
++#   makes the shortest-path cap and the step-by-step recomputation both visible.
++# - Complexity calibration:
++#   The generator uses one dominant one-cell-wide chamber plus a few distractors. That keeps
++#   the visual story legible: a short lane, a longer detour, and one leftover over-limit token.
++# - Broken original assumptions:
++#   In the base task maroon cells were globally passable, so deleting one could not shorten any
++#   route. Here only orange floor is traversable; a maroon may be used only as the final target
++#   cell. Therefore distances must be recomputed after every single move.
++# - Placement legality:
++#   The chamber is defined in local coordinates around the fixed center and then rotated /
++#   mirrored. All transformed cells stay inside the 11x11 canvas, never overlap the destination,
++#   and the ring openings are explicitly carved.
++# - Visual observability:
++#   Walls isolate one narrow chamber, so a human can see the front maroon disappear first,
++#   then notice that deeper maroons become newly available one by one. The untouched fourth
++#   maroon demonstrates the path-length threshold.
++# - Generator guarantees:
++#   Each accepted sample must satisfy:
++#   1. at least one maroon is collected by the fused solver,
++#   2. at least two collected maroons were not initially eligible under the threshold,
++#   3. an iterative solver without the threshold would collect strictly more maroons.
++
++import random
++from collections import deque
++
++import numpy as np
++
++from arc_utils import neighbors4
++
++
++GRID_H, GRID_W = 11, 11
++CENTER_R, CENTER_C = 5, 5
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++MAROON = 9
++DEST_SIDE = 3
++PATH_LIMIT = 3
++GEN_RETRIES = 300
++DISTRACTOR_RANGE = (1, 4)
++
++
++# Canonical west-facing chamber.
++CANONICAL_BOX = {(dr, dc) for dr in range(-3, 3) for dc in range(-5, -1)}
++CANONICAL_FLOOR = {
++    (0, -2),
++    (-1, -2),
++    (-2, -2),
++    (-2, -3),
++    (-2, -4),
++    (-1, -4),
++    (-1, -5),
++}
++CANONICAL_CHAIN = [
++    (0, -3),
++    (0, -4),
++    (0, -5),
++    (1, -5),
++]
++
++
++def _transform(dr: int, dc: int, rot: int, mirror: bool) -> tuple[int, int]:
++    if mirror:
++        dr = -dr
++    for _ in range(rot % 4):
++        dr, dc = dc, -dr
++    return int(dr), int(dc)
++
++
++def _to_abs(coords, rot: int, mirror: bool) -> set[tuple[int, int]]:
++    out = set()
++    for dr, dc in coords:
++        tr, tc = _transform(int(dr), int(dc), rot, mirror)
++        out.add((CENTER_R + tr, CENTER_C + tc))
++    return out
++
++
++def _chain_abs(rot: int, mirror: bool) -> list[tuple[int, int]]:
++    out = []
++    for dr, dc in CANONICAL_CHAIN:
++        tr, tc = _transform(int(dr), int(dc), rot, mirror)
++        out.append((CENTER_R + tr, CENTER_C + tc))
++    return out
++
++
++def _dest_cells(center_r: int, center_c: int, h: int, w: int) -> list[tuple[int, int]]:
++    cells = []
++    for r in range(center_r - 1, center_r + 2):
++        for c in range(center_c - 1, center_c + 2):
++            if 0 <= r < h and 0 <= c < w:
++                cells.append((r, c))
++    cells.sort()
++    return cells
++
++
++def _ring_cells(dest_set: set[tuple[int, int]], h: int, w: int) -> set[tuple[int, int]]:
++    ring = set()
++    for r, c in dest_set:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
++                ring.add((rr, cc))
++    return ring
++
++
++def _floor_starts(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> list[tuple[int, int]]:
++    h, w = grid.shape
++    starts = []
++    seen = set()
++    for r, c in dest_set:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set and int(grid[rr, cc]) == FLOOR_COLOR:
++                if (rr, cc) not in seen:
++                    seen.add((rr, cc))
++                    starts.append((rr, cc))
++    return starts
++
++
++def _floor_distances(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> np.ndarray:
++    h, w = grid.shape
++    inf = 10**9
++    dist = np.full((h, w), inf, dtype=int)
++    q = deque()
++    for r, c in _floor_starts(grid, dest_set):
++        dist[r, c] = 0
++        q.append((r, c))
++
++    while q:
++        r, c = q.popleft()
++        d = int(dist[r, c])
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR and dist[rr, cc] == inf:
++                dist[rr, cc] = d + 1
++                q.append((rr, cc))
++    return dist
++
++
++def _eligible_tokens(grid: np.ndarray, dest_set: set[tuple[int, int]], path_limit: int) -> list[tuple[int, int, int]]:
++    dist = _floor_distances(grid, dest_set)
++    h, w = grid.shape
++    inf = 10**9
++    cands = []
++    for r, c in np.argwhere(grid == MAROON):
++        r = int(r)
++        c = int(c)
++        if (r, c) in dest_set:
++            continue
++        best = inf
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR:
++                best = min(best, int(dist[rr, cc]) + 1)
++        if best <= path_limit:
++            cands.append((int(best), r, c))
++    cands.sort()
++    return cands
++
++
++def _simulate(
++    grid: np.ndarray,
++    *,
++    path_limit: int,
++    iterative: bool,
++) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
++    out = np.array(grid, dtype=int).copy()
++    h, w = out.shape
++    centers = np.argwhere(out == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center"
++    cr, cc = map(int, centers[0])
++    dest_cells = _dest_cells(cr, cc, h, w)
++    dest_set = set(dest_cells)
++
++    history: list[tuple[int, int, int]] = []
++    fill_idx = 0
++    while fill_idx < len(dest_cells):
++        cands = _eligible_tokens(out, dest_set, path_limit)
++        if not cands:
++            break
++        chosen = cands[:1] if iterative else cands[: len(dest_cells) - fill_idx]
++        for dist, r, c in chosen:
++            out[r, c] = FLOOR_COLOR
++            dr, dc = dest_cells[fill_idx]
++            out[dr, dc] = MAROON
++            history.append((int(dist), int(r), int(c)))
++            fill_idx += 1
++            if fill_idx >= len(dest_cells):
++                break
++        if not iterative:
++            break
++    return out, history
++
++
++def _make_base_grid() -> np.ndarray:
++    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W):
++        grid[r, c] = DEST_COLOR
++    grid[CENTER_R, CENTER_C] = RED_CENTER
++    return grid
++
++
++def _apply_chamber(grid: np.ndarray, rot: int, mirror: bool) -> tuple[list[tuple[int, int]], set[tuple[int, int]]]:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    ring = _ring_cells(dest_set, GRID_H, GRID_W)
++    floor_cells = _to_abs(CANONICAL_FLOOR, rot, mirror)
++    box_cells = _to_abs(CANONICAL_BOX, rot, mirror)
++    chain_cells = _chain_abs(rot, mirror)
++    openings = floor_cells & ring
++
++    for r, c in ring - openings:
++        grid[r, c] = WALL_COLOR
++
++    carved = floor_cells | set(chain_cells)
++    for r, c in box_cells:
++        grid[r, c] = FLOOR_COLOR if (r, c) in carved else WALL_COLOR
++
++    return chain_cells, box_cells | ring
++
++
++def _reachable_floor(grid: np.ndarray) -> set[tuple[int, int]]:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    seen = set()
++    q = deque(_floor_starts(grid, dest_set))
++    for cell in q:
++        seen.add(cell)
++    while q:
++        r, c = q.popleft()
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < GRID_H and 0 <= cc < GRID_W and int(grid[rr, cc]) == FLOOR_COLOR and (rr, cc) not in seen:
++                seen.add((rr, cc))
++                q.append((rr, cc))
++    return seen
++
++
++def _build_candidate() -> np.ndarray:
++    grid = _make_base_grid()
++    rot = random.randrange(4)
++    mirror = bool(random.randrange(2))
++    chain_cells, reserved = _apply_chamber(grid, rot, mirror)
++
++    inp = grid.copy()
++    for r, c in chain_cells:
++        inp[r, c] = MAROON
++
++    reachable_floor = _reachable_floor(grid)
++    distractor_pool = [
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if int(inp[r, c]) == FLOOR_COLOR and (r, c) not in reachable_floor and (r, c) not in reserved
++    ]
++    random.shuffle(distractor_pool)
++    distractor_count = min(len(distractor_pool), random.randint(*DISTRACTOR_RANGE))
++    for r, c in distractor_pool[:distractor_count]:
++        inp[r, c] = MAROON
++
++    return inp
++
++
++def _is_good_variant(inp: np.ndarray) -> bool:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    initial = _eligible_tokens(inp, dest_set, PATH_LIMIT)
++    fused_out, fused_hist = _simulate(inp, path_limit=PATH_LIMIT, iterative=True)
++    no_limit_out, no_limit_hist = _simulate(inp, path_limit=GRID_H * GRID_W, iterative=True)
++
++    initial_set = {(r, c) for _d, r, c in initial}
++    later_only = [(r, c) for _d, r, c in fused_hist if (r, c) not in initial_set]
++
++    if not fused_hist:
++        return False
++    if len(later_only) < 2:
++        return False
++    if len(no_limit_hist) <= len(fused_hist):
++        return False
++    if not np.array_equal(main(inp), fused_out):
++        return False
++    if np.array_equal(no_limit_out, fused_out):
++        return False
++    return True
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Pull maroon pixels into the 3x3 block around the unique red center, one shortest-path step at a time.
++
++    Input structure:
++    - The board is an 11x11 orange floor with a fixed green 3x3 destination around one red center.
++    - Magenta walls form narrow corridors near the destination.
++    - Maroon pixels sit on floor cells outside the block; some are near the opening, others are deeper in the corridor.
++
++    Rule:
++    - Repeatedly recompute which maroon pixel is reachable from the destination through orange floor cells.
++    - A maroon qualifies only if its current shortest path length is at most 3, where the last step may enter the maroon but other maroons are not traversable.
++    - On each iteration, move only the single nearest qualifying maroon into the next destination cell in row-major order, erase its source to floor, then recompute from the updated grid.
++    - Stop when the block is full or no maroon remains within the path-length limit.
++
++    Key insight:
++    - Removing one maroon can open a shorter route to deeper maroons, so the reachable set is dynamic; however the 3-step cap still prevents some connected maroons from ever being collected.
++    """
++
++    out, _history = _simulate(np.asarray(grid, dtype=int), path_limit=PATH_LIMIT, iterative=True)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        inp = _build_candidate()
++        try:
++            if _is_good_variant(inp):
++                return inp
++        except Exception:
++            pass
++    raise RuntimeError(f"Failed to generate valid combo sample after {GEN_RETRIES} attempts")
+
+ succeeded in 285ms:
+input
+77777777777
+77777777777
+77777777777
+77776667777
+77763336777
+97763236777
+77763336777
+77766777677
+77766967677
+77766977677
+77769976677
+output
+77777777777
+77777777777
+77777777777
+77776667777
+77769996777
+97763236777
+77763336777
+77766777677
+77766767677
+77766777677
+77769776677
+
+codex
+已完成，代码保存在 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/18/code.py:1)。
+
+`main()` 现在实现的是：
+- 只允许通过橙色地板走最短路，栗色像素只能作为终点进入，不能当中转。
+- 阈值固定为 `3` 步。
+- 每次只收集当前最近的一个栗色像素，移走后立刻重算，再决定下一个。
+
+`generate_input()` 改成了一个可旋转/镜像的窄走廊模板，并在验收时强制检查融合行为没有退化：
+- 初始阈值内可收集的像素只有 `1` 个。
+- 融合规则最终会收集 `3` 个，其中 `2` 个是“初始不合格、后续因近路打开才变合格”的。
+- 去掉阈值后，同样的逐步规则会收集 `4` 个，所以阈值确实在起作用。
+
+验证结果：
+- 规定的 50 次压力测试通过，`Success: 50/50`。
+- 额外抽样 120 个生成样本，分布稳定为：
+  - 初始可收集数 `1`
+  - 融合后收集数 `3`
+  - 后续新解锁数 `2`
+  - 无阈值逐步收集数 `4`
+
+这说明现在的样本同时体现了 `D1/1` 和 `D15/0`，没有退化回原题或单一变体。
+diff --git a/ceshi/code_combo/dd6b8c4b/18/code.py b/ceshi/code_combo/dd6b8c4b/18/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0945308f3d2f7f762343a0b77378f40541308401
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/18/code.py
+@@ -0,0 +1,318 @@
++# Combo variant of dd6b8c4b (index 18)
++# combo_spec: D1/1+D15/0
++# Name: 最短路径长度约束+逐步收集
++#
++# Design analysis for the fused rule:
++# - Concrete behavior:
++#   A canonical corridor sits beside the 3x3 destination block. The first maroon is within
++#   3 floor-steps, the second and third are initially too far because only a detour reaches
++#   them, and the fourth remains at distance 4 even after earlier maroons disappear. This
++#   makes the shortest-path cap and the step-by-step recomputation both visible.
++# - Complexity calibration:
++#   The generator uses one dominant one-cell-wide chamber plus a few distractors. That keeps
++#   the visual story legible: a short lane, a longer detour, and one leftover over-limit token.
++# - Broken original assumptions:
++#   In the base task maroon cells were globally passable, so deleting one could not shorten any
++#   route. Here only orange floor is traversable; a maroon may be used only as the final target
++#   cell. Therefore distances must be recomputed after every single move.
++# - Placement legality:
++#   The chamber is defined in local coordinates around the fixed center and then rotated /
++#   mirrored. All transformed cells stay inside the 11x11 canvas, never overlap the destination,
++#   and the ring openings are explicitly carved.
++# - Visual observability:
++#   Walls isolate one narrow chamber, so a human can see the front maroon disappear first,
++#   then notice that deeper maroons become newly available one by one. The untouched fourth
++#   maroon demonstrates the path-length threshold.
++# - Generator guarantees:
++#   Each accepted sample must satisfy:
++#   1. at least one maroon is collected by the fused solver,
++#   2. at least two collected maroons were not initially eligible under the threshold,
++#   3. an iterative solver without the threshold would collect strictly more maroons.
++
++import random
++from collections import deque
++
++import numpy as np
++
++from arc_utils import neighbors4
++
++
++GRID_H, GRID_W = 11, 11
++CENTER_R, CENTER_C = 5, 5
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++MAROON = 9
++DEST_SIDE = 3
++PATH_LIMIT = 3
++GEN_RETRIES = 300
++DISTRACTOR_RANGE = (1, 4)
++
++
++# Canonical west-facing chamber.
++CANONICAL_BOX = {(dr, dc) for dr in range(-3, 3) for dc in range(-5, -1)}
++CANONICAL_FLOOR = {
++    (0, -2),
++    (-1, -2),
++    (-2, -2),
++    (-2, -3),
++    (-2, -4),
++    (-1, -4),
++    (-1, -5),
++}
++CANONICAL_CHAIN = [
++    (0, -3),
++    (0, -4),
++    (0, -5),
++    (1, -5),
++]
++
++
++def _transform(dr: int, dc: int, rot: int, mirror: bool) -> tuple[int, int]:
++    if mirror:
++        dr = -dr
++    for _ in range(rot % 4):
++        dr, dc = dc, -dr
++    return int(dr), int(dc)
++
++
++def _to_abs(coords, rot: int, mirror: bool) -> set[tuple[int, int]]:
++    out = set()
++    for dr, dc in coords:
++        tr, tc = _transform(int(dr), int(dc), rot, mirror)
++        out.add((CENTER_R + tr, CENTER_C + tc))
++    return out
++
++
++def _chain_abs(rot: int, mirror: bool) -> list[tuple[int, int]]:
++    out = []
++    for dr, dc in CANONICAL_CHAIN:
++        tr, tc = _transform(int(dr), int(dc), rot, mirror)
++        out.append((CENTER_R + tr, CENTER_C + tc))
++    return out
++
++
++def _dest_cells(center_r: int, center_c: int, h: int, w: int) -> list[tuple[int, int]]:
++    cells = []
++    for r in range(center_r - 1, center_r + 2):
++        for c in range(center_c - 1, center_c + 2):
++            if 0 <= r < h and 0 <= c < w:
++                cells.append((r, c))
++    cells.sort()
++    return cells
++
++
++def _ring_cells(dest_set: set[tuple[int, int]], h: int, w: int) -> set[tuple[int, int]]:
++    ring = set()
++    for r, c in dest_set:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
++                ring.add((rr, cc))
++    return ring
++
++
++def _floor_starts(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> list[tuple[int, int]]:
++    h, w = grid.shape
++    starts = []
++    seen = set()
++    for r, c in dest_set:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set and int(grid[rr, cc]) == FLOOR_COLOR:
++                if (rr, cc) not in seen:
++                    seen.add((rr, cc))
++                    starts.append((rr, cc))
++    return starts
++
++
++def _floor_distances(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> np.ndarray:
++    h, w = grid.shape
++    inf = 10**9
++    dist = np.full((h, w), inf, dtype=int)
++    q = deque()
++    for r, c in _floor_starts(grid, dest_set):
++        dist[r, c] = 0
++        q.append((r, c))
++
++    while q:
++        r, c = q.popleft()
++        d = int(dist[r, c])
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR and dist[rr, cc] == inf:
++                dist[rr, cc] = d + 1
++                q.append((rr, cc))
++    return dist
++
++
++def _eligible_tokens(grid: np.ndarray, dest_set: set[tuple[int, int]], path_limit: int) -> list[tuple[int, int, int]]:
++    dist = _floor_distances(grid, dest_set)
++    h, w = grid.shape
++    inf = 10**9
++    cands = []
++    for r, c in np.argwhere(grid == MAROON):
++        r = int(r)
++        c = int(c)
++        if (r, c) in dest_set:
++            continue
++        best = inf
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and int(grid[rr, cc]) == FLOOR_COLOR:
++                best = min(best, int(dist[rr, cc]) + 1)
++        if best <= path_limit:
++            cands.append((int(best), r, c))
++    cands.sort()
++    return cands
++
++
++def _simulate(
++    grid: np.ndarray,
++    *,
++    path_limit: int,
++    iterative: bool,
++) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
++    out = np.array(grid, dtype=int).copy()
++    h, w = out.shape
++    centers = np.argwhere(out == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center"
++    cr, cc = map(int, centers[0])
++    dest_cells = _dest_cells(cr, cc, h, w)
++    dest_set = set(dest_cells)
++
++    history: list[tuple[int, int, int]] = []
++    fill_idx = 0
++    while fill_idx < len(dest_cells):
++        cands = _eligible_tokens(out, dest_set, path_limit)
++        if not cands:
++            break
++        chosen = cands[:1] if iterative else cands[: len(dest_cells) - fill_idx]
++        for dist, r, c in chosen:
++            out[r, c] = FLOOR_COLOR
++            dr, dc = dest_cells[fill_idx]
++            out[dr, dc] = MAROON
++            history.append((int(dist), int(r), int(c)))
++            fill_idx += 1
++            if fill_idx >= len(dest_cells):
++                break
++        if not iterative:
++            break
++    return out, history
++
++
++def _make_base_grid() -> np.ndarray:
++    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W):
++        grid[r, c] = DEST_COLOR
++    grid[CENTER_R, CENTER_C] = RED_CENTER
++    return grid
++
++
++def _apply_chamber(grid: np.ndarray, rot: int, mirror: bool) -> tuple[list[tuple[int, int]], set[tuple[int, int]]]:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    ring = _ring_cells(dest_set, GRID_H, GRID_W)
++    floor_cells = _to_abs(CANONICAL_FLOOR, rot, mirror)
++    box_cells = _to_abs(CANONICAL_BOX, rot, mirror)
++    chain_cells = _chain_abs(rot, mirror)
++    openings = floor_cells & ring
++
++    for r, c in ring - openings:
++        grid[r, c] = WALL_COLOR
++
++    carved = floor_cells | set(chain_cells)
++    for r, c in box_cells:
++        grid[r, c] = FLOOR_COLOR if (r, c) in carved else WALL_COLOR
++
++    return chain_cells, box_cells | ring
++
++
++def _reachable_floor(grid: np.ndarray) -> set[tuple[int, int]]:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    seen = set()
++    q = deque(_floor_starts(grid, dest_set))
++    for cell in q:
++        seen.add(cell)
++    while q:
++        r, c = q.popleft()
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < GRID_H and 0 <= cc < GRID_W and int(grid[rr, cc]) == FLOOR_COLOR and (rr, cc) not in seen:
++                seen.add((rr, cc))
++                q.append((rr, cc))
++    return seen
++
++
++def _build_candidate() -> np.ndarray:
++    grid = _make_base_grid()
++    rot = random.randrange(4)
++    mirror = bool(random.randrange(2))
++    chain_cells, reserved = _apply_chamber(grid, rot, mirror)
++
++    inp = grid.copy()
++    for r, c in chain_cells:
++        inp[r, c] = MAROON
++
++    reachable_floor = _reachable_floor(grid)
++    distractor_pool = [
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if int(inp[r, c]) == FLOOR_COLOR and (r, c) not in reachable_floor and (r, c) not in reserved
++    ]
++    random.shuffle(distractor_pool)
++    distractor_count = min(len(distractor_pool), random.randint(*DISTRACTOR_RANGE))
++    for r, c in distractor_pool[:distractor_count]:
++        inp[r, c] = MAROON
++
++    return inp
++
++
++def _is_good_variant(inp: np.ndarray) -> bool:
++    dest_set = set(_dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W))
++    initial = _eligible_tokens(inp, dest_set, PATH_LIMIT)
++    fused_out, fused_hist = _simulate(inp, path_limit=PATH_LIMIT, iterative=True)
++    no_limit_out, no_limit_hist = _simulate(inp, path_limit=GRID_H * GRID_W, iterative=True)
++
++    initial_set = {(r, c) for _d, r, c in initial}
++    later_only = [(r, c) for _d, r, c in fused_hist if (r, c) not in initial_set]
++
++    if not fused_hist:
++        return False
++    if len(later_only) < 2:
++        return False
++    if len(no_limit_hist) <= len(fused_hist):
++        return False
++    if not np.array_equal(main(inp), fused_out):
++        return False
++    if np.array_equal(no_limit_out, fused_out):
++        return False
++    return True
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Pull maroon pixels into the 3x3 block around the unique red center, one shortest-path step at a time.
++
++    Input structure:
++    - The board is an 11x11 orange floor with a fixed green 3x3 destination around one red center.
++    - Magenta walls form narrow corridors near the destination.
++    - Maroon pixels sit on floor cells outside the block; some are near the opening, others are deeper in the corridor.
++
++    Rule:
++    - Repeatedly recompute which maroon pixel is reachable from the destination through orange floor cells.
++    - A maroon qualifies only if its current shortest path length is at most 3, where the last step may enter the maroon but other maroons are not traversable.
++    - On each iteration, move only the single nearest qualifying maroon into the next destination cell in row-major order, erase its source to floor, then recompute from the updated grid.
++    - Stop when the block is full or no maroon remains within the path-length limit.
++
++    Key insight:
++    - Removing one maroon can open a shorter route to deeper maroons, so the reachable set is dynamic; however the 3-step cap still prevents some connected maroons from ever being collected.
++    """
++
++    out, _history = _simulate(np.asarray(grid, dtype=int), path_limit=PATH_LIMIT, iterative=True)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        inp = _build_candidate()
++        try:
++            if _is_good_variant(inp):
++                return inp
++        except Exception:
++            pass
++    raise RuntimeError(f"Failed to generate valid combo sample after {GEN_RETRIES} attempts")
+
+tokens used
+76,579
+已完成，代码保存在 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/18/code.py:1)。
+
+`main()` 现在实现的是：
+- 只允许通过橙色地板走最短路，栗色像素只能作为终点进入，不能当中转。
+- 阈值固定为 `3` 步。
+- 每次只收集当前最近的一个栗色像素，移走后立刻重算，再决定下一个。
+
+`generate_input()` 改成了一个可旋转/镜像的窄走廊模板，并在验收时强制检查融合行为没有退化：
+- 初始阈值内可收集的像素只有 `1` 个。
+- 融合规则最终会收集 `3` 个，其中 `2` 个是“初始不合格、后续因近路打开才变合格”的。
+- 去掉阈值后，同样的逐步规则会收集 `4` 个，所以阈值确实在起作用。
+
+验证结果：
+- 规定的 50 次压力测试通过，`Success: 50/50`。
+- 额外抽样 120 个生成样本，分布稳定为：
+  - 初始可收集数 `1`
+  - 融合后收集数 `3`
+  - 后续新解锁数 `2`
+  - 无阈值逐步收集数 `4`
+
+这说明现在的样本同时体现了 `D1/1` 和 `D15/0`，没有退化回原题或单一变体。

@@ -1,0 +1,4210 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e2baf-ff19-73e0-b824-8a8d6ed9f7e0
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: dfadab01
+    **摘要**: 输入中的单像素标记按固定字形字典被替换为对应的4x4图案（标记色->图案色），样本字形及其右下标签在输出中消失，超出网格边缘的部分被裁剪
+
+    ## 要实现的融合组合
+    - **组合名称**: 十字标记编码字形+减少标记色
+    - **combo_spec**: D3/4+D12/0
+
+    ### 融合描述（实现规格）
+
+    标记不是单像素而是小十字形，十字臂的数量（1-4）编码对应哪种字形。 但只使用2种标记色，同一色的十字标记臂数不同→对应不同字形。 解题者需要通过计数十字臂确定字形类型，颜色仅区分两大类。 推理从"看颜色查表"变为"数臂数+看颜色"的双层编码。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D3/4** — 标记来源对象 (`src`)
+  - 当前值: 散布在网格中的单像素标记，使用字形字典中的颜色（2、3、5、8），标记位置即字形放置的左上角
+  - 改为: 十字形标记编码字形类型 — 标记不是单像素，而是小十字形（中心+上下左右各1像素），十字臂的数量（1-4）编码对应哪种字形。解题者需要计数十字臂来确定字形类型，而非直接看颜色。
+  - 来源: creative（参考任务: None）
+- **D12/0** — 标记颜色的种类数 (`meta`)
+  - 当前值: 使用4种标记色（2、3、5、8），对应4种不同的字形图案
+  - 改为: 仅使用2种标记色 — 减少到只有2种标记色和2种字形。简化了映射关系，但可以增加字形复杂度或添加其他维度的难度来补偿。视觉上更简洁。
+  - 来源: inversion（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/dfadab01.py`
+
+    ```python
+    from __future__ import annotations
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding fixed 4x4 glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show a sample 4x4 glyph in the output color, with a same-rule marker just below-right of the sample.
+
+    Rule:
+    - Replace each marker color by its learned 4x4 glyph: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping at the grid boundary.
+    - Remove the sample glyphs and skip their below-right label markers.
+
+    Key insight:
+    - The colored pixels are control pixels for a fixed glyph alphabet; non-control sample glyphs are only legend entries, not preserved scene objects.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            # Legend labels appear one cell below-right of the sample glyph bbox.
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 10x10 or 20x20 [observed]; must accommodate marker_grid_rows * row_spacing + glyph_size(4)
+  glyph_alphabet:
+    fixed 4x4 patterns, each 8 filled pixels out of 16:
+      marker 2 (red) -> color 4 (yellow) solid frame
+      marker 3 (green) -> color 1 (blue) open ring
+      marker 5 (gray) -> color 6 (magenta) diagonal blocks
+      marker 8 (azure) -> color 7 (orange) X-shape
+  marker_grid:
+    markers placed on a regular grid of positions (rows x cols)
+    shape: 2x2 to 5x5; rows and cols chosen independently
+    row_spacing: 4-6, uniform within example [observed]
+    col_spacing: 4-6, may be non-uniform across columns
+    fill_rate: 60-100% of grid cells contain a marker; unfilled cells are empty (black)
+    marker_types_used: 1-4 distinct types from {2,3,5,8}; each cell assigned one type
+  legend:
+    0 or 1 legend entry per input [observed]; shows one glyph type's mapping
+    structure: the 4x4 glyph drawn in output color + a label marker of matching type at (glyph_row+4, glyph_col+4)
+    legend glyph may overlap a grid cell position (the marker pixel sits where glyph mask has 0)
+    label marker is skipped in output (not expanded)
+  output:
+    black background; each real marker replaced by its 4x4 glyph in the mapped output color
+    glyph top-left at marker position; clipped at grid boundary
+    legend glyph and label removed; no glyph painted for label markers
+    glyphs never overlap (guaranteed by spacing >= 4)
+
+generation_strategy:
+  approach: direct construction (constraints are easy to satisfy constructively)
+  steps:
+    1. Pick grid dimensions ensuring rows * row_spacing and cols * col_spacing fit (with room for 4-cell glyph); e.g. for 5x5 grid with spacing 4, need >= 20.
+    2. Choose 1-4 marker types from {2,3,5,8}. Choose grid shape (R x C, each 2-5). Choose row_spacing and col_spacing (4-6 each).
+    3. Compute marker row/col positions; first row/col >= 0, last row + 3 <= H, last col + 3 <= W (or allow clipping for edge markers).
+    4. Fill grid cells: assign a random marker type to each cell; optionally leave some cells empty (fill_rate >= 60%).
+    5. Optionally add one legend entry: pick a used marker type, find a location where the 4x4 glyph + label at (+4,+4) fits without conflicting with real markers. Draw glyph in output color; place label marker pixel.
+    6. Build input grid: black background + single marker pixels at filled grid cells + legend if present.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+## 已有单变体参考代码
+
+以下组成项已有单变体实现，可作为融合时的参考：
+
+            ### 参考代码: D3/4
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/dfadab01/D3/4/code.py`
+
+            ```python
+            # Variant of dfadab01
+# Dimension: D3 — 标记来源对象 (src)
+# Change: 散布在网格中的单像素标记，使用字形字典中的颜色（2、3、5、8），标记位置即字形放置的左上角... → 十字形标记编码字形类型
+
+from __future__ import annotations
+
+import itertools
+import random
+
+import numpy as np
+
+"""
+Design analysis for the D3 variant.
+
+a) Concrete behavior and trace:
+   - Real controls are no longer one colored pixel. Each control is now a small cross:
+     a fixed red center (2) plus 1-4 fixed green arm pixels (3) in the four cardinal
+     directions. The arm count is the code. Mapping is:
+       1 arm -> yellow frame, 2 arms -> blue ring, 3 arms -> pink diagonal blocks,
+       4 arms -> orange X.
+   - The glyph anchor stays at the control's logical position: the red center cell is
+     the top-left corner where the 4x4 glyph is painted in the output.
+   - Example trace: in the original task, a single grey pixel 5 at (6, 9) directly
+     meant "paint the magenta diagonal-block glyph at (6, 9)". In this variant, the
+     input instead shows a red center at (6, 9) with exactly three green arms around
+     it. The solver must count the three arms, map that count to the third glyph, and
+     paint the same 4x4 magenta diagonal-block pattern at (6, 9).
+   - Legend behavior stays structurally the same: an optional sample glyph may appear
+     in input, and its label is now a matching cross centered at (+4, +4) from the
+     sample glyph's top-left corner. The sample glyph and its label disappear in the
+     output.
+
+b) Complexity calibration:
+   - Using a fixed center color and a fixed arm color avoids the 1-arm ambiguity that
+     would arise if all cross pixels had the same color. Type is still encoded only by
+     arm count, not by which colors appear.
+   - Arm directions are randomized per marker, so orientation is a nuisance variable
+     and the only stable signal is the count 1-4. This makes the D3 change visible.
+   - The count vocabulary remains only four cases, mirroring the original four glyph
+     types and keeping the task learnable from a few examples.
+
+c) Implicit-assumption audit for main():
+   - Original code assumed every control pixel could be found by scanning colors 2/3/5/8.
+     That fails here because color no longer identifies the glyph class.
+   - Original legend-skip logic relied on the marker coordinate itself being the label
+     anchor. That still works if the new marker's logical anchor is the red center.
+   - Original painting code safely overwrote output because glyphs never overlapped.
+     That assumption remains valid only if generator spacing keeps marker anchors at
+     least 4 cells apart; the generator preserves this.
+   - The new solver assumes every real marker center is color 2, lies away from the
+     border so its possible arms fit, and has 1-4 adjacent arm cells of color 3.
+     The generator constructs exactly that.
+
+d) Placement legality:
+   - Center cells are restricted to rows/cols 1..H-2 so the full cross fits.
+   - Marker anchors sit on a sparse regular grid with 4-6 spacing, so neither input
+     crosses nor output 4x4 glyphs overlap.
+   - Legend placement is accepted only if the 4x4 sample glyph and the label cross are
+     both fully in bounds and disjoint from all real marker pixels.
+
+e) Visual observability:
+   - The new input visibly differs from the source task because controls are plus-like
+     objects instead of isolated pixels.
+   - Because direction sets vary but output depends only on arm count, multiple markers
+     per sample support the intended abstraction.
+
+f) Visual cleanliness:
+   - Real controls occupy isolated grid positions with black padding around them.
+   - Legend glyphs are placed in empty regions so sample colors do not tangle with real
+     controls.
+
+g) Color inferability:
+   - No hidden sorting or color-id arithmetic is used. Colors only separate roles:
+     red=center, green=arms, and the four output glyph colors stay the original fixed
+     alphabet.
+"""
+
+
+CENTER_COLOR = 2
+ARM_COLOR = 3
+CARDINAL_DIRS: tuple[tuple[int, int], ...] = ((-1, 0), (0, 1), (1, 0), (0, -1))
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    1: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    2: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    4: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+ARM_SUBSETS: dict[int, tuple[tuple[tuple[int, int], ...], ...]] = {
+    count: tuple(itertools.combinations(CARDINAL_DIRS, count)) for count in range(1, 5)
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def _count_arms(g: np.ndarray, r: int, c: int) -> int:
+    h, w = g.shape
+    count = 0
+    for dr, dc in CARDINAL_DIRS:
+        rr, cc = r + dr, c + dc
+        if 0 <= rr < h and 0 <= cc < w and int(g[rr, cc]) == ARM_COLOR:
+            count += 1
+    return count
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Decode each cross marker by its arm count, then expand it into the matching 4x4 glyph.
+
+    Input structure:
+    - Black background with control markers made from a red center pixel plus 1-4 green arm pixels in the four cardinal directions.
+    - The number of attached arms selects one of four fixed glyphs; the specific arm directions are incidental.
+    - Some inputs also contain one sample 4x4 glyph in its output color, with a matching label cross centered four cells below-right of that sample.
+
+    Rule:
+    - For each red center pixel, count how many green arm pixels touch it orthogonally.
+    - Map arm counts 1, 2, 3, 4 to the four learned glyph/color pairs, and paint the 4x4 glyph with its top-left corner at the center cell, clipping at the grid boundary.
+    - Remove any legend glyph and skip the below-right label cross instead of expanding it.
+
+    Key insight:
+    - Marker color no longer names the glyph class; the only semantic code is the number of orthogonal arms attached to a fixed-color center.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, CENTER_COLOR, ARM_COLOR, 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    centers = np.argwhere(g == CENTER_COLOR)
+    assert centers.size
+
+    seen_marker = False
+    for r, c in centers:
+        arm_count = _count_arms(g, int(r), int(c))
+        if arm_count not in GLYPHS:
+            continue
+        seen_marker = True
+        glyph_color, mask = GLYPHS[arm_count]
+        if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+            continue
+        _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+
+def _sample_axis_positions(length: int, count: int, rng: random.Random) -> list[int]:
+    max_center = length - 2
+    for _ in range(200):
+        gaps = [rng.randint(4, 6) for _ in range(count - 1)]
+        span = sum(gaps)
+        max_start = max_center - span
+        if max_start < 1:
+            continue
+        start = rng.randint(1, max_start)
+        pos = [start]
+        for gap in gaps:
+            pos.append(pos[-1] + gap)
+        return pos
+    raise RuntimeError("failed to sample axis positions")
+
+
+def _marker_cells(r: int, c: int, arm_dirs: tuple[tuple[int, int], ...]) -> set[tuple[int, int]]:
+    cells = {(r, c)}
+    for dr, dc in arm_dirs:
+        cells.add((r + dr, c + dc))
+    return cells
+
+
+def _draw_marker(grid: np.ndarray, r: int, c: int, arm_dirs: tuple[tuple[int, int], ...]) -> None:
+    grid[r, c] = CENTER_COLOR
+    for dr, dc in arm_dirs:
+        grid[r + dr, c + dc] = ARM_COLOR
+
+
+def _choose_arm_dirs(arm_count: int, rng: random.Random) -> tuple[tuple[int, int], ...]:
+    return tuple(rng.choice(ARM_SUBSETS[arm_count]))
+
+
+def _build_expected_output(
+    shape: tuple[int, int], markers: list[tuple[int, int, int]]
+) -> np.ndarray:
+    out = np.zeros(shape, dtype=int)
+    for r, c, arm_count in markers:
+        glyph_color, mask = GLYPHS[arm_count]
+        _paint_clipped(out, r, c, glyph_color, mask)
+    return out
+
+
+def _find_legend(
+    shape: tuple[int, int],
+    used_counts: list[int],
+    occupied: set[tuple[int, int]],
+    rng: random.Random,
+) -> tuple[int, int, int, tuple[tuple[int, int], ...]] | None:
+    h, w = shape
+    order = [(r, c) for r in range(h - 5) for c in range(w - 5)]
+    rng.shuffle(order)
+    count_order = used_counts[:]
+    rng.shuffle(count_order)
+
+    for arm_count in count_order:
+        glyph_color, mask = GLYPHS[arm_count]
+        arm_variants = list(ARM_SUBSETS[arm_count])
+        rng.shuffle(arm_variants)
+        for r0, c0 in order:
+            glyph_cells = {
+                (r0 + dr, c0 + dc) for dr in range(4) for dc in range(4) if bool(mask[dr, dc])
+            }
+            for arm_dirs in arm_variants:
+                center_r, center_c = r0 + 4, c0 + 4
+                label_cells = _marker_cells(center_r, center_c, arm_dirs)
+                all_cells = glyph_cells | label_cells
+                if not all(0 <= rr < h and 0 <= cc < w for rr, cc in all_cells):
+                    continue
+                if all_cells & occupied:
+                    continue
+                return r0, c0, arm_count, tuple(arm_dirs)
+    return None
+
+
+def generate_input() -> np.ndarray:
+    rng = random.Random()
+
+    for _ in range(200):
+        size = rng.choice([10, 20])
+        h = w = size
+        if size == 10:
+            row_count = col_count = 2
+        else:
+            row_count = rng.randint(2, 5)
+            col_count = rng.randint(2, 5)
+
+        row_positions = _sample_axis_positions(h, row_count, rng)
+        col_positions = _sample_axis_positions(w, col_count, rng)
+        slots = [(r, c) for r in row_positions for c in col_positions]
+        min_fill = max(4, int(np.ceil(0.6 * len(slots))))
+        occupied_count = rng.randint(min_fill, len(slots))
+        chosen_slots = rng.sample(slots, occupied_count)
+
+        type_count = rng.randint(2, min(4, occupied_count))
+        used_counts = rng.sample([1, 2, 3, 4], type_count)
+        arm_counts = used_counts[:] + [rng.choice(used_counts) for _ in range(occupied_count - type_count)]
+        rng.shuffle(arm_counts)
+
+        grid = np.zeros((h, w), dtype=int)
+        occupied_cells: set[tuple[int, int]] = set()
+        markers: list[tuple[int, int, int]] = []
+        valid = True
+
+        for (r, c), arm_count in zip(chosen_slots, arm_counts, strict=True):
+            arm_dirs = _choose_arm_dirs(arm_count, rng)
+            cells = _marker_cells(r, c, arm_dirs)
+            if any(cell in occupied_cells for cell in cells):
+                valid = False
+                break
+            if not all(0 <= rr < h and 0 <= cc < w for rr, cc in cells):
+                valid = False
+                break
+            _draw_marker(grid, r, c, arm_dirs)
+            occupied_cells |= cells
+            markers.append((r, c, arm_count))
+
+        if not valid:
+            continue
+
+        if rng.random() < 0.75:
+            legend = _find_legend((h, w), used_counts, occupied_cells, rng)
+            if legend is not None:
+                r0, c0, arm_count, arm_dirs = legend
+                glyph_color, mask = GLYPHS[arm_count]
+                for dr in range(4):
+                    for dc in range(4):
+                        if bool(mask[dr, dc]):
+                            grid[r0 + dr, c0 + dc] = glyph_color
+                _draw_marker(grid, r0 + 4, c0 + 4, arm_dirs)
+
+        expected = _build_expected_output((h, w), markers)
+        actual = main(grid)
+        if not np.array_equal(actual, expected):
+            continue
+        return grid
+
+    raise RuntimeError("failed to generate a valid input")
+
+            ```
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of dfadab01 (index 18)
+    # combo_spec: D3/4+D12/0
+    # Name: 十字标记编码字形+减少标记色
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18` 存在（如不存在则创建）。
+codex
+先检查原始 `dfadab01` 实现、单变体参考和目标目录状态，然后我会把融合规则落实成可验证的 solver/generator 设计，再直接落到代码和测试。
+exec
+/bin/bash -lc "sed -n '1,420p' /home/lixinyu/snap/new/ceshi/code/dfadab01/D3/4/code.py" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc 'ls -la /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Variant of dfadab01
+# Dimension: D3 — 标记来源对象 (src)
+# Change: 散布在网格中的单像素标记，使用字形字典中的颜色（2、3、5、8），标记位置即字形放置的左上角... → 十字形标记编码字形类型
+
+from __future__ import annotations
+
+import itertools
+import random
+
+import numpy as np
+
+"""
+Design analysis for the D3 variant.
+
+a) Concrete behavior and trace:
+   - Real controls are no longer one colored pixel. Each control is now a small cross:
+     a fixed red center (2) plus 1-4 fixed green arm pixels (3) in the four cardinal
+     directions. The arm count is the code. Mapping is:
+       1 arm -> yellow frame, 2 arms -> blue ring, 3 arms -> pink diagonal blocks,
+       4 arms -> orange X.
+   - The glyph anchor stays at the control's logical position: the red center cell is
+     the top-left corner where the 4x4 glyph is painted in the output.
+   - Example trace: in the original task, a single grey pixel 5 at (6, 9) directly
+     meant "paint the magenta diagonal-block glyph at (6, 9)". In this variant, the
+     input instead shows a red center at (6, 9) with exactly three green arms around
+     it. The solver must count the three arms, map that count to the third glyph, and
+     paint the same 4x4 magenta diagonal-block pattern at (6, 9).
+   - Legend behavior stays structurally the same: an optional sample glyph may appear
+     in input, and its label is now a matching cross centered at (+4, +4) from the
+     sample glyph's top-left corner. The sample glyph and its label disappear in the
+     output.
+
+b) Complexity calibration:
+   - Using a fixed center color and a fixed arm color avoids the 1-arm ambiguity that
+     would arise if all cross pixels had the same color. Type is still encoded only by
+     arm count, not by which colors appear.
+   - Arm directions are randomized per marker, so orientation is a nuisance variable
+     and the only stable signal is the count 1-4. This makes the D3 change visible.
+   - The count vocabulary remains only four cases, mirroring the original four glyph
+     types and keeping the task learnable from a few examples.
+
+c) Implicit-assumption audit for main():
+   - Original code assumed every control pixel could be found by scanning colors 2/3/5/8.
+     That fails here because color no longer identifies the glyph class.
+   - Original legend-skip logic relied on the marker coordinate itself being the label
+     anchor. That still works if the new marker's logical anchor is the red center.
+   - Original painting code safely overwrote output because glyphs never overlapped.
+     That assumption remains valid only if generator spacing keeps marker anchors at
+     least 4 cells apart; the generator preserves this.
+   - The new solver assumes every real marker center is color 2, lies away from the
+     border so its possible arms fit, and has 1-4 adjacent arm cells of color 3.
+     The generator constructs exactly that.
+
+d) Placement legality:
+   - Center cells are restricted to rows/cols 1..H-2 so the full cross fits.
+   - Marker anchors sit on a sparse regular grid with 4-6 spacing, so neither input
+     crosses nor output 4x4 glyphs overlap.
+   - Legend placement is accepted only if the 4x4 sample glyph and the label cross are
+     both fully in bounds and disjoint from all real marker pixels.
+
+e) Visual observability:
+   - The new input visibly differs from the source task because controls are plus-like
+     objects instead of isolated pixels.
+   - Because direction sets vary but output depends only on arm count, multiple markers
+     per sample support the intended abstraction.
+
+f) Visual cleanliness:
+   - Real controls occupy isolated grid positions with black padding around them.
+   - Legend glyphs are placed in empty regions so sample colors do not tangle with real
+     controls.
+
+g) Color inferability:
+   - No hidden sorting or color-id arithmetic is used. Colors only separate roles:
+     red=center, green=arms, and the four output glyph colors stay the original fixed
+     alphabet.
+"""
+
+
+CENTER_COLOR = 2
+ARM_COLOR = 3
+CARDINAL_DIRS: tuple[tuple[int, int], ...] = ((-1, 0), (0, 1), (1, 0), (0, -1))
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    1: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    2: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    4: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+ARM_SUBSETS: dict[int, tuple[tuple[tuple[int, int], ...], ...]] = {
+    count: tuple(itertools.combinations(CARDINAL_DIRS, count)) for count in range(1, 5)
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def _count_arms(g: np.ndarray, r: int, c: int) -> int:
+    h, w = g.shape
+    count = 0
+    for dr, dc in CARDINAL_DIRS:
+        rr, cc = r + dr, c + dc
+        if 0 <= rr < h and 0 <= cc < w and int(g[rr, cc]) == ARM_COLOR:
+            count += 1
+    return count
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Decode each cross marker by its arm count, then expand it into the matching 4x4 glyph.
+
+    Input structure:
+    - Black background with control markers made from a red center pixel plus 1-4 green arm pixels in the four cardinal directions.
+    - The number of attached arms selects one of four fixed glyphs; the specific arm directions are incidental.
+    - Some inputs also contain one sample 4x4 glyph in its output color, with a matching label cross centered four cells below-right of that sample.
+
+    Rule:
+    - For each red center pixel, count how many green arm pixels touch it orthogonally.
+    - Map arm counts 1, 2, 3, 4 to the four learned glyph/color pairs, and paint the 4x4 glyph with its top-left corner at the center cell, clipping at the grid boundary.
+    - Remove any legend glyph and skip the below-right label cross instead of expanding it.
+
+    Key insight:
+    - Marker color no longer names the glyph class; the only semantic code is the number of orthogonal arms attached to a fixed-color center.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, CENTER_COLOR, ARM_COLOR, 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    centers = np.argwhere(g == CENTER_COLOR)
+    assert centers.size
+
+    seen_marker = False
+    for r, c in centers:
+        arm_count = _count_arms(g, int(r), int(c))
+        if arm_count not in GLYPHS:
+            continue
+        seen_marker = True
+        glyph_color, mask = GLYPHS[arm_count]
+        if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+            continue
+        _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+
+def _sample_axis_positions(length: int, count: int, rng: random.Random) -> list[int]:
+    max_center = length - 2
+    for _ in range(200):
+        gaps = [rng.randint(4, 6) for _ in range(count - 1)]
+        span = sum(gaps)
+        max_start = max_center - span
+        if max_start < 1:
+            continue
+        start = rng.randint(1, max_start)
+        pos = [start]
+        for gap in gaps:
+            pos.append(pos[-1] + gap)
+        return pos
+    raise RuntimeError("failed to sample axis positions")
+
+
+def _marker_cells(r: int, c: int, arm_dirs: tuple[tuple[int, int], ...]) -> set[tuple[int, int]]:
+    cells = {(r, c)}
+    for dr, dc in arm_dirs:
+        cells.add((r + dr, c + dc))
+    return cells
+
+
+def _draw_marker(grid: np.ndarray, r: int, c: int, arm_dirs: tuple[tuple[int, int], ...]) -> None:
+    grid[r, c] = CENTER_COLOR
+    for dr, dc in arm_dirs:
+        grid[r + dr, c + dc] = ARM_COLOR
+
+
+def _choose_arm_dirs(arm_count: int, rng: random.Random) -> tuple[tuple[int, int], ...]:
+    return tuple(rng.choice(ARM_SUBSETS[arm_count]))
+
+
+def _build_expected_output(
+    shape: tuple[int, int], markers: list[tuple[int, int, int]]
+) -> np.ndarray:
+    out = np.zeros(shape, dtype=int)
+    for r, c, arm_count in markers:
+        glyph_color, mask = GLYPHS[arm_count]
+        _paint_clipped(out, r, c, glyph_color, mask)
+    return out
+
+
+def _find_legend(
+    shape: tuple[int, int],
+    used_counts: list[int],
+    occupied: set[tuple[int, int]],
+    rng: random.Random,
+) -> tuple[int, int, int, tuple[tuple[int, int], ...]] | None:
+    h, w = shape
+    order = [(r, c) for r in range(h - 5) for c in range(w - 5)]
+    rng.shuffle(order)
+    count_order = used_counts[:]
+    rng.shuffle(count_order)
+
+    for arm_count in count_order:
+        glyph_color, mask = GLYPHS[arm_count]
+        arm_variants = list(ARM_SUBSETS[arm_count])
+        rng.shuffle(arm_variants)
+        for r0, c0 in order:
+            glyph_cells = {
+                (r0 + dr, c0 + dc) for dr in range(4) for dc in range(4) if bool(mask[dr, dc])
+            }
+            for arm_dirs in arm_variants:
+                center_r, center_c = r0 + 4, c0 + 4
+                label_cells = _marker_cells(center_r, center_c, arm_dirs)
+                all_cells = glyph_cells | label_cells
+                if not all(0 <= rr < h and 0 <= cc < w for rr, cc in all_cells):
+                    continue
+                if all_cells & occupied:
+                    continue
+                return r0, c0, arm_count, tuple(arm_dirs)
+    return None
+
+
+def generate_input() -> np.ndarray:
+    rng = random.Random()
+
+    for _ in range(200):
+        size = rng.choice([10, 20])
+        h = w = size
+        if size == 10:
+            row_count = col_count = 2
+        else:
+            row_count = rng.randint(2, 5)
+            col_count = rng.randint(2, 5)
+
+        row_positions = _sample_axis_positions(h, row_count, rng)
+        col_positions = _sample_axis_positions(w, col_count, rng)
+        slots = [(r, c) for r in row_positions for c in col_positions]
+        min_fill = max(4, int(np.ceil(0.6 * len(slots))))
+        occupied_count = rng.randint(min_fill, len(slots))
+        chosen_slots = rng.sample(slots, occupied_count)
+
+        type_count = rng.randint(2, min(4, occupied_count))
+        used_counts = rng.sample([1, 2, 3, 4], type_count)
+        arm_counts = used_counts[:] + [rng.choice(used_counts) for _ in range(occupied_count - type_count)]
+        rng.shuffle(arm_counts)
+
+        grid = np.zeros((h, w), dtype=int)
+        occupied_cells: set[tuple[int, int]] = set()
+        markers: list[tuple[int, int, int]] = []
+        valid = True
+
+        for (r, c), arm_count in zip(chosen_slots, arm_counts, strict=True):
+            arm_dirs = _choose_arm_dirs(arm_count, rng)
+            cells = _marker_cells(r, c, arm_dirs)
+            if any(cell in occupied_cells for cell in cells):
+                valid = False
+                break
+            if not all(0 <= rr < h and 0 <= cc < w for rr, cc in cells):
+                valid = False
+                break
+            _draw_marker(grid, r, c, arm_dirs)
+            occupied_cells |= cells
+            markers.append((r, c, arm_count))
+
+        if not valid:
+            continue
+
+        if rng.random() < 0.75:
+            legend = _find_legend((h, w), used_counts, occupied_cells, rng)
+            if legend is not None:
+                r0, c0, arm_count, arm_dirs = legend
+                glyph_color, mask = GLYPHS[arm_count]
+                for dr in range(4):
+                    for dc in range(4):
+                        if bool(mask[dr, dc]):
+                            grid[r0 + dr, c0 + dc] = glyph_color
+                _draw_marker(grid, r0 + 4, c0 + 4, arm_dirs)
+
+        expected = _build_expected_output((h, w), markers)
+        actual = main(grid)
+        if not np.array_equal(actual, expected):
+            continue
+        return grid
+
+    raise RuntimeError("failed to generate a valid input")
+
+ exited 2 in 0ms:
+ls: cannot access '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18': No such file or directory
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/dfadab01.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding fixed 4x4 glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show a sample 4x4 glyph in the output color, with a same-rule marker just below-right of the sample.
+
+    Rule:
+    - Replace each marker color by its learned 4x4 glyph: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping at the grid boundary.
+    - Remove the sample glyphs and skip their below-right label markers.
+
+    Key insight:
+    - The colored pixels are control pixels for a fixed glyph alphabet; non-control sample glyphs are only legend entries, not preserved scene objects.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            # Legend labels appear one cell below-right of the sample glyph bbox.
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+codex
+规则已经出现一个关键歧义点：`D12/0` 单独看像是把字形种类降到 2，但融合描述明确要求“同一色靠臂数再区分”，这更像是保留 4 个字形、改成 `2 种颜色 × 每色 2 个臂数档` 的双层编码。我先按这个更强的融合解释落地，否则会退化成只靠臂数或只剩 2 个字形。
+codex
+接下来我会看一下原题样例，确认原始 legend 放置和网格尺度约束，然后把生成器的合法性边界一次性定死。
+exec
+/bin/bash -lc "sed -n '1,240p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json, pathlib
+p=pathlib.Path('/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json')
+obj=json.loads(p.read_text())
+print('train', len(obj.get('train', [])), 'test', len(obj.get('test', [])))
+for split in ['train','test']:
+    for i,pair in enumerate(obj.get(split, [])):
+        gi=pair['input']
+        go=pair.get('output')
+        print(split, i, 'in', len(gi), 'x', len(gi[0]), 'out', (len(go), len(go[0])) if go else None)
+        if i<2:
+            print('input:')
+            for row in gi: print(''.join(map(str,row)))
+            if go:
+                print('output:')
+                for row in go: print(''.join(map(str,row)))
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+train 4 test 1
+train 0 in 20 x 20 out (20, 20)
+input:
+00000000000000000000
+06600000200002000000
+06600000000000000000
+00066000000000000000
+00066000000000000000
+00000500000000000000
+00000000200002000000
+00000000000000000000
+00000000000000000000
+00000000000000000000
+00000000000000000000
+00300000500005000000
+00000000000000000000
+00000000000000000000
+00000000000000000000
+00000000000000000000
+00300000300003000000
+00000000000000000000
+00000000000000000000
+00000000000000000000
+output:
+00000000000000000000
+00000000444404444000
+00000000400404004000
+00000000400404004000
+00000000444404444000
+00000000000000000000
+00000000444404444000
+00000000400404004000
+00000000400404004000
+00000000444404444000
+00000000000000000000
+00011000660006600000
+00100100660006600000
+00100100006600066000
+00011000006600066000
+00000000000000000000
+00011000011000110000
+00100100100101001000
+00100100100101001000
+00011000011000110000
+train 1 in 10 x 10 out (10, 10)
+input:
+0000000000
+0300020000
+0000000000
+0000000000
+0000000000
+0200031100
+0000010010
+0000010010
+0000001100
+0000000003
+output:
+0000000000
+0011044440
+0100140040
+0100140040
+0011044440
+0444401100
+0400410010
+0400410010
+0444401100
+0000000000
+train 2 in 10 x 10 out (10, 10)
+train 3 in 20 x 20 out (20, 20)
+test 0 in 20 x 20 out (20, 20)
+input:
+00000000000000000000
+80008000800080008000
+00000000000000000000
+00000000000000000000
+00000000000000000000
+80007007000000008000
+00000770000000000000
+00000770000000000000
+00007007000000000000
+80000000800000008000
+00000000000000000000
+00000000000000000000
+00000000000000000000
+80000000000080008000
+00000000000000000000
+00000000000000000000
+00000000000000000000
+80008000800080008000
+00000000000000000000
+00000000000000000000
+output:
+00000000000000000000
+70077007700770077007
+07700770077007700770
+07700770077007700770
+70077007700770077007
+70070000000000007007
+07700000000000000770
+07700000000000000770
+70070000000000007007
+70070000000000007007
+07700000000000000770
+07700000000000000770
+70070000000000007007
+70070000000070077007
+07700000000007700770
+07700000000007700770
+70070000000070077007
+70077007700770077007
+07700770077007700770
+07700770077007700770
+
+codex
+设计已经定下来了：只用两种标记色 `2/3`，每个十字都同时含这两色；中心色决定“大类”，臂数只取 `2` 或 `4` 两档并在两种中心色上重复出现，这样颜色和计数两者都必须参与解码，避免退化成单维规则。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+codex
+开始写目标文件。除了 solver/generator，我会把设计分析直接放进代码顶部，方便后续审查 `main()` 的新假设和生成器对应保障。
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py
+diff --git a/ceshi/code_combo/dfadab01/18/code.py b/ceshi/code_combo/dfadab01/18/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..63609c71a3f67278569468ed20c2db7054a0f05d
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/18/code.py
+@@ -0,0 +1,366 @@
++# Combo variant of dfadab01 (index 18)
++# combo_spec: D3/4+D12/0
++# Name: 十字标记编码字形+减少标记色
++
++from __future__ import annotations
++
++import itertools
++import random
++
++import numpy as np
++
++"""
++Design analysis for the combo variant.
++
++a) Concrete behavior and trace:
++   - Original task: each real control is one pixel whose color directly names one of
++     four fixed 4x4 glyphs. A legend, when present, shows the glyph itself plus a
++     below-right label pixel of the same marker color.
++   - Combo behavior: each real control is now a two-color cross. The center cell is
++     either red (2) or green (3), and every arm cell uses the opposite color. The
++     center color picks one of two glyph families; the arm count picks one of two
++     glyphs inside that family.
++   - Concrete trace: a red center at (6, 9) with two green arms no longer means
++     "paint whatever red used to mean". Instead the solver reads the center color
++     (red family) and counts two opposite-color arms, then paints the yellow frame
++     glyph with top-left anchor at (6, 9). A green center with the same two-arm count
++     maps to a different glyph, so color alone and count alone are both insufficient.
++   - Legends still consist of one sample output glyph and a matching label control at
++     (+4, +4) from the sample glyph's top-left corner. The label is a full combo-style
++     cross and is removed in the output.
++
++b) Complexity calibration:
++   - The fused rule keeps four target glyphs, but compresses the marker palette to two
++     colors total. This preserves enough variety to stay nontrivial while making the
++     input visibly cleaner than the source task.
++   - To avoid degenerating into a count-only rule, both center colors reuse the same
++     two arm-count values: 2 and 4. The four semantic types are therefore the Cartesian
++     product {red-center, green-center} x {2 arms, 4 arms}.
++   - Counts 2 and 4 are repeated across samples and are visually distinct, while
++     two-arm direction sets vary so the stable feature is the count rather than the
++     orientation.
++
++c) Implicit-assumption audit for main():
++   - The original loop over marker colors 2/3/5/8 breaks immediately because input
++     colors no longer identify glyphs one-to-one.
++   - The original logic assumed every marker cell was itself the anchor. Here only the
++     center cell is the anchor, so the solver must reject arm pixels. Using only arm
++     counts {2, 4} guarantees every arm pixel has exactly one opposite-color neighbor
++     and never masquerades as a valid center.
++   - The legend-skip check still depends on the control anchor being exactly four cells
++     below-right of the sample glyph. That remains valid because the cross center is the
++     logical anchor.
++   - Painting still assumes output glyphs do not overlap. The generator keeps anchor
++     spacing at least four, so clipped 4x4 outputs remain disjoint.
++
++d) Placement legality:
++   - Real marker centers are restricted to rows/cols 1..H-2 so every possible arm stays
++     in bounds.
++   - Marker anchors live on a sparse regular grid with gaps 4-6, which prevents cross
++     overlap in the input and glyph overlap in the output.
++   - Legend placement is accepted only if the sample glyph and its label cross are fully
++     in bounds and disjoint from every real marker cell.
++
++e) Visual observability:
++   - The input now visibly differs from the seed task because controls are small crosses
++     instead of isolated pixels, and because only red/green are used for all controls.
++   - Across examples, identical arm counts appear under both center colors, and both arm
++     counts appear under the same center color. This makes the dual encoding observable
++     from a few training pairs.
++
++f) Visual cleanliness:
++   - Crosses are isolated by black padding, so no marker touches a glyph-colored legend
++     sample or another control.
++   - Using only two marker colors keeps the scene readable even when many controls are
++     present.
++
++g) Change inferability:
++   - No hidden numeric ordering is used. The only inputs to decoding are visible center
++     color and visible orthogonal arm count.
++   - The generator always places all four semantic marker types among the real controls,
++     so the combined color+count code is exercised instead of collapsing to a simpler
++     subrule.
++"""
++
++
++RED = 2
++GREEN = 3
++MARKER_COLORS: tuple[int, int] = (RED, GREEN)
++CARDINAL_DIRS: tuple[tuple[int, int], ...] = ((-1, 0), (0, 1), (1, 0), (0, -1))
++ARM_COUNTS: tuple[int, int] = (2, 4)
++
++GLYPHS: dict[tuple[int, int], tuple[int, np.ndarray]] = {
++    (RED, 2): (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (RED, 4): (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (GREEN, 2): (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (GREEN, 4): (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++ARM_SUBSETS: dict[int, tuple[tuple[tuple[int, int], ...], ...]] = {
++    count: tuple(itertools.combinations(CARDINAL_DIRS, count)) for count in ARM_COUNTS
++}
++
++
++def _other_marker_color(color: int) -> int:
++    return GREEN if color == RED else RED
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
++        return False
++    patch = g[r0 : r0 + 4, c0 : c0 + 4]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _count_opposite_arms(g: np.ndarray, r: int, c: int) -> int:
++    h, w = g.shape
++    center_color = int(g[r, c])
++    arm_color = _other_marker_color(center_color)
++    count = 0
++    for dr, dc in CARDINAL_DIRS:
++        rr, cc = r + dr, c + dc
++        if 0 <= rr < h and 0 <= cc < w and int(g[rr, cc]) == arm_color:
++            count += 1
++    return count
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Decode each two-color cross by combining its center color and arm count, then paint the matched 4x4 glyph.
++
++    Input structure:
++    - Black background with control markers drawn only in red and green.
++    - Each control is a small cross whose center is one of those colors and whose arms use the opposite color.
++    - The center color selects a glyph family, while the number of orthogonal arms selects one of two glyphs inside that family; an optional legend still shows one output glyph plus a matching label cross at (+4, +4).
++
++    Rule:
++    - Scan red and green cells as possible cross centers, count how many opposite-color arm cells touch orthogonally, and keep only the valid two-arm or four-arm centers.
++    - Map `(center color, arm count)` to the learned glyph/color pair, then paint the 4x4 glyph with its top-left corner at the center cell, clipping at the grid boundary.
++    - If that center is the label cross for a legend glyph sitting four cells up-left, skip it; legend samples themselves are removed from the output.
++
++    Key insight:
++    - The marker code is genuinely two-dimensional: the same arm count means different glyphs under different center colors, and the same center color means different glyphs under different arm counts.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, RED, GREEN, 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    candidates = np.argwhere(np.isin(g, MARKER_COLORS))
++    assert candidates.size
++
++    seen_marker = False
++    for r, c in candidates:
++        center_color = int(g[r, c])
++        arm_count = _count_opposite_arms(g, int(r), int(c))
++        glyph = GLYPHS.get((center_color, arm_count))
++        if glyph is None:
++            continue
++        seen_marker = True
++        glyph_color, mask = glyph
++        if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
++            continue
++        _paint_clipped(out, int(r), int(c), glyph_color, mask)
++
++    assert seen_marker
++    return out
++
++
++def _sample_axis_positions(length: int, count: int, rng: random.Random) -> list[int]:
++    max_center = length - 2
++    for _ in range(200):
++        gaps = [rng.randint(4, 6) for _ in range(count - 1)]
++        span = sum(gaps)
++        max_start = max_center - span
++        if max_start < 1:
++            continue
++        start = rng.randint(1, max_start)
++        pos = [start]
++        for gap in gaps:
++            pos.append(pos[-1] + gap)
++        return pos
++    raise RuntimeError("failed to sample axis positions")
++
++
++def _marker_cells(r: int, c: int, arm_dirs: tuple[tuple[int, int], ...]) -> set[tuple[int, int]]:
++    cells = {(r, c)}
++    for dr, dc in arm_dirs:
++        cells.add((r + dr, c + dc))
++    return cells
++
++
++def _draw_marker(
++    grid: np.ndarray, r: int, c: int, center_color: int, arm_dirs: tuple[tuple[int, int], ...]
++) -> None:
++    grid[r, c] = center_color
++    arm_color = _other_marker_color(center_color)
++    for dr, dc in arm_dirs:
++        grid[r + dr, c + dc] = arm_color
++
++
++def _choose_arm_dirs(arm_count: int, rng: random.Random) -> tuple[tuple[int, int], ...]:
++    return tuple(rng.choice(ARM_SUBSETS[arm_count]))
++
++
++def _build_expected_output(
++    shape: tuple[int, int], markers: list[tuple[int, int, int, int]]
++) -> np.ndarray:
++    out = np.zeros(shape, dtype=int)
++    for r, c, center_color, arm_count in markers:
++        glyph_color, mask = GLYPHS[(center_color, arm_count)]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _find_legend(
++    shape: tuple[int, int],
++    used_types: list[tuple[int, int]],
++    occupied: set[tuple[int, int]],
++    rng: random.Random,
++) -> tuple[int, int, int, tuple[tuple[int, int], ...]] | None:
++    h, w = shape
++    order = [(r, c) for r in range(h - 5) for c in range(w - 5)]
++    rng.shuffle(order)
++    type_order = used_types[:]
++    rng.shuffle(type_order)
++
++    for center_color, arm_count in type_order:
++        glyph_color, mask = GLYPHS[(center_color, arm_count)]
++        arm_variants = list(ARM_SUBSETS[arm_count])
++        rng.shuffle(arm_variants)
++        for r0, c0 in order:
++            glyph_cells = {
++                (r0 + dr, c0 + dc) for dr in range(4) for dc in range(4) if bool(mask[dr, dc])
++            }
++            for arm_dirs in arm_variants:
++                center_r, center_c = r0 + 4, c0 + 4
++                label_cells = _marker_cells(center_r, center_c, tuple(arm_dirs))
++                all_cells = glyph_cells | label_cells
++                if not all(0 <= rr < h and 0 <= cc < w for rr, cc in all_cells):
++                    continue
++                if all_cells & occupied:
++                    continue
++                return r0, c0, center_color, tuple(arm_dirs)
++    return None
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++    base_types = list(GLYPHS.keys())
++
++    for _ in range(200):
++        size = rng.choice([10, 20])
++        h = w = size
++        if size == 10:
++            row_count = col_count = 2
++        else:
++            row_count = rng.randint(2, 5)
++            col_count = rng.randint(2, 5)
++
++        row_positions = _sample_axis_positions(h, row_count, rng)
++        col_positions = _sample_axis_positions(w, col_count, rng)
++        slots = [(r, c) for r in row_positions for c in col_positions]
++        min_fill = max(4, int(np.ceil(0.6 * len(slots))))
++        occupied_count = rng.randint(min_fill, len(slots))
++        chosen_slots = rng.sample(slots, occupied_count)
++
++        marker_types = base_types[:] + [rng.choice(base_types) for _ in range(occupied_count - 4)]
++        rng.shuffle(marker_types)
++
++        grid = np.zeros((h, w), dtype=int)
++        occupied_cells: set[tuple[int, int]] = set()
++        markers: list[tuple[int, int, int, int]] = []
++        valid = True
++
++        for (r, c), (center_color, arm_count) in zip(chosen_slots, marker_types, strict=True):
++            arm_dirs = _choose_arm_dirs(arm_count, rng)
++            cells = _marker_cells(r, c, arm_dirs)
++            if any(cell in occupied_cells for cell in cells):
++                valid = False
++                break
++            if not all(0 <= rr < h and 0 <= cc < w for rr, cc in cells):
++                valid = False
++                break
++            _draw_marker(grid, r, c, center_color, arm_dirs)
++            occupied_cells |= cells
++            markers.append((r, c, center_color, arm_count))
++
++        if not valid:
++            continue
++
++        if rng.random() < 0.75:
++            legend = _find_legend((h, w), base_types, occupied_cells, rng)
++            if legend is not None:
++                r0, c0, center_color, arm_dirs = legend
++                arm_count = len(arm_dirs)
++                glyph_color, mask = GLYPHS[(center_color, arm_count)]
++                for dr in range(4):
++                    for dc in range(4):
++                        if bool(mask[dr, dc]):
++                            grid[r0 + dr, c0 + dc] = glyph_color
++                _draw_marker(grid, r0 + 4, c0 + 4, center_color, arm_dirs)
++
++        expected = _build_expected_output((h, w), markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid input")
+
+diff --git a/ceshi/code_combo/dfadab01/18/code.py b/ceshi/code_combo/dfadab01/18/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..63609c71a3f67278569468ed20c2db7054a0f05d
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/18/code.py
+@@ -0,0 +1,366 @@
++# Combo variant of dfadab01 (index 18)
++# combo_spec: D3/4+D12/0
++# Name: 十字标记编码字形+减少标记色
++
++from __future__ import annotations
++
++import itertools
++import random
++
++import numpy as np
++
++"""
++Design analysis for the combo variant.
++
++a) Concrete behavior and trace:
++   - Original task: each real control is one pixel whose color directly names one of
++     four fixed 4x4 glyphs. A legend, when present, shows the glyph itself plus a
++     below-right label pixel of the same marker color.
++   - Combo behavior: each real control is now a two-color cross. The center cell is
++     either red (2) or green (3), and every arm cell uses the opposite color. The
++     center color picks one of two glyph families; the arm count picks one of two
++     glyphs inside that family.
++   - Concrete trace: a red center at (6, 9) with two green arms no longer means
++     "paint whatever red used to mean". Instead the solver reads the center color
++     (red family) and counts two opposite-color arms, then paints the yellow frame
++     glyph with top-left anchor at (6, 9). A green center with the same two-arm count
++     maps to a different glyph, so color alone and count alone are both insufficient.
++   - Legends still consist of one sample output glyph and a matching label control at
++     (+4, +4) from the sample glyph's top-left corner. The label is a full combo-style
++     cross and is removed in the output.
++
++b) Complexity calibration:
++   - The fused rule keeps four target glyphs, but compresses the marker palette to two
++     colors total. This preserves enough variety to stay nontrivial while making the
++     input visibly cleaner than the source task.
++   - To avoid degenerating into a count-only rule, both center colors reuse the same
++     two arm-count values: 2 and 4. The four semantic types are therefore the Cartesian
++     product {red-center, green-center} x {2 arms, 4 arms}.
++   - Counts 2 and 4 are repeated across samples and are visually distinct, while
++     two-arm direction sets vary so the stable feature is the count rather than the
++     orientation.
++
++c) Implicit-assumption audit for main():
++   - The original loop over marker colors 2/3/5/8 breaks immediately because input
++     colors no longer identify glyphs one-to-one.
++   - The original logic assumed every marker cell was itself the anchor. Here only the
++     center cell is the anchor, so the solver must reject arm pixels. Using only arm
++     counts {2, 4} guarantees every arm pixel has exactly one opposite-color neighbor
++     and never masquerades as a valid center.
++   - The legend-skip check still depends on the control anchor being exactly four cells
++     below-right of the sample glyph. That remains valid because the cross center is the
++     logical anchor.
++   - Painting still assumes output glyphs do not overlap. The generator keeps anchor
++     spacing at least four, so clipped 4x4 outputs remain disjoint.
++
++d) Placement legality:
++   - Real marker centers are restricted to rows/cols 1..H-2 so every possible arm stays
++     in bounds.
++   - Marker anchors live on a sparse regular grid with gaps 4-6, which prevents cross
++     overlap in the input and glyph overlap in the output.
++   - Legend placement is accepted only if the sample glyph and its label cross are fully
++     in bounds and disjoint from every real marker cell.
++
++e) Visual observability:
++   - The input now visibly differs from the seed task because controls are small crosses
++     instead of isolated pixels, and because only red/green are used for all controls.
++   - Across examples, identical arm counts appear under both center colors, and both arm
++     counts appear under the same center color. This makes the dual encoding observable
++     from a few training pairs.
++
++f) Visual cleanliness:
++   - Crosses are isolated by black padding, so no marker touches a glyph-colored legend
++     sample or another control.
++   - Using only two marker colors keeps the scene readable even when many controls are
++     present.
++
++g) Change inferability:
++   - No hidden numeric ordering is used. The only inputs to decoding are visible center
++     color and visible orthogonal arm count.
++   - The generator always places all four semantic marker types among the real controls,
++     so the combined color+count code is exercised instead of collapsing to a simpler
++     subrule.
++"""
++
++
++RED = 2
++GREEN = 3
++MARKER_COLORS: tuple[int, int] = (RED, GREEN)
++CARDINAL_DIRS: tuple[tuple[int, int], ...] = ((-1, 0), (0, 1), (1, 0), (0, -1))
++ARM_COUNTS: tuple[int, int] = (2, 4)
++
++GLYPHS: dict[tuple[int, int], tuple[int, np.ndarray]] = {
++    (RED, 2): (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (RED, 4): (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (GREEN, 2): (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (GREEN, 4): (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++ARM_SUBSETS: dict[int, tuple[tuple[tuple[int, int], ...], ...]] = {
++    count: tuple(itertools.combinations(CARDINAL_DIRS, count)) for count in ARM_COUNTS
++}
++
++
++def _other_marker_color(color: int) -> int:
++    return GREEN if color == RED else RED
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
++        return False
++    patch = g[r0 : r0 + 4, c0 : c0 + 4]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _count_opposite_arms(g: np.ndarray, r: int, c: int) -> int:
++    h, w = g.shape
++    center_color = int(g[r, c])
++    arm_color = _other_marker_color(center_color)
++    count = 0
++    for dr, dc in CARDINAL_DIRS:
++        rr, cc = r + dr, c + dc
++        if 0 <= rr < h and 0 <= cc < w and int(g[rr, cc]) == arm_color:
++            count += 1
++    return count
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Decode each two-color cross by combining its center color and arm count, then paint the matched 4x4 glyph.
++
++    Input structure:
++    - Black background with control markers drawn only in red and green.
++    - Each control is a small cross whose center is one of those colors and whose arms use the opposite color.
++    - The center color selects a glyph family, while the number of orthogonal arms selects one of two glyphs inside that family; an optional legend still shows one output glyph plus a matching label cross at (+4, +4).
++
++    Rule:
++    - Scan red and green cells as possible cross centers, count how many opposite-color arm cells touch orthogonally, and keep only the valid two-arm or four-arm centers.
++    - Map `(center color, arm count)` to the learned glyph/color pair, then paint the 4x4 glyph with its top-left corner at the center cell, clipping at the grid boundary.
++    - If that center is the label cross for a legend glyph sitting four cells up-left, skip it; legend samples themselves are removed from the output.
++
++    Key insight:
++    - The marker code is genuinely two-dimensional: the same arm count means different glyphs under different center colors, and the same center color means different glyphs under different arm counts.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, RED, GREEN, 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    candidates = np.argwhere(np.isin(g, MARKER_COLORS))
++    assert candidates.size
++
++    seen_marker = False
++    for r, c in candidates:
++        center_color = int(g[r, c])
++        arm_count = _count_opposite_arms(g, int(r), int(c))
++        glyph = GLYPHS.get((center_color, arm_count))
++        if glyph is None:
++            continue
++        seen_marker = True
++        glyph_color, mask = glyph
++        if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
++            continue
++        _paint_clipped(out, int(r), int(c), glyph_color, mask)
++
++    assert seen_marker
++    return out
++
++
++def _sample_axis_positions(length: int, count: int, rng: random.Random) -> list[int]:
++    max_center = length - 2
++    for _ in range(200):
++        gaps = [rng.randint(4, 6) for _ in range(count - 1)]
++        span = sum(gaps)
++        max_start = max_center - span
++        if max_start < 1:
++            continue
++        start = rng.randint(1, max_start)
++        pos = [start]
++        for gap in gaps:
++            pos.append(pos[-1] + gap)
++        return pos
++    raise RuntimeError("failed to sample axis positions")
++
++
++def _marker_cells(r: int, c: int, arm_dirs: tuple[tuple[int, int], ...]) -> set[tuple[int, int]]:
++    cells = {(r, c)}
++    for dr, dc in arm_dirs:
++        cells.add((r + dr, c + dc))
++    return cells
++
++
++def _draw_marker(
++    grid: np.ndarray, r: int, c: int, center_color: int, arm_dirs: tuple[tuple[int, int], ...]
++) -> None:
++    grid[r, c] = center_color
++    arm_color = _other_marker_color(center_color)
++    for dr, dc in arm_dirs:
++        grid[r + dr, c + dc] = arm_color
++
++
++def _choose_arm_dirs(arm_count: int, rng: random.Random) -> tuple[tuple[int, int], ...]:
++    return tuple(rng.choice(ARM_SUBSETS[arm_count]))
++
++
++def _build_expected_output(
++    shape: tuple[int, int], markers: list[tuple[int, int, int, int]]
++) -> np.ndarray:
++    out = np.zeros(shape, dtype=int)
++    for r, c, center_color, arm_count in markers:
++        glyph_color, mask = GLYPHS[(center_color, arm_count)]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _find_legend(
++    shape: tuple[int, int],
++    used_types: list[tuple[int, int]],
++    occupied: set[tuple[int, int]],
++    rng: random.Random,
++) -> tuple[int, int, int, tuple[tuple[int, int], ...]] | None:
++    h, w = shape
++    order = [(r, c) for r in range(h - 5) for c in range(w - 5)]
++    rng.shuffle(order)
++    type_order = used_types[:]
++    rng.shuffle(type_order)
++
++    for center_color, arm_count in type_order:
++        glyph_color, mask = GLYPHS[(center_color, arm_count)]
++        arm_variants = list(ARM_SUBSETS[arm_count])
++        rng.shuffle(arm_variants)
++        for r0, c0 in order:
++            glyph_cells = {
++                (r0 + dr, c0 + dc) for dr in range(4) for dc in range(4) if bool(mask[dr, dc])
++            }
++            for arm_dirs in arm_variants:
++                center_r, center_c = r0 + 4, c0 + 4
++                label_cells = _marker_cells(center_r, center_c, tuple(arm_dirs))
++                all_cells = glyph_cells | label_cells
++                if not all(0 <= rr < h and 0 <= cc < w for rr, cc in all_cells):
++                    continue
++                if all_cells & occupied:
++                    continue
++                return r0, c0, center_color, tuple(arm_dirs)
++    return None
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++    base_types = list(GLYPHS.keys())
++
++    for _ in range(200):
++        size = rng.choice([10, 20])
++        h = w = size
++        if size == 10:
++            row_count = col_count = 2
++        else:
++            row_count = rng.randint(2, 5)
++            col_count = rng.randint(2, 5)
++
++        row_positions = _sample_axis_positions(h, row_count, rng)
++        col_positions = _sample_axis_positions(w, col_count, rng)
++        slots = [(r, c) for r in row_positions for c in col_positions]
++        min_fill = max(4, int(np.ceil(0.6 * len(slots))))
++        occupied_count = rng.randint(min_fill, len(slots))
++        chosen_slots = rng.sample(slots, occupied_count)
++
++        marker_types = base_types[:] + [rng.choice(base_types) for _ in range(occupied_count - 4)]
++        rng.shuffle(marker_types)
++
++        grid = np.zeros((h, w), dtype=int)
++        occupied_cells: set[tuple[int, int]] = set()
++        markers: list[tuple[int, int, int, int]] = []
++        valid = True
++
++        for (r, c), (center_color, arm_count) in zip(chosen_slots, marker_types, strict=True):
++            arm_dirs = _choose_arm_dirs(arm_count, rng)
++            cells = _marker_cells(r, c, arm_dirs)
++            if any(cell in occupied_cells for cell in cells):
++                valid = False
++                break
++            if not all(0 <= rr < h and 0 <= cc < w for rr, cc in cells):
++                valid = False
++                break
++            _draw_marker(grid, r, c, center_color, arm_dirs)
++            occupied_cells |= cells
++            markers.append((r, c, center_color, arm_count))
++
++        if not valid:
++            continue
++
++        if rng.random() < 0.75:
++            legend = _find_legend((h, w), base_types, occupied_cells, rng)
++            if legend is not None:
++                r0, c0, center_color, arm_dirs = legend
++                arm_count = len(arm_dirs)
++                glyph_color, mask = GLYPHS[(center_color, arm_count)]
++                for dr in range(4):
++                    for dc in range(4):
++                        if bool(mask[dr, dc]):
++                            grid[r0 + dr, c0 + dc] = glyph_color
++                _draw_marker(grid, r0 + 4, c0 + 4, center_color, arm_dirs)
++
++        expected = _build_expected_output((h, w), markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid input")
+
+codex
+代码已写完，先跑用户要求的 50 次稳定性测试；如果有失败，我会直接回到生成器或解码条件上修。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/18/code.py b/ceshi/code_combo/dfadab01/18/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..63609c71a3f67278569468ed20c2db7054a0f05d
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/18/code.py
+@@ -0,0 +1,366 @@
++# Combo variant of dfadab01 (index 18)
++# combo_spec: D3/4+D12/0
++# Name: 十字标记编码字形+减少标记色
++
++from __future__ import annotations
++
++import itertools
++import random
++
++import numpy as np
++
++"""
++Design analysis for the combo variant.
++
++a) Concrete behavior and trace:
++   - Original task: each real control is one pixel whose color directly names one of
++     four fixed 4x4 glyphs. A legend, when present, shows the glyph itself plus a
++     below-right label pixel of the same marker color.
++   - Combo behavior: each real control is now a two-color cross. The center cell is
++     either red (2) or green (3), and every arm cell uses the opposite color. The
++     center color picks one of two glyph families; the arm count picks one of two
++     glyphs inside that family.
++   - Concrete trace: a red center at (6, 9) with two green arms no longer means
++     "paint whatever red used to mean". Instead the solver reads the center color
++     (red family) and counts two opposite-color arms, then paints the yellow frame
++     glyph with top-left anchor at (6, 9). A green center with the same two-arm count
++     maps to a different glyph, so color alone and count alone are both insufficient.
++   - Legends still consist of one sample output glyph and a matching label control at
++     (+4, +4) from the sample glyph's top-left corner. The label is a full combo-style
++     cross and is removed in the output.
++
++b) Complexity calibration:
++   - The fused rule keeps four target glyphs, but compresses the marker palette to two
++     colors total. This preserves enough variety to stay nontrivial while making the
++     input visibly cleaner than the source task.
++   - To avoid degenerating into a count-only rule, both center colors reuse the same
++     two arm-count values: 2 and 4. The four semantic types are therefore the Cartesian
++     product {red-center, green-center} x {2 arms, 4 arms}.
++   - Counts 2 and 4 are repeated across samples and are visually distinct, while
++     two-arm direction sets vary so the stable feature is the count rather than the
++     orientation.
++
++c) Implicit-assumption audit for main():
++   - The original loop over marker colors 2/3/5/8 breaks immediately because input
++     colors no longer identify glyphs one-to-one.
++   - The original logic assumed every marker cell was itself the anchor. Here only the
++     center cell is the anchor, so the solver must reject arm pixels. Using only arm
++     counts {2, 4} guarantees every arm pixel has exactly one opposite-color neighbor
++     and never masquerades as a valid center.
++   - The legend-skip check still depends on the control anchor being exactly four cells
++     below-right of the sample glyph. That remains valid because the cross center is the
++     logical anchor.
++   - Painting still assumes output glyphs do not overlap. The generator keeps anchor
++     spacing at least four, so clipped 4x4 outputs remain disjoint.
++
++d) Placement legality:
++   - Real marker centers are restricted to rows/cols 1..H-2 so every possible arm stays
++     in bounds.
++   - Marker anchors live on a sparse regular grid with gaps 4-6, which prevents cross
++     overlap in the input and glyph overlap in the output.
++   - Legend placement is accepted only if the sample glyph and its label cross are fully
++     in bounds and disjoint from every real marker cell.
++
++e) Visual observability:
++   - The input now visibly differs from the seed task because controls are small crosses
++     instead of isolated pixels, and because only red/green are used for all controls.
++   - Across examples, identical arm counts appear under both center colors, and both arm
++     counts appear under the same center color. This makes the dual encoding observable
++     from a few training pairs.
++
++f) Visual cleanliness:
++   - Crosses are isolated by black padding, so no marker touches a glyph-colored legend
++     sample or another control.
++   - Using only two marker colors keeps the scene readable even when many controls are
++     present.
++
++g) Change inferability:
++   - No hidden numeric ordering is used. The only inputs to decoding are visible center
++     color and visible orthogonal arm count.
++   - The generator always places all four semantic marker types among the real controls,
++     so the combined color+count code is exercised instead of collapsing to a simpler
++     subrule.
++"""
++
++
++RED = 2
++GREEN = 3
++MARKER_COLORS: tuple[int, int] = (RED, GREEN)
++CARDINAL_DIRS: tuple[tuple[int, int], ...] = ((-1, 0), (0, 1), (1, 0), (0, -1))
++ARM_COUNTS: tuple[int, int] = (2, 4)
++
++GLYPHS: dict[tuple[int, int], tuple[int, np.ndarray]] = {
++    (RED, 2): (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (RED, 4): (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (GREEN, 2): (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (GREEN, 4): (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++ARM_SUBSETS: dict[int, tuple[tuple[tuple[int, int], ...], ...]] = {
++    count: tuple(itertools.combinations(CARDINAL_DIRS, count)) for count in ARM_COUNTS
++}
++
++
++def _other_marker_color(color: int) -> int:
++    return GREEN if color == RED else RED
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
++        return False
++    patch = g[r0 : r0 + 4, c0 : c0 + 4]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _count_opposite_arms(g: np.ndarray, r: int, c: int) -> int:
++    h, w = g.shape
++    center_color = int(g[r, c])
++    arm_color = _other_marker_color(center_color)
++    count = 0
++    for dr, dc in CARDINAL_DIRS:
++        rr, cc = r + dr, c + dc
++        if 0 <= rr < h and 0 <= cc < w and int(g[rr, cc]) == arm_color:
++            count += 1
++    return count
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Decode each two-color cross by combining its center color and arm count, then paint the matched 4x4 glyph.
++
++    Input structure:
++    - Black background with control markers drawn only in red and green.
++    - Each control is a small cross whose center is one of those colors and whose arms use the opposite color.
++    - The center color selects a glyph family, while the number of orthogonal arms selects one of two glyphs inside that family; an optional legend still shows one output glyph plus a matching label cross at (+4, +4).
++
++    Rule:
++    - Scan red and green cells as possible cross centers, count how many opposite-color arm cells touch orthogonally, and keep only the valid two-arm or four-arm centers.
++    - Map `(center color, arm count)` to the learned glyph/color pair, then paint the 4x4 glyph with its top-left corner at the center cell, clipping at the grid boundary.
++    - If that center is the label cross for a legend glyph sitting four cells up-left, skip it; legend samples themselves are removed from the output.
++
++    Key insight:
++    - The marker code is genuinely two-dimensional: the same arm count means different glyphs under different center colors, and the same center color means different glyphs under different arm counts.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, RED, GREEN, 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    candidates = np.argwhere(np.isin(g, MARKER_COLORS))
++    assert candidates.size
++
++    seen_marker = False
++    for r, c in candidates:
++        center_color = int(g[r, c])
++        arm_count = _count_opposite_arms(g, int(r), int(c))
++        glyph = GLYPHS.get((center_color, arm_count))
++        if glyph is None:
++            continue
++        seen_marker = True
++        glyph_color, mask = glyph
++        if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
++            continue
++        _paint_clipped(out, int(r), int(c), glyph_color, mask)
++
++    assert seen_marker
++    return out
++
++
++def _sample_axis_positions(length: int, count: int, rng: random.Random) -> list[int]:
++    max_center = length - 2
++    for _ in range(200):
++        gaps = [rng.randint(4, 6) for _ in range(count - 1)]
++        span = sum(gaps)
++        max_start = max_center - span
++        if max_start < 1:
++            continue
++        start = rng.randint(1, max_start)
++        pos = [start]
++        for gap in gaps:
++            pos.append(pos[-1] + gap)
++        return pos
++    raise RuntimeError("failed to sample axis positions")
++
++
++def _marker_cells(r: int, c: int, arm_dirs: tuple[tuple[int, int], ...]) -> set[tuple[int, int]]:
++    cells = {(r, c)}
++    for dr, dc in arm_dirs:
++        cells.add((r + dr, c + dc))
++    return cells
++
++
++def _draw_marker(
++    grid: np.ndarray, r: int, c: int, center_color: int, arm_dirs: tuple[tuple[int, int], ...]
++) -> None:
++    grid[r, c] = center_color
++    arm_color = _other_marker_color(center_color)
++    for dr, dc in arm_dirs:
++        grid[r + dr, c + dc] = arm_color
++
++
++def _choose_arm_dirs(arm_count: int, rng: random.Random) -> tuple[tuple[int, int], ...]:
++    return tuple(rng.choice(ARM_SUBSETS[arm_count]))
++
++
++def _build_expected_output(
++    shape: tuple[int, int], markers: list[tuple[int, int, int, int]]
++) -> np.ndarray:
++    out = np.zeros(shape, dtype=int)
++    for r, c, center_color, arm_count in markers:
++        glyph_color, mask = GLYPHS[(center_color, arm_count)]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _find_legend(
++    shape: tuple[int, int],
++    used_types: list[tuple[int, int]],
++    occupied: set[tuple[int, int]],
++    rng: random.Random,
++) -> tuple[int, int, int, tuple[tuple[int, int], ...]] | None:
++    h, w = shape
++    order = [(r, c) for r in range(h - 5) for c in range(w - 5)]
++    rng.shuffle(order)
++    type_order = used_types[:]
++    rng.shuffle(type_order)
++
++    for center_color, arm_count in type_order:
++        glyph_color, mask = GLYPHS[(center_color, arm_count)]
++        arm_variants = list(ARM_SUBSETS[arm_count])
++        rng.shuffle(arm_variants)
++        for r0, c0 in order:
++            glyph_cells = {
++                (r0 + dr, c0 + dc) for dr in range(4) for dc in range(4) if bool(mask[dr, dc])
++            }
++            for arm_dirs in arm_variants:
++                center_r, center_c = r0 + 4, c0 + 4
++                label_cells = _marker_cells(center_r, center_c, tuple(arm_dirs))
++                all_cells = glyph_cells | label_cells
++                if not all(0 <= rr < h and 0 <= cc < w for rr, cc in all_cells):
++                    continue
++                if all_cells & occupied:
++                    continue
++                return r0, c0, center_color, tuple(arm_dirs)
++    return None
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++    base_types = list(GLYPHS.keys())
++
++    for _ in range(200):
++        size = rng.choice([10, 20])
++        h = w = size
++        if size == 10:
++            row_count = col_count = 2
++        else:
++            row_count = rng.randint(2, 5)
++            col_count = rng.randint(2, 5)
++
++        row_positions = _sample_axis_positions(h, row_count, rng)
++        col_positions = _sample_axis_positions(w, col_count, rng)
++        slots = [(r, c) for r in row_positions for c in col_positions]
++        min_fill = max(4, int(np.ceil(0.6 * len(slots))))
++        occupied_count = rng.randint(min_fill, len(slots))
++        chosen_slots = rng.sample(slots, occupied_count)
++
++        marker_types = base_types[:] + [rng.choice(base_types) for _ in range(occupied_count - 4)]
++        rng.shuffle(marker_types)
++
++        grid = np.zeros((h, w), dtype=int)
++        occupied_cells: set[tuple[int, int]] = set()
++        markers: list[tuple[int, int, int, int]] = []
++        valid = True
++
++        for (r, c), (center_color, arm_count) in zip(chosen_slots, marker_types, strict=True):
++            arm_dirs = _choose_arm_dirs(arm_count, rng)
++            cells = _marker_cells(r, c, arm_dirs)
++            if any(cell in occupied_cells for cell in cells):
++                valid = False
++                break
++            if not all(0 <= rr < h and 0 <= cc < w for rr, cc in cells):
++                valid = False
++                break
++            _draw_marker(grid, r, c, center_color, arm_dirs)
++            occupied_cells |= cells
++            markers.append((r, c, center_color, arm_count))
++
++        if not valid:
++            continue
++
++        if rng.random() < 0.75:
++            legend = _find_legend((h, w), base_types, occupied_cells, rng)
++            if legend is not None:
++                r0, c0, center_color, arm_dirs = legend
++                arm_count = len(arm_dirs)
++                glyph_color, mask = GLYPHS[(center_color, arm_count)]
++                for dr in range(4):
++                    for dc in range(4):
++                        if bool(mask[dr, dc]):
++                            grid[r0 + dr, c0 + dc] = glyph_color
++                _draw_marker(grid, r0 + 4, c0 + 4, center_color, arm_dirs)
++
++        expected = _build_expected_output((h, w), markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid input")
+
+ succeeded in 328ms:
+Success: 50/50, Time: 0.1s (1ms/call)
+
+codex
+稳定性没问题。现在补做“融合行为是否真的发生”的量化检查：我会统计样本里是否同时出现“同色不同臂数”和“同臂数不同中心色”两类对照，这能直接验证双层编码没有退化。
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util
+import numpy as np
+from collections import Counter, defaultdict
+
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+samples = 200
+both_colors = 0
+both_counts = 0
+same_color_two_counts = 0
+same_count_two_colors = 0
+combo_counter = Counter()
+marker_counter = []
+
+for _ in range(samples):
+    g = mod.generate_input()
+    centers = []
+    for r, c in np.argwhere(np.isin(g, mod.MARKER_COLORS)):
+        center_color = int(g[r, c])
+        arm_count = mod._count_opposite_arms(g, int(r), int(c))
+        if (center_color, arm_count) in mod.GLYPHS:
+            glyph_color, _ = mod.GLYPHS[(center_color, arm_count)]
+            if mod._has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mod.GLYPHS[(center_color, arm_count)][1]):
+                continue
+            centers.append((center_color, arm_count))
+    marker_counter.append(len(centers))
+    colors = {c for c, _ in centers}
+    counts = {a for _, a in centers}
+    if len(colors) == 2:
+        both_colors += 1
+    if len(counts) == 2:
+        both_counts += 1
+    by_color = defaultdict(set)
+    by_count = defaultdict(set)
+    for center_color, arm_count in centers:
+        by_color[center_color].add(arm_count)
+        by_count[arm_count].add(center_color)
+        combo_counter[(center_color, arm_count)] += 1
+    if all(by_color[color] == set(mod.ARM_COUNTS) for color in mod.MARKER_COLORS):
+        same_color_two_counts += 1
+    if all(by_count[count] == set(mod.MARKER_COLORS) for count in mod.ARM_COUNTS):
+        same_count_two_colors += 1
+
+print('samples', samples)
+print('both center colors present:', both_colors)
+print('both arm counts present:', both_counts)
+print('each center color paired with both counts:', same_color_two_counts)
+print('each arm count paired with both center colors:', same_count_two_colors)
+print('combo frequencies:', dict(sorted(combo_counter.items())))
+print('marker count range:', min(marker_counter), max(marker_counter), 'avg', round(sum(marker_counter)/len(marker_counter), 2))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/18/code.py b/ceshi/code_combo/dfadab01/18/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..63609c71a3f67278569468ed20c2db7054a0f05d
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/18/code.py
+@@ -0,0 +1,366 @@
++# Combo variant of dfadab01 (index 18)
++# combo_spec: D3/4+D12/0
++# Name: 十字标记编码字形+减少标记色
++
++from __future__ import annotations
++
++import itertools
++import random
++
++import numpy as np
++
++"""
++Design analysis for the combo variant.
++
++a) Concrete behavior and trace:
++   - Original task: each real control is one pixel whose color directly names one of
++     four fixed 4x4 glyphs. A legend, when present, shows the glyph itself plus a
++     below-right label pixel of the same marker color.
++   - Combo behavior: each real control is now a two-color cross. The center cell is
++     either red (2) or green (3), and every arm cell uses the opposite color. The
++     center color picks one of two glyph families; the arm count picks one of two
++     glyphs inside that family.
++   - Concrete trace: a red center at (6, 9) with two green arms no longer means
++     "paint whatever red used to mean". Instead the solver reads the center color
++     (red family) and counts two opposite-color arms, then paints the yellow frame
++     glyph with top-left anchor at (6, 9). A green center with the same two-arm count
++     maps to a different glyph, so color alone and count alone are both insufficient.
++   - Legends still consist of one sample output glyph and a matching label control at
++     (+4, +4) from the sample glyph's top-left corner. The label is a full combo-style
++     cross and is removed in the output.
++
++b) Complexity calibration:
++   - The fused rule keeps four target glyphs, but compresses the marker palette to two
++     colors total. This preserves enough variety to stay nontrivial while making the
++     input visibly cleaner than the source task.
++   - To avoid degenerating into a count-only rule, both center colors reuse the same
++     two arm-count values: 2 and 4. The four semantic types are therefore the Cartesian
++     product {red-center, green-center} x {2 arms, 4 arms}.
++   - Counts 2 and 4 are repeated across samples and are visually distinct, while
++     two-arm direction sets vary so the stable feature is the count rather than the
++     orientation.
++
++c) Implicit-assumption audit for main():
++   - The original loop over marker colors 2/3/5/8 breaks immediately because input
++     colors no longer identify glyphs one-to-one.
++   - The original logic assumed every marker cell was itself the anchor. Here only the
++     center cell is the anchor, so the solver must reject arm pixels. Using only arm
++     counts {2, 4} guarantees every arm pixel has exactly one opposite-color neighbor
++     and never masquerades as a valid center.
++   - The legend-skip check still depends on the control anchor being exactly four cells
++     below-right of the sample glyph. That remains valid because the cross center is the
++     logical anchor.
++   - Painting still assumes output glyphs do not overlap. The generator keeps anchor
++     spacing at least four, so clipped 4x4 outputs remain disjoint.
++
++d) Placement legality:
++   - Real marker centers are restricted to rows/cols 1..H-2 so every possible arm stays
++     in bounds.
++   - Marker anchors live on a sparse regular grid with gaps 4-6, which prevents cross
++     overlap in the input and glyph overlap in the output.
++   - Legend placement is accepted only if the sample glyph and its label cross are fully
++     in bounds and disjoint from every real marker cell.
++
++e) Visual observability:
++   - The input now visibly differs from the seed task because controls are small crosses
++     instead of isolated pixels, and because only red/green are used for all controls.
++   - Across examples, identical arm counts appear under both center colors, and both arm
++     counts appear under the same center color. This makes the dual encoding observable
++     from a few training pairs.
++
++f) Visual cleanliness:
++   - Crosses are isolated by black padding, so no marker touches a glyph-colored legend
++     sample or another control.
++   - Using only two marker colors keeps the scene readable even when many controls are
++     present.
++
++g) Change inferability:
++   - No hidden numeric ordering is used. The only inputs to decoding are visible center
++     color and visible orthogonal arm count.
++   - The generator always places all four semantic marker types among the real controls,
++     so the combined color+count code is exercised instead of collapsing to a simpler
++     subrule.
++"""
++
++
++RED = 2
++GREEN = 3
++MARKER_COLORS: tuple[int, int] = (RED, GREEN)
++CARDINAL_DIRS: tuple[tuple[int, int], ...] = ((-1, 0), (0, 1), (1, 0), (0, -1))
++ARM_COUNTS: tuple[int, int] = (2, 4)
++
++GLYPHS: dict[tuple[int, int], tuple[int, np.ndarray]] = {
++    (RED, 2): (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (RED, 4): (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (GREEN, 2): (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (GREEN, 4): (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++ARM_SUBSETS: dict[int, tuple[tuple[tuple[int, int], ...], ...]] = {
++    count: tuple(itertools.combinations(CARDINAL_DIRS, count)) for count in ARM_COUNTS
++}
++
++
++def _other_marker_color(color: int) -> int:
++    return GREEN if color == RED else RED
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
++        return False
++    patch = g[r0 : r0 + 4, c0 : c0 + 4]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _count_opposite_arms(g: np.ndarray, r: int, c: int) -> int:
++    h, w = g.shape
++    center_color = int(g[r, c])
++    arm_color = _other_marker_color(center_color)
++    count = 0
++    for dr, dc in CARDINAL_DIRS:
++        rr, cc = r + dr, c + dc
++        if 0 <= rr < h and 0 <= cc < w and int(g[rr, cc]) == arm_color:
++            count += 1
++    return count
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Decode each two-color cross by combining its center color and arm count, then paint the matched 4x4 glyph.
++
++    Input structure:
++    - Black background with control markers drawn only in red and green.
++    - Each control is a small cross whose center is one of those colors and whose arms use the opposite color.
++    - The center color selects a glyph family, while the number of orthogonal arms selects one of two glyphs inside that family; an optional legend still shows one output glyph plus a matching label cross at (+4, +4).
++
++    Rule:
++    - Scan red and green cells as possible cross centers, count how many opposite-color arm cells touch orthogonally, and keep only the valid two-arm or four-arm centers.
++    - Map `(center color, arm count)` to the learned glyph/color pair, then paint the 4x4 glyph with its top-left corner at the center cell, clipping at the grid boundary.
++    - If that center is the label cross for a legend glyph sitting four cells up-left, skip it; legend samples themselves are removed from the output.
++
++    Key insight:
++    - The marker code is genuinely two-dimensional: the same arm count means different glyphs under different center colors, and the same center color means different glyphs under different arm counts.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, RED, GREEN, 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    candidates = np.argwhere(np.isin(g, MARKER_COLORS))
++    assert candidates.size
++
++    seen_marker = False
++    for r, c in candidates:
++        center_color = int(g[r, c])
++        arm_count = _count_opposite_arms(g, int(r), int(c))
++        glyph = GLYPHS.get((center_color, arm_count))
++        if glyph is None:
++            continue
++        seen_marker = True
++        glyph_color, mask = glyph
++        if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
++            continue
++        _paint_clipped(out, int(r), int(c), glyph_color, mask)
++
++    assert seen_marker
++    return out
++
++
++def _sample_axis_positions(length: int, count: int, rng: random.Random) -> list[int]:
++    max_center = length - 2
++    for _ in range(200):
++        gaps = [rng.randint(4, 6) for _ in range(count - 1)]
++        span = sum(gaps)
++        max_start = max_center - span
++        if max_start < 1:
++            continue
++        start = rng.randint(1, max_start)
++        pos = [start]
++        for gap in gaps:
++            pos.append(pos[-1] + gap)
++        return pos
++    raise RuntimeError("failed to sample axis positions")
++
++
++def _marker_cells(r: int, c: int, arm_dirs: tuple[tuple[int, int], ...]) -> set[tuple[int, int]]:
++    cells = {(r, c)}
++    for dr, dc in arm_dirs:
++        cells.add((r + dr, c + dc))
++    return cells
++
++
++def _draw_marker(
++    grid: np.ndarray, r: int, c: int, center_color: int, arm_dirs: tuple[tuple[int, int], ...]
++) -> None:
++    grid[r, c] = center_color
++    arm_color = _other_marker_color(center_color)
++    for dr, dc in arm_dirs:
++        grid[r + dr, c + dc] = arm_color
++
++
++def _choose_arm_dirs(arm_count: int, rng: random.Random) -> tuple[tuple[int, int], ...]:
++    return tuple(rng.choice(ARM_SUBSETS[arm_count]))
++
++
++def _build_expected_output(
++    shape: tuple[int, int], markers: list[tuple[int, int, int, int]]
++) -> np.ndarray:
++    out = np.zeros(shape, dtype=int)
++    for r, c, center_color, arm_count in markers:
++        glyph_color, mask = GLYPHS[(center_color, arm_count)]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _find_legend(
++    shape: tuple[int, int],
++    used_types: list[tuple[int, int]],
++    occupied: set[tuple[int, int]],
++    rng: random.Random,
++) -> tuple[int, int, int, tuple[tuple[int, int], ...]] | None:
++    h, w = shape
++    order = [(r, c) for r in range(h - 5) for c in range(w - 5)]
++    rng.shuffle(order)
++    type_order = used_types[:]
++    rng.shuffle(type_order)
++
++    for center_color, arm_count in type_order:
++        glyph_color, mask = GLYPHS[(center_color, arm_count)]
++        arm_variants = list(ARM_SUBSETS[arm_count])
++        rng.shuffle(arm_variants)
++        for r0, c0 in order:
++            glyph_cells = {
++                (r0 + dr, c0 + dc) for dr in range(4) for dc in range(4) if bool(mask[dr, dc])
++            }
++            for arm_dirs in arm_variants:
++                center_r, center_c = r0 + 4, c0 + 4
++                label_cells = _marker_cells(center_r, center_c, tuple(arm_dirs))
++                all_cells = glyph_cells | label_cells
++                if not all(0 <= rr < h and 0 <= cc < w for rr, cc in all_cells):
++                    continue
++                if all_cells & occupied:
++                    continue
++                return r0, c0, center_color, tuple(arm_dirs)
++    return None
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++    base_types = list(GLYPHS.keys())
++
++    for _ in range(200):
++        size = rng.choice([10, 20])
++        h = w = size
++        if size == 10:
++            row_count = col_count = 2
++        else:
++            row_count = rng.randint(2, 5)
++            col_count = rng.randint(2, 5)
++
++        row_positions = _sample_axis_positions(h, row_count, rng)
++        col_positions = _sample_axis_positions(w, col_count, rng)
++        slots = [(r, c) for r in row_positions for c in col_positions]
++        min_fill = max(4, int(np.ceil(0.6 * len(slots))))
++        occupied_count = rng.randint(min_fill, len(slots))
++        chosen_slots = rng.sample(slots, occupied_count)
++
++        marker_types = base_types[:] + [rng.choice(base_types) for _ in range(occupied_count - 4)]
++        rng.shuffle(marker_types)
++
++        grid = np.zeros((h, w), dtype=int)
++        occupied_cells: set[tuple[int, int]] = set()
++        markers: list[tuple[int, int, int, int]] = []
++        valid = True
++
++        for (r, c), (center_color, arm_count) in zip(chosen_slots, marker_types, strict=True):
++            arm_dirs = _choose_arm_dirs(arm_count, rng)
++            cells = _marker_cells(r, c, arm_dirs)
++            if any(cell in occupied_cells for cell in cells):
++                valid = False
++                break
++            if not all(0 <= rr < h and 0 <= cc < w for rr, cc in cells):
++                valid = False
++                break
++            _draw_marker(grid, r, c, center_color, arm_dirs)
++            occupied_cells |= cells
++            markers.append((r, c, center_color, arm_count))
++
++        if not valid:
++            continue
++
++        if rng.random() < 0.75:
++            legend = _find_legend((h, w), base_types, occupied_cells, rng)
++            if legend is not None:
++                r0, c0, center_color, arm_dirs = legend
++                arm_count = len(arm_dirs)
++                glyph_color, mask = GLYPHS[(center_color, arm_count)]
++                for dr in range(4):
++                    for dc in range(4):
++                        if bool(mask[dr, dc]):
++                            grid[r0 + dr, c0 + dc] = glyph_color
++                _draw_marker(grid, r0 + 4, c0 + 4, center_color, arm_dirs)
++
++        expected = _build_expected_output((h, w), markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid input")
+
+ succeeded in 477ms:
+samples 200
+both center colors present: 200
+both arm counts present: 200
+each center color paired with both counts: 200
+each arm count paired with both center colors: 200
+combo frequencies: {(2, 2): 357, (2, 4): 355, (3, 2): 343, (3, 4): 339}
+marker count range: 4 24 avg 6.97
+
+codex
+双层编码指标是满覆盖的：200/200 个样本里，两种中心色都出现、两种臂数都出现，而且每个中心色都配到两种臂数、每个臂数也都跨两种中心色出现。最后再做一次文件级复查，确认 `main()` 的新假设都被生成器显式满足。
+exec
+/bin/bash -lc "nl -ba /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py | sed -n '1,320p'" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+     1	# Combo variant of dfadab01 (index 18)
+     2	# combo_spec: D3/4+D12/0
+     3	# Name: 十字标记编码字形+减少标记色
+     4	
+     5	from __future__ import annotations
+     6	
+     7	import itertools
+     8	import random
+     9	
+    10	import numpy as np
+    11	
+    12	"""
+    13	Design analysis for the combo variant.
+    14	
+    15	a) Concrete behavior and trace:
+    16	   - Original task: each real control is one pixel whose color directly names one of
+    17	     four fixed 4x4 glyphs. A legend, when present, shows the glyph itself plus a
+    18	     below-right label pixel of the same marker color.
+    19	   - Combo behavior: each real control is now a two-color cross. The center cell is
+    20	     either red (2) or green (3), and every arm cell uses the opposite color. The
+    21	     center color picks one of two glyph families; the arm count picks one of two
+    22	     glyphs inside that family.
+    23	   - Concrete trace: a red center at (6, 9) with two green arms no longer means
+    24	     "paint whatever red used to mean". Instead the solver reads the center color
+    25	     (red family) and counts two opposite-color arms, then paints the yellow frame
+    26	     glyph with top-left anchor at (6, 9). A green center with the same two-arm count
+    27	     maps to a different glyph, so color alone and count alone are both insufficient.
+    28	   - Legends still consist of one sample output glyph and a matching label control at
+    29	     (+4, +4) from the sample glyph's top-left corner. The label is a full combo-style
+    30	     cross and is removed in the output.
+    31	
+    32	b) Complexity calibration:
+    33	   - The fused rule keeps four target glyphs, but compresses the marker palette to two
+    34	     colors total. This preserves enough variety to stay nontrivial while making the
+    35	     input visibly cleaner than the source task.
+    36	   - To avoid degenerating into a count-only rule, both center colors reuse the same
+    37	     two arm-count values: 2 and 4. The four semantic types are therefore the Cartesian
+    38	     product {red-center, green-center} x {2 arms, 4 arms}.
+    39	   - Counts 2 and 4 are repeated across samples and are visually distinct, while
+    40	     two-arm direction sets vary so the stable feature is the count rather than the
+    41	     orientation.
+    42	
+    43	c) Implicit-assumption audit for main():
+    44	   - The original loop over marker colors 2/3/5/8 breaks immediately because input
+    45	     colors no longer identify glyphs one-to-one.
+    46	   - The original logic assumed every marker cell was itself the anchor. Here only the
+    47	     center cell is the anchor, so the solver must reject arm pixels. Using only arm
+    48	     counts {2, 4} guarantees every arm pixel has exactly one opposite-color neighbor
+    49	     and never masquerades as a valid center.
+    50	   - The legend-skip check still depends on the control anchor being exactly four cells
+    51	     below-right of the sample glyph. That remains valid because the cross center is the
+    52	     logical anchor.
+    53	   - Painting still assumes output glyphs do not overlap. The generator keeps anchor
+    54	     spacing at least four, so clipped 4x4 outputs remain disjoint.
+    55	
+    56	d) Placement legality:
+    57	   - Real marker centers are restricted to rows/cols 1..H-2 so every possible arm stays
+    58	     in bounds.
+    59	   - Marker anchors live on a sparse regular grid with gaps 4-6, which prevents cross
+    60	     overlap in the input and glyph overlap in the output.
+    61	   - Legend placement is accepted only if the sample glyph and its label cross are fully
+    62	     in bounds and disjoint from every real marker cell.
+    63	
+    64	e) Visual observability:
+    65	   - The input now visibly differs from the seed task because controls are small crosses
+    66	     instead of isolated pixels, and because only red/green are used for all controls.
+    67	   - Across examples, identical arm counts appear under both center colors, and both arm
+    68	     counts appear under the same center color. This makes the dual encoding observable
+    69	     from a few training pairs.
+    70	
+    71	f) Visual cleanliness:
+    72	   - Crosses are isolated by black padding, so no marker touches a glyph-colored legend
+    73	     sample or another control.
+    74	   - Using only two marker colors keeps the scene readable even when many controls are
+    75	     present.
+    76	
+    77	g) Change inferability:
+    78	   - No hidden numeric ordering is used. The only inputs to decoding are visible center
+    79	     color and visible orthogonal arm count.
+    80	   - The generator always places all four semantic marker types among the real controls,
+    81	     so the combined color+count code is exercised instead of collapsing to a simpler
+    82	     subrule.
+    83	"""
+    84	
+    85	
+    86	RED = 2
+    87	GREEN = 3
+    88	MARKER_COLORS: tuple[int, int] = (RED, GREEN)
+    89	CARDINAL_DIRS: tuple[tuple[int, int], ...] = ((-1, 0), (0, 1), (1, 0), (0, -1))
+    90	ARM_COUNTS: tuple[int, int] = (2, 4)
+    91	
+    92	GLYPHS: dict[tuple[int, int], tuple[int, np.ndarray]] = {
+    93	    (RED, 2): (
+    94	        4,
+    95	        np.array(
+    96	            [
+    97	                [1, 1, 1, 1],
+    98	                [1, 0, 0, 1],
+    99	                [1, 0, 0, 1],
+   100	                [1, 1, 1, 1],
+   101	            ],
+   102	            dtype=bool,
+   103	        ),
+   104	    ),
+   105	    (RED, 4): (
+   106	        1,
+   107	        np.array(
+   108	            [
+   109	                [0, 1, 1, 0],
+   110	                [1, 0, 0, 1],
+   111	                [1, 0, 0, 1],
+   112	                [0, 1, 1, 0],
+   113	            ],
+   114	            dtype=bool,
+   115	        ),
+   116	    ),
+   117	    (GREEN, 2): (
+   118	        6,
+   119	        np.array(
+   120	            [
+   121	                [1, 1, 0, 0],
+   122	                [1, 1, 0, 0],
+   123	                [0, 0, 1, 1],
+   124	                [0, 0, 1, 1],
+   125	            ],
+   126	            dtype=bool,
+   127	        ),
+   128	    ),
+   129	    (GREEN, 4): (
+   130	        7,
+   131	        np.array(
+   132	            [
+   133	                [1, 0, 0, 1],
+   134	                [0, 1, 1, 0],
+   135	                [0, 1, 1, 0],
+   136	                [1, 0, 0, 1],
+   137	            ],
+   138	            dtype=bool,
+   139	        ),
+   140	    ),
+   141	}
+   142	
+   143	ARM_SUBSETS: dict[int, tuple[tuple[tuple[int, int], ...], ...]] = {
+   144	    count: tuple(itertools.combinations(CARDINAL_DIRS, count)) for count in ARM_COUNTS
+   145	}
+   146	
+   147	
+   148	def _other_marker_color(color: int) -> int:
+   149	    return GREEN if color == RED else RED
+   150	
+   151	
+   152	def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+   153	    h, w = g.shape
+   154	    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+   155	        return False
+   156	    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+   157	    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+   158	
+   159	
+   160	def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+   161	    h, w = out.shape
+   162	    for dr in range(4):
+   163	        rr = r0 + dr
+   164	        if rr < 0 or rr >= h:
+   165	            continue
+   166	        for dc in range(4):
+   167	            cc = c0 + dc
+   168	            if 0 <= cc < w and bool(mask[dr, dc]):
+   169	                out[rr, cc] = color
+   170	
+   171	
+   172	def _count_opposite_arms(g: np.ndarray, r: int, c: int) -> int:
+   173	    h, w = g.shape
+   174	    center_color = int(g[r, c])
+   175	    arm_color = _other_marker_color(center_color)
+   176	    count = 0
+   177	    for dr, dc in CARDINAL_DIRS:
+   178	        rr, cc = r + dr, c + dc
+   179	        if 0 <= rr < h and 0 <= cc < w and int(g[rr, cc]) == arm_color:
+   180	            count += 1
+   181	    return count
+   182	
+   183	
+   184	def main(grid: np.ndarray) -> np.ndarray:
+   185	    """
+   186	    Decode each two-color cross by combining its center color and arm count, then paint the matched 4x4 glyph.
+   187	
+   188	    Input structure:
+   189	    - Black background with control markers drawn only in red and green.
+   190	    - Each control is a small cross whose center is one of those colors and whose arms use the opposite color.
+   191	    - The center color selects a glyph family, while the number of orthogonal arms selects one of two glyphs inside that family; an optional legend still shows one output glyph plus a matching label cross at (+4, +4).
+   192	
+   193	    Rule:
+   194	    - Scan red and green cells as possible cross centers, count how many opposite-color arm cells touch orthogonally, and keep only the valid two-arm or four-arm centers.
+   195	    - Map `(center color, arm count)` to the learned glyph/color pair, then paint the 4x4 glyph with its top-left corner at the center cell, clipping at the grid boundary.
+   196	    - If that center is the label cross for a legend glyph sitting four cells up-left, skip it; legend samples themselves are removed from the output.
+   197	
+   198	    Key insight:
+   199	    - The marker code is genuinely two-dimensional: the same arm count means different glyphs under different center colors, and the same center color means different glyphs under different arm counts.
+   200	    """
+   201	    g = np.asarray(grid, dtype=int)
+   202	    assert g.ndim == 2
+   203	    assert set(np.unique(g)).issubset({0, RED, GREEN, 1, 4, 6, 7})
+   204	
+   205	    out = np.zeros_like(g)
+   206	    candidates = np.argwhere(np.isin(g, MARKER_COLORS))
+   207	    assert candidates.size
+   208	
+   209	    seen_marker = False
+   210	    for r, c in candidates:
+   211	        center_color = int(g[r, c])
+   212	        arm_count = _count_opposite_arms(g, int(r), int(c))
+   213	        glyph = GLYPHS.get((center_color, arm_count))
+   214	        if glyph is None:
+   215	            continue
+   216	        seen_marker = True
+   217	        glyph_color, mask = glyph
+   218	        if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+   219	            continue
+   220	        _paint_clipped(out, int(r), int(c), glyph_color, mask)
+   221	
+   222	    assert seen_marker
+   223	    return out
+   224	
+   225	
+   226	def _sample_axis_positions(length: int, count: int, rng: random.Random) -> list[int]:
+   227	    max_center = length - 2
+   228	    for _ in range(200):
+   229	        gaps = [rng.randint(4, 6) for _ in range(count - 1)]
+   230	        span = sum(gaps)
+   231	        max_start = max_center - span
+   232	        if max_start < 1:
+   233	            continue
+   234	        start = rng.randint(1, max_start)
+   235	        pos = [start]
+   236	        for gap in gaps:
+   237	            pos.append(pos[-1] + gap)
+   238	        return pos
+   239	    raise RuntimeError("failed to sample axis positions")
+   240	
+   241	
+   242	def _marker_cells(r: int, c: int, arm_dirs: tuple[tuple[int, int], ...]) -> set[tuple[int, int]]:
+   243	    cells = {(r, c)}
+   244	    for dr, dc in arm_dirs:
+   245	        cells.add((r + dr, c + dc))
+   246	    return cells
+   247	
+   248	
+   249	def _draw_marker(
+   250	    grid: np.ndarray, r: int, c: int, center_color: int, arm_dirs: tuple[tuple[int, int], ...]
+   251	) -> None:
+   252	    grid[r, c] = center_color
+   253	    arm_color = _other_marker_color(center_color)
+   254	    for dr, dc in arm_dirs:
+   255	        grid[r + dr, c + dc] = arm_color
+   256	
+   257	
+   258	def _choose_arm_dirs(arm_count: int, rng: random.Random) -> tuple[tuple[int, int], ...]:
+   259	    return tuple(rng.choice(ARM_SUBSETS[arm_count]))
+   260	
+   261	
+   262	def _build_expected_output(
+   263	    shape: tuple[int, int], markers: list[tuple[int, int, int, int]]
+   264	) -> np.ndarray:
+   265	    out = np.zeros(shape, dtype=int)
+   266	    for r, c, center_color, arm_count in markers:
+   267	        glyph_color, mask = GLYPHS[(center_color, arm_count)]
+   268	        _paint_clipped(out, r, c, glyph_color, mask)
+   269	    return out
+   270	
+   271	
+   272	def _find_legend(
+   273	    shape: tuple[int, int],
+   274	    used_types: list[tuple[int, int]],
+   275	    occupied: set[tuple[int, int]],
+   276	    rng: random.Random,
+   277	) -> tuple[int, int, int, tuple[tuple[int, int], ...]] | None:
+   278	    h, w = shape
+   279	    order = [(r, c) for r in range(h - 5) for c in range(w - 5)]
+   280	    rng.shuffle(order)
+   281	    type_order = used_types[:]
+   282	    rng.shuffle(type_order)
+   283	
+   284	    for center_color, arm_count in type_order:
+   285	        glyph_color, mask = GLYPHS[(center_color, arm_count)]
+   286	        arm_variants = list(ARM_SUBSETS[arm_count])
+   287	        rng.shuffle(arm_variants)
+   288	        for r0, c0 in order:
+   289	            glyph_cells = {
+   290	                (r0 + dr, c0 + dc) for dr in range(4) for dc in range(4) if bool(mask[dr, dc])
+   291	            }
+   292	            for arm_dirs in arm_variants:
+   293	                center_r, center_c = r0 + 4, c0 + 4
+   294	                label_cells = _marker_cells(center_r, center_c, tuple(arm_dirs))
+   295	                all_cells = glyph_cells | label_cells
+   296	                if not all(0 <= rr < h and 0 <= cc < w for rr, cc in all_cells):
+   297	                    continue
+   298	                if all_cells & occupied:
+   299	                    continue
+   300	                return r0, c0, center_color, tuple(arm_dirs)
+   301	    return None
+   302	
+   303	
+   304	def generate_input() -> np.ndarray:
+   305	    rng = random.Random()
+   306	    base_types = list(GLYPHS.keys())
+   307	
+   308	    for _ in range(200):
+   309	        size = rng.choice([10, 20])
+   310	        h = w = size
+   311	        if size == 10:
+   312	            row_count = col_count = 2
+   313	        else:
+   314	            row_count = rng.randint(2, 5)
+   315	            col_count = rng.randint(2, 5)
+   316	
+   317	        row_positions = _sample_axis_positions(h, row_count, rng)
+   318	        col_positions = _sample_axis_positions(w, col_count, rng)
+   319	        slots = [(r, c) for r in row_positions for c in col_positions]
+   320	        min_fill = max(4, int(np.ceil(0.6 * len(slots))))
+
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util
+import numpy as np
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+for i in range(5):
+    g = mod.generate_input()
+    o = mod.main(g)
+    print('sample', i, g.shape, 'input colors', sorted(map(int, np.unique(g))), 'output colors', sorted(map(int, np.unique(o))))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/18/code.py b/ceshi/code_combo/dfadab01/18/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..63609c71a3f67278569468ed20c2db7054a0f05d
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/18/code.py
+@@ -0,0 +1,366 @@
++# Combo variant of dfadab01 (index 18)
++# combo_spec: D3/4+D12/0
++# Name: 十字标记编码字形+减少标记色
++
++from __future__ import annotations
++
++import itertools
++import random
++
++import numpy as np
++
++"""
++Design analysis for the combo variant.
++
++a) Concrete behavior and trace:
++   - Original task: each real control is one pixel whose color directly names one of
++     four fixed 4x4 glyphs. A legend, when present, shows the glyph itself plus a
++     below-right label pixel of the same marker color.
++   - Combo behavior: each real control is now a two-color cross. The center cell is
++     either red (2) or green (3), and every arm cell uses the opposite color. The
++     center color picks one of two glyph families; the arm count picks one of two
++     glyphs inside that family.
++   - Concrete trace: a red center at (6, 9) with two green arms no longer means
++     "paint whatever red used to mean". Instead the solver reads the center color
++     (red family) and counts two opposite-color arms, then paints the yellow frame
++     glyph with top-left anchor at (6, 9). A green center with the same two-arm count
++     maps to a different glyph, so color alone and count alone are both insufficient.
++   - Legends still consist of one sample output glyph and a matching label control at
++     (+4, +4) from the sample glyph's top-left corner. The label is a full combo-style
++     cross and is removed in the output.
++
++b) Complexity calibration:
++   - The fused rule keeps four target glyphs, but compresses the marker palette to two
++     colors total. This preserves enough variety to stay nontrivial while making the
++     input visibly cleaner than the source task.
++   - To avoid degenerating into a count-only rule, both center colors reuse the same
++     two arm-count values: 2 and 4. The four semantic types are therefore the Cartesian
++     product {red-center, green-center} x {2 arms, 4 arms}.
++   - Counts 2 and 4 are repeated across samples and are visually distinct, while
++     two-arm direction sets vary so the stable feature is the count rather than the
++     orientation.
++
++c) Implicit-assumption audit for main():
++   - The original loop over marker colors 2/3/5/8 breaks immediately because input
++     colors no longer identify glyphs one-to-one.
++   - The original logic assumed every marker cell was itself the anchor. Here only the
++     center cell is the anchor, so the solver must reject arm pixels. Using only arm
++     counts {2, 4} guarantees every arm pixel has exactly one opposite-color neighbor
++     and never masquerades as a valid center.
++   - The legend-skip check still depends on the control anchor being exactly four cells
++     below-right of the sample glyph. That remains valid because the cross center is the
++     logical anchor.
++   - Painting still assumes output glyphs do not overlap. The generator keeps anchor
++     spacing at least four, so clipped 4x4 outputs remain disjoint.
++
++d) Placement legality:
++   - Real marker centers are restricted to rows/cols 1..H-2 so every possible arm stays
++     in bounds.
++   - Marker anchors live on a sparse regular grid with gaps 4-6, which prevents cross
++     overlap in the input and glyph overlap in the output.
++   - Legend placement is accepted only if the sample glyph and its label cross are fully
++     in bounds and disjoint from every real marker cell.
++
++e) Visual observability:
++   - The input now visibly differs from the seed task because controls are small crosses
++     instead of isolated pixels, and because only red/green are used for all controls.
++   - Across examples, identical arm counts appear under both center colors, and both arm
++     counts appear under the same center color. This makes the dual encoding observable
++     from a few training pairs.
++
++f) Visual cleanliness:
++   - Crosses are isolated by black padding, so no marker touches a glyph-colored legend
++     sample or another control.
++   - Using only two marker colors keeps the scene readable even when many controls are
++     present.
++
++g) Change inferability:
++   - No hidden numeric ordering is used. The only inputs to decoding are visible center
++     color and visible orthogonal arm count.
++   - The generator always places all four semantic marker types among the real controls,
++     so the combined color+count code is exercised instead of collapsing to a simpler
++     subrule.
++"""
++
++
++RED = 2
++GREEN = 3
++MARKER_COLORS: tuple[int, int] = (RED, GREEN)
++CARDINAL_DIRS: tuple[tuple[int, int], ...] = ((-1, 0), (0, 1), (1, 0), (0, -1))
++ARM_COUNTS: tuple[int, int] = (2, 4)
++
++GLYPHS: dict[tuple[int, int], tuple[int, np.ndarray]] = {
++    (RED, 2): (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (RED, 4): (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (GREEN, 2): (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (GREEN, 4): (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++ARM_SUBSETS: dict[int, tuple[tuple[tuple[int, int], ...], ...]] = {
++    count: tuple(itertools.combinations(CARDINAL_DIRS, count)) for count in ARM_COUNTS
++}
++
++
++def _other_marker_color(color: int) -> int:
++    return GREEN if color == RED else RED
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
++        return False
++    patch = g[r0 : r0 + 4, c0 : c0 + 4]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _count_opposite_arms(g: np.ndarray, r: int, c: int) -> int:
++    h, w = g.shape
++    center_color = int(g[r, c])
++    arm_color = _other_marker_color(center_color)
++    count = 0
++    for dr, dc in CARDINAL_DIRS:
++        rr, cc = r + dr, c + dc
++        if 0 <= rr < h and 0 <= cc < w and int(g[rr, cc]) == arm_color:
++            count += 1
++    return count
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Decode each two-color cross by combining its center color and arm count, then paint the matched 4x4 glyph.
++
++    Input structure:
++    - Black background with control markers drawn only in red and green.
++    - Each control is a small cross whose center is one of those colors and whose arms use the opposite color.
++    - The center color selects a glyph family, while the number of orthogonal arms selects one of two glyphs inside that family; an optional legend still shows one output glyph plus a matching label cross at (+4, +4).
++
++    Rule:
++    - Scan red and green cells as possible cross centers, count how many opposite-color arm cells touch orthogonally, and keep only the valid two-arm or four-arm centers.
++    - Map `(center color, arm count)` to the learned glyph/color pair, then paint the 4x4 glyph with its top-left corner at the center cell, clipping at the grid boundary.
++    - If that center is the label cross for a legend glyph sitting four cells up-left, skip it; legend samples themselves are removed from the output.
++
++    Key insight:
++    - The marker code is genuinely two-dimensional: the same arm count means different glyphs under different center colors, and the same center color means different glyphs under different arm counts.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, RED, GREEN, 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    candidates = np.argwhere(np.isin(g, MARKER_COLORS))
++    assert candidates.size
++
++    seen_marker = False
++    for r, c in candidates:
++        center_color = int(g[r, c])
++        arm_count = _count_opposite_arms(g, int(r), int(c))
++        glyph = GLYPHS.get((center_color, arm_count))
++        if glyph is None:
++            continue
++        seen_marker = True
++        glyph_color, mask = glyph
++        if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
++            continue
++        _paint_clipped(out, int(r), int(c), glyph_color, mask)
++
++    assert seen_marker
++    return out
++
++
++def _sample_axis_positions(length: int, count: int, rng: random.Random) -> list[int]:
++    max_center = length - 2
++    for _ in range(200):
++        gaps = [rng.randint(4, 6) for _ in range(count - 1)]
++        span = sum(gaps)
++        max_start = max_center - span
++        if max_start < 1:
++            continue
++        start = rng.randint(1, max_start)
++        pos = [start]
++        for gap in gaps:
++            pos.append(pos[-1] + gap)
++        return pos
++    raise RuntimeError("failed to sample axis positions")
++
++
++def _marker_cells(r: int, c: int, arm_dirs: tuple[tuple[int, int], ...]) -> set[tuple[int, int]]:
++    cells = {(r, c)}
++    for dr, dc in arm_dirs:
++        cells.add((r + dr, c + dc))
++    return cells
++
++
++def _draw_marker(
++    grid: np.ndarray, r: int, c: int, center_color: int, arm_dirs: tuple[tuple[int, int], ...]
++) -> None:
++    grid[r, c] = center_color
++    arm_color = _other_marker_color(center_color)
++    for dr, dc in arm_dirs:
++        grid[r + dr, c + dc] = arm_color
++
++
++def _choose_arm_dirs(arm_count: int, rng: random.Random) -> tuple[tuple[int, int], ...]:
++    return tuple(rng.choice(ARM_SUBSETS[arm_count]))
++
++
++def _build_expected_output(
++    shape: tuple[int, int], markers: list[tuple[int, int, int, int]]
++) -> np.ndarray:
++    out = np.zeros(shape, dtype=int)
++    for r, c, center_color, arm_count in markers:
++        glyph_color, mask = GLYPHS[(center_color, arm_count)]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _find_legend(
++    shape: tuple[int, int],
++    used_types: list[tuple[int, int]],
++    occupied: set[tuple[int, int]],
++    rng: random.Random,
++) -> tuple[int, int, int, tuple[tuple[int, int], ...]] | None:
++    h, w = shape
++    order = [(r, c) for r in range(h - 5) for c in range(w - 5)]
++    rng.shuffle(order)
++    type_order = used_types[:]
++    rng.shuffle(type_order)
++
++    for center_color, arm_count in type_order:
++        glyph_color, mask = GLYPHS[(center_color, arm_count)]
++        arm_variants = list(ARM_SUBSETS[arm_count])
++        rng.shuffle(arm_variants)
++        for r0, c0 in order:
++            glyph_cells = {
++                (r0 + dr, c0 + dc) for dr in range(4) for dc in range(4) if bool(mask[dr, dc])
++            }
++            for arm_dirs in arm_variants:
++                center_r, center_c = r0 + 4, c0 + 4
++                label_cells = _marker_cells(center_r, center_c, tuple(arm_dirs))
++                all_cells = glyph_cells | label_cells
++                if not all(0 <= rr < h and 0 <= cc < w for rr, cc in all_cells):
++                    continue
++                if all_cells & occupied:
++                    continue
++                return r0, c0, center_color, tuple(arm_dirs)
++    return None
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++    base_types = list(GLYPHS.keys())
++
++    for _ in range(200):
++        size = rng.choice([10, 20])
++        h = w = size
++        if size == 10:
++            row_count = col_count = 2
++        else:
++            row_count = rng.randint(2, 5)
++            col_count = rng.randint(2, 5)
++
++        row_positions = _sample_axis_positions(h, row_count, rng)
++        col_positions = _sample_axis_positions(w, col_count, rng)
++        slots = [(r, c) for r in row_positions for c in col_positions]
++        min_fill = max(4, int(np.ceil(0.6 * len(slots))))
++        occupied_count = rng.randint(min_fill, len(slots))
++        chosen_slots = rng.sample(slots, occupied_count)
++
++        marker_types = base_types[:] + [rng.choice(base_types) for _ in range(occupied_count - 4)]
++        rng.shuffle(marker_types)
++
++        grid = np.zeros((h, w), dtype=int)
++        occupied_cells: set[tuple[int, int]] = set()
++        markers: list[tuple[int, int, int, int]] = []
++        valid = True
++
++        for (r, c), (center_color, arm_count) in zip(chosen_slots, marker_types, strict=True):
++            arm_dirs = _choose_arm_dirs(arm_count, rng)
++            cells = _marker_cells(r, c, arm_dirs)
++            if any(cell in occupied_cells for cell in cells):
++                valid = False
++                break
++            if not all(0 <= rr < h and 0 <= cc < w for rr, cc in cells):
++                valid = False
++                break
++            _draw_marker(grid, r, c, center_color, arm_dirs)
++            occupied_cells |= cells
++            markers.append((r, c, center_color, arm_count))
++
++        if not valid:
++            continue
++
++        if rng.random() < 0.75:
++            legend = _find_legend((h, w), base_types, occupied_cells, rng)
++            if legend is not None:
++                r0, c0, center_color, arm_dirs = legend
++                arm_count = len(arm_dirs)
++                glyph_color, mask = GLYPHS[(center_color, arm_count)]
++                for dr in range(4):
++                    for dc in range(4):
++                        if bool(mask[dr, dc]):
++                            grid[r0 + dr, c0 + dc] = glyph_color
++                _draw_marker(grid, r0 + 4, c0 + 4, center_color, arm_dirs)
++
++        expected = _build_expected_output((h, w), markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid input")
+
+ succeeded in 198ms:
+sample 0 (10, 10) input colors [0, 2, 3] output colors [0, 1, 4, 6, 7]
+sample 1 (10, 10) input colors [0, 2, 3] output colors [0, 1, 4, 6, 7]
+sample 2 (20, 20) input colors [0, 2, 3] output colors [0, 1, 4, 6, 7]
+sample 3 (20, 20) input colors [0, 2, 3, 4] output colors [0, 1, 4, 6, 7]
+sample 4 (20, 20) input colors [0, 1, 2, 3] output colors [0, 1, 4, 6, 7]
+
+codex
+融合变体代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py:1)。
+
+`main()` 在 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py:184) 改成了解码双层控制信号：十字中心色 `2/3` 决定两大类，臂数只用 `{2,4}` 两档并在两种中心色上重复，因此必须同时看“颜色 + 计数”才能确定 4 种字形。`generate_input()` 在 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py:304) 保证所有 4 种语义组合都出现在真实标记里，并继续支持可选 legend，label 也改成同样的十字标记。
+
+验证结果：
+- 规定测试通过：`Success: 50/50, Time: 0.1s (1ms/call)`
+- 融合行为量化检查（200 样本）：
+  - 两种中心色都出现：`200/200`
+  - 两种臂数都出现：`200/200`
+  - 每种中心色都同时配到两种臂数：`200/200`
+  - 每种臂数都同时跨两种中心色出现：`200/200`
+
+新隐式假设也已和生成器对齐：`main()` 只把拥有 `2` 或 `4` 个异色正交臂的像素当作中心，生成器据此避免 `1` 臂退化；中心位置限制在 `1..H-2`，间距保持 `4-6`，所以输入十字和输出 `4x4` 字形都不会冲突。
+diff --git a/ceshi/code_combo/dfadab01/18/code.py b/ceshi/code_combo/dfadab01/18/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..63609c71a3f67278569468ed20c2db7054a0f05d
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/18/code.py
+@@ -0,0 +1,366 @@
++# Combo variant of dfadab01 (index 18)
++# combo_spec: D3/4+D12/0
++# Name: 十字标记编码字形+减少标记色
++
++from __future__ import annotations
++
++import itertools
++import random
++
++import numpy as np
++
++"""
++Design analysis for the combo variant.
++
++a) Concrete behavior and trace:
++   - Original task: each real control is one pixel whose color directly names one of
++     four fixed 4x4 glyphs. A legend, when present, shows the glyph itself plus a
++     below-right label pixel of the same marker color.
++   - Combo behavior: each real control is now a two-color cross. The center cell is
++     either red (2) or green (3), and every arm cell uses the opposite color. The
++     center color picks one of two glyph families; the arm count picks one of two
++     glyphs inside that family.
++   - Concrete trace: a red center at (6, 9) with two green arms no longer means
++     "paint whatever red used to mean". Instead the solver reads the center color
++     (red family) and counts two opposite-color arms, then paints the yellow frame
++     glyph with top-left anchor at (6, 9). A green center with the same two-arm count
++     maps to a different glyph, so color alone and count alone are both insufficient.
++   - Legends still consist of one sample output glyph and a matching label control at
++     (+4, +4) from the sample glyph's top-left corner. The label is a full combo-style
++     cross and is removed in the output.
++
++b) Complexity calibration:
++   - The fused rule keeps four target glyphs, but compresses the marker palette to two
++     colors total. This preserves enough variety to stay nontrivial while making the
++     input visibly cleaner than the source task.
++   - To avoid degenerating into a count-only rule, both center colors reuse the same
++     two arm-count values: 2 and 4. The four semantic types are therefore the Cartesian
++     product {red-center, green-center} x {2 arms, 4 arms}.
++   - Counts 2 and 4 are repeated across samples and are visually distinct, while
++     two-arm direction sets vary so the stable feature is the count rather than the
++     orientation.
++
++c) Implicit-assumption audit for main():
++   - The original loop over marker colors 2/3/5/8 breaks immediately because input
++     colors no longer identify glyphs one-to-one.
++   - The original logic assumed every marker cell was itself the anchor. Here only the
++     center cell is the anchor, so the solver must reject arm pixels. Using only arm
++     counts {2, 4} guarantees every arm pixel has exactly one opposite-color neighbor
++     and never masquerades as a valid center.
++   - The legend-skip check still depends on the control anchor being exactly four cells
++     below-right of the sample glyph. That remains valid because the cross center is the
++     logical anchor.
++   - Painting still assumes output glyphs do not overlap. The generator keeps anchor
++     spacing at least four, so clipped 4x4 outputs remain disjoint.
++
++d) Placement legality:
++   - Real marker centers are restricted to rows/cols 1..H-2 so every possible arm stays
++     in bounds.
++   - Marker anchors live on a sparse regular grid with gaps 4-6, which prevents cross
++     overlap in the input and glyph overlap in the output.
++   - Legend placement is accepted only if the sample glyph and its label cross are fully
++     in bounds and disjoint from every real marker cell.
++
++e) Visual observability:
++   - The input now visibly differs from the seed task because controls are small crosses
++     instead of isolated pixels, and because only red/green are used for all controls.
++   - Across examples, identical arm counts appear under both center colors, and both arm
++     counts appear under the same center color. This makes the dual encoding observable
++     from a few training pairs.
++
++f) Visual cleanliness:
++   - Crosses are isolated by black padding, so no marker touches a glyph-colored legend
++     sample or another control.
++   - Using only two marker colors keeps the scene readable even when many controls are
++     present.
++
++g) Change inferability:
++   - No hidden numeric ordering is used. The only inputs to decoding are visible center
++     color and visible orthogonal arm count.
++   - The generator always places all four semantic marker types among the real controls,
++     so the combined color+count code is exercised instead of collapsing to a simpler
++     subrule.
++"""
++
++
++RED = 2
++GREEN = 3
++MARKER_COLORS: tuple[int, int] = (RED, GREEN)
++CARDINAL_DIRS: tuple[tuple[int, int], ...] = ((-1, 0), (0, 1), (1, 0), (0, -1))
++ARM_COUNTS: tuple[int, int] = (2, 4)
++
++GLYPHS: dict[tuple[int, int], tuple[int, np.ndarray]] = {
++    (RED, 2): (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (RED, 4): (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (GREEN, 2): (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    (GREEN, 4): (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++ARM_SUBSETS: dict[int, tuple[tuple[tuple[int, int], ...], ...]] = {
++    count: tuple(itertools.combinations(CARDINAL_DIRS, count)) for count in ARM_COUNTS
++}
++
++
++def _other_marker_color(color: int) -> int:
++    return GREEN if color == RED else RED
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
++        return False
++    patch = g[r0 : r0 + 4, c0 : c0 + 4]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _count_opposite_arms(g: np.ndarray, r: int, c: int) -> int:
++    h, w = g.shape
++    center_color = int(g[r, c])
++    arm_color = _other_marker_color(center_color)
++    count = 0
++    for dr, dc in CARDINAL_DIRS:
++        rr, cc = r + dr, c + dc
++        if 0 <= rr < h and 0 <= cc < w and int(g[rr, cc]) == arm_color:
++            count += 1
++    return count
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Decode each two-color cross by combining its center color and arm count, then paint the matched 4x4 glyph.
++
++    Input structure:
++    - Black background with control markers drawn only in red and green.
++    - Each control is a small cross whose center is one of those colors and whose arms use the opposite color.
++    - The center color selects a glyph family, while the number of orthogonal arms selects one of two glyphs inside that family; an optional legend still shows one output glyph plus a matching label cross at (+4, +4).
++
++    Rule:
++    - Scan red and green cells as possible cross centers, count how many opposite-color arm cells touch orthogonally, and keep only the valid two-arm or four-arm centers.
++    - Map `(center color, arm count)` to the learned glyph/color pair, then paint the 4x4 glyph with its top-left corner at the center cell, clipping at the grid boundary.
++    - If that center is the label cross for a legend glyph sitting four cells up-left, skip it; legend samples themselves are removed from the output.
++
++    Key insight:
++    - The marker code is genuinely two-dimensional: the same arm count means different glyphs under different center colors, and the same center color means different glyphs under different arm counts.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, RED, GREEN, 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    candidates = np.argwhere(np.isin(g, MARKER_COLORS))
++    assert candidates.size
++
++    seen_marker = False
++    for r, c in candidates:
++        center_color = int(g[r, c])
++        arm_count = _count_opposite_arms(g, int(r), int(c))
++        glyph = GLYPHS.get((center_color, arm_count))
++        if glyph is None:
++            continue
++        seen_marker = True
++        glyph_color, mask = glyph
++        if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
++            continue
++        _paint_clipped(out, int(r), int(c), glyph_color, mask)
++
++    assert seen_marker
++    return out
++
++
++def _sample_axis_positions(length: int, count: int, rng: random.Random) -> list[int]:
++    max_center = length - 2
++    for _ in range(200):
++        gaps = [rng.randint(4, 6) for _ in range(count - 1)]
++        span = sum(gaps)
++        max_start = max_center - span
++        if max_start < 1:
++            continue
++        start = rng.randint(1, max_start)
++        pos = [start]
++        for gap in gaps:
++            pos.append(pos[-1] + gap)
++        return pos
++    raise RuntimeError("failed to sample axis positions")
++
++
++def _marker_cells(r: int, c: int, arm_dirs: tuple[tuple[int, int], ...]) -> set[tuple[int, int]]:
++    cells = {(r, c)}
++    for dr, dc in arm_dirs:
++        cells.add((r + dr, c + dc))
++    return cells
++
++
++def _draw_marker(
++    grid: np.ndarray, r: int, c: int, center_color: int, arm_dirs: tuple[tuple[int, int], ...]
++) -> None:
++    grid[r, c] = center_color
++    arm_color = _other_marker_color(center_color)
++    for dr, dc in arm_dirs:
++        grid[r + dr, c + dc] = arm_color
++
++
++def _choose_arm_dirs(arm_count: int, rng: random.Random) -> tuple[tuple[int, int], ...]:
++    return tuple(rng.choice(ARM_SUBSETS[arm_count]))
++
++
++def _build_expected_output(
++    shape: tuple[int, int], markers: list[tuple[int, int, int, int]]
++) -> np.ndarray:
++    out = np.zeros(shape, dtype=int)
++    for r, c, center_color, arm_count in markers:
++        glyph_color, mask = GLYPHS[(center_color, arm_count)]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _find_legend(
++    shape: tuple[int, int],
++    used_types: list[tuple[int, int]],
++    occupied: set[tuple[int, int]],
++    rng: random.Random,
++) -> tuple[int, int, int, tuple[tuple[int, int], ...]] | None:
++    h, w = shape
++    order = [(r, c) for r in range(h - 5) for c in range(w - 5)]
++    rng.shuffle(order)
++    type_order = used_types[:]
++    rng.shuffle(type_order)
++
++    for center_color, arm_count in type_order:
++        glyph_color, mask = GLYPHS[(center_color, arm_count)]
++        arm_variants = list(ARM_SUBSETS[arm_count])
++        rng.shuffle(arm_variants)
++        for r0, c0 in order:
++            glyph_cells = {
++                (r0 + dr, c0 + dc) for dr in range(4) for dc in range(4) if bool(mask[dr, dc])
++            }
++            for arm_dirs in arm_variants:
++                center_r, center_c = r0 + 4, c0 + 4
++                label_cells = _marker_cells(center_r, center_c, tuple(arm_dirs))
++                all_cells = glyph_cells | label_cells
++                if not all(0 <= rr < h and 0 <= cc < w for rr, cc in all_cells):
++                    continue
++                if all_cells & occupied:
++                    continue
++                return r0, c0, center_color, tuple(arm_dirs)
++    return None
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++    base_types = list(GLYPHS.keys())
++
++    for _ in range(200):
++        size = rng.choice([10, 20])
++        h = w = size
++        if size == 10:
++            row_count = col_count = 2
++        else:
++            row_count = rng.randint(2, 5)
++            col_count = rng.randint(2, 5)
++
++        row_positions = _sample_axis_positions(h, row_count, rng)
++        col_positions = _sample_axis_positions(w, col_count, rng)
++        slots = [(r, c) for r in row_positions for c in col_positions]
++        min_fill = max(4, int(np.ceil(0.6 * len(slots))))
++        occupied_count = rng.randint(min_fill, len(slots))
++        chosen_slots = rng.sample(slots, occupied_count)
++
++        marker_types = base_types[:] + [rng.choice(base_types) for _ in range(occupied_count - 4)]
++        rng.shuffle(marker_types)
++
++        grid = np.zeros((h, w), dtype=int)
++        occupied_cells: set[tuple[int, int]] = set()
++        markers: list[tuple[int, int, int, int]] = []
++        valid = True
++
++        for (r, c), (center_color, arm_count) in zip(chosen_slots, marker_types, strict=True):
++            arm_dirs = _choose_arm_dirs(arm_count, rng)
++            cells = _marker_cells(r, c, arm_dirs)
++            if any(cell in occupied_cells for cell in cells):
++                valid = False
++                break
++            if not all(0 <= rr < h and 0 <= cc < w for rr, cc in cells):
++                valid = False
++                break
++            _draw_marker(grid, r, c, center_color, arm_dirs)
++            occupied_cells |= cells
++            markers.append((r, c, center_color, arm_count))
++
++        if not valid:
++            continue
++
++        if rng.random() < 0.75:
++            legend = _find_legend((h, w), base_types, occupied_cells, rng)
++            if legend is not None:
++                r0, c0, center_color, arm_dirs = legend
++                arm_count = len(arm_dirs)
++                glyph_color, mask = GLYPHS[(center_color, arm_count)]
++                for dr in range(4):
++                    for dc in range(4):
++                        if bool(mask[dr, dc]):
++                            grid[r0 + dr, c0 + dc] = glyph_color
++                _draw_marker(grid, r0 + 4, c0 + 4, center_color, arm_dirs)
++
++        expected = _build_expected_output((h, w), markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid input")
+
+tokens used
+77,966
+融合变体代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py:1)。
+
+`main()` 在 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py:184) 改成了解码双层控制信号：十字中心色 `2/3` 决定两大类，臂数只用 `{2,4}` 两档并在两种中心色上重复，因此必须同时看“颜色 + 计数”才能确定 4 种字形。`generate_input()` 在 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/18/code.py:304) 保证所有 4 种语义组合都出现在真实标记里，并继续支持可选 legend，label 也改成同样的十字标记。
+
+验证结果：
+- 规定测试通过：`Success: 50/50, Time: 0.1s (1ms/call)`
+- 融合行为量化检查（200 样本）：
+  - 两种中心色都出现：`200/200`
+  - 两种臂数都出现：`200/200`
+  - 每种中心色都同时配到两种臂数：`200/200`
+  - 每种臂数都同时跨两种中心色出现：`200/200`
+
+新隐式假设也已和生成器对齐：`main()` 只把拥有 `2` 或 `4` 个异色正交臂的像素当作中心，生成器据此避免 `1` 臂退化；中心位置限制在 `1..H-2`，间距保持 `4-6`，所以输入十字和输出 `4x4` 字形都不会冲突。

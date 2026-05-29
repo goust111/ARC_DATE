@@ -1,0 +1,3773 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e2bb0-021a-7110-bfd2-da4a09ddf7cd
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: dfadab01
+    **摘要**: 输入中的单像素标记按固定字形字典被替换为对应的4x4图案（标记色->图案色），样本字形及其右下标签在输出中消失，超出网格边缘的部分被裁剪
+
+    ## 要实现的融合组合
+    - **组合名称**: 字形叠加+按色批处理
+    - **combo_spec**: D1/4+D9/0
+
+    ### 融合描述（实现规格）
+
+    字形放置按标记色分批次进行（先色2、再色3、再色5、最后色8），后放置的字形覆盖先放置的。 当两个不同色标记的字形区域重叠时，重叠像素取两色中较大色号值（叠加合成规则）。 解题者需要同时理解批处理顺序和叠加合成规则，在重叠区域推断哪些像素来自哪一层。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D1/4** — 字形替换变换方式 (`transform`)
+  - 当前值: 每个标记像素被替换为固定4x4字形图案，标记位置为字形左上角，字形使用与标记色不同的固定输出色
+  - 改为: 字形叠加合成 — 当两个标记的4x4字形区域发生重叠时，重叠像素取两个字形颜色中较大的色号值（或特定合成规则如异或）。解题者需要理解叠加规则，并在重叠区域推断正确的颜色。
+  - 来源: creative（参考任务: None）
+- **D9/0** — 字形放置的多步处理顺序 (`multi_step`)
+  - 当前值: 单步处理：所有标记同时被替换为字形，无先后顺序依赖
+  - 改为: 按颜色分批次处理 — 先放置所有色2标记的字形，再放置色3的，依此类推。后放置的字形可以覆盖先放置的字形。当字形区域重叠时，处理顺序决定最终可见结果。解题者需要推断颜色优先级。
+  - 来源: multi_step（参考任务: 271d71e2）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/dfadab01.py`
+
+    ```python
+    from __future__ import annotations
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding fixed 4x4 glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show a sample 4x4 glyph in the output color, with a same-rule marker just below-right of the sample.
+
+    Rule:
+    - Replace each marker color by its learned 4x4 glyph: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping at the grid boundary.
+    - Remove the sample glyphs and skip their below-right label markers.
+
+    Key insight:
+    - The colored pixels are control pixels for a fixed glyph alphabet; non-control sample glyphs are only legend entries, not preserved scene objects.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            # Legend labels appear one cell below-right of the sample glyph bbox.
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 10x10 or 20x20 [observed]; must accommodate marker_grid_rows * row_spacing + glyph_size(4)
+  glyph_alphabet:
+    fixed 4x4 patterns, each 8 filled pixels out of 16:
+      marker 2 (red) -> color 4 (yellow) solid frame
+      marker 3 (green) -> color 1 (blue) open ring
+      marker 5 (gray) -> color 6 (magenta) diagonal blocks
+      marker 8 (azure) -> color 7 (orange) X-shape
+  marker_grid:
+    markers placed on a regular grid of positions (rows x cols)
+    shape: 2x2 to 5x5; rows and cols chosen independently
+    row_spacing: 4-6, uniform within example [observed]
+    col_spacing: 4-6, may be non-uniform across columns
+    fill_rate: 60-100% of grid cells contain a marker; unfilled cells are empty (black)
+    marker_types_used: 1-4 distinct types from {2,3,5,8}; each cell assigned one type
+  legend:
+    0 or 1 legend entry per input [observed]; shows one glyph type's mapping
+    structure: the 4x4 glyph drawn in output color + a label marker of matching type at (glyph_row+4, glyph_col+4)
+    legend glyph may overlap a grid cell position (the marker pixel sits where glyph mask has 0)
+    label marker is skipped in output (not expanded)
+  output:
+    black background; each real marker replaced by its 4x4 glyph in the mapped output color
+    glyph top-left at marker position; clipped at grid boundary
+    legend glyph and label removed; no glyph painted for label markers
+    glyphs never overlap (guaranteed by spacing >= 4)
+
+generation_strategy:
+  approach: direct construction (constraints are easy to satisfy constructively)
+  steps:
+    1. Pick grid dimensions ensuring rows * row_spacing and cols * col_spacing fit (with room for 4-cell glyph); e.g. for 5x5 grid with spacing 4, need >= 20.
+    2. Choose 1-4 marker types from {2,3,5,8}. Choose grid shape (R x C, each 2-5). Choose row_spacing and col_spacing (4-6 each).
+    3. Compute marker row/col positions; first row/col >= 0, last row + 3 <= H, last col + 3 <= W (or allow clipping for edge markers).
+    4. Fill grid cells: assign a random marker type to each cell; optionally leave some cells empty (fill_rate >= 60%).
+    5. Optionally add one legend entry: pick a used marker type, find a location where the 4x4 glyph + label at (+4,+4) fits without conflicting with real markers. Draw glyph in output color; place label marker pixel.
+    6. Build input grid: black background + single marker pixels at filled grid cells + legend if present.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+## 已有单变体参考代码
+
+以下组成项已有单变体实现，可作为融合时的参考：
+
+            ### 参考代码: D9/0
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/dfadab01/D9/0/code.py`
+
+            ```python
+            # Variant of dfadab01
+# Dimension: D9 — 字形放置的多步处理顺序 (multi_step)
+# Change: 单步处理：所有标记同时被替换为字形，无先后顺序依赖... → 按颜色分批次处理
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+PROCESS_ORDER: tuple[int, ...] = (2, 3, 5, 8)
+
+
+DESIGN_ANALYSIS = """
+variant_spec:
+  core_change:
+    original: marker spacing prevented glyph overlap, so paint order was implementation detail only.
+    variant: real markers are packed with spacing 2 on one axis, so 4x4 glyph footprints overlap and
+      the explicit batch order 2 -> 3 -> 5 -> 8 determines which color survives on shared pixels.
+  concrete_visual_form:
+    input:
+      - same single-pixel markers in colors 2/3/5/8
+      - optional legend keeps the old format: one 4x4 sample glyph plus its marker at (+4,+4)
+      - dense rows or columns of markers create intended future overlap in the output
+    output:
+      - same glyph dictionary and same clipping rule
+      - overlapping regions show only the later batch's glyph color
+  behavior_trace:
+    example:
+      markers: color-8 at (0,0), color-2 at (0,2)
+      original generator: this never happened because spacing >= 4 removed interaction
+      variant:
+        1. paint color-2 glyph at (0,2)
+        2. paint color-8 glyph at (0,0) later in the global order
+        3. cells where both masks are true now end up orange (7), not yellow (4)
+      difference: the same geometric overlap is no longer ambiguous or ignorable; order is now visible.
+  complexity_calibration:
+    - only one axis overlaps; the orthogonal axis keeps spacing >= 4
+    - this keeps the output readable while still creating multiple cross-color collisions
+    - each example uses 2-4 marker colors with repeated rows/columns so the priority is inferable
+    - first two lines are opposite marker sequences, preventing a false left-to-right interpretation
+  implicit_assumption_audit:
+    - iterating GLYPHS.items() was harmless before because outputs never overlapped; now order matters,
+      so main() must use an explicit PROCESS_ORDER constant instead of relying on dict insertion order.
+    - _paint_clipped always overwrites; before this was benign, now it is the intended last-wins rule.
+    - legend skipping via _has_source_glyph still works, but only if generator keeps each legend's 5x5
+      bbox clear of real markers and other legends; the generator enforces that.
+  placement_legality:
+    - marker top-left positions are fully inside the grid so no input object overlaps another object
+    - overlap happens only in the derived output footprints
+    - legends are placed only when a clean 5x5 area exists
+  observability_and_tidiness:
+    - cross-color overlap is mandatory
+    - order sensitivity is checked by comparing forward-order and reverse-order outputs
+    - horizontal or vertical banding keeps the scene structured instead of chaotic
+  new_solver_assumptions_and_generator_guards:
+    - solver assumes marker colors belong to PROCESS_ORDER; generator samples only from that set
+    - solver assumes at least one real marker exists; generator always places a full marker lattice
+    - solver assumes any legend label has its exact source glyph at (-4,-4); generator draws legends in that format
+"""
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def _ordered_output(g: np.ndarray, order: tuple[int, ...]) -> np.ndarray:
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color in order:
+        glyph_color, mask = GLYPHS[marker_color]
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+    assert seen_marker
+    return out
+
+
+def _repeat_to_length(seq: list[int], length: int) -> list[int]:
+    out: list[int] = []
+    while len(out) < length:
+        out.extend(seq)
+    return out[:length]
+
+
+def _real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
+    markers: list[tuple[int, int, int]] = []
+    for marker_color in PROCESS_ORDER:
+        glyph_color, mask = GLYPHS[marker_color]
+        for r, c in np.argwhere(g == marker_color):
+            rr, cc = int(r), int(c)
+            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
+                continue
+            markers.append((marker_color, rr, cc))
+    return markers
+
+
+def _variant_metrics(g: np.ndarray) -> dict[str, int]:
+    H, W = g.shape
+    coverage: dict[tuple[int, int], set[int]] = {}
+    for marker_color, r0, c0 in _real_markers(g):
+        _, mask = GLYPHS[marker_color]
+        for dr in range(4):
+            rr = r0 + dr
+            if rr < 0 or rr >= H:
+                continue
+            for dc in range(4):
+                cc = c0 + dc
+                if 0 <= cc < W and bool(mask[dr, dc]):
+                    coverage.setdefault((rr, cc), set()).add(marker_color)
+
+    overlap_pixels = sum(1 for colors in coverage.values() if len(colors) >= 2)
+    forward = _ordered_output(g, PROCESS_ORDER)
+    reverse = _ordered_output(g, tuple(reversed(PROCESS_ORDER)))
+    order_diff_pixels = int(np.count_nonzero(forward != reverse))
+    return {
+        "overlap_pixels": int(overlap_pixels),
+        "order_diff_pixels": order_diff_pixels,
+        "real_markers": len(_real_markers(g)),
+    }
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its fixed 4x4 glyph, resolving overlaps by color batches.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also include one sample 4x4 glyph in its output color, plus a matching marker at the sample's lower-right corner.
+    - Unlike the original non-overlapping layouts, marker spacing may be tight enough that expanded glyphs collide.
+
+    Rule:
+    - Use the same glyph dictionary as before: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint all color-2 markers first, then all color-3 markers, then color-5, then color-8; later batches overwrite earlier painted cells wherever glyph masks overlap.
+    - Clip each 4x4 glyph to the grid bounds, and remove the sample glyph/label pair by skipping label markers.
+
+    Key insight:
+    - The alphabet itself is unchanged; the new information is a global marker-color priority, visible only where dense marker placements make glyph footprints overlap.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+    return _ordered_output(g, PROCESS_ORDER)
+
+
+def _place_legend(g: np.ndarray, used_colors: list[int], rng: random.Random) -> bool:
+    H, W = g.shape
+    candidates = [
+        (0, 0),
+        (0, W - 5),
+        (H - 5, 0),
+        (H - 5, W - 5),
+        (0, max(0, (W - 5) // 2)),
+        (max(0, (H - 5) // 2), 0),
+    ]
+    rng.shuffle(candidates)
+
+    for r0, c0 in candidates:
+        if r0 < 0 or c0 < 0 or r0 + 4 >= H or c0 + 4 >= W:
+            continue
+        if np.any(g[r0 : r0 + 5, c0 : c0 + 5] != 0):
+            continue
+        marker_color = rng.choice(used_colors)
+        glyph_color, mask = GLYPHS[marker_color]
+        for dr in range(4):
+            for dc in range(4):
+                if bool(mask[dr, dc]):
+                    g[r0 + dr, c0 + dc] = glyph_color
+        g[r0 + 4, c0 + 4] = marker_color
+        return True
+    return False
+
+
+def _build_marker_grid(rng: random.Random) -> np.ndarray:
+    orientation = rng.choice(["horizontal", "vertical"])
+    size = rng.choice([10, 20])
+    H = W = size
+    g = np.zeros((H, W), dtype=int)
+
+    used_count = rng.choices([2, 3, 4], weights=[1, 3, 3], k=1)[0]
+    used_colors = rng.sample(list(PROCESS_ORDER), used_count)
+    palette = rng.sample(used_colors, len(used_colors))
+    reverse_palette = list(reversed(palette))
+
+    if orientation == "horizontal":
+        row_spacing = rng.choice([4, 5])
+        col_spacing = 2
+        rows_max = 1 + (H - 4) // row_spacing
+        cols_max = 1 + (W - 4) // col_spacing
+        rows = min(rows_max, rng.choice([2, 3, 4]))
+        cols = min(cols_max, rng.choice([4, 5, 6]))
+        rows = max(rows, 2)
+        cols = max(cols, 4)
+        height = 4 + (rows - 1) * row_spacing
+        width = 4 + (cols - 1) * col_spacing
+        r_start = rng.randint(0, H - height)
+        c_start = rng.randint(0, W - width)
+        row_positions = [r_start + i * row_spacing for i in range(rows)]
+        col_positions = [c_start + i * col_spacing for i in range(cols)]
+
+        for ridx, r in enumerate(row_positions):
+            if ridx == 0:
+                base = palette
+            elif ridx == 1:
+                base = reverse_palette
+            else:
+                shift = ridx % len(palette)
+                base = palette[shift:] + palette[:shift]
+            seq = _repeat_to_length(base, cols)
+            for cidx, c in enumerate(col_positions):
+                g[r, c] = seq[cidx]
+    else:
+        row_spacing = 2
+        col_spacing = rng.choice([4, 5])
+        rows_max = 1 + (H - 4) // row_spacing
+        cols_max = 1 + (W - 4) // col_spacing
+        rows = min(rows_max, rng.choice([4, 5, 6]))
+        cols = min(cols_max, rng.choice([2, 3, 4]))
+        rows = max(rows, 4)
+        cols = max(cols, 2)
+        height = 4 + (rows - 1) * row_spacing
+        width = 4 + (cols - 1) * col_spacing
+        r_start = rng.randint(0, H - height)
+        c_start = rng.randint(0, W - width)
+        row_positions = [r_start + i * row_spacing for i in range(rows)]
+        col_positions = [c_start + i * col_spacing for i in range(cols)]
+
+        for cidx, c in enumerate(col_positions):
+            if cidx == 0:
+                base = palette
+            elif cidx == 1:
+                base = reverse_palette
+            else:
+                shift = cidx % len(palette)
+                base = palette[shift:] + palette[:shift]
+            seq = _repeat_to_length(base, rows)
+            for ridx, r in enumerate(row_positions):
+                g[r, c] = seq[ridx]
+
+    if rng.random() < 0.5:
+        _place_legend(g, used_colors, rng)
+
+    return g
+
+
+def generate_input() -> np.ndarray:
+    rng = random.Random()
+
+    for _ in range(200):
+        g = _build_marker_grid(rng)
+        out = main(g)
+        metrics = _variant_metrics(g)
+        if metrics["real_markers"] < 4:
+            continue
+        if metrics["overlap_pixels"] < 4:
+            continue
+        if metrics["order_diff_pixels"] < 2:
+            continue
+        assert out.shape == g.shape
+        return g
+
+    raise RuntimeError("failed to generate a D9-visible instance")
+
+            ```
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/3/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/3/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of dfadab01 (index 3)
+    # combo_spec: D1/4+D9/0
+    # Name: 字形叠加+按色批处理
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/3` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/271d71e2.py` — 参考任务 271d71e2 的 solver（D9/0 的灵感来源）
+codex
+我先读取原题 solver、单变体参考和目标目录状态，确认需要保留的结构，再设计融合规则和生成约束。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/dfadab01.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding fixed 4x4 glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show a sample 4x4 glyph in the output color, with a same-rule marker just below-right of the sample.
+
+    Rule:
+    - Replace each marker color by its learned 4x4 glyph: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping at the grid boundary.
+    - Remove the sample glyphs and skip their below-right label markers.
+
+    Key insight:
+    - The colored pixels are control pixels for a fixed glyph alphabet; non-control sample glyphs are only legend entries, not preserved scene objects.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            # Legend labels appear one cell below-right of the sample glyph bbox.
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+exec
+/bin/bash -lc "sed -n '1,420p' /home/lixinyu/snap/new/ceshi/code/dfadab01/D9/0/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Variant of dfadab01
+# Dimension: D9 — 字形放置的多步处理顺序 (multi_step)
+# Change: 单步处理：所有标记同时被替换为字形，无先后顺序依赖... → 按颜色分批次处理
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+PROCESS_ORDER: tuple[int, ...] = (2, 3, 5, 8)
+
+
+DESIGN_ANALYSIS = """
+variant_spec:
+  core_change:
+    original: marker spacing prevented glyph overlap, so paint order was implementation detail only.
+    variant: real markers are packed with spacing 2 on one axis, so 4x4 glyph footprints overlap and
+      the explicit batch order 2 -> 3 -> 5 -> 8 determines which color survives on shared pixels.
+  concrete_visual_form:
+    input:
+      - same single-pixel markers in colors 2/3/5/8
+      - optional legend keeps the old format: one 4x4 sample glyph plus its marker at (+4,+4)
+      - dense rows or columns of markers create intended future overlap in the output
+    output:
+      - same glyph dictionary and same clipping rule
+      - overlapping regions show only the later batch's glyph color
+  behavior_trace:
+    example:
+      markers: color-8 at (0,0), color-2 at (0,2)
+      original generator: this never happened because spacing >= 4 removed interaction
+      variant:
+        1. paint color-2 glyph at (0,2)
+        2. paint color-8 glyph at (0,0) later in the global order
+        3. cells where both masks are true now end up orange (7), not yellow (4)
+      difference: the same geometric overlap is no longer ambiguous or ignorable; order is now visible.
+  complexity_calibration:
+    - only one axis overlaps; the orthogonal axis keeps spacing >= 4
+    - this keeps the output readable while still creating multiple cross-color collisions
+    - each example uses 2-4 marker colors with repeated rows/columns so the priority is inferable
+    - first two lines are opposite marker sequences, preventing a false left-to-right interpretation
+  implicit_assumption_audit:
+    - iterating GLYPHS.items() was harmless before because outputs never overlapped; now order matters,
+      so main() must use an explicit PROCESS_ORDER constant instead of relying on dict insertion order.
+    - _paint_clipped always overwrites; before this was benign, now it is the intended last-wins rule.
+    - legend skipping via _has_source_glyph still works, but only if generator keeps each legend's 5x5
+      bbox clear of real markers and other legends; the generator enforces that.
+  placement_legality:
+    - marker top-left positions are fully inside the grid so no input object overlaps another object
+    - overlap happens only in the derived output footprints
+    - legends are placed only when a clean 5x5 area exists
+  observability_and_tidiness:
+    - cross-color overlap is mandatory
+    - order sensitivity is checked by comparing forward-order and reverse-order outputs
+    - horizontal or vertical banding keeps the scene structured instead of chaotic
+  new_solver_assumptions_and_generator_guards:
+    - solver assumes marker colors belong to PROCESS_ORDER; generator samples only from that set
+    - solver assumes at least one real marker exists; generator always places a full marker lattice
+    - solver assumes any legend label has its exact source glyph at (-4,-4); generator draws legends in that format
+"""
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def _ordered_output(g: np.ndarray, order: tuple[int, ...]) -> np.ndarray:
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color in order:
+        glyph_color, mask = GLYPHS[marker_color]
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+    assert seen_marker
+    return out
+
+
+def _repeat_to_length(seq: list[int], length: int) -> list[int]:
+    out: list[int] = []
+    while len(out) < length:
+        out.extend(seq)
+    return out[:length]
+
+
+def _real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
+    markers: list[tuple[int, int, int]] = []
+    for marker_color in PROCESS_ORDER:
+        glyph_color, mask = GLYPHS[marker_color]
+        for r, c in np.argwhere(g == marker_color):
+            rr, cc = int(r), int(c)
+            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
+                continue
+            markers.append((marker_color, rr, cc))
+    return markers
+
+
+def _variant_metrics(g: np.ndarray) -> dict[str, int]:
+    H, W = g.shape
+    coverage: dict[tuple[int, int], set[int]] = {}
+    for marker_color, r0, c0 in _real_markers(g):
+        _, mask = GLYPHS[marker_color]
+        for dr in range(4):
+            rr = r0 + dr
+            if rr < 0 or rr >= H:
+                continue
+            for dc in range(4):
+                cc = c0 + dc
+                if 0 <= cc < W and bool(mask[dr, dc]):
+                    coverage.setdefault((rr, cc), set()).add(marker_color)
+
+    overlap_pixels = sum(1 for colors in coverage.values() if len(colors) >= 2)
+    forward = _ordered_output(g, PROCESS_ORDER)
+    reverse = _ordered_output(g, tuple(reversed(PROCESS_ORDER)))
+    order_diff_pixels = int(np.count_nonzero(forward != reverse))
+    return {
+        "overlap_pixels": int(overlap_pixels),
+        "order_diff_pixels": order_diff_pixels,
+        "real_markers": len(_real_markers(g)),
+    }
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its fixed 4x4 glyph, resolving overlaps by color batches.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also include one sample 4x4 glyph in its output color, plus a matching marker at the sample's lower-right corner.
+    - Unlike the original non-overlapping layouts, marker spacing may be tight enough that expanded glyphs collide.
+
+    Rule:
+    - Use the same glyph dictionary as before: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint all color-2 markers first, then all color-3 markers, then color-5, then color-8; later batches overwrite earlier painted cells wherever glyph masks overlap.
+    - Clip each 4x4 glyph to the grid bounds, and remove the sample glyph/label pair by skipping label markers.
+
+    Key insight:
+    - The alphabet itself is unchanged; the new information is a global marker-color priority, visible only where dense marker placements make glyph footprints overlap.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+    return _ordered_output(g, PROCESS_ORDER)
+
+
+def _place_legend(g: np.ndarray, used_colors: list[int], rng: random.Random) -> bool:
+    H, W = g.shape
+    candidates = [
+        (0, 0),
+        (0, W - 5),
+        (H - 5, 0),
+        (H - 5, W - 5),
+        (0, max(0, (W - 5) // 2)),
+        (max(0, (H - 5) // 2), 0),
+    ]
+    rng.shuffle(candidates)
+
+    for r0, c0 in candidates:
+        if r0 < 0 or c0 < 0 or r0 + 4 >= H or c0 + 4 >= W:
+            continue
+        if np.any(g[r0 : r0 + 5, c0 : c0 + 5] != 0):
+            continue
+        marker_color = rng.choice(used_colors)
+        glyph_color, mask = GLYPHS[marker_color]
+        for dr in range(4):
+            for dc in range(4):
+                if bool(mask[dr, dc]):
+                    g[r0 + dr, c0 + dc] = glyph_color
+        g[r0 + 4, c0 + 4] = marker_color
+        return True
+    return False
+
+
+def _build_marker_grid(rng: random.Random) -> np.ndarray:
+    orientation = rng.choice(["horizontal", "vertical"])
+    size = rng.choice([10, 20])
+    H = W = size
+    g = np.zeros((H, W), dtype=int)
+
+    used_count = rng.choices([2, 3, 4], weights=[1, 3, 3], k=1)[0]
+    used_colors = rng.sample(list(PROCESS_ORDER), used_count)
+    palette = rng.sample(used_colors, len(used_colors))
+    reverse_palette = list(reversed(palette))
+
+    if orientation == "horizontal":
+        row_spacing = rng.choice([4, 5])
+        col_spacing = 2
+        rows_max = 1 + (H - 4) // row_spacing
+        cols_max = 1 + (W - 4) // col_spacing
+        rows = min(rows_max, rng.choice([2, 3, 4]))
+        cols = min(cols_max, rng.choice([4, 5, 6]))
+        rows = max(rows, 2)
+        cols = max(cols, 4)
+        height = 4 + (rows - 1) * row_spacing
+        width = 4 + (cols - 1) * col_spacing
+        r_start = rng.randint(0, H - height)
+        c_start = rng.randint(0, W - width)
+        row_positions = [r_start + i * row_spacing for i in range(rows)]
+        col_positions = [c_start + i * col_spacing for i in range(cols)]
+
+        for ridx, r in enumerate(row_positions):
+            if ridx == 0:
+                base = palette
+            elif ridx == 1:
+                base = reverse_palette
+            else:
+                shift = ridx % len(palette)
+                base = palette[shift:] + palette[:shift]
+            seq = _repeat_to_length(base, cols)
+            for cidx, c in enumerate(col_positions):
+                g[r, c] = seq[cidx]
+    else:
+        row_spacing = 2
+        col_spacing = rng.choice([4, 5])
+        rows_max = 1 + (H - 4) // row_spacing
+        cols_max = 1 + (W - 4) // col_spacing
+        rows = min(rows_max, rng.choice([4, 5, 6]))
+        cols = min(cols_max, rng.choice([2, 3, 4]))
+        rows = max(rows, 4)
+        cols = max(cols, 2)
+        height = 4 + (rows - 1) * row_spacing
+        width = 4 + (cols - 1) * col_spacing
+        r_start = rng.randint(0, H - height)
+        c_start = rng.randint(0, W - width)
+        row_positions = [r_start + i * row_spacing for i in range(rows)]
+        col_positions = [c_start + i * col_spacing for i in range(cols)]
+
+        for cidx, c in enumerate(col_positions):
+            if cidx == 0:
+                base = palette
+            elif cidx == 1:
+                base = reverse_palette
+            else:
+                shift = cidx % len(palette)
+                base = palette[shift:] + palette[:shift]
+            seq = _repeat_to_length(base, rows)
+            for ridx, r in enumerate(row_positions):
+                g[r, c] = seq[ridx]
+
+    if rng.random() < 0.5:
+        _place_legend(g, used_colors, rng)
+
+    return g
+
+
+def generate_input() -> np.ndarray:
+    rng = random.Random()
+
+    for _ in range(200):
+        g = _build_marker_grid(rng)
+        out = main(g)
+        metrics = _variant_metrics(g)
+        if metrics["real_markers"] < 4:
+            continue
+        if metrics["overlap_pixels"] < 4:
+            continue
+        if metrics["order_diff_pixels"] < 2:
+            continue
+        assert out.shape == g.shape
+        return g
+
+    raise RuntimeError("failed to generate a D9-visible instance")
+
+exec
+/bin/bash -lc "sed -n '1,220p' /home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+{
+    "train": [
+      {
+        "input": [
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 6, 6, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0],
+          [0, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 3, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 3, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        ],
+        "output": [
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 0, 4, 4, 4, 4, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 4, 0, 4, 0, 0, 4, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 4, 0, 4, 0, 0, 4, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 0, 4, 4, 4, 4, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 0, 4, 4, 4, 4, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 4, 0, 4, 0, 0, 4, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 4, 0, 4, 0, 0, 4, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 0, 4, 4, 4, 4, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 1, 1, 0, 0, 0, 6, 6, 0, 0, 0, 6, 6, 0, 0, 0, 0, 0],
+          [0, 0, 1, 0, 0, 1, 0, 0, 6, 6, 0, 0, 0, 6, 6, 0, 0, 0, 0, 0],
+          [0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 6, 6, 0, 0, 0, 6, 6, 0, 0, 0],
+          [0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 6, 6, 0, 0, 0, 6, 6, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0],
+          [0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0],
+          [0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0],
+          [0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0]
+        ]
+      },
+      {
+        "input": [
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 3, 0, 0, 0, 2, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 2, 0, 0, 0, 3, 1, 1, 0, 0],
+          [0, 0, 0, 0, 0, 1, 0, 0, 1, 0],
+          [0, 0, 0, 0, 0, 1, 0, 0, 1, 0],
+          [0, 0, 0, 0, 0, 0, 1, 1, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 3]
+        ],
+        "output": [
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 1, 1, 0, 4, 4, 4, 4, 0],
+          [0, 1, 0, 0, 1, 4, 0, 0, 4, 0],
+          [0, 1, 0, 0, 1, 4, 0, 0, 4, 0],
+          [0, 0, 1, 1, 0, 4, 4, 4, 4, 0],
+          [0, 4, 4, 4, 4, 0, 1, 1, 0, 0],
+          [0, 4, 0, 0, 4, 1, 0, 0, 1, 0],
+          [0, 4, 0, 0, 4, 1, 0, 0, 1, 0],
+          [0, 4, 4, 4, 4, 0, 1, 1, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        ]
+      },
+      {
+        "input": [
+          [4, 4, 4, 4, 0, 0, 2, 0, 0, 0],
+          [4, 0, 0, 4, 0, 0, 0, 0, 0, 0],
+          [4, 0, 0, 4, 0, 0, 0, 0, 0, 0],
+          [4, 4, 4, 4, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 2, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [2, 0, 0, 0, 0, 0, 2, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        ],
+        "output": [
+          [0, 0, 0, 0, 0, 0, 4, 4, 4, 4],
+          [0, 0, 0, 0, 0, 0, 4, 0, 0, 4],
+          [0, 0, 0, 0, 0, 0, 4, 0, 0, 4],
+          [0, 0, 0, 0, 0, 0, 4, 4, 4, 4],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [4, 4, 4, 4, 0, 0, 4, 4, 4, 4],
+          [4, 0, 0, 4, 0, 0, 4, 0, 0, 4],
+          [4, 0, 0, 4, 0, 0, 4, 0, 0, 4],
+          [4, 4, 4, 4, 0, 0, 4, 4, 4, 4]
+        ]
+      },
+      {
+        "input": [
+          [2, 0, 0, 0, 2, 0, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [2, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 8, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [5, 0, 0, 0, 3, 0, 0, 0, 5, 0, 0, 0, 2, 0, 0, 0, 5, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [8, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [8, 0, 0, 0, 8, 0, 0, 0, 5, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        ],
+        "output": [
+          [4, 4, 4, 4, 4, 4, 4, 4, 6, 6, 0, 0, 7, 0, 0, 7, 7, 0, 0, 7],
+          [4, 0, 0, 4, 4, 0, 0, 4, 6, 6, 0, 0, 0, 7, 7, 0, 0, 7, 7, 0],
+          [4, 0, 0, 4, 4, 0, 0, 4, 0, 0, 6, 6, 0, 7, 7, 0, 0, 7, 7, 0],
+          [4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 6, 6, 7, 0, 0, 7, 7, 0, 0, 7],
+          [4, 4, 4, 4, 0, 1, 1, 0, 4, 4, 4, 4, 0, 1, 1, 0, 7, 0, 0, 7],
+          [4, 0, 0, 4, 1, 0, 0, 1, 4, 0, 0, 4, 1, 0, 0, 1, 0, 7, 7, 0],
+          [4, 0, 0, 4, 1, 0, 0, 1, 4, 0, 0, 4, 1, 0, 0, 1, 0, 7, 7, 0],
+          [4, 4, 4, 4, 0, 1, 1, 0, 4, 4, 4, 4, 0, 1, 1, 0, 7, 0, 0, 7],
+          [6, 6, 0, 0, 0, 1, 1, 0, 6, 6, 0, 0, 4, 4, 4, 4, 6, 6, 0, 0],
+          [6, 6, 0, 0, 1, 0, 0, 1, 6, 6, 0, 0, 4, 0, 0, 4, 6, 6, 0, 0],
+          [0, 0, 6, 6, 1, 0, 0, 1, 0, 0, 6, 6, 4, 0, 0, 4, 0, 0, 6, 6],
+          [0, 0, 6, 6, 0, 1, 1, 0, 0, 0, 6, 6, 4, 4, 4, 4, 0, 0, 6, 6],
+          [7, 0, 0, 7, 0, 1, 1, 0, 4, 4, 4, 4, 0, 1, 1, 0, 4, 4, 4, 4],
+          [0, 7, 7, 0, 1, 0, 0, 1, 4, 0, 0, 4, 1, 0, 0, 1, 4, 0, 0, 4],
+          [0, 7, 7, 0, 1, 0, 0, 1, 4, 0, 0, 4, 1, 0, 0, 1, 4, 0, 0, 4],
+          [7, 0, 0, 7, 0, 1, 1, 0, 4, 4, 4, 4, 0, 1, 1, 0, 4, 4, 4, 4],
+          [7, 0, 0, 7, 7, 0, 0, 7, 6, 6, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4],
+          [0, 7, 7, 0, 0, 7, 7, 0, 6, 6, 0, 0, 4, 0, 0, 4, 4, 0, 0, 4],
+          [0, 7, 7, 0, 0, 7, 7, 0, 0, 0, 6, 6, 4, 0, 0, 4, 4, 0, 0, 4],
+          [7, 0, 0, 7, 7, 0, 0, 7, 0, 0, 6, 6, 4, 4, 4, 4, 4, 4, 4, 4]
+        ]
+      }
+    ],
+    "test": [
+      {
+        "input": [
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [8, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [8, 0, 0, 0, 7, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0],
+          [0, 0, 0, 0, 0, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 7, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [8, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [8, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        ],
+        "output": [
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          [7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7],
+          [0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0],
+          [0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0],
+          [7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7],
+          [7, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 7],
+          [0, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 0],
+          [0, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 0],
+          [7, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 7],
+          [7, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 7],
+          [0, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 0],
+          [0, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 0],
+          [7, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 7],
+          [7, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 7, 7, 0, 0, 7],
+          [0, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 0, 0, 7, 7, 0],
+          [0, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 0, 0, 7, 7, 0],
+          [7, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 7, 7, 0, 0, 7],
+          [7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7],
+          [0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0],
+          [0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0, 0, 7, 7, 0]
+        ]
+      }
+    ]
+  }
+exec
+/bin/bash -lc 'ls -la /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/3' in /home/lixinyu/snap/new
+ exited 2 in 0ms:
+ls: cannot access '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/3': No such file or directory
+
+codex
+我已经确认原题只有单步无重叠，D9 参考版通过把一个轴的间距压到 `2` 制造重叠。下一步我会把融合分析写进代码里的 `DESIGN_ANALYSIS`，并把求解规则改成“按 `2,3,5,8` 分批放置，但重叠像素用 `max(existing, glyph_color)` 合成”，再让生成器强制产生能区分该规则与原始 last-wins 规则的样本。
+Implement the combo variant by combining dense overlapping layouts with a per-pixel max merge rule, then verify both solvability and non-degeneracy with metrics.
+  ✓ Design fused rule and generator constraints from original solver/spec and D9 reference
+  → Write combo variant file with analysis, solver, generator, and visibility metrics
+  • Run the required 50-trial test and inspect behavior metrics; iterate until stable
+codex
+接下来我会创建目标文件并直接写入完整实现：包括 `DESIGN_ANALYSIS`、新的 `main()` 文档字符串、融合求解逻辑，以及带可观测性约束的生成器和度量函数。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/3' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/3/code.py
+diff --git a/ceshi/code_combo/dfadab01/3/code.py b/ceshi/code_combo/dfadab01/3/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a742457fc48ef8544181de958bad4a49f8798f8
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/3/code.py
+@@ -0,0 +1,388 @@
++# Combo variant of dfadab01 (index 3)
++# combo_spec: D1/4+D9/0
++# Name: 字形叠加+按色批处理
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++GLYPHS: dict[int, tuple[int, np.ndarray]] = {
++    2: (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    3: (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    5: (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    8: (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++PROCESS_ORDER: tuple[int, ...] = (2, 3, 5, 8)
++
++
++DESIGN_ANALYSIS = """
++variant_spec:
++  combo: D1/4 + D9/0
++  concrete_visual_form:
++    input:
++      - still uses single-cell markers in {2,3,5,8}
++      - still may contain one legend glyph drawn in output color, with its label marker at (+4,+4)
++      - real markers are arranged on a tidy lattice, but one axis now uses spacing 2 so the derived 4x4 glyphs overlap
++    output:
++      - glyph dictionary and clipping behavior are unchanged
++      - markers are processed in global batches 2 -> 3 -> 5 -> 8
++      - when a later glyph lands on an already painted cell, the cell stores max(existing_color, glyph_color) instead of blind overwrite
++  behavior_trace:
++    example:
++      markers:
++        - color 2 at (0,0) -> yellow frame (color 4)
++        - color 3 at (0,2) -> blue ring (color 1)
++      original task:
++        - such dense placement was absent, so both glyphs never interacted
++      D9-only last-wins:
++        - batch 2 paints first
++        - batch 3 paints later and would replace shared cells by color 1
++      fused combo:
++        - batch 2 still paints first and batch 3 still arrives later
++        - on shared mask cells the merge rule is max(4,1)=4, so part of the earlier yellow frame remains visible
++      difference:
++        - the same overlap now exposes both the batch schedule and the compositing rule; later arrival does not guarantee visual dominance
++  complexity_calibration:
++    - only one axis is compressed to spacing 2; the orthogonal axis stays at 4 or 5 so rows/columns remain readable
++    - generator always includes marker colors 2 and 3, because their mapped glyph colors 4 and 1 create visible max-vs-overwrite disagreements
++    - optional extra colors 5 and/or 8 add additional collisions where the later batch does dominate, preventing the puzzle from collapsing into a pure 2/3 special case
++    - repeated band motifs and reversed second row/column give multiple corroborating overlaps instead of a single accident
++  implicit_assumption_audit:
++    - original main() could iterate GLYPHS.items() because overlap never mattered; combo main() must use explicit PROCESS_ORDER
++    - original _paint_clipped overwrote cells; combo logic must merge with max() on occupied cells
++    - legend detection via _has_source_glyph still assumes each label marker has an exact 4x4 sample glyph at (-4,-4); generator preserves a clean 5x5 legend area
++    - solver still assumes inputs only use marker colors plus legend output colors; generator samples only from that palette
++  placement_legality:
++    - input objects never overlap: only single-pixel markers are placed on the lattice, and legends are inserted only in empty 5x5 windows
++    - overlap occurs only after expansion in the output space
++    - all marker coordinates stay inside the board; clipping is allowed only for derived glyph footprints near edges
++  observability_and_tidy_layout:
++    - every accepted sample has real overlap, at least one 2-vs-3 overlap, and a nonzero pixel difference from the D9-only overwrite output
++    - the lattice stays striped rather than chaotic, so humans can compare repeated collisions across rows/columns
++    - overlap depth is limited by using a single dense axis; this keeps the output decipherable
++  generator_metrics:
++    - overlap_pixels: cells influenced by at least two real markers
++    - pair23_overlap_pixels: cells touched by both marker colors 2 and 3
++    - overwrite_diff_pixels: cells where combo output differs from the D9-only last-wins output
++    - pair_count: number of distinct cross-color overlap pairs present in one instance
++  new_solver_assumptions_and_generator_guards:
++    - solver assumes at least one non-legend marker exists; generator always places a populated lattice
++    - solver assumes sample legends never intersect real markers; _place_legend enforces that
++    - solver assumes the only meaningful merge is max(existing_color, glyph_color); generator guarantees overlaps are frequent enough for that rule to be observable
++"""
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
++        return False
++    patch = g[r0 : r0 + 4, c0 : c0 + 4]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped_overwrite(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _paint_clipped_max_merge(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = max(int(out[rr, cc]), color)
++
++
++def _ordered_output(g: np.ndarray, use_max_merge: bool) -> np.ndarray:
++    out = np.zeros_like(g)
++    seen_marker = False
++    for marker_color in PROCESS_ORDER:
++        glyph_color, mask = GLYPHS[marker_color]
++        coords = np.argwhere(g == marker_color)
++        if coords.size:
++            seen_marker = True
++        for r, c in coords:
++            rr, cc = int(r), int(c)
++            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
++                continue
++            if use_max_merge:
++                _paint_clipped_max_merge(out, rr, cc, glyph_color, mask)
++            else:
++                _paint_clipped_overwrite(out, rr, cc, glyph_color, mask)
++    assert seen_marker
++    return out
++
++
++def _repeat_to_length(seq: list[int], length: int) -> list[int]:
++    out: list[int] = []
++    while len(out) < length:
++        out.extend(seq)
++    return out[:length]
++
++
++def _real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
++    markers: list[tuple[int, int, int]] = []
++    for marker_color in PROCESS_ORDER:
++        glyph_color, mask = GLYPHS[marker_color]
++        for r, c in np.argwhere(g == marker_color):
++            rr, cc = int(r), int(c)
++            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
++                continue
++            markers.append((marker_color, rr, cc))
++    return markers
++
++
++def _coverage_sets(g: np.ndarray) -> dict[tuple[int, int], set[int]]:
++    h, w = g.shape
++    coverage: dict[tuple[int, int], set[int]] = {}
++    for marker_color, r0, c0 in _real_markers(g):
++        _, mask = GLYPHS[marker_color]
++        for dr in range(4):
++            rr = r0 + dr
++            if rr < 0 or rr >= h:
++                continue
++            for dc in range(4):
++                cc = c0 + dc
++                if 0 <= cc < w and bool(mask[dr, dc]):
++                    coverage.setdefault((rr, cc), set()).add(marker_color)
++    return coverage
++
++
++def _variant_metrics(g: np.ndarray) -> dict[str, int]:
++    coverage = _coverage_sets(g)
++    overlap_pixels = 0
++    pair23_overlap_pixels = 0
++    pair_set: set[tuple[int, int]] = set()
++    for colors in coverage.values():
++        if len(colors) >= 2:
++            overlap_pixels += 1
++            ordered = sorted(colors)
++            for idx, a in enumerate(ordered):
++                for b in ordered[idx + 1 :]:
++                    pair_set.add((a, b))
++            if 2 in colors and 3 in colors:
++                pair23_overlap_pixels += 1
++
++    combo = _ordered_output(g, use_max_merge=True)
++    overwrite = _ordered_output(g, use_max_merge=False)
++    overwrite_diff_pixels = int(np.count_nonzero(combo != overwrite))
++    early_survivor_pixels = int(np.count_nonzero((combo == 4) & (overwrite == 1)))
++    return {
++        "real_markers": len(_real_markers(g)),
++        "overlap_pixels": overlap_pixels,
++        "pair23_overlap_pixels": pair23_overlap_pixels,
++        "pair_count": len(pair_set),
++        "overwrite_diff_pixels": overwrite_diff_pixels,
++        "early_survivor_pixels": early_survivor_pixels,
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each marker into its fixed 4x4 glyph, but resolve dense overlaps by batched max-compositing.
++
++    Input structure:
++    - The board is still mostly black, with single-cell markers in colors 2, 3, 5, and/or 8.
++    - Some inputs also contain one legend entry: a 4x4 sample glyph already drawn in its output color, plus a matching marker at the sample's lower-right corner.
++    - Real markers may now be packed closely enough that their 4x4 output footprints overlap after expansion.
++
++    Rule:
++    - Use the same glyph dictionary as the base task: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
++    - Process marker colors in the fixed batch order 2, then 3, then 5, then 8; for each real marker, place its glyph with the marker as the glyph's top-left corner and clip at the grid edge.
++    - If a glyph paints onto an already nonzero output cell, keep the larger of the existing output color and the incoming glyph color instead of blindly overwriting; skip legend labels and erase the legend sample itself as before.
++
++    Key insight:
++    - The alphabet and legend format are unchanged, but dense placement turns the task into layered compositing: you must infer both the global color-batch schedule and that overlap pixels follow a max-color merge rather than simple last-wins painting.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++    return _ordered_output(g, use_max_merge=True)
++
++
++def _place_legend(g: np.ndarray, used_colors: list[int], rng: random.Random) -> bool:
++    h, w = g.shape
++    candidates = [
++        (0, 0),
++        (0, w - 5),
++        (h - 5, 0),
++        (h - 5, w - 5),
++        (0, max(0, (w - 5) // 2)),
++        (max(0, (h - 5) // 2), 0),
++    ]
++    rng.shuffle(candidates)
++
++    for r0, c0 in candidates:
++        if r0 < 0 or c0 < 0 or r0 + 4 >= h or c0 + 4 >= w:
++            continue
++        if np.any(g[r0 : r0 + 5, c0 : c0 + 5] != 0):
++            continue
++        marker_color = rng.choice(used_colors)
++        glyph_color, mask = GLYPHS[marker_color]
++        for dr in range(4):
++            for dc in range(4):
++                if bool(mask[dr, dc]):
++                    g[r0 + dr, c0 + dc] = glyph_color
++        g[r0 + 4, c0 + 4] = marker_color
++        return True
++    return False
++
++
++def _build_palette(rng: random.Random) -> list[int]:
++    extra_count = rng.choice([0, 1, 2])
++    extras = rng.sample([5, 8], k=extra_count)
++    return [2, 3, *extras]
++
++
++def _build_marker_grid(rng: random.Random) -> np.ndarray:
++    orientation = rng.choice(["horizontal", "vertical"])
++    size = rng.choices([10, 20], weights=[1, 4], k=1)[0]
++    h = w = size
++    g = np.zeros((h, w), dtype=int)
++
++    palette = _build_palette(rng)
++    reverse_palette = list(reversed(palette))
++
++    if orientation == "horizontal":
++        row_spacing = rng.choice([4, 5])
++        col_spacing = 2
++        rows_max = 1 + (h - 4) // row_spacing
++        cols_max = 1 + (w - 4) // col_spacing
++        rows = min(rows_max, rng.choice([2, 3, 4]))
++        cols = min(cols_max, rng.choice([5, 6, 7]))
++        rows = max(rows, 2)
++        cols = max(cols, 5 if size == 20 else 4)
++        height = 4 + (rows - 1) * row_spacing
++        width = 4 + (cols - 1) * col_spacing
++        r_start = rng.randint(0, h - height)
++        c_start = rng.randint(0, w - width)
++        row_positions = [r_start + i * row_spacing for i in range(rows)]
++        col_positions = [c_start + i * col_spacing for i in range(cols)]
++
++        for ridx, r in enumerate(row_positions):
++            if ridx == 0:
++                base = palette
++            elif ridx == 1:
++                base = reverse_palette
++            else:
++                shift = ridx % len(palette)
++                base = palette[shift:] + palette[:shift]
++            seq = _repeat_to_length(base, cols)
++            for cidx, c in enumerate(col_positions):
++                g[r, c] = seq[cidx]
++    else:
++        row_spacing = 2
++        col_spacing = rng.choice([4, 5])
++        rows_max = 1 + (h - 4) // row_spacing
++        cols_max = 1 + (w - 4) // col_spacing
++        rows = min(rows_max, rng.choice([5, 6, 7]))
++        cols = min(cols_max, rng.choice([2, 3, 4]))
++        rows = max(rows, 5 if size == 20 else 4)
++        cols = max(cols, 2)
++        height = 4 + (rows - 1) * row_spacing
++        width = 4 + (cols - 1) * col_spacing
++        r_start = rng.randint(0, h - height)
++        c_start = rng.randint(0, w - width)
++        row_positions = [r_start + i * row_spacing for i in range(rows)]
++        col_positions = [c_start + i * col_spacing for i in range(cols)]
++
++        for cidx, c in enumerate(col_positions):
++            if cidx == 0:
++                base = palette
++            elif cidx == 1:
++                base = reverse_palette
++            else:
++                shift = cidx % len(palette)
++                base = palette[shift:] + palette[:shift]
++            seq = _repeat_to_length(base, rows)
++            for ridx, r in enumerate(row_positions):
++                g[r, c] = seq[ridx]
++
++    if rng.random() < 0.4:
++        _place_legend(g, palette, rng)
++
++    return g
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++
++    for _ in range(400):
++        g = _build_marker_grid(rng)
++        out = main(g)
++        metrics = _variant_metrics(g)
++        if metrics["real_markers"] < 6:
++            continue
++        if metrics["overlap_pixels"] < 8:
++            continue
++        if metrics["pair23_overlap_pixels"] < 4:
++            continue
++        if metrics["overwrite_diff_pixels"] < 2:
++            continue
++        if metrics["early_survivor_pixels"] < 2:
++            continue
++        if metrics["pair_count"] < 1:
++            continue
++        assert out.shape == g.shape
++        return g
++
++    raise RuntimeError("failed to generate a visible D1/4+D9/0 instance")
+
+diff --git a/ceshi/code_combo/dfadab01/3/code.py b/ceshi/code_combo/dfadab01/3/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a742457fc48ef8544181de958bad4a49f8798f8
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/3/code.py
+@@ -0,0 +1,388 @@
++# Combo variant of dfadab01 (index 3)
++# combo_spec: D1/4+D9/0
++# Name: 字形叠加+按色批处理
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++GLYPHS: dict[int, tuple[int, np.ndarray]] = {
++    2: (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    3: (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    5: (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    8: (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++PROCESS_ORDER: tuple[int, ...] = (2, 3, 5, 8)
++
++
++DESIGN_ANALYSIS = """
++variant_spec:
++  combo: D1/4 + D9/0
++  concrete_visual_form:
++    input:
++      - still uses single-cell markers in {2,3,5,8}
++      - still may contain one legend glyph drawn in output color, with its label marker at (+4,+4)
++      - real markers are arranged on a tidy lattice, but one axis now uses spacing 2 so the derived 4x4 glyphs overlap
++    output:
++      - glyph dictionary and clipping behavior are unchanged
++      - markers are processed in global batches 2 -> 3 -> 5 -> 8
++      - when a later glyph lands on an already painted cell, the cell stores max(existing_color, glyph_color) instead of blind overwrite
++  behavior_trace:
++    example:
++      markers:
++        - color 2 at (0,0) -> yellow frame (color 4)
++        - color 3 at (0,2) -> blue ring (color 1)
++      original task:
++        - such dense placement was absent, so both glyphs never interacted
++      D9-only last-wins:
++        - batch 2 paints first
++        - batch 3 paints later and would replace shared cells by color 1
++      fused combo:
++        - batch 2 still paints first and batch 3 still arrives later
++        - on shared mask cells the merge rule is max(4,1)=4, so part of the earlier yellow frame remains visible
++      difference:
++        - the same overlap now exposes both the batch schedule and the compositing rule; later arrival does not guarantee visual dominance
++  complexity_calibration:
++    - only one axis is compressed to spacing 2; the orthogonal axis stays at 4 or 5 so rows/columns remain readable
++    - generator always includes marker colors 2 and 3, because their mapped glyph colors 4 and 1 create visible max-vs-overwrite disagreements
++    - optional extra colors 5 and/or 8 add additional collisions where the later batch does dominate, preventing the puzzle from collapsing into a pure 2/3 special case
++    - repeated band motifs and reversed second row/column give multiple corroborating overlaps instead of a single accident
++  implicit_assumption_audit:
++    - original main() could iterate GLYPHS.items() because overlap never mattered; combo main() must use explicit PROCESS_ORDER
++    - original _paint_clipped overwrote cells; combo logic must merge with max() on occupied cells
++    - legend detection via _has_source_glyph still assumes each label marker has an exact 4x4 sample glyph at (-4,-4); generator preserves a clean 5x5 legend area
++    - solver still assumes inputs only use marker colors plus legend output colors; generator samples only from that palette
++  placement_legality:
++    - input objects never overlap: only single-pixel markers are placed on the lattice, and legends are inserted only in empty 5x5 windows
++    - overlap occurs only after expansion in the output space
++    - all marker coordinates stay inside the board; clipping is allowed only for derived glyph footprints near edges
++  observability_and_tidy_layout:
++    - every accepted sample has real overlap, at least one 2-vs-3 overlap, and a nonzero pixel difference from the D9-only overwrite output
++    - the lattice stays striped rather than chaotic, so humans can compare repeated collisions across rows/columns
++    - overlap depth is limited by using a single dense axis; this keeps the output decipherable
++  generator_metrics:
++    - overlap_pixels: cells influenced by at least two real markers
++    - pair23_overlap_pixels: cells touched by both marker colors 2 and 3
++    - overwrite_diff_pixels: cells where combo output differs from the D9-only last-wins output
++    - pair_count: number of distinct cross-color overlap pairs present in one instance
++  new_solver_assumptions_and_generator_guards:
++    - solver assumes at least one non-legend marker exists; generator always places a populated lattice
++    - solver assumes sample legends never intersect real markers; _place_legend enforces that
++    - solver assumes the only meaningful merge is max(existing_color, glyph_color); generator guarantees overlaps are frequent enough for that rule to be observable
++"""
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
++        return False
++    patch = g[r0 : r0 + 4, c0 : c0 + 4]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped_overwrite(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _paint_clipped_max_merge(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = max(int(out[rr, cc]), color)
++
++
++def _ordered_output(g: np.ndarray, use_max_merge: bool) -> np.ndarray:
++    out = np.zeros_like(g)
++    seen_marker = False
++    for marker_color in PROCESS_ORDER:
++        glyph_color, mask = GLYPHS[marker_color]
++        coords = np.argwhere(g == marker_color)
++        if coords.size:
++            seen_marker = True
++        for r, c in coords:
++            rr, cc = int(r), int(c)
++            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
++                continue
++            if use_max_merge:
++                _paint_clipped_max_merge(out, rr, cc, glyph_color, mask)
++            else:
++                _paint_clipped_overwrite(out, rr, cc, glyph_color, mask)
++    assert seen_marker
++    return out
++
++
++def _repeat_to_length(seq: list[int], length: int) -> list[int]:
++    out: list[int] = []
++    while len(out) < length:
++        out.extend(seq)
++    return out[:length]
++
++
++def _real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
++    markers: list[tuple[int, int, int]] = []
++    for marker_color in PROCESS_ORDER:
++        glyph_color, mask = GLYPHS[marker_color]
++        for r, c in np.argwhere(g == marker_color):
++            rr, cc = int(r), int(c)
++            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
++                continue
++            markers.append((marker_color, rr, cc))
++    return markers
++
++
++def _coverage_sets(g: np.ndarray) -> dict[tuple[int, int], set[int]]:
++    h, w = g.shape
++    coverage: dict[tuple[int, int], set[int]] = {}
++    for marker_color, r0, c0 in _real_markers(g):
++        _, mask = GLYPHS[marker_color]
++        for dr in range(4):
++            rr = r0 + dr
++            if rr < 0 or rr >= h:
++                continue
++            for dc in range(4):
++                cc = c0 + dc
++                if 0 <= cc < w and bool(mask[dr, dc]):
++                    coverage.setdefault((rr, cc), set()).add(marker_color)
++    return coverage
++
++
++def _variant_metrics(g: np.ndarray) -> dict[str, int]:
++    coverage = _coverage_sets(g)
++    overlap_pixels = 0
++    pair23_overlap_pixels = 0
++    pair_set: set[tuple[int, int]] = set()
++    for colors in coverage.values():
++        if len(colors) >= 2:
++            overlap_pixels += 1
++            ordered = sorted(colors)
++            for idx, a in enumerate(ordered):
++                for b in ordered[idx + 1 :]:
++                    pair_set.add((a, b))
++            if 2 in colors and 3 in colors:
++                pair23_overlap_pixels += 1
++
++    combo = _ordered_output(g, use_max_merge=True)
++    overwrite = _ordered_output(g, use_max_merge=False)
++    overwrite_diff_pixels = int(np.count_nonzero(combo != overwrite))
++    early_survivor_pixels = int(np.count_nonzero((combo == 4) & (overwrite == 1)))
++    return {
++        "real_markers": len(_real_markers(g)),
++        "overlap_pixels": overlap_pixels,
++        "pair23_overlap_pixels": pair23_overlap_pixels,
++        "pair_count": len(pair_set),
++        "overwrite_diff_pixels": overwrite_diff_pixels,
++        "early_survivor_pixels": early_survivor_pixels,
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each marker into its fixed 4x4 glyph, but resolve dense overlaps by batched max-compositing.
++
++    Input structure:
++    - The board is still mostly black, with single-cell markers in colors 2, 3, 5, and/or 8.
++    - Some inputs also contain one legend entry: a 4x4 sample glyph already drawn in its output color, plus a matching marker at the sample's lower-right corner.
++    - Real markers may now be packed closely enough that their 4x4 output footprints overlap after expansion.
++
++    Rule:
++    - Use the same glyph dictionary as the base task: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
++    - Process marker colors in the fixed batch order 2, then 3, then 5, then 8; for each real marker, place its glyph with the marker as the glyph's top-left corner and clip at the grid edge.
++    - If a glyph paints onto an already nonzero output cell, keep the larger of the existing output color and the incoming glyph color instead of blindly overwriting; skip legend labels and erase the legend sample itself as before.
++
++    Key insight:
++    - The alphabet and legend format are unchanged, but dense placement turns the task into layered compositing: you must infer both the global color-batch schedule and that overlap pixels follow a max-color merge rather than simple last-wins painting.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++    return _ordered_output(g, use_max_merge=True)
++
++
++def _place_legend(g: np.ndarray, used_colors: list[int], rng: random.Random) -> bool:
++    h, w = g.shape
++    candidates = [
++        (0, 0),
++        (0, w - 5),
++        (h - 5, 0),
++        (h - 5, w - 5),
++        (0, max(0, (w - 5) // 2)),
++        (max(0, (h - 5) // 2), 0),
++    ]
++    rng.shuffle(candidates)
++
++    for r0, c0 in candidates:
++        if r0 < 0 or c0 < 0 or r0 + 4 >= h or c0 + 4 >= w:
++            continue
++        if np.any(g[r0 : r0 + 5, c0 : c0 + 5] != 0):
++            continue
++        marker_color = rng.choice(used_colors)
++        glyph_color, mask = GLYPHS[marker_color]
++        for dr in range(4):
++            for dc in range(4):
++                if bool(mask[dr, dc]):
++                    g[r0 + dr, c0 + dc] = glyph_color
++        g[r0 + 4, c0 + 4] = marker_color
++        return True
++    return False
++
++
++def _build_palette(rng: random.Random) -> list[int]:
++    extra_count = rng.choice([0, 1, 2])
++    extras = rng.sample([5, 8], k=extra_count)
++    return [2, 3, *extras]
++
++
++def _build_marker_grid(rng: random.Random) -> np.ndarray:
++    orientation = rng.choice(["horizontal", "vertical"])
++    size = rng.choices([10, 20], weights=[1, 4], k=1)[0]
++    h = w = size
++    g = np.zeros((h, w), dtype=int)
++
++    palette = _build_palette(rng)
++    reverse_palette = list(reversed(palette))
++
++    if orientation == "horizontal":
++        row_spacing = rng.choice([4, 5])
++        col_spacing = 2
++        rows_max = 1 + (h - 4) // row_spacing
++        cols_max = 1 + (w - 4) // col_spacing
++        rows = min(rows_max, rng.choice([2, 3, 4]))
++        cols = min(cols_max, rng.choice([5, 6, 7]))
++        rows = max(rows, 2)
++        cols = max(cols, 5 if size == 20 else 4)
++        height = 4 + (rows - 1) * row_spacing
++        width = 4 + (cols - 1) * col_spacing
++        r_start = rng.randint(0, h - height)
++        c_start = rng.randint(0, w - width)
++        row_positions = [r_start + i * row_spacing for i in range(rows)]
++        col_positions = [c_start + i * col_spacing for i in range(cols)]
++
++        for ridx, r in enumerate(row_positions):
++            if ridx == 0:
++                base = palette
++            elif ridx == 1:
++                base = reverse_palette
++            else:
++                shift = ridx % len(palette)
++                base = palette[shift:] + palette[:shift]
++            seq = _repeat_to_length(base, cols)
++            for cidx, c in enumerate(col_positions):
++                g[r, c] = seq[cidx]
++    else:
++        row_spacing = 2
++        col_spacing = rng.choice([4, 5])
++        rows_max = 1 + (h - 4) // row_spacing
++        cols_max = 1 + (w - 4) // col_spacing
++        rows = min(rows_max, rng.choice([5, 6, 7]))
++        cols = min(cols_max, rng.choice([2, 3, 4]))
++        rows = max(rows, 5 if size == 20 else 4)
++        cols = max(cols, 2)
++        height = 4 + (rows - 1) * row_spacing
++        width = 4 + (cols - 1) * col_spacing
++        r_start = rng.randint(0, h - height)
++        c_start = rng.randint(0, w - width)
++        row_positions = [r_start + i * row_spacing for i in range(rows)]
++        col_positions = [c_start + i * col_spacing for i in range(cols)]
++
++        for cidx, c in enumerate(col_positions):
++            if cidx == 0:
++                base = palette
++            elif cidx == 1:
++                base = reverse_palette
++            else:
++                shift = cidx % len(palette)
++                base = palette[shift:] + palette[:shift]
++            seq = _repeat_to_length(base, rows)
++            for ridx, r in enumerate(row_positions):
++                g[r, c] = seq[ridx]
++
++    if rng.random() < 0.4:
++        _place_legend(g, palette, rng)
++
++    return g
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++
++    for _ in range(400):
++        g = _build_marker_grid(rng)
++        out = main(g)
++        metrics = _variant_metrics(g)
++        if metrics["real_markers"] < 6:
++            continue
++        if metrics["overlap_pixels"] < 8:
++            continue
++        if metrics["pair23_overlap_pixels"] < 4:
++            continue
++        if metrics["overwrite_diff_pixels"] < 2:
++            continue
++        if metrics["early_survivor_pixels"] < 2:
++            continue
++        if metrics["pair_count"] < 1:
++            continue
++        assert out.shape == g.shape
++        return g
++
++    raise RuntimeError("failed to generate a visible D1/4+D9/0 instance")
+
+codex
+代码已写入。我先跑语法检查和题目要求的 50 次压力测试，如果失败就回到生成约束或融合逻辑上修。
+exec
+/bin/bash -lc 'python -m py_compile /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/3/code.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/3/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/3/code.py b/ceshi/code_combo/dfadab01/3/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a742457fc48ef8544181de958bad4a49f8798f8
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/3/code.py
+@@ -0,0 +1,388 @@
++# Combo variant of dfadab01 (index 3)
++# combo_spec: D1/4+D9/0
++# Name: 字形叠加+按色批处理
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++GLYPHS: dict[int, tuple[int, np.ndarray]] = {
++    2: (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    3: (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    5: (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    8: (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++PROCESS_ORDER: tuple[int, ...] = (2, 3, 5, 8)
++
++
++DESIGN_ANALYSIS = """
++variant_spec:
++  combo: D1/4 + D9/0
++  concrete_visual_form:
++    input:
++      - still uses single-cell markers in {2,3,5,8}
++      - still may contain one legend glyph drawn in output color, with its label marker at (+4,+4)
++      - real markers are arranged on a tidy lattice, but one axis now uses spacing 2 so the derived 4x4 glyphs overlap
++    output:
++      - glyph dictionary and clipping behavior are unchanged
++      - markers are processed in global batches 2 -> 3 -> 5 -> 8
++      - when a later glyph lands on an already painted cell, the cell stores max(existing_color, glyph_color) instead of blind overwrite
++  behavior_trace:
++    example:
++      markers:
++        - color 2 at (0,0) -> yellow frame (color 4)
++        - color 3 at (0,2) -> blue ring (color 1)
++      original task:
++        - such dense placement was absent, so both glyphs never interacted
++      D9-only last-wins:
++        - batch 2 paints first
++        - batch 3 paints later and would replace shared cells by color 1
++      fused combo:
++        - batch 2 still paints first and batch 3 still arrives later
++        - on shared mask cells the merge rule is max(4,1)=4, so part of the earlier yellow frame remains visible
++      difference:
++        - the same overlap now exposes both the batch schedule and the compositing rule; later arrival does not guarantee visual dominance
++  complexity_calibration:
++    - only one axis is compressed to spacing 2; the orthogonal axis stays at 4 or 5 so rows/columns remain readable
++    - generator always includes marker colors 2 and 3, because their mapped glyph colors 4 and 1 create visible max-vs-overwrite disagreements
++    - optional extra colors 5 and/or 8 add additional collisions where the later batch does dominate, preventing the puzzle from collapsing into a pure 2/3 special case
++    - repeated band motifs and reversed second row/column give multiple corroborating overlaps instead of a single accident
++  implicit_assumption_audit:
++    - original main() could iterate GLYPHS.items() because overlap never mattered; combo main() must use explicit PROCESS_ORDER
++    - original _paint_clipped overwrote cells; combo logic must merge with max() on occupied cells
++    - legend detection via _has_source_glyph still assumes each label marker has an exact 4x4 sample glyph at (-4,-4); generator preserves a clean 5x5 legend area
++    - solver still assumes inputs only use marker colors plus legend output colors; generator samples only from that palette
++  placement_legality:
++    - input objects never overlap: only single-pixel markers are placed on the lattice, and legends are inserted only in empty 5x5 windows
++    - overlap occurs only after expansion in the output space
++    - all marker coordinates stay inside the board; clipping is allowed only for derived glyph footprints near edges
++  observability_and_tidy_layout:
++    - every accepted sample has real overlap, at least one 2-vs-3 overlap, and a nonzero pixel difference from the D9-only overwrite output
++    - the lattice stays striped rather than chaotic, so humans can compare repeated collisions across rows/columns
++    - overlap depth is limited by using a single dense axis; this keeps the output decipherable
++  generator_metrics:
++    - overlap_pixels: cells influenced by at least two real markers
++    - pair23_overlap_pixels: cells touched by both marker colors 2 and 3
++    - overwrite_diff_pixels: cells where combo output differs from the D9-only last-wins output
++    - pair_count: number of distinct cross-color overlap pairs present in one instance
++  new_solver_assumptions_and_generator_guards:
++    - solver assumes at least one non-legend marker exists; generator always places a populated lattice
++    - solver assumes sample legends never intersect real markers; _place_legend enforces that
++    - solver assumes the only meaningful merge is max(existing_color, glyph_color); generator guarantees overlaps are frequent enough for that rule to be observable
++"""
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
++        return False
++    patch = g[r0 : r0 + 4, c0 : c0 + 4]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped_overwrite(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _paint_clipped_max_merge(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = max(int(out[rr, cc]), color)
++
++
++def _ordered_output(g: np.ndarray, use_max_merge: bool) -> np.ndarray:
++    out = np.zeros_like(g)
++    seen_marker = False
++    for marker_color in PROCESS_ORDER:
++        glyph_color, mask = GLYPHS[marker_color]
++        coords = np.argwhere(g == marker_color)
++        if coords.size:
++            seen_marker = True
++        for r, c in coords:
++            rr, cc = int(r), int(c)
++            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
++                continue
++            if use_max_merge:
++                _paint_clipped_max_merge(out, rr, cc, glyph_color, mask)
++            else:
++                _paint_clipped_overwrite(out, rr, cc, glyph_color, mask)
++    assert seen_marker
++    return out
++
++
++def _repeat_to_length(seq: list[int], length: int) -> list[int]:
++    out: list[int] = []
++    while len(out) < length:
++        out.extend(seq)
++    return out[:length]
++
++
++def _real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
++    markers: list[tuple[int, int, int]] = []
++    for marker_color in PROCESS_ORDER:
++        glyph_color, mask = GLYPHS[marker_color]
++        for r, c in np.argwhere(g == marker_color):
++            rr, cc = int(r), int(c)
++            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
++                continue
++            markers.append((marker_color, rr, cc))
++    return markers
++
++
++def _coverage_sets(g: np.ndarray) -> dict[tuple[int, int], set[int]]:
++    h, w = g.shape
++    coverage: dict[tuple[int, int], set[int]] = {}
++    for marker_color, r0, c0 in _real_markers(g):
++        _, mask = GLYPHS[marker_color]
++        for dr in range(4):
++            rr = r0 + dr
++            if rr < 0 or rr >= h:
++                continue
++            for dc in range(4):
++                cc = c0 + dc
++                if 0 <= cc < w and bool(mask[dr, dc]):
++                    coverage.setdefault((rr, cc), set()).add(marker_color)
++    return coverage
++
++
++def _variant_metrics(g: np.ndarray) -> dict[str, int]:
++    coverage = _coverage_sets(g)
++    overlap_pixels = 0
++    pair23_overlap_pixels = 0
++    pair_set: set[tuple[int, int]] = set()
++    for colors in coverage.values():
++        if len(colors) >= 2:
++            overlap_pixels += 1
++            ordered = sorted(colors)
++            for idx, a in enumerate(ordered):
++                for b in ordered[idx + 1 :]:
++                    pair_set.add((a, b))
++            if 2 in colors and 3 in colors:
++                pair23_overlap_pixels += 1
++
++    combo = _ordered_output(g, use_max_merge=True)
++    overwrite = _ordered_output(g, use_max_merge=False)
++    overwrite_diff_pixels = int(np.count_nonzero(combo != overwrite))
++    early_survivor_pixels = int(np.count_nonzero((combo == 4) & (overwrite == 1)))
++    return {
++        "real_markers": len(_real_markers(g)),
++        "overlap_pixels": overlap_pixels,
++        "pair23_overlap_pixels": pair23_overlap_pixels,
++        "pair_count": len(pair_set),
++        "overwrite_diff_pixels": overwrite_diff_pixels,
++        "early_survivor_pixels": early_survivor_pixels,
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each marker into its fixed 4x4 glyph, but resolve dense overlaps by batched max-compositing.
++
++    Input structure:
++    - The board is still mostly black, with single-cell markers in colors 2, 3, 5, and/or 8.
++    - Some inputs also contain one legend entry: a 4x4 sample glyph already drawn in its output color, plus a matching marker at the sample's lower-right corner.
++    - Real markers may now be packed closely enough that their 4x4 output footprints overlap after expansion.
++
++    Rule:
++    - Use the same glyph dictionary as the base task: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
++    - Process marker colors in the fixed batch order 2, then 3, then 5, then 8; for each real marker, place its glyph with the marker as the glyph's top-left corner and clip at the grid edge.
++    - If a glyph paints onto an already nonzero output cell, keep the larger of the existing output color and the incoming glyph color instead of blindly overwriting; skip legend labels and erase the legend sample itself as before.
++
++    Key insight:
++    - The alphabet and legend format are unchanged, but dense placement turns the task into layered compositing: you must infer both the global color-batch schedule and that overlap pixels follow a max-color merge rather than simple last-wins painting.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++    return _ordered_output(g, use_max_merge=True)
++
++
++def _place_legend(g: np.ndarray, used_colors: list[int], rng: random.Random) -> bool:
++    h, w = g.shape
++    candidates = [
++        (0, 0),
++        (0, w - 5),
++        (h - 5, 0),
++        (h - 5, w - 5),
++        (0, max(0, (w - 5) // 2)),
++        (max(0, (h - 5) // 2), 0),
++    ]
++    rng.shuffle(candidates)
++
++    for r0, c0 in candidates:
++        if r0 < 0 or c0 < 0 or r0 + 4 >= h or c0 + 4 >= w:
++            continue
++        if np.any(g[r0 : r0 + 5, c0 : c0 + 5] != 0):
++            continue
++        marker_color = rng.choice(used_colors)
++        glyph_color, mask = GLYPHS[marker_color]
++        for dr in range(4):
++            for dc in range(4):
++                if bool(mask[dr, dc]):
++                    g[r0 + dr, c0 + dc] = glyph_color
++        g[r0 + 4, c0 + 4] = marker_color
++        return True
++    return False
++
++
++def _build_palette(rng: random.Random) -> list[int]:
++    extra_count = rng.choice([0, 1, 2])
++    extras = rng.sample([5, 8], k=extra_count)
++    return [2, 3, *extras]
++
++
++def _build_marker_grid(rng: random.Random) -> np.ndarray:
++    orientation = rng.choice(["horizontal", "vertical"])
++    size = rng.choices([10, 20], weights=[1, 4], k=1)[0]
++    h = w = size
++    g = np.zeros((h, w), dtype=int)
++
++    palette = _build_palette(rng)
++    reverse_palette = list(reversed(palette))
++
++    if orientation == "horizontal":
++        row_spacing = rng.choice([4, 5])
++        col_spacing = 2
++        rows_max = 1 + (h - 4) // row_spacing
++        cols_max = 1 + (w - 4) // col_spacing
++        rows = min(rows_max, rng.choice([2, 3, 4]))
++        cols = min(cols_max, rng.choice([5, 6, 7]))
++        rows = max(rows, 2)
++        cols = max(cols, 5 if size == 20 else 4)
++        height = 4 + (rows - 1) * row_spacing
++        width = 4 + (cols - 1) * col_spacing
++        r_start = rng.randint(0, h - height)
++        c_start = rng.randint(0, w - width)
++        row_positions = [r_start + i * row_spacing for i in range(rows)]
++        col_positions = [c_start + i * col_spacing for i in range(cols)]
++
++        for ridx, r in enumerate(row_positions):
++            if ridx == 0:
++                base = palette
++            elif ridx == 1:
++                base = reverse_palette
++            else:
++                shift = ridx % len(palette)
++                base = palette[shift:] + palette[:shift]
++            seq = _repeat_to_length(base, cols)
++            for cidx, c in enumerate(col_positions):
++                g[r, c] = seq[cidx]
++    else:
++        row_spacing = 2
++        col_spacing = rng.choice([4, 5])
++        rows_max = 1 + (h - 4) // row_spacing
++        cols_max = 1 + (w - 4) // col_spacing
++        rows = min(rows_max, rng.choice([5, 6, 7]))
++        cols = min(cols_max, rng.choice([2, 3, 4]))
++        rows = max(rows, 5 if size == 20 else 4)
++        cols = max(cols, 2)
++        height = 4 + (rows - 1) * row_spacing
++        width = 4 + (cols - 1) * col_spacing
++        r_start = rng.randint(0, h - height)
++        c_start = rng.randint(0, w - width)
++        row_positions = [r_start + i * row_spacing for i in range(rows)]
++        col_positions = [c_start + i * col_spacing for i in range(cols)]
++
++        for cidx, c in enumerate(col_positions):
++            if cidx == 0:
++                base = palette
++            elif cidx == 1:
++                base = reverse_palette
++            else:
++                shift = cidx % len(palette)
++                base = palette[shift:] + palette[:shift]
++            seq = _repeat_to_length(base, rows)
++            for ridx, r in enumerate(row_positions):
++                g[r, c] = seq[ridx]
++
++    if rng.random() < 0.4:
++        _place_legend(g, palette, rng)
++
++    return g
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++
++    for _ in range(400):
++        g = _build_marker_grid(rng)
++        out = main(g)
++        metrics = _variant_metrics(g)
++        if metrics["real_markers"] < 6:
++            continue
++        if metrics["overlap_pixels"] < 8:
++            continue
++        if metrics["pair23_overlap_pixels"] < 4:
++            continue
++        if metrics["overwrite_diff_pixels"] < 2:
++            continue
++        if metrics["early_survivor_pixels"] < 2:
++            continue
++        if metrics["pair_count"] < 1:
++            continue
++        assert out.shape == g.shape
++        return g
++
++    raise RuntimeError("failed to generate a visible D1/4+D9/0 instance")
+
+ succeeded in 258ms:
+Success: 50/50, Time: 0.1s (2ms/call)
+
+codex
+测试已经过了，但这只能说明 `main()`/`generate_input()` 不崩。我现在补做退化检查，统计重叠像素、`2`/`3` 冲突像素，以及融合输出相对 D9-only 覆盖规则的差异分布，确认生成器没有退回原行为。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util, statistics
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/3/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+keys = [
+    'real_markers',
+    'overlap_pixels',
+    'pair23_overlap_pixels',
+    'pair_count',
+    'overwrite_diff_pixels',
+    'early_survivor_pixels',
+]
+vals = {k: [] for k in keys}
+for _ in range(200):
+    g = mod.generate_input()
+    m = mod._variant_metrics(g)
+    for k in keys:
+        vals[k].append(m[k])
+for k in keys:
+    arr = vals[k]
+    print(f'{k}: min={min(arr)}, mean={statistics.mean(arr):.2f}, max={max(arr)}')
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/3/code.py b/ceshi/code_combo/dfadab01/3/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a742457fc48ef8544181de958bad4a49f8798f8
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/3/code.py
+@@ -0,0 +1,388 @@
++# Combo variant of dfadab01 (index 3)
++# combo_spec: D1/4+D9/0
++# Name: 字形叠加+按色批处理
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++GLYPHS: dict[int, tuple[int, np.ndarray]] = {
++    2: (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    3: (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    5: (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    8: (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++PROCESS_ORDER: tuple[int, ...] = (2, 3, 5, 8)
++
++
++DESIGN_ANALYSIS = """
++variant_spec:
++  combo: D1/4 + D9/0
++  concrete_visual_form:
++    input:
++      - still uses single-cell markers in {2,3,5,8}
++      - still may contain one legend glyph drawn in output color, with its label marker at (+4,+4)
++      - real markers are arranged on a tidy lattice, but one axis now uses spacing 2 so the derived 4x4 glyphs overlap
++    output:
++      - glyph dictionary and clipping behavior are unchanged
++      - markers are processed in global batches 2 -> 3 -> 5 -> 8
++      - when a later glyph lands on an already painted cell, the cell stores max(existing_color, glyph_color) instead of blind overwrite
++  behavior_trace:
++    example:
++      markers:
++        - color 2 at (0,0) -> yellow frame (color 4)
++        - color 3 at (0,2) -> blue ring (color 1)
++      original task:
++        - such dense placement was absent, so both glyphs never interacted
++      D9-only last-wins:
++        - batch 2 paints first
++        - batch 3 paints later and would replace shared cells by color 1
++      fused combo:
++        - batch 2 still paints first and batch 3 still arrives later
++        - on shared mask cells the merge rule is max(4,1)=4, so part of the earlier yellow frame remains visible
++      difference:
++        - the same overlap now exposes both the batch schedule and the compositing rule; later arrival does not guarantee visual dominance
++  complexity_calibration:
++    - only one axis is compressed to spacing 2; the orthogonal axis stays at 4 or 5 so rows/columns remain readable
++    - generator always includes marker colors 2 and 3, because their mapped glyph colors 4 and 1 create visible max-vs-overwrite disagreements
++    - optional extra colors 5 and/or 8 add additional collisions where the later batch does dominate, preventing the puzzle from collapsing into a pure 2/3 special case
++    - repeated band motifs and reversed second row/column give multiple corroborating overlaps instead of a single accident
++  implicit_assumption_audit:
++    - original main() could iterate GLYPHS.items() because overlap never mattered; combo main() must use explicit PROCESS_ORDER
++    - original _paint_clipped overwrote cells; combo logic must merge with max() on occupied cells
++    - legend detection via _has_source_glyph still assumes each label marker has an exact 4x4 sample glyph at (-4,-4); generator preserves a clean 5x5 legend area
++    - solver still assumes inputs only use marker colors plus legend output colors; generator samples only from that palette
++  placement_legality:
++    - input objects never overlap: only single-pixel markers are placed on the lattice, and legends are inserted only in empty 5x5 windows
++    - overlap occurs only after expansion in the output space
++    - all marker coordinates stay inside the board; clipping is allowed only for derived glyph footprints near edges
++  observability_and_tidy_layout:
++    - every accepted sample has real overlap, at least one 2-vs-3 overlap, and a nonzero pixel difference from the D9-only overwrite output
++    - the lattice stays striped rather than chaotic, so humans can compare repeated collisions across rows/columns
++    - overlap depth is limited by using a single dense axis; this keeps the output decipherable
++  generator_metrics:
++    - overlap_pixels: cells influenced by at least two real markers
++    - pair23_overlap_pixels: cells touched by both marker colors 2 and 3
++    - overwrite_diff_pixels: cells where combo output differs from the D9-only last-wins output
++    - pair_count: number of distinct cross-color overlap pairs present in one instance
++  new_solver_assumptions_and_generator_guards:
++    - solver assumes at least one non-legend marker exists; generator always places a populated lattice
++    - solver assumes sample legends never intersect real markers; _place_legend enforces that
++    - solver assumes the only meaningful merge is max(existing_color, glyph_color); generator guarantees overlaps are frequent enough for that rule to be observable
++"""
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
++        return False
++    patch = g[r0 : r0 + 4, c0 : c0 + 4]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped_overwrite(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _paint_clipped_max_merge(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = max(int(out[rr, cc]), color)
++
++
++def _ordered_output(g: np.ndarray, use_max_merge: bool) -> np.ndarray:
++    out = np.zeros_like(g)
++    seen_marker = False
++    for marker_color in PROCESS_ORDER:
++        glyph_color, mask = GLYPHS[marker_color]
++        coords = np.argwhere(g == marker_color)
++        if coords.size:
++            seen_marker = True
++        for r, c in coords:
++            rr, cc = int(r), int(c)
++            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
++                continue
++            if use_max_merge:
++                _paint_clipped_max_merge(out, rr, cc, glyph_color, mask)
++            else:
++                _paint_clipped_overwrite(out, rr, cc, glyph_color, mask)
++    assert seen_marker
++    return out
++
++
++def _repeat_to_length(seq: list[int], length: int) -> list[int]:
++    out: list[int] = []
++    while len(out) < length:
++        out.extend(seq)
++    return out[:length]
++
++
++def _real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
++    markers: list[tuple[int, int, int]] = []
++    for marker_color in PROCESS_ORDER:
++        glyph_color, mask = GLYPHS[marker_color]
++        for r, c in np.argwhere(g == marker_color):
++            rr, cc = int(r), int(c)
++            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
++                continue
++            markers.append((marker_color, rr, cc))
++    return markers
++
++
++def _coverage_sets(g: np.ndarray) -> dict[tuple[int, int], set[int]]:
++    h, w = g.shape
++    coverage: dict[tuple[int, int], set[int]] = {}
++    for marker_color, r0, c0 in _real_markers(g):
++        _, mask = GLYPHS[marker_color]
++        for dr in range(4):
++            rr = r0 + dr
++            if rr < 0 or rr >= h:
++                continue
++            for dc in range(4):
++                cc = c0 + dc
++                if 0 <= cc < w and bool(mask[dr, dc]):
++                    coverage.setdefault((rr, cc), set()).add(marker_color)
++    return coverage
++
++
++def _variant_metrics(g: np.ndarray) -> dict[str, int]:
++    coverage = _coverage_sets(g)
++    overlap_pixels = 0
++    pair23_overlap_pixels = 0
++    pair_set: set[tuple[int, int]] = set()
++    for colors in coverage.values():
++        if len(colors) >= 2:
++            overlap_pixels += 1
++            ordered = sorted(colors)
++            for idx, a in enumerate(ordered):
++                for b in ordered[idx + 1 :]:
++                    pair_set.add((a, b))
++            if 2 in colors and 3 in colors:
++                pair23_overlap_pixels += 1
++
++    combo = _ordered_output(g, use_max_merge=True)
++    overwrite = _ordered_output(g, use_max_merge=False)
++    overwrite_diff_pixels = int(np.count_nonzero(combo != overwrite))
++    early_survivor_pixels = int(np.count_nonzero((combo == 4) & (overwrite == 1)))
++    return {
++        "real_markers": len(_real_markers(g)),
++        "overlap_pixels": overlap_pixels,
++        "pair23_overlap_pixels": pair23_overlap_pixels,
++        "pair_count": len(pair_set),
++        "overwrite_diff_pixels": overwrite_diff_pixels,
++        "early_survivor_pixels": early_survivor_pixels,
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each marker into its fixed 4x4 glyph, but resolve dense overlaps by batched max-compositing.
++
++    Input structure:
++    - The board is still mostly black, with single-cell markers in colors 2, 3, 5, and/or 8.
++    - Some inputs also contain one legend entry: a 4x4 sample glyph already drawn in its output color, plus a matching marker at the sample's lower-right corner.
++    - Real markers may now be packed closely enough that their 4x4 output footprints overlap after expansion.
++
++    Rule:
++    - Use the same glyph dictionary as the base task: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
++    - Process marker colors in the fixed batch order 2, then 3, then 5, then 8; for each real marker, place its glyph with the marker as the glyph's top-left corner and clip at the grid edge.
++    - If a glyph paints onto an already nonzero output cell, keep the larger of the existing output color and the incoming glyph color instead of blindly overwriting; skip legend labels and erase the legend sample itself as before.
++
++    Key insight:
++    - The alphabet and legend format are unchanged, but dense placement turns the task into layered compositing: you must infer both the global color-batch schedule and that overlap pixels follow a max-color merge rather than simple last-wins painting.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++    return _ordered_output(g, use_max_merge=True)
++
++
++def _place_legend(g: np.ndarray, used_colors: list[int], rng: random.Random) -> bool:
++    h, w = g.shape
++    candidates = [
++        (0, 0),
++        (0, w - 5),
++        (h - 5, 0),
++        (h - 5, w - 5),
++        (0, max(0, (w - 5) // 2)),
++        (max(0, (h - 5) // 2), 0),
++    ]
++    rng.shuffle(candidates)
++
++    for r0, c0 in candidates:
++        if r0 < 0 or c0 < 0 or r0 + 4 >= h or c0 + 4 >= w:
++            continue
++        if np.any(g[r0 : r0 + 5, c0 : c0 + 5] != 0):
++            continue
++        marker_color = rng.choice(used_colors)
++        glyph_color, mask = GLYPHS[marker_color]
++        for dr in range(4):
++            for dc in range(4):
++                if bool(mask[dr, dc]):
++                    g[r0 + dr, c0 + dc] = glyph_color
++        g[r0 + 4, c0 + 4] = marker_color
++        return True
++    return False
++
++
++def _build_palette(rng: random.Random) -> list[int]:
++    extra_count = rng.choice([0, 1, 2])
++    extras = rng.sample([5, 8], k=extra_count)
++    return [2, 3, *extras]
++
++
++def _build_marker_grid(rng: random.Random) -> np.ndarray:
++    orientation = rng.choice(["horizontal", "vertical"])
++    size = rng.choices([10, 20], weights=[1, 4], k=1)[0]
++    h = w = size
++    g = np.zeros((h, w), dtype=int)
++
++    palette = _build_palette(rng)
++    reverse_palette = list(reversed(palette))
++
++    if orientation == "horizontal":
++        row_spacing = rng.choice([4, 5])
++        col_spacing = 2
++        rows_max = 1 + (h - 4) // row_spacing
++        cols_max = 1 + (w - 4) // col_spacing
++        rows = min(rows_max, rng.choice([2, 3, 4]))
++        cols = min(cols_max, rng.choice([5, 6, 7]))
++        rows = max(rows, 2)
++        cols = max(cols, 5 if size == 20 else 4)
++        height = 4 + (rows - 1) * row_spacing
++        width = 4 + (cols - 1) * col_spacing
++        r_start = rng.randint(0, h - height)
++        c_start = rng.randint(0, w - width)
++        row_positions = [r_start + i * row_spacing for i in range(rows)]
++        col_positions = [c_start + i * col_spacing for i in range(cols)]
++
++        for ridx, r in enumerate(row_positions):
++            if ridx == 0:
++                base = palette
++            elif ridx == 1:
++                base = reverse_palette
++            else:
++                shift = ridx % len(palette)
++                base = palette[shift:] + palette[:shift]
++            seq = _repeat_to_length(base, cols)
++            for cidx, c in enumerate(col_positions):
++                g[r, c] = seq[cidx]
++    else:
++        row_spacing = 2
++        col_spacing = rng.choice([4, 5])
++        rows_max = 1 + (h - 4) // row_spacing
++        cols_max = 1 + (w - 4) // col_spacing
++        rows = min(rows_max, rng.choice([5, 6, 7]))
++        cols = min(cols_max, rng.choice([2, 3, 4]))
++        rows = max(rows, 5 if size == 20 else 4)
++        cols = max(cols, 2)
++        height = 4 + (rows - 1) * row_spacing
++        width = 4 + (cols - 1) * col_spacing
++        r_start = rng.randint(0, h - height)
++        c_start = rng.randint(0, w - width)
++        row_positions = [r_start + i * row_spacing for i in range(rows)]
++        col_positions = [c_start + i * col_spacing for i in range(cols)]
++
++        for cidx, c in enumerate(col_positions):
++            if cidx == 0:
++                base = palette
++            elif cidx == 1:
++                base = reverse_palette
++            else:
++                shift = cidx % len(palette)
++                base = palette[shift:] + palette[:shift]
++            seq = _repeat_to_length(base, rows)
++            for ridx, r in enumerate(row_positions):
++                g[r, c] = seq[ridx]
++
++    if rng.random() < 0.4:
++        _place_legend(g, palette, rng)
++
++    return g
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++
++    for _ in range(400):
++        g = _build_marker_grid(rng)
++        out = main(g)
++        metrics = _variant_metrics(g)
++        if metrics["real_markers"] < 6:
++            continue
++        if metrics["overlap_pixels"] < 8:
++            continue
++        if metrics["pair23_overlap_pixels"] < 4:
++            continue
++        if metrics["overwrite_diff_pixels"] < 2:
++            continue
++        if metrics["early_survivor_pixels"] < 2:
++            continue
++        if metrics["pair_count"] < 1:
++            continue
++        assert out.shape == g.shape
++        return g
++
++    raise RuntimeError("failed to generate a visible D1/4+D9/0 instance")
+
+ succeeded in 679ms:
+real_markers: min=8, mean=15.73, max=28
+overlap_pixels: min=12, mean=31.14, max=80
+pair23_overlap_pixels: min=4, mean=14.98, max=48
+pair_count: min=1, mean=2.55, max=4
+overwrite_diff_pixels: min=4, mean=14.98, max=48
+early_survivor_pixels: min=4, mean=14.98, max=48
+
+The combo variant file is implemented, passes the required 50-trial test, and generator metrics confirm visible fused behavior rather than degenerating to the original overwrite rule.
+  ✓ Design fused rule and generator constraints from original solver/spec and D9 reference
+  ✓ Write combo variant file with analysis, solver, generator, and visibility metrics
+  ✓ Run the required 50-trial test and inspect behavior metrics; iterate until stable
+diff --git a/ceshi/code_combo/dfadab01/3/code.py b/ceshi/code_combo/dfadab01/3/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a742457fc48ef8544181de958bad4a49f8798f8
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/3/code.py
+@@ -0,0 +1,388 @@
++# Combo variant of dfadab01 (index 3)
++# combo_spec: D1/4+D9/0
++# Name: 字形叠加+按色批处理
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++GLYPHS: dict[int, tuple[int, np.ndarray]] = {
++    2: (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    3: (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    5: (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    8: (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++PROCESS_ORDER: tuple[int, ...] = (2, 3, 5, 8)
++
++
++DESIGN_ANALYSIS = """
++variant_spec:
++  combo: D1/4 + D9/0
++  concrete_visual_form:
++    input:
++      - still uses single-cell markers in {2,3,5,8}
++      - still may contain one legend glyph drawn in output color, with its label marker at (+4,+4)
++      - real markers are arranged on a tidy lattice, but one axis now uses spacing 2 so the derived 4x4 glyphs overlap
++    output:
++      - glyph dictionary and clipping behavior are unchanged
++      - markers are processed in global batches 2 -> 3 -> 5 -> 8
++      - when a later glyph lands on an already painted cell, the cell stores max(existing_color, glyph_color) instead of blind overwrite
++  behavior_trace:
++    example:
++      markers:
++        - color 2 at (0,0) -> yellow frame (color 4)
++        - color 3 at (0,2) -> blue ring (color 1)
++      original task:
++        - such dense placement was absent, so both glyphs never interacted
++      D9-only last-wins:
++        - batch 2 paints first
++        - batch 3 paints later and would replace shared cells by color 1
++      fused combo:
++        - batch 2 still paints first and batch 3 still arrives later
++        - on shared mask cells the merge rule is max(4,1)=4, so part of the earlier yellow frame remains visible
++      difference:
++        - the same overlap now exposes both the batch schedule and the compositing rule; later arrival does not guarantee visual dominance
++  complexity_calibration:
++    - only one axis is compressed to spacing 2; the orthogonal axis stays at 4 or 5 so rows/columns remain readable
++    - generator always includes marker colors 2 and 3, because their mapped glyph colors 4 and 1 create visible max-vs-overwrite disagreements
++    - optional extra colors 5 and/or 8 add additional collisions where the later batch does dominate, preventing the puzzle from collapsing into a pure 2/3 special case
++    - repeated band motifs and reversed second row/column give multiple corroborating overlaps instead of a single accident
++  implicit_assumption_audit:
++    - original main() could iterate GLYPHS.items() because overlap never mattered; combo main() must use explicit PROCESS_ORDER
++    - original _paint_clipped overwrote cells; combo logic must merge with max() on occupied cells
++    - legend detection via _has_source_glyph still assumes each label marker has an exact 4x4 sample glyph at (-4,-4); generator preserves a clean 5x5 legend area
++    - solver still assumes inputs only use marker colors plus legend output colors; generator samples only from that palette
++  placement_legality:
++    - input objects never overlap: only single-pixel markers are placed on the lattice, and legends are inserted only in empty 5x5 windows
++    - overlap occurs only after expansion in the output space
++    - all marker coordinates stay inside the board; clipping is allowed only for derived glyph footprints near edges
++  observability_and_tidy_layout:
++    - every accepted sample has real overlap, at least one 2-vs-3 overlap, and a nonzero pixel difference from the D9-only overwrite output
++    - the lattice stays striped rather than chaotic, so humans can compare repeated collisions across rows/columns
++    - overlap depth is limited by using a single dense axis; this keeps the output decipherable
++  generator_metrics:
++    - overlap_pixels: cells influenced by at least two real markers
++    - pair23_overlap_pixels: cells touched by both marker colors 2 and 3
++    - overwrite_diff_pixels: cells where combo output differs from the D9-only last-wins output
++    - pair_count: number of distinct cross-color overlap pairs present in one instance
++  new_solver_assumptions_and_generator_guards:
++    - solver assumes at least one non-legend marker exists; generator always places a populated lattice
++    - solver assumes sample legends never intersect real markers; _place_legend enforces that
++    - solver assumes the only meaningful merge is max(existing_color, glyph_color); generator guarantees overlaps are frequent enough for that rule to be observable
++"""
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
++        return False
++    patch = g[r0 : r0 + 4, c0 : c0 + 4]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped_overwrite(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _paint_clipped_max_merge(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = max(int(out[rr, cc]), color)
++
++
++def _ordered_output(g: np.ndarray, use_max_merge: bool) -> np.ndarray:
++    out = np.zeros_like(g)
++    seen_marker = False
++    for marker_color in PROCESS_ORDER:
++        glyph_color, mask = GLYPHS[marker_color]
++        coords = np.argwhere(g == marker_color)
++        if coords.size:
++            seen_marker = True
++        for r, c in coords:
++            rr, cc = int(r), int(c)
++            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
++                continue
++            if use_max_merge:
++                _paint_clipped_max_merge(out, rr, cc, glyph_color, mask)
++            else:
++                _paint_clipped_overwrite(out, rr, cc, glyph_color, mask)
++    assert seen_marker
++    return out
++
++
++def _repeat_to_length(seq: list[int], length: int) -> list[int]:
++    out: list[int] = []
++    while len(out) < length:
++        out.extend(seq)
++    return out[:length]
++
++
++def _real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
++    markers: list[tuple[int, int, int]] = []
++    for marker_color in PROCESS_ORDER:
++        glyph_color, mask = GLYPHS[marker_color]
++        for r, c in np.argwhere(g == marker_color):
++            rr, cc = int(r), int(c)
++            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
++                continue
++            markers.append((marker_color, rr, cc))
++    return markers
++
++
++def _coverage_sets(g: np.ndarray) -> dict[tuple[int, int], set[int]]:
++    h, w = g.shape
++    coverage: dict[tuple[int, int], set[int]] = {}
++    for marker_color, r0, c0 in _real_markers(g):
++        _, mask = GLYPHS[marker_color]
++        for dr in range(4):
++            rr = r0 + dr
++            if rr < 0 or rr >= h:
++                continue
++            for dc in range(4):
++                cc = c0 + dc
++                if 0 <= cc < w and bool(mask[dr, dc]):
++                    coverage.setdefault((rr, cc), set()).add(marker_color)
++    return coverage
++
++
++def _variant_metrics(g: np.ndarray) -> dict[str, int]:
++    coverage = _coverage_sets(g)
++    overlap_pixels = 0
++    pair23_overlap_pixels = 0
++    pair_set: set[tuple[int, int]] = set()
++    for colors in coverage.values():
++        if len(colors) >= 2:
++            overlap_pixels += 1
++            ordered = sorted(colors)
++            for idx, a in enumerate(ordered):
++                for b in ordered[idx + 1 :]:
++                    pair_set.add((a, b))
++            if 2 in colors and 3 in colors:
++                pair23_overlap_pixels += 1
++
++    combo = _ordered_output(g, use_max_merge=True)
++    overwrite = _ordered_output(g, use_max_merge=False)
++    overwrite_diff_pixels = int(np.count_nonzero(combo != overwrite))
++    early_survivor_pixels = int(np.count_nonzero((combo == 4) & (overwrite == 1)))
++    return {
++        "real_markers": len(_real_markers(g)),
++        "overlap_pixels": overlap_pixels,
++        "pair23_overlap_pixels": pair23_overlap_pixels,
++        "pair_count": len(pair_set),
++        "overwrite_diff_pixels": overwrite_diff_pixels,
++        "early_survivor_pixels": early_survivor_pixels,
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each marker into its fixed 4x4 glyph, but resolve dense overlaps by batched max-compositing.
++
++    Input structure:
++    - The board is still mostly black, with single-cell markers in colors 2, 3, 5, and/or 8.
++    - Some inputs also contain one legend entry: a 4x4 sample glyph already drawn in its output color, plus a matching marker at the sample's lower-right corner.
++    - Real markers may now be packed closely enough that their 4x4 output footprints overlap after expansion.
++
++    Rule:
++    - Use the same glyph dictionary as the base task: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
++    - Process marker colors in the fixed batch order 2, then 3, then 5, then 8; for each real marker, place its glyph with the marker as the glyph's top-left corner and clip at the grid edge.
++    - If a glyph paints onto an already nonzero output cell, keep the larger of the existing output color and the incoming glyph color instead of blindly overwriting; skip legend labels and erase the legend sample itself as before.
++
++    Key insight:
++    - The alphabet and legend format are unchanged, but dense placement turns the task into layered compositing: you must infer both the global color-batch schedule and that overlap pixels follow a max-color merge rather than simple last-wins painting.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++    return _ordered_output(g, use_max_merge=True)
++
++
++def _place_legend(g: np.ndarray, used_colors: list[int], rng: random.Random) -> bool:
++    h, w = g.shape
++    candidates = [
++        (0, 0),
++        (0, w - 5),
++        (h - 5, 0),
++        (h - 5, w - 5),
++        (0, max(0, (w - 5) // 2)),
++        (max(0, (h - 5) // 2), 0),
++    ]
++    rng.shuffle(candidates)
++
++    for r0, c0 in candidates:
++        if r0 < 0 or c0 < 0 or r0 + 4 >= h or c0 + 4 >= w:
++            continue
++        if np.any(g[r0 : r0 + 5, c0 : c0 + 5] != 0):
++            continue
++        marker_color = rng.choice(used_colors)
++        glyph_color, mask = GLYPHS[marker_color]
++        for dr in range(4):
++            for dc in range(4):
++                if bool(mask[dr, dc]):
++                    g[r0 + dr, c0 + dc] = glyph_color
++        g[r0 + 4, c0 + 4] = marker_color
++        return True
++    return False
++
++
++def _build_palette(rng: random.Random) -> list[int]:
++    extra_count = rng.choice([0, 1, 2])
++    extras = rng.sample([5, 8], k=extra_count)
++    return [2, 3, *extras]
++
++
++def _build_marker_grid(rng: random.Random) -> np.ndarray:
++    orientation = rng.choice(["horizontal", "vertical"])
++    size = rng.choices([10, 20], weights=[1, 4], k=1)[0]
++    h = w = size
++    g = np.zeros((h, w), dtype=int)
++
++    palette = _build_palette(rng)
++    reverse_palette = list(reversed(palette))
++
++    if orientation == "horizontal":
++        row_spacing = rng.choice([4, 5])
++        col_spacing = 2
++        rows_max = 1 + (h - 4) // row_spacing
++        cols_max = 1 + (w - 4) // col_spacing
++        rows = min(rows_max, rng.choice([2, 3, 4]))
++        cols = min(cols_max, rng.choice([5, 6, 7]))
++        rows = max(rows, 2)
++        cols = max(cols, 5 if size == 20 else 4)
++        height = 4 + (rows - 1) * row_spacing
++        width = 4 + (cols - 1) * col_spacing
++        r_start = rng.randint(0, h - height)
++        c_start = rng.randint(0, w - width)
++        row_positions = [r_start + i * row_spacing for i in range(rows)]
++        col_positions = [c_start + i * col_spacing for i in range(cols)]
++
++        for ridx, r in enumerate(row_positions):
++            if ridx == 0:
++                base = palette
++            elif ridx == 1:
++                base = reverse_palette
++            else:
++                shift = ridx % len(palette)
++                base = palette[shift:] + palette[:shift]
++            seq = _repeat_to_length(base, cols)
++            for cidx, c in enumerate(col_positions):
++                g[r, c] = seq[cidx]
++    else:
++        row_spacing = 2
++        col_spacing = rng.choice([4, 5])
++        rows_max = 1 + (h - 4) // row_spacing
++        cols_max = 1 + (w - 4) // col_spacing
++        rows = min(rows_max, rng.choice([5, 6, 7]))
++        cols = min(cols_max, rng.choice([2, 3, 4]))
++        rows = max(rows, 5 if size == 20 else 4)
++        cols = max(cols, 2)
++        height = 4 + (rows - 1) * row_spacing
++        width = 4 + (cols - 1) * col_spacing
++        r_start = rng.randint(0, h - height)
++        c_start = rng.randint(0, w - width)
++        row_positions = [r_start + i * row_spacing for i in range(rows)]
++        col_positions = [c_start + i * col_spacing for i in range(cols)]
++
++        for cidx, c in enumerate(col_positions):
++            if cidx == 0:
++                base = palette
++            elif cidx == 1:
++                base = reverse_palette
++            else:
++                shift = cidx % len(palette)
++                base = palette[shift:] + palette[:shift]
++            seq = _repeat_to_length(base, rows)
++            for ridx, r in enumerate(row_positions):
++                g[r, c] = seq[ridx]
++
++    if rng.random() < 0.4:
++        _place_legend(g, palette, rng)
++
++    return g
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++
++    for _ in range(400):
++        g = _build_marker_grid(rng)
++        out = main(g)
++        metrics = _variant_metrics(g)
++        if metrics["real_markers"] < 6:
++            continue
++        if metrics["overlap_pixels"] < 8:
++            continue
++        if metrics["pair23_overlap_pixels"] < 4:
++            continue
++        if metrics["overwrite_diff_pixels"] < 2:
++            continue
++        if metrics["early_survivor_pixels"] < 2:
++            continue
++        if metrics["pair_count"] < 1:
++            continue
++        assert out.shape == g.shape
++        return g
++
++    raise RuntimeError("failed to generate a visible D1/4+D9/0 instance")
+
+codex
+融合变体已写入 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/3/code.py)。
+
+实现内容是把 `dfadab01` 改成 `D1/4 + D9/0` 组合版：`main()` 保留了四段式说明，求解逻辑改为按 `2 -> 3 -> 5 -> 8` 分批放置字形，并在重叠像素上使用 `max(existing_color, glyph_color)` 合成；`generate_input()` 则强制生成单轴间距为 `2` 的密集标记阵列，确保真实重叠、`2/3` 冲突、以及与 D9-only `last-wins` 输出的可见差异。设计分析、隐式假设审查和生成器守卫都放进了 `DESIGN_ANALYSIS`。
+
+验证结果通过：
+- 题目要求的 50 次测试成功率 `50/50`
+- 200 个生成样本的关键指标分布：
+  - `overlap_pixels`: min `12`, mean `31.14`, max `80`
+  - `pair23_overlap_pixels`: min `4`, mean `14.98`, max `48`
+  - `overwrite_diff_pixels`: min `4`, mean `14.98`, max `48`
+  - `pair_count`: min `1`, mean `2.55`, max `4`
+
+这些指标说明生成器没有退化回原题或 D9-only 覆盖规则，融合行为在样本中是稳定可见的。
+diff --git a/ceshi/code_combo/dfadab01/3/code.py b/ceshi/code_combo/dfadab01/3/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a742457fc48ef8544181de958bad4a49f8798f8
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/3/code.py
+@@ -0,0 +1,388 @@
++# Combo variant of dfadab01 (index 3)
++# combo_spec: D1/4+D9/0
++# Name: 字形叠加+按色批处理
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++GLYPHS: dict[int, tuple[int, np.ndarray]] = {
++    2: (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    3: (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    5: (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    8: (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++PROCESS_ORDER: tuple[int, ...] = (2, 3, 5, 8)
++
++
++DESIGN_ANALYSIS = """
++variant_spec:
++  combo: D1/4 + D9/0
++  concrete_visual_form:
++    input:
++      - still uses single-cell markers in {2,3,5,8}
++      - still may contain one legend glyph drawn in output color, with its label marker at (+4,+4)
++      - real markers are arranged on a tidy lattice, but one axis now uses spacing 2 so the derived 4x4 glyphs overlap
++    output:
++      - glyph dictionary and clipping behavior are unchanged
++      - markers are processed in global batches 2 -> 3 -> 5 -> 8
++      - when a later glyph lands on an already painted cell, the cell stores max(existing_color, glyph_color) instead of blind overwrite
++  behavior_trace:
++    example:
++      markers:
++        - color 2 at (0,0) -> yellow frame (color 4)
++        - color 3 at (0,2) -> blue ring (color 1)
++      original task:
++        - such dense placement was absent, so both glyphs never interacted
++      D9-only last-wins:
++        - batch 2 paints first
++        - batch 3 paints later and would replace shared cells by color 1
++      fused combo:
++        - batch 2 still paints first and batch 3 still arrives later
++        - on shared mask cells the merge rule is max(4,1)=4, so part of the earlier yellow frame remains visible
++      difference:
++        - the same overlap now exposes both the batch schedule and the compositing rule; later arrival does not guarantee visual dominance
++  complexity_calibration:
++    - only one axis is compressed to spacing 2; the orthogonal axis stays at 4 or 5 so rows/columns remain readable
++    - generator always includes marker colors 2 and 3, because their mapped glyph colors 4 and 1 create visible max-vs-overwrite disagreements
++    - optional extra colors 5 and/or 8 add additional collisions where the later batch does dominate, preventing the puzzle from collapsing into a pure 2/3 special case
++    - repeated band motifs and reversed second row/column give multiple corroborating overlaps instead of a single accident
++  implicit_assumption_audit:
++    - original main() could iterate GLYPHS.items() because overlap never mattered; combo main() must use explicit PROCESS_ORDER
++    - original _paint_clipped overwrote cells; combo logic must merge with max() on occupied cells
++    - legend detection via _has_source_glyph still assumes each label marker has an exact 4x4 sample glyph at (-4,-4); generator preserves a clean 5x5 legend area
++    - solver still assumes inputs only use marker colors plus legend output colors; generator samples only from that palette
++  placement_legality:
++    - input objects never overlap: only single-pixel markers are placed on the lattice, and legends are inserted only in empty 5x5 windows
++    - overlap occurs only after expansion in the output space
++    - all marker coordinates stay inside the board; clipping is allowed only for derived glyph footprints near edges
++  observability_and_tidy_layout:
++    - every accepted sample has real overlap, at least one 2-vs-3 overlap, and a nonzero pixel difference from the D9-only overwrite output
++    - the lattice stays striped rather than chaotic, so humans can compare repeated collisions across rows/columns
++    - overlap depth is limited by using a single dense axis; this keeps the output decipherable
++  generator_metrics:
++    - overlap_pixels: cells influenced by at least two real markers
++    - pair23_overlap_pixels: cells touched by both marker colors 2 and 3
++    - overwrite_diff_pixels: cells where combo output differs from the D9-only last-wins output
++    - pair_count: number of distinct cross-color overlap pairs present in one instance
++  new_solver_assumptions_and_generator_guards:
++    - solver assumes at least one non-legend marker exists; generator always places a populated lattice
++    - solver assumes sample legends never intersect real markers; _place_legend enforces that
++    - solver assumes the only meaningful merge is max(existing_color, glyph_color); generator guarantees overlaps are frequent enough for that rule to be observable
++"""
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
++        return False
++    patch = g[r0 : r0 + 4, c0 : c0 + 4]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped_overwrite(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _paint_clipped_max_merge(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = max(int(out[rr, cc]), color)
++
++
++def _ordered_output(g: np.ndarray, use_max_merge: bool) -> np.ndarray:
++    out = np.zeros_like(g)
++    seen_marker = False
++    for marker_color in PROCESS_ORDER:
++        glyph_color, mask = GLYPHS[marker_color]
++        coords = np.argwhere(g == marker_color)
++        if coords.size:
++            seen_marker = True
++        for r, c in coords:
++            rr, cc = int(r), int(c)
++            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
++                continue
++            if use_max_merge:
++                _paint_clipped_max_merge(out, rr, cc, glyph_color, mask)
++            else:
++                _paint_clipped_overwrite(out, rr, cc, glyph_color, mask)
++    assert seen_marker
++    return out
++
++
++def _repeat_to_length(seq: list[int], length: int) -> list[int]:
++    out: list[int] = []
++    while len(out) < length:
++        out.extend(seq)
++    return out[:length]
++
++
++def _real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
++    markers: list[tuple[int, int, int]] = []
++    for marker_color in PROCESS_ORDER:
++        glyph_color, mask = GLYPHS[marker_color]
++        for r, c in np.argwhere(g == marker_color):
++            rr, cc = int(r), int(c)
++            if _has_source_glyph(g, rr - 4, cc - 4, glyph_color, mask):
++                continue
++            markers.append((marker_color, rr, cc))
++    return markers
++
++
++def _coverage_sets(g: np.ndarray) -> dict[tuple[int, int], set[int]]:
++    h, w = g.shape
++    coverage: dict[tuple[int, int], set[int]] = {}
++    for marker_color, r0, c0 in _real_markers(g):
++        _, mask = GLYPHS[marker_color]
++        for dr in range(4):
++            rr = r0 + dr
++            if rr < 0 or rr >= h:
++                continue
++            for dc in range(4):
++                cc = c0 + dc
++                if 0 <= cc < w and bool(mask[dr, dc]):
++                    coverage.setdefault((rr, cc), set()).add(marker_color)
++    return coverage
++
++
++def _variant_metrics(g: np.ndarray) -> dict[str, int]:
++    coverage = _coverage_sets(g)
++    overlap_pixels = 0
++    pair23_overlap_pixels = 0
++    pair_set: set[tuple[int, int]] = set()
++    for colors in coverage.values():
++        if len(colors) >= 2:
++            overlap_pixels += 1
++            ordered = sorted(colors)
++            for idx, a in enumerate(ordered):
++                for b in ordered[idx + 1 :]:
++                    pair_set.add((a, b))
++            if 2 in colors and 3 in colors:
++                pair23_overlap_pixels += 1
++
++    combo = _ordered_output(g, use_max_merge=True)
++    overwrite = _ordered_output(g, use_max_merge=False)
++    overwrite_diff_pixels = int(np.count_nonzero(combo != overwrite))
++    early_survivor_pixels = int(np.count_nonzero((combo == 4) & (overwrite == 1)))
++    return {
++        "real_markers": len(_real_markers(g)),
++        "overlap_pixels": overlap_pixels,
++        "pair23_overlap_pixels": pair23_overlap_pixels,
++        "pair_count": len(pair_set),
++        "overwrite_diff_pixels": overwrite_diff_pixels,
++        "early_survivor_pixels": early_survivor_pixels,
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each marker into its fixed 4x4 glyph, but resolve dense overlaps by batched max-compositing.
++
++    Input structure:
++    - The board is still mostly black, with single-cell markers in colors 2, 3, 5, and/or 8.
++    - Some inputs also contain one legend entry: a 4x4 sample glyph already drawn in its output color, plus a matching marker at the sample's lower-right corner.
++    - Real markers may now be packed closely enough that their 4x4 output footprints overlap after expansion.
++
++    Rule:
++    - Use the same glyph dictionary as the base task: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
++    - Process marker colors in the fixed batch order 2, then 3, then 5, then 8; for each real marker, place its glyph with the marker as the glyph's top-left corner and clip at the grid edge.
++    - If a glyph paints onto an already nonzero output cell, keep the larger of the existing output color and the incoming glyph color instead of blindly overwriting; skip legend labels and erase the legend sample itself as before.
++
++    Key insight:
++    - The alphabet and legend format are unchanged, but dense placement turns the task into layered compositing: you must infer both the global color-batch schedule and that overlap pixels follow a max-color merge rather than simple last-wins painting.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++    return _ordered_output(g, use_max_merge=True)
++
++
++def _place_legend(g: np.ndarray, used_colors: list[int], rng: random.Random) -> bool:
++    h, w = g.shape
++    candidates = [
++        (0, 0),
++        (0, w - 5),
++        (h - 5, 0),
++        (h - 5, w - 5),
++        (0, max(0, (w - 5) // 2)),
++        (max(0, (h - 5) // 2), 0),
++    ]
++    rng.shuffle(candidates)
++
++    for r0, c0 in candidates:
++        if r0 < 0 or c0 < 0 or r0 + 4 >= h or c0 + 4 >= w:
++            continue
++        if np.any(g[r0 : r0 + 5, c0 : c0 + 5] != 0):
++            continue
++        marker_color = rng.choice(used_colors)
++        glyph_color, mask = GLYPHS[marker_color]
++        for dr in range(4):
++            for dc in range(4):
++                if bool(mask[dr, dc]):
++                    g[r0 + dr, c0 + dc] = glyph_color
++        g[r0 + 4, c0 + 4] = marker_color
++        return True
++    return False
++
++
++def _build_palette(rng: random.Random) -> list[int]:
++    extra_count = rng.choice([0, 1, 2])
++    extras = rng.sample([5, 8], k=extra_count)
++    return [2, 3, *extras]
++
++
++def _build_marker_grid(rng: random.Random) -> np.ndarray:
++    orientation = rng.choice(["horizontal", "vertical"])
++    size = rng.choices([10, 20], weights=[1, 4], k=1)[0]
++    h = w = size
++    g = np.zeros((h, w), dtype=int)
++
++    palette = _build_palette(rng)
++    reverse_palette = list(reversed(palette))
++
++    if orientation == "horizontal":
++        row_spacing = rng.choice([4, 5])
++        col_spacing = 2
++        rows_max = 1 + (h - 4) // row_spacing
++        cols_max = 1 + (w - 4) // col_spacing
++        rows = min(rows_max, rng.choice([2, 3, 4]))
++        cols = min(cols_max, rng.choice([5, 6, 7]))
++        rows = max(rows, 2)
++        cols = max(cols, 5 if size == 20 else 4)
++        height = 4 + (rows - 1) * row_spacing
++        width = 4 + (cols - 1) * col_spacing
++        r_start = rng.randint(0, h - height)
++        c_start = rng.randint(0, w - width)
++        row_positions = [r_start + i * row_spacing for i in range(rows)]
++        col_positions = [c_start + i * col_spacing for i in range(cols)]
++
++        for ridx, r in enumerate(row_positions):
++            if ridx == 0:
++                base = palette
++            elif ridx == 1:
++                base = reverse_palette
++            else:
++                shift = ridx % len(palette)
++                base = palette[shift:] + palette[:shift]
++            seq = _repeat_to_length(base, cols)
++            for cidx, c in enumerate(col_positions):
++                g[r, c] = seq[cidx]
++    else:
++        row_spacing = 2
++        col_spacing = rng.choice([4, 5])
++        rows_max = 1 + (h - 4) // row_spacing
++        cols_max = 1 + (w - 4) // col_spacing
++        rows = min(rows_max, rng.choice([5, 6, 7]))
++        cols = min(cols_max, rng.choice([2, 3, 4]))
++        rows = max(rows, 5 if size == 20 else 4)
++        cols = max(cols, 2)
++        height = 4 + (rows - 1) * row_spacing
++        width = 4 + (cols - 1) * col_spacing
++        r_start = rng.randint(0, h - height)
++        c_start = rng.randint(0, w - width)
++        row_positions = [r_start + i * row_spacing for i in range(rows)]
++        col_positions = [c_start + i * col_spacing for i in range(cols)]
++
++        for cidx, c in enumerate(col_positions):
++            if cidx == 0:
++                base = palette
++            elif cidx == 1:
++                base = reverse_palette
++            else:
++                shift = cidx % len(palette)
++                base = palette[shift:] + palette[:shift]
++            seq = _repeat_to_length(base, rows)
++            for ridx, r in enumerate(row_positions):
++                g[r, c] = seq[ridx]
++
++    if rng.random() < 0.4:
++        _place_legend(g, palette, rng)
++
++    return g
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++
++    for _ in range(400):
++        g = _build_marker_grid(rng)
++        out = main(g)
++        metrics = _variant_metrics(g)
++        if metrics["real_markers"] < 6:
++            continue
++        if metrics["overlap_pixels"] < 8:
++            continue
++        if metrics["pair23_overlap_pixels"] < 4:
++            continue
++        if metrics["overwrite_diff_pixels"] < 2:
++            continue
++        if metrics["early_survivor_pixels"] < 2:
++            continue
++        if metrics["pair_count"] < 1:
++            continue
++        assert out.shape == g.shape
++        return g
++
++    raise RuntimeError("failed to generate a visible D1/4+D9/0 instance")
+
+tokens used
+72,524
+融合变体已写入 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/3/code.py)。
+
+实现内容是把 `dfadab01` 改成 `D1/4 + D9/0` 组合版：`main()` 保留了四段式说明，求解逻辑改为按 `2 -> 3 -> 5 -> 8` 分批放置字形，并在重叠像素上使用 `max(existing_color, glyph_color)` 合成；`generate_input()` 则强制生成单轴间距为 `2` 的密集标记阵列，确保真实重叠、`2/3` 冲突、以及与 D9-only `last-wins` 输出的可见差异。设计分析、隐式假设审查和生成器守卫都放进了 `DESIGN_ANALYSIS`。
+
+验证结果通过：
+- 题目要求的 50 次测试成功率 `50/50`
+- 200 个生成样本的关键指标分布：
+  - `overlap_pixels`: min `12`, mean `31.14`, max `80`
+  - `pair23_overlap_pixels`: min `4`, mean `14.98`, max `48`
+  - `overwrite_diff_pixels`: min `4`, mean `14.98`, max `48`
+  - `pair_count`: min `1`, mean `2.55`, max `4`
+
+这些指标说明生成器没有退化回原题或 D9-only 覆盖规则，融合行为在样本中是稳定可见的。

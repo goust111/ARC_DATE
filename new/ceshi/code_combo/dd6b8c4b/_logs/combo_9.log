@@ -1,0 +1,4795 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: high
+reasoning summaries: none
+session id: 019e3512-584d-7f53-9a61-8dbcd34f16e4
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: dd6b8c4b
+    **摘要**: 通过橙色背景从绿色方块进行flood-fill可达性检测，收集可达的栗色像素，按距离排序后以行优先顺序填入绿色方块内部
+
+    ## 要实现的融合组合
+    - **组合名称**: 多色像素+距离梯度填充色
+    - **combo_spec**: D5/1+D8/2
+
+    ### 融合描述（实现规格）
+
+    待收集像素有多种颜色（D5/1），填入方块时颜色由收集距离决定（D8/2，形成距离热力图）。多色源的原始颜色被距离梯度色覆盖，解题者需要理解源颜色在可达性判定中有意义，但填充色由距离决定。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D5/1** — 源对象（被收集的对象） (`src`)
+  - 当前值: 栗色（maroon/9）散布像素——散落在网格各处的单个栗色像素，作为被收集的目标
+  - 改为: 多种颜色的待收集像素 — 散布的像素不仅有栗色，还有其他颜色（如蓝色、黄色）。不同颜色的像素填入方块后保持各自颜色。解题者需要追踪多种颜色的收集与排序。
+  - 来源: color_grouping（参考任务: b5ca7ac4）
+- **D8/2** — 方块内部填充与原有内容的交互 (`transform`)
+  - 当前值: 收集到的栗色像素覆盖方块内部的绿色像素（从左上角按行优先），红色中心像素在最后可能被覆盖也可能保留（取决于收集数量）
+  - 改为: 填充颜色由收集距离决定 — 不是所有像素都填为栗色——距离近的像素填为深色，距离远的填为浅色（使用多种颜色表示距离梯度）。方块内部呈现距离热力图效果。
+  - 来源: creative（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/dd6b8c4b.py`
+
+    ```python
+    import numpy as np
+
+from arc_utils import neighbors4
+import random
+from collections import deque
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Move the closest reachable maroon pixels into the 3×3 block around the unique red center.
+
+    Input structure:
+    - bg = orange floor, magenta walls, scattered maroon (9) pixels.
+    - A unique red (2) pixel marks the center of a 3×3 destination block.
+
+    Rule:
+    - Maroon pixels connected to the destination through floor/maroon cells (not blocked by walls) are candidates.
+    - Rank candidates by distance to the destination; the closest ones fill the block in row-major order.
+    - Moved maroons are erased (replaced with floor color).
+
+    Key insight: Wall barriers restrict connectivity — only maroon pixels reachable via flood-fill through the floor qualify, so proximity alone isn't enough.
+    """
+
+    grid = np.asarray(grid, dtype=int)
+    h, w = grid.shape
+    out = grid.copy()
+
+    centers = np.argwhere(grid == 2)
+    assert len(centers) == 1, "grid must have exactly one red (2) center pixel"
+    cr, cc = map(int, centers[0])
+
+    # Destination = 3x3 block around the center.
+    dest_cells: list[tuple[int, int]] = []
+    for r in range(cr - 1, cr + 2):
+        for c in range(cc - 1, cc + 2):
+            if 0 <= r < h and 0 <= c < w:
+                dest_cells.append((r, c))
+    dest_cells.sort()
+    dest_set = set(dest_cells)
+
+    # Infer floor color from the ring around the destination.
+    ring_colors: list[int] = []
+    for r, c in dest_cells:
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and (rr, cc2) not in dest_set:
+                ring_colors.append(int(grid[rr, cc2]))
+
+    cand_ring = [x for x in ring_colors if x not in (2, 3, 9)]
+    assert cand_ring, "ring around destination must contain passable (non-maroon, non-red, non-wall) cells to infer floor color"
+    _vals, _cnts = np.unique(cand_ring, return_counts=True)
+    ring_blocker = int(_vals[_cnts.argmax()])
+    other = [int(x) for x in np.unique(grid) if int(x) not in (2, 3, 9, ring_blocker)]
+    floor = other[0] if len(other) == 1 else (max(other, key=lambda c: int((grid == c).sum())) if other else None)
+    if floor is None:
+        floor = ring_blocker
+
+    passable = {floor, 9}
+
+    # BFS start = passable cells adjacent to the destination.
+    starts: list[tuple[int, int]] = []
+    seen = set()
+    for r, c in dest_cells:
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and int(grid[rr, cc2]) in passable:
+                if (rr, cc2) not in seen:
+                    seen.add((rr, cc2))
+                    starts.append((rr, cc2))
+    assert starts, "there must be at least one passable cell adjacent to the destination block to begin BFS"
+
+    INF = 10**9
+    dist = np.full((h, w), INF, dtype=int)
+    q = list(starts)
+    for r, c in starts:
+        dist[r, c] = 0
+
+    qi = 0
+    while qi < len(q):
+        r, c = q[qi]
+        qi += 1
+        d = dist[r, c]
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and int(grid[rr, cc2]) in passable and dist[rr, cc2] == INF:
+                dist[rr, cc2] = d + 1
+                q.append((rr, cc2))
+
+    maroons = [(int(dist[r, c]), int(r), int(c)) for r, c in np.argwhere(grid == 9)]
+    maroons = [t for t in maroons if t[0] < INF]
+    maroons.sort()  # by distance then row then col
+
+    k = min(len(dest_cells), len(maroons))
+    chosen = {(r, c) for _, r, c in maroons[:k]}
+
+    for r, c in chosen:
+        out[r, c] = floor
+
+    for r, c in dest_cells[:k]:
+        out[r, c] = 9
+
+    return out
+
+# --------------- generator (c) ---------------
+
+# ---- CFG: tunable generation parameters ----
+GRID_H, GRID_W = 11, 11          # canvas size (fixed per spec)
+CENTER_R, CENTER_C = 5, 5        # dest block center
+FLOOR_COLOR, WALL_COLOR = 7, 6   # orange floor, magenta wall
+DEST_COLOR, RED_CENTER = 3, 2    # green ring, red center
+MAROON = 9
+
+WALL_PROB = 0.75                  # probability of placing walls
+RING_GAP_RANGE = (1, 4)          # number of corridor openings in wall ring
+WALL_STYLES = ['arms', 'frame', 'mixed']
+
+# Wall extension parameters per style
+ARM_EXTEND_PROB = 0.5             # per-cell chance of extending an arm (arms style)
+ARM_LENGTH_RANGE = (1, 5)         # arm extension length (arms style)
+FRAME_DIST_RANGE = (3, 4)        # outer frame distance from center
+FRAME_CONNECT_PROB = 0.4          # chance of connecting inner ring to outer frame
+FRAME_GAP_REMOVE_PROB = 0.3       # chance of removing an outer frame cell
+MIXED_EXTEND_PROB = 0.6           # per-cell chance of extending (mixed style)
+
+FILL_K_RANGE = (2, 9)            # how many maroon fill the dest block
+DISTRACTOR_MAX = 10               # max unreachable distractor maroons
+TOTAL_MAROON_RANGE = (4, 16)     # total maroon count bounds
+MIN_REACHABLE = 2                 # minimum reachable floor cells to accept layout
+GEN_RETRIES = 300                 # max generation attempts
+
+
+def _bfs_reachable(grid, dest_set):
+    """BFS from floor cells adjacent to dest through floor cells. Returns set of reachable (r,c)."""
+    visited = set()
+    queue = deque()
+    for dr, dc in dest_set:
+        for nr, nc in neighbors4(dr, dc):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                if grid[nr, nc] == FLOOR_COLOR and (nr, nc) not in visited:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+    while queue:
+        r, c = queue.popleft()
+        for nr, nc in neighbors4(r, c):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in visited:
+                if grid[nr, nc] == FLOOR_COLOR and (nr, nc) not in dest_set:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+    return visited
+
+
+def _outward_dirs(r, c):
+    """Return directions pointing away from center for a ring cell."""
+    dirs = []
+    if r < CENTER_R: dirs.append((-1, 0))
+    if r > CENTER_R: dirs.append((1, 0))
+    if c < CENTER_C: dirs.append((0, -1))
+    if c > CENTER_C: dirs.append((0, 1))
+    return dirs
+
+
+def _extend_arm(wall_cells, dest_set, r, c, max_len):
+    """Extend a wall arm outward from (r,c) in a random outward direction, up to max_len cells."""
+    dirs = _outward_dirs(r, c)
+    if not dirs:
+        return
+    dr, dc = random.choice(dirs)
+    length = random.randint(1, max_len)
+    nr, nc = r, c
+    for _ in range(length):
+        nr, nc = nr + dr, nc + dc
+        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+            wall_cells.add((nr, nc))
+        else:
+            break
+
+
+def _build_walls(grid, dest_set):
+    """Build wall barrier around dest with corridor openings, extending outward."""
+    # Ring = cells 4-adjacent to dest but not in dest
+    ring = set()
+    for dr, dc in dest_set:
+        for nr, nc in neighbors4(dr, dc):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                ring.add((nr, nc))
+    ring = sorted(ring)
+
+    # Choose gaps as corridor openings
+    num_gaps = random.randint(*RING_GAP_RANGE)
+    gap_cells = set(random.sample(ring, num_gaps))
+    wall_ring = [cell for cell in ring if cell not in gap_cells]
+    wall_cells = set(wall_ring)
+
+    style = random.choice(WALL_STYLES)
+
+    if style == 'arms':
+        for r, c in wall_ring:
+            if random.random() < ARM_EXTEND_PROB:
+                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
+
+    elif style == 'frame':
+        # Outer frame at distance 3-4 from center
+        dist2 = random.randint(*FRAME_DIST_RANGE)
+        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
+            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
+                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
+                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
+                        wall_cells.add((r, c))
+        # Connect inner ring to outer frame
+        for r, c in wall_ring:
+            dirs = _outward_dirs(r, c)
+            if dirs and random.random() < FRAME_CONNECT_PROB:
+                dr, dc = random.choice(dirs)
+                nr, nc = r + dr, c + dc
+                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                    wall_cells.add((nr, nc))
+                    nr, nc = nr + dr, nc + dc
+        # Remove some outer frame cells for gaps
+        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
+        if outer_frame:
+            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
+            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
+                if random.random() < FRAME_GAP_REMOVE_PROB:
+                    wall_cells.discard(rc)
+
+    else:  # mixed
+        for r, c in wall_ring:
+            if random.random() < MIXED_EXTEND_PROB:
+                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
+                _extend_arm(wall_cells, dest_set, r, c, max_len)
+
+    for r, c in wall_cells:
+        grid[r, c] = WALL_COLOR
+
+
+def _gen_attempt():
+    """Build a candidate input grid; returns the grid or None on failure."""
+    dest_cells = [(r, c) for r in range(CENTER_R - 1, CENTER_R + 2)
+                  for c in range(CENTER_C - 1, CENTER_C + 2)]
+    dest_set = set(dest_cells)
+
+    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
+    for r, c in dest_cells:
+        grid[r, c] = DEST_COLOR
+    grid[CENTER_R, CENTER_C] = RED_CENTER
+
+    if random.random() < WALL_PROB:
+        _build_walls(grid, dest_set)
+
+    reachable_floor = _bfs_reachable(grid, dest_set)
+    if len(reachable_floor) < MIN_REACHABLE:
+        return None
+
+    all_floor = {(r, c) for r in range(GRID_H) for c in range(GRID_W)
+                 if grid[r, c] == FLOOR_COLOR and (r, c) not in dest_set}
+    unreachable_floor = all_floor - reachable_floor
+
+    # Choose fill count k
+    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
+    if max_k < FILL_K_RANGE[0]:
+        return None
+    k = random.randint(FILL_K_RANGE[0], max_k)
+
+    # Choose distractor count
+    max_dist = min(DISTRACTOR_MAX, len(unreachable_floor))
+    num_distractors = random.randint(0, max_dist) if max_dist > 0 else 0
+
+    # Enforce total maroon count within bounds
+    total = k + num_distractors
+    if total < TOTAL_MAROON_RANGE[0]:
+        needed = TOTAL_MAROON_RANGE[0] - total
+        if len(unreachable_floor) >= num_distractors + needed:
+            num_distractors += needed
+        elif max_k >= k + needed:
+            k += needed
+        else:
+            return None
+    if k + num_distractors > TOTAL_MAROON_RANGE[1]:
+        num_distractors = max(0, TOTAL_MAROON_RANGE[1] - k)
+
+    source_cells = random.sample(list(reachable_floor), k)
+    distractor_cells = random.sample(list(unreachable_floor), num_distractors)
+
+    # Build INPUT: dest is green+red, maroon on source and distractor positions
+    inp = grid.copy()
+    for r, c in source_cells + distractor_cells:
+        inp[r, c] = MAROON
+
+    # Build expected OUTPUT: first k dest cells (row-major) become maroon, sources erased
+    out = grid.copy()
+    for r, c in dest_cells[:k]:
+        out[r, c] = MAROON
+    for r, c in distractor_cells:
+        out[r, c] = MAROON
+
+    # Validate with solver
+    try:
+        result = main(inp)
+        if np.array_equal(result, out):
+            return inp
+    except Exception:
+        pass
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        result = _gen_attempt()
+        if result is not None:
+            return result
+    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 11x11, always
+  colors: floor=orange(7), wall=magenta(6) or absent, dest_ring=green(3), center=red(2), tokens=maroon(9)
+  dest_block:
+    shape: 3x3 centered at (5,5), always
+    content: 8 green cells surrounding 1 red center
+  walls:
+    presence: 0-1 wall colors; 4/5 examples have walls [observed]
+    role: wall cells adjacent to dest block restrict BFS; partitions floor into connected components
+    structure: single connected or multi-component wall forming corridors/barriers around dest
+    wall_surrounds_dest: wall occupies most of the 16-cell ring at distance 2 from center, with 1-4 floor gaps serving as corridor openings
+  maroon_tokens:
+    count: 4-16
+    placement: scattered on floor cells, never inside dest block, never on wall
+    reachable: 2-15 tokens reachable via 4-connected BFS through floor+maroon from dest openings
+    unreachable: 0-10 tokens in walled-off floor regions (distractors)
+    reachable_fill_range: 2-9 (min of 9 and reachable count); varies to show partial and full fills
+  transformation:
+    rule: BFS from passable cells adjacent to dest block through floor+maroon; rank reachable maroon by distance (ties broken by row then col); closest k fill dest in row-major order; moved maroon erased to floor
+    conservation: total maroon count preserved (moved, not created/destroyed)
+    dest_fill: first k cells in row-major order become maroon(9), rest keep green(3)/red(2)
+
+generation_strategy:
+  approach: output-first
+  steps:
+    1. Fix grid 11x11, dest block at rows 4-6 cols 4-6 (green ring + red center).
+    2. Decide fill count k in 2-9. Place k maroon in dest row-major; remaining dest cells keep green/red.
+    3. Decide if walls exist (yes/no). If yes, pick wall=6 floor=7 (or swap roles).
+    4. If walls, build wall barrier around dest with 1-4 floor gaps as corridor openings. Wall forms connected or near-connected frame at ~distance 2 from center, extending outward as corridor arms.
+    5. Place k maroon tokens on floor cells reachable from dest openings via BFS, at varied distances. These are the sources that will be erased in output.
+    6. Optionally place 0-10 additional maroon tokens in unreachable floor regions (walled off from dest) as distractors.
+    7. Derive input: copy output grid, move maroon from dest back to source positions (restore dest to green/red), place erased maroon back on floor.
+    8. Validate: run solver on input and confirm output matches.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+## 已有单变体参考代码
+
+以下组成项已有单变体实现，可作为融合时的参考：
+
+            ### 参考代码: D5/1
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/dd6b8c4b/D5/1/code.py`
+
+            ```python
+            # Variant of dd6b8c4b
+# Dimension: D5 — 源对象（被收集的对象） (src)
+# Change: 栗色（maroon/9）散布像素——散落在网格各处的单个栗色像素，作为被收集的目标... → 多种颜色的待收集像素
+
+import random
+from collections import deque
+
+import numpy as np
+
+from arc_utils import neighbors4
+
+
+# Design analysis for the D5 variant
+# ----------------------------------
+# a) Concrete behavior:
+#    - Keep the original 11x11 scene, fixed 3x3 destination at the red center, orange floor,
+#      optional magenta walls, and single-pixel source tokens scattered on floor cells.
+#    - The only semantic change is that source tokens are no longer all maroon. Each puzzle now
+#      uses 2-3 colors chosen from a small palette such as blue/yellow/azure/maroon.
+#    - Solver behavior stays "reachable via floor flood-fill -> sort by (distance,row,col) ->
+#      place into destination row-major", but each destination cell receives the chosen token's
+#      own color instead of a uniform maroon.
+#    - Example trace: if reachable tokens sorted by the original rule are
+#      [(d=0,r=3,c=5,color=1), (d=1,r=6,c=5,color=4), (d=1,r=7,c=5,color=9)],
+#      then the first three destination cells become [1,4,9]. The old task would have written
+#      [9,9,9] instead. This is the exact locus of change.
+# b) Complexity calibration:
+#    - Limit token colors to a small visible palette {1,4,8,9}; each sample activates only 2-3
+#      of them. This is enough to make the variant obvious while avoiding an unstructured color soup.
+#    - Tokens remain single pixels, so the original reasoning burden (connectivity + ordering) is
+#      preserved; only color tracking is added.
+# c) Original implicit assumptions that break under D5:
+#    - `passable = {floor, 9}` assumed 9 was the only movable source color; now every token color
+#      must be passable.
+#    - `np.argwhere(grid == 9)` assumed candidate detection was color-specific; now candidates are
+#      all non-structural token colors.
+#    - `out[r, c] = 9` for destination fill assumed all moved tokens share one color; now fill must
+#      use the chosen tokens' individual colors in sorted order.
+#    - Floor inference in the original solver relied on 9 being the only non-structural color.
+#      For this controlled variant we keep the original structural colors fixed, so the solver can
+#      use explicit constants and avoid confusing token colors with terrain.
+# d) Placement legality:
+#    - Generator samples source and distractor cells only from floor cells outside the destination.
+#    - Reachable sources are sampled from the BFS-reachable floor component; distractors come from
+#      unreachable floor cells, so no overlap or out-of-bounds cases can occur.
+#    - Validation still uses output-first checking: build the expected output, run `main(input)`,
+#      and accept only exact matches.
+# e) Visual observability:
+#    - Every accepted sample has at least two distinct reachable token colors, so the destination
+#      visibly contains multiple colors after the move.
+#    - Ordering never depends on color id, only on visible geometry (distance then row-major ties).
+# f) Visual cleanliness:
+#    - Reuse the original sparse single-pixel layout and small color set. Structural colors remain
+#      unchanged, so the new information is isolated to the moved tokens.
+# g) Color inference:
+#    - There is no hidden recoloring map. A token keeps its color when moved, which is directly
+#      inferable across a few examples.
+# h) New solver assumptions and generator guarantees:
+#    - Assumption: all movable tokens use colors outside {2,3,6,7}. Generator enforces this.
+#    - Assumption: at least one floor/token cell touches the destination from outside. Generator
+#      rejects layouts with no BFS start.
+#    - Assumption: all reachable tokens should be moved because the generator places exactly `k`
+#      reachable tokens and `k <= 9`. Generator enforces this and validates by exact solve-check.
+# i) Reference-task calibration:
+#    - The source task `b5ca7ac4` preserves each square's interior color pattern while moving the
+#      square by a structural rule. This variant mirrors that complexity level: motion is still
+#      governed by geometry, but color content must be preserved instead of collapsed to one color.
+
+
+GRID_H, GRID_W = 11, 11
+CENTER_R, CENTER_C = 5, 5
+FLOOR_COLOR, WALL_COLOR = 7, 6
+DEST_COLOR, RED_CENTER = 3, 2
+SOURCE_PALETTE = (1, 4, 8, 9)
+
+WALL_PROB = 0.75
+RING_GAP_RANGE = (1, 4)
+WALL_STYLES = ["arms", "frame", "mixed"]
+
+ARM_EXTEND_PROB = 0.5
+ARM_LENGTH_RANGE = (1, 5)
+FRAME_DIST_RANGE = (3, 4)
+FRAME_CONNECT_PROB = 0.4
+FRAME_GAP_REMOVE_PROB = 0.3
+MIXED_EXTEND_PROB = 0.6
+
+FILL_K_RANGE = (2, 9)
+DISTRACTOR_MAX = 10
+TOTAL_TOKEN_RANGE = (4, 16)
+MIN_REACHABLE = 2
+GEN_RETRIES = 300
+INF = 10**9
+
+
+def _dest_cells(cr: int, cc: int, h: int, w: int) -> list[tuple[int, int]]:
+    cells = []
+    for r in range(cr - 1, cr + 2):
+        for c in range(cc - 1, cc + 2):
+            if 0 <= r < h and 0 <= c < w:
+                cells.append((r, c))
+    cells.sort()
+    return cells
+
+
+def _distance_map(
+    grid: np.ndarray,
+    dest_cells: list[tuple[int, int]],
+    passable: set[int],
+) -> np.ndarray:
+    h, w = grid.shape
+    dest_set = set(dest_cells)
+    dist = np.full((h, w), INF, dtype=int)
+    queue = deque()
+
+    for r, c in dest_cells:
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
+                if int(grid[rr, cc]) in passable and dist[rr, cc] == INF:
+                    dist[rr, cc] = 0
+                    queue.append((rr, cc))
+
+    assert queue, "there must be at least one passable cell adjacent to the destination block"
+
+    while queue:
+        r, c = queue.popleft()
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == INF:
+                if int(grid[rr, cc]) in passable:
+                    dist[rr, cc] = int(dist[r, c]) + 1
+                    queue.append((rr, cc))
+
+    return dist
+
+
+def _sorted_reachable_tokens(
+    grid: np.ndarray,
+    dist: np.ndarray,
+    token_colors: set[int],
+) -> list[tuple[int, int, int, int]]:
+    tokens = []
+    for r in range(grid.shape[0]):
+        for c in range(grid.shape[1]):
+            color = int(grid[r, c])
+            if color in token_colors and int(dist[r, c]) < INF:
+                tokens.append((int(dist[r, c]), int(r), int(c), color))
+    tokens.sort()
+    return tokens
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Move the closest reachable colored pixels into the 3×3 block around the unique red center.
+
+    Input structure:
+    - Orange floor and optional magenta walls surround a fixed green 3×3 destination with one red center.
+    - Single-pixel source tokens of several colors are scattered on floor cells outside that block.
+
+    Rule:
+    - Flood-fill outward from floor/token cells touching the destination, moving only through floor or token cells.
+    - Collect every reachable colored token, sort them by distance to the destination and then by row/column, and write their colors into the destination in row-major order.
+    - Erase the moved source tokens back to floor, while unreachable colored tokens stay where they are.
+
+    Key insight: The geometry is still controlled by wall-restricted reachability, but now the solver must preserve the color sequence of the selected tokens instead of collapsing everything to one color.
+    """
+
+    grid = np.asarray(grid, dtype=int)
+    h, w = grid.shape
+    out = grid.copy()
+
+    centers = np.argwhere(grid == RED_CENTER)
+    assert len(centers) == 1, "grid must have exactly one red center pixel"
+    cr, cc = map(int, centers[0])
+
+    dest_cells = _dest_cells(cr, cc, h, w)
+    token_colors = {
+        int(color) for color in np.unique(grid)
+        if int(color) not in {FLOOR_COLOR, WALL_COLOR, DEST_COLOR, RED_CENTER}
+    }
+    assert token_colors, "grid must contain at least one non-structural token color"
+
+    passable = {FLOOR_COLOR, *token_colors}
+    dist = _distance_map(grid, dest_cells, passable)
+    tokens = _sorted_reachable_tokens(grid, dist, token_colors)
+
+    k = min(len(dest_cells), len(tokens))
+    chosen = tokens[:k]
+
+    for _, r, c, _ in chosen:
+        out[r, c] = FLOOR_COLOR
+
+    for (r, c), (_, _, _, color) in zip(dest_cells[:k], chosen):
+        out[r, c] = color
+
+    return out
+
+
+def _bfs_reachable_floor(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> tuple[set[tuple[int, int]], np.ndarray]:
+    dist = _distance_map(grid, sorted(dest_set), {FLOOR_COLOR})
+    reachable = {
+        (r, c)
+        for r in range(GRID_H)
+        for c in range(GRID_W)
+        if (r, c) not in dest_set and grid[r, c] == FLOOR_COLOR and int(dist[r, c]) < INF
+    }
+    return reachable, dist
+
+
+def _outward_dirs(r: int, c: int) -> list[tuple[int, int]]:
+    dirs = []
+    if r < CENTER_R:
+        dirs.append((-1, 0))
+    if r > CENTER_R:
+        dirs.append((1, 0))
+    if c < CENTER_C:
+        dirs.append((0, -1))
+    if c > CENTER_C:
+        dirs.append((0, 1))
+    return dirs
+
+
+def _extend_arm(wall_cells: set[tuple[int, int]], dest_set: set[tuple[int, int]], r: int, c: int, max_len: int) -> None:
+    dirs = _outward_dirs(r, c)
+    if not dirs:
+        return
+    dr, dc = random.choice(dirs)
+    nr, nc = r, c
+    for _ in range(random.randint(1, max_len)):
+        nr += dr
+        nc += dc
+        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+            wall_cells.add((nr, nc))
+        else:
+            break
+
+
+def _build_walls(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> None:
+    ring = set()
+    for r, c in dest_set:
+        for nr, nc in neighbors4(r, c):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                ring.add((nr, nc))
+    ring = sorted(ring)
+
+    gap_cells = set(random.sample(ring, random.randint(*RING_GAP_RANGE)))
+    wall_ring = [cell for cell in ring if cell not in gap_cells]
+    wall_cells = set(wall_ring)
+    style = random.choice(WALL_STYLES)
+
+    if style == "arms":
+        for r, c in wall_ring:
+            if random.random() < ARM_EXTEND_PROB:
+                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
+    elif style == "frame":
+        dist2 = random.randint(*FRAME_DIST_RANGE)
+        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
+            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
+                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
+                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
+                        wall_cells.add((r, c))
+        for r, c in wall_ring:
+            dirs = _outward_dirs(r, c)
+            if dirs and random.random() < FRAME_CONNECT_PROB:
+                dr, dc = random.choice(dirs)
+                nr, nc = r + dr, c + dc
+                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                    wall_cells.add((nr, nc))
+                    nr += dr
+                    nc += dc
+        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
+        if outer_frame:
+            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
+            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
+                if random.random() < FRAME_GAP_REMOVE_PROB:
+                    wall_cells.discard(rc)
+    else:
+        for r, c in wall_ring:
+            if random.random() < MIXED_EXTEND_PROB:
+                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
+                _extend_arm(wall_cells, dest_set, r, c, max_len)
+
+    for r, c in wall_cells:
+        grid[r, c] = WALL_COLOR
+
+
+def _assign_colors(count: int, active_colors: list[int]) -> list[int]:
+    colors = list(active_colors)
+    while len(colors) < count:
+        colors.append(random.choice(active_colors))
+    random.shuffle(colors)
+    return colors
+
+
+def _gen_attempt() -> np.ndarray | None:
+    dest_cells = _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W)
+    dest_set = set(dest_cells)
+
+    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
+    for r, c in dest_cells:
+        base[r, c] = DEST_COLOR
+    base[CENTER_R, CENTER_C] = RED_CENTER
+
+    if random.random() < WALL_PROB:
+        _build_walls(base, dest_set)
+
+    reachable_floor, dist = _bfs_reachable_floor(base, dest_set)
+    if len(reachable_floor) < MIN_REACHABLE:
+        return None
+
+    all_floor = {
+        (r, c)
+        for r in range(GRID_H)
+        for c in range(GRID_W)
+        if base[r, c] == FLOOR_COLOR and (r, c) not in dest_set
+    }
+    unreachable_floor = all_floor - reachable_floor
+
+    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
+    if max_k < FILL_K_RANGE[0]:
+        return None
+    k = random.randint(FILL_K_RANGE[0], max_k)
+
+    max_dist = min(DISTRACTOR_MAX, len(unreachable_floor))
+    num_distractors = random.randint(0, max_dist) if max_dist > 0 else 0
+
+    total = k + num_distractors
+    if total < TOTAL_TOKEN_RANGE[0]:
+        needed = TOTAL_TOKEN_RANGE[0] - total
+        if len(unreachable_floor) >= num_distractors + needed:
+            num_distractors += needed
+        elif max_k >= k + needed:
+            k += needed
+        else:
+            return None
+    if k + num_distractors > TOTAL_TOKEN_RANGE[1]:
+        num_distractors = max(0, TOTAL_TOKEN_RANGE[1] - k)
+
+    source_cells = random.sample(list(reachable_floor), k)
+    distractor_cells = random.sample(list(unreachable_floor), num_distractors)
+
+    active_count = random.randint(2, min(3, k, len(SOURCE_PALETTE)))
+    active_colors = random.sample(list(SOURCE_PALETTE), active_count)
+    source_colors = _assign_colors(k, active_colors)
+    if len(set(source_colors)) < 2:
+        return None
+    distractor_colors = [random.choice(active_colors) for _ in range(num_distractors)]
+
+    inp = base.copy()
+    for (r, c), color in zip(source_cells, source_colors):
+        inp[r, c] = color
+    for (r, c), color in zip(distractor_cells, distractor_colors):
+        inp[r, c] = color
+
+    ordered_sources = sorted(
+        [(int(dist[r, c]), int(r), int(c), color) for (r, c), color in zip(source_cells, source_colors)]
+    )
+
+    out = base.copy()
+    for (r, c), color in zip(distractor_cells, distractor_colors):
+        out[r, c] = color
+    for (r, c), (_, _, _, color) in zip(dest_cells[:k], ordered_sources):
+        out[r, c] = color
+
+    try:
+        result = main(inp)
+        if np.array_equal(result, out):
+            return inp
+    except Exception:
+        pass
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+            ```
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/9/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dd6b8c4b.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/9/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of dd6b8c4b (index 9)
+    # combo_spec: D5/1+D8/2
+    # Name: 多色像素+距离梯度填充色
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/9` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/b5ca7ac4.py` — 参考任务 b5ca7ac4 的 solver（D5/1 的灵感来源）
+
+codex
+先检查原始 solver、单变体参考和目标目录状态，再据此做融合设计并落到新文件。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/dd6b8c4b.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+import numpy as np
+
+from arc_utils import neighbors4
+import random
+from collections import deque
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Move the closest reachable maroon pixels into the 3×3 block around the unique red center.
+
+    Input structure:
+    - bg = orange floor, magenta walls, scattered maroon (9) pixels.
+    - A unique red (2) pixel marks the center of a 3×3 destination block.
+
+    Rule:
+    - Maroon pixels connected to the destination through floor/maroon cells (not blocked by walls) are candidates.
+    - Rank candidates by distance to the destination; the closest ones fill the block in row-major order.
+    - Moved maroons are erased (replaced with floor color).
+
+    Key insight: Wall barriers restrict connectivity — only maroon pixels reachable via flood-fill through the floor qualify, so proximity alone isn't enough.
+    """
+
+    grid = np.asarray(grid, dtype=int)
+    h, w = grid.shape
+    out = grid.copy()
+
+    centers = np.argwhere(grid == 2)
+    assert len(centers) == 1, "grid must have exactly one red (2) center pixel"
+    cr, cc = map(int, centers[0])
+
+    # Destination = 3x3 block around the center.
+    dest_cells: list[tuple[int, int]] = []
+    for r in range(cr - 1, cr + 2):
+        for c in range(cc - 1, cc + 2):
+            if 0 <= r < h and 0 <= c < w:
+                dest_cells.append((r, c))
+    dest_cells.sort()
+    dest_set = set(dest_cells)
+
+    # Infer floor color from the ring around the destination.
+    ring_colors: list[int] = []
+    for r, c in dest_cells:
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and (rr, cc2) not in dest_set:
+                ring_colors.append(int(grid[rr, cc2]))
+
+    cand_ring = [x for x in ring_colors if x not in (2, 3, 9)]
+    assert cand_ring, "ring around destination must contain passable (non-maroon, non-red, non-wall) cells to infer floor color"
+    _vals, _cnts = np.unique(cand_ring, return_counts=True)
+    ring_blocker = int(_vals[_cnts.argmax()])
+    other = [int(x) for x in np.unique(grid) if int(x) not in (2, 3, 9, ring_blocker)]
+    floor = other[0] if len(other) == 1 else (max(other, key=lambda c: int((grid == c).sum())) if other else None)
+    if floor is None:
+        floor = ring_blocker
+
+    passable = {floor, 9}
+
+    # BFS start = passable cells adjacent to the destination.
+    starts: list[tuple[int, int]] = []
+    seen = set()
+    for r, c in dest_cells:
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and int(grid[rr, cc2]) in passable:
+                if (rr, cc2) not in seen:
+                    seen.add((rr, cc2))
+                    starts.append((rr, cc2))
+    assert starts, "there must be at least one passable cell adjacent to the destination block to begin BFS"
+
+    INF = 10**9
+    dist = np.full((h, w), INF, dtype=int)
+    q = list(starts)
+    for r, c in starts:
+        dist[r, c] = 0
+
+    qi = 0
+    while qi < len(q):
+        r, c = q[qi]
+        qi += 1
+        d = dist[r, c]
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and int(grid[rr, cc2]) in passable and dist[rr, cc2] == INF:
+                dist[rr, cc2] = d + 1
+                q.append((rr, cc2))
+
+    maroons = [(int(dist[r, c]), int(r), int(c)) for r, c in np.argwhere(grid == 9)]
+    maroons = [t for t in maroons if t[0] < INF]
+    maroons.sort()  # by distance then row then col
+
+    k = min(len(dest_cells), len(maroons))
+    chosen = {(r, c) for _, r, c in maroons[:k]}
+
+    for r, c in chosen:
+        out[r, c] = floor
+
+    for r, c in dest_cells[:k]:
+        out[r, c] = 9
+
+    return out
+
+# --------------- generator (c) ---------------
+
+# ---- CFG: tunable generation parameters ----
+GRID_H, GRID_W = 11, 11          # canvas size (fixed per spec)
+CENTER_R, CENTER_C = 5, 5        # dest block center
+FLOOR_COLOR, WALL_COLOR = 7, 6   # orange floor, magenta wall
+DEST_COLOR, RED_CENTER = 3, 2    # green ring, red center
+MAROON = 9
+
+WALL_PROB = 0.75                  # probability of placing walls
+RING_GAP_RANGE = (1, 4)          # number of corridor openings in wall ring
+WALL_STYLES = ['arms', 'frame', 'mixed']
+
+# Wall extension parameters per style
+ARM_EXTEND_PROB = 0.5             # per-cell chance of extending an arm (arms style)
+ARM_LENGTH_RANGE = (1, 5)         # arm extension length (arms style)
+FRAME_DIST_RANGE = (3, 4)        # outer frame distance from center
+FRAME_CONNECT_PROB = 0.4          # chance of connecting inner ring to outer frame
+FRAME_GAP_REMOVE_PROB = 0.3       # chance of removing an outer frame cell
+MIXED_EXTEND_PROB = 0.6           # per-cell chance of extending (mixed style)
+
+FILL_K_RANGE = (2, 9)            # how many maroon fill the dest block
+DISTRACTOR_MAX = 10               # max unreachable distractor maroons
+TOTAL_MAROON_RANGE = (4, 16)     # total maroon count bounds
+MIN_REACHABLE = 2                 # minimum reachable floor cells to accept layout
+GEN_RETRIES = 300                 # max generation attempts
+
+
+def _bfs_reachable(grid, dest_set):
+    """BFS from floor cells adjacent to dest through floor cells. Returns set of reachable (r,c)."""
+    visited = set()
+    queue = deque()
+    for dr, dc in dest_set:
+        for nr, nc in neighbors4(dr, dc):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                if grid[nr, nc] == FLOOR_COLOR and (nr, nc) not in visited:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+    while queue:
+        r, c = queue.popleft()
+        for nr, nc in neighbors4(r, c):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in visited:
+                if grid[nr, nc] == FLOOR_COLOR and (nr, nc) not in dest_set:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+    return visited
+
+
+def _outward_dirs(r, c):
+    """Return directions pointing away from center for a ring cell."""
+    dirs = []
+    if r < CENTER_R: dirs.append((-1, 0))
+    if r > CENTER_R: dirs.append((1, 0))
+    if c < CENTER_C: dirs.append((0, -1))
+    if c > CENTER_C: dirs.append((0, 1))
+    return dirs
+
+
+def _extend_arm(wall_cells, dest_set, r, c, max_len):
+    """Extend a wall arm outward from (r,c) in a random outward direction, up to max_len cells."""
+    dirs = _outward_dirs(r, c)
+    if not dirs:
+        return
+    dr, dc = random.choice(dirs)
+    length = random.randint(1, max_len)
+    nr, nc = r, c
+    for _ in range(length):
+        nr, nc = nr + dr, nc + dc
+        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+            wall_cells.add((nr, nc))
+        else:
+            break
+
+
+def _build_walls(grid, dest_set):
+    """Build wall barrier around dest with corridor openings, extending outward."""
+    # Ring = cells 4-adjacent to dest but not in dest
+    ring = set()
+    for dr, dc in dest_set:
+        for nr, nc in neighbors4(dr, dc):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                ring.add((nr, nc))
+    ring = sorted(ring)
+
+    # Choose gaps as corridor openings
+    num_gaps = random.randint(*RING_GAP_RANGE)
+    gap_cells = set(random.sample(ring, num_gaps))
+    wall_ring = [cell for cell in ring if cell not in gap_cells]
+    wall_cells = set(wall_ring)
+
+    style = random.choice(WALL_STYLES)
+
+    if style == 'arms':
+        for r, c in wall_ring:
+            if random.random() < ARM_EXTEND_PROB:
+                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
+
+    elif style == 'frame':
+        # Outer frame at distance 3-4 from center
+        dist2 = random.randint(*FRAME_DIST_RANGE)
+        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
+            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
+                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
+                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
+                        wall_cells.add((r, c))
+        # Connect inner ring to outer frame
+        for r, c in wall_ring:
+            dirs = _outward_dirs(r, c)
+            if dirs and random.random() < FRAME_CONNECT_PROB:
+                dr, dc = random.choice(dirs)
+                nr, nc = r + dr, c + dc
+                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                    wall_cells.add((nr, nc))
+                    nr, nc = nr + dr, nc + dc
+        # Remove some outer frame cells for gaps
+        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
+        if outer_frame:
+            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
+            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
+                if random.random() < FRAME_GAP_REMOVE_PROB:
+                    wall_cells.discard(rc)
+
+    else:  # mixed
+        for r, c in wall_ring:
+            if random.random() < MIXED_EXTEND_PROB:
+                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
+                _extend_arm(wall_cells, dest_set, r, c, max_len)
+
+    for r, c in wall_cells:
+        grid[r, c] = WALL_COLOR
+
+
+def _gen_attempt():
+    """Build a candidate input grid; returns the grid or None on failure."""
+    dest_cells = [(r, c) for r in range(CENTER_R - 1, CENTER_R + 2)
+                  for c in range(CENTER_C - 1, CENTER_C + 2)]
+    dest_set = set(dest_cells)
+
+    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
+    for r, c in dest_cells:
+        grid[r, c] = DEST_COLOR
+    grid[CENTER_R, CENTER_C] = RED_CENTER
+
+    if random.random() < WALL_PROB:
+        _build_walls(grid, dest_set)
+
+    reachable_floor = _bfs_reachable(grid, dest_set)
+    if len(reachable_floor) < MIN_REACHABLE:
+        return None
+
+    all_floor = {(r, c) for r in range(GRID_H) for c in range(GRID_W)
+                 if grid[r, c] == FLOOR_COLOR and (r, c) not in dest_set}
+    unreachable_floor = all_floor - reachable_floor
+
+    # Choose fill count k
+    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
+    if max_k < FILL_K_RANGE[0]:
+        return None
+    k = random.randint(FILL_K_RANGE[0], max_k)
+
+
+exec
+/bin/bash -lc "sed -n '1,220p' /home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dd6b8c4b.json" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+{"train": [{"input": [[7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 6, 6, 6, 6, 6, 6, 6, 9, 9, 7], [7, 6, 9, 9, 7, 7, 7, 6, 9, 9, 7], [7, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7], [7, 7, 7, 6, 3, 3, 3, 6, 7, 7, 7], [7, 7, 7, 6, 3, 2, 3, 6, 7, 9, 7], [7, 9, 7, 6, 3, 3, 3, 6, 7, 7, 7], [9, 9, 7, 6, 6, 7, 6, 6, 6, 6, 7], [7, 7, 7, 6, 7, 7, 7, 9, 9, 6, 7], [7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]], "output": [[7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 6, 6, 6, 6, 6, 6, 6, 9, 9, 7], [7, 6, 9, 9, 7, 7, 7, 6, 9, 9, 7], [7, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7], [7, 7, 7, 6, 9, 9, 3, 6, 7, 7, 7], [7, 7, 7, 6, 3, 2, 3, 6, 7, 9, 7], [7, 9, 7, 6, 3, 3, 3, 6, 7, 7, 7], [9, 9, 7, 6, 6, 7, 6, 6, 6, 6, 7], [7, 7, 7, 6, 7, 7, 7, 7, 7, 6, 7], [7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]]}, {"input": [[7, 7, 7, 7, 7, 7, 9, 9, 9, 7, 7], [7, 7, 7, 7, 7, 7, 9, 9, 7, 7, 9], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 9], [9, 7, 7, 6, 6, 6, 6, 6, 6, 6, 6], [7, 7, 7, 6, 3, 3, 3, 6, 9, 7, 7], [7, 7, 9, 6, 3, 2, 3, 6, 7, 7, 7], [7, 7, 7, 6, 3, 3, 3, 6, 7, 9, 7], [7, 7, 7, 6, 7, 7, 7, 6, 7, 7, 7], [7, 9, 7, 6, 7, 9, 7, 6, 7, 7, 7], [7, 7, 9, 6, 7, 9, 7, 6, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]], "output": [[7, 7, 7, 7, 7, 7, 9, 9, 9, 7, 7], [7, 7, 7, 7, 7, 7, 7, 9, 7, 7, 9], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 9], [7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 6], [7, 7, 7, 6, 9, 9, 9, 6, 7, 7, 7], [7, 7, 7, 6, 9, 9, 9, 6, 7, 7, 7], [7, 7, 7, 6, 9, 9, 9, 6, 7, 7, 7], [7, 7, 7, 6, 7, 7, 7, 6, 7, 7, 7], [7, 7, 7, 6, 7, 7, 7, 6, 7, 7, 7], [7, 7, 7, 6, 7, 7, 7, 6, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]]}, {"input": [[7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 9, 7], [7, 7, 9, 7, 7, 7, 7, 7, 7, 7, 9], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 3, 3, 3, 7, 7, 7, 7], [7, 7, 7, 7, 3, 2, 3, 7, 7, 7, 7], [7, 7, 7, 7, 3, 3, 3, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 9, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]], "output": [[7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 9, 9, 9, 7, 7, 7, 7], [7, 7, 7, 7, 9, 2, 3, 7, 7, 7, 7], [7, 7, 7, 7, 3, 3, 3, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]]}], "test": [{"input": [[6, 6, 9, 7, 7, 7, 7, 7, 9, 6, 6], [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6], [9, 6, 9, 7, 7, 7, 7, 7, 9, 6, 7], [7, 6, 7, 6, 6, 7, 6, 6, 7, 6, 9], [7, 6, 7, 6, 3, 3, 3, 6, 7, 6, 7], [7, 6, 7, 7, 3, 2, 3, 7, 7, 6, 9], [7, 6, 7, 6, 3, 3, 3, 6, 7, 6, 7], [7, 6, 7, 6, 6, 7, 6, 6, 7, 6, 9], [7, 6, 9, 7, 7, 9, 7, 7, 9, 6, 7], [7, 6, 6, 6, 6, 6, 6, 6, 7, 6, 6], [7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 6]], "output": [[6, 6, 9, 7, 7, 7, 7, 7, 9, 6, 6], [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6], [7, 6, 7, 7, 7, 7, 7, 7, 7, 6, 7], [7, 6, 7, 6, 6, 7, 6, 6, 7, 6, 9], [7, 6, 7, 6, 9, 9, 9, 6, 7, 6, 7], [7, 6, 7, 7, 9, 9, 9, 7, 7, 6, 9], [7, 6, 7, 6, 3, 3, 3, 6, 7, 6, 7], [7, 6, 7, 6, 6, 7, 6, 6, 7, 6, 9], [7, 6, 7, 7, 7, 7, 7, 7, 7, 6, 7], [7, 6, 6, 6, 6, 6, 6, 6, 7, 6, 6], [7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 6]]}, {"input": [[7, 7, 7, 6, 9, 7, 9, 6, 7, 7, 7], [7, 7, 9, 6, 6, 6, 6, 6, 7, 7, 9], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [6, 6, 9, 6, 6, 7, 6, 6, 6, 6, 9], [7, 7, 7, 6, 3, 3, 3, 6, 7, 7, 7], [7, 6, 6, 6, 3, 2, 3, 6, 7, 6, 6], [7, 7, 7, 6, 3, 3, 3, 6, 7, 7, 7], [6, 6, 9, 6, 6, 6, 7, 6, 6, 6, 9], [7, 7, 7, 6, 7, 7, 7, 6, 7, 7, 7], [7, 6, 6, 6, 7, 6, 6, 6, 7, 6, 6], [9, 9, 9, 6, 9, 7, 9, 6, 9, 9, 9]], "output": [[7, 7, 7, 6, 9, 7, 9, 6, 7, 7, 7], [7, 7, 7, 6, 6, 6, 6, 6, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [6, 6, 7, 6, 6, 7, 6, 6, 6, 6, 7], [7, 7, 7, 6, 9, 9, 9, 6, 7, 7, 7], [7, 6, 6, 6, 9, 9, 9, 6, 7, 6, 6], [7, 7, 7, 6, 9, 9, 9, 6, 7, 7, 7], [6, 6, 7, 6, 6, 6, 7, 6, 6, 6, 7], [7, 7, 7, 6, 7, 7, 7, 6, 7, 7, 7], [7, 6, 6, 6, 7, 6, 6, 6, 7, 6, 6], [7, 9, 9, 6, 7, 7, 7, 6, 9, 9, 9]]}]}
+exec
+/bin/bash -lc 'pwd && ls -la /home/lixinyu/snap/new/arc2_solver_select && ls -la /home/lixinyu/snap/new/ceshi/code/dd6b8c4b/D5/1 && ls -la /home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+/home/lixinyu/snap/new
+total 2028
+drwxrwxr-x+  3 lixinyu lixinyu  4096 May 13 05:59 .
+drwxrwxrwx+ 27 lixinyu lixinyu  4096 May 16 03:15 ..
+-rw-rw-r--+  1 lixinyu lixinyu  9780 May  4 06:14 0934a4d8.py
+-rw-rw-rw-+  1 lixinyu lixinyu  7696 Apr 14 05:54 136b0064.py
+-rw-rw-rw-+  1 lixinyu lixinyu 10204 Apr 14 03:48 13e47133.py
+-rw-rw-rw-+  1 lixinyu lixinyu 11586 Apr  1 22:03 142ca369.py
+-rw-rw-rw-+  1 lixinyu lixinyu 28469 Apr  4 11:36 16b78196.py
+-rw-rw-rw-+  1 lixinyu lixinyu  9445 Apr 17 11:29 16de56c4.py
+-rw-rw-rw-+  1 lixinyu lixinyu  4552 Apr 13 10:26 1818057f.py
+-rw-rw-rw-+  1 lixinyu lixinyu 20569 Apr 20 05:14 195c6913.py
+-rw-rw-rw-+  1 lixinyu lixinyu  8094 Apr 14 03:48 1ae2feb7.py
+-rw-rw-rw-+  1 lixinyu lixinyu 12932 Apr  3 06:20 20270e3b.py
+-rw-rw-r--+  1 lixinyu lixinyu 27285 May  3 03:13 21897d95.py
+-rw-rw-rw-+  1 lixinyu lixinyu  7632 Apr  4 12:03 221dfab4.py
+-rw-rw-rw-+  1 lixinyu lixinyu 11591 Apr  6 04:42 247ef758.py
+-rw-rw-r--+  1 lixinyu lixinyu  2586 Apr 26 20:30 269e22fb.py
+-rw-rw-r--+  1 lixinyu lixinyu 19271 Apr  7 08:28 271d71e2.py
+-rw-rw-rw-+  1 lixinyu lixinyu  5890 May  5 21:48 28a6681f.py
+-rw-rw-rw-+  1 lixinyu lixinyu  9286 Apr  7 10:21 291dc1e1.py
+-rw-rw-rw-+  1 lixinyu lixinyu 15821 Apr  9 04:52 2b83f449.py
+-rw-rw-rw-+  1 lixinyu lixinyu  3625 May  3 04:34 2ba387bc.py
+-rw-rw-rw-+  1 lixinyu lixinyu 21672 Apr  4 06:57 2c181942.py
+-rw-rw-r--+  1 lixinyu lixinyu 25485 May  4 06:16 2d0172a1.py
+-rw-rw-rw-+  1 lixinyu lixinyu  5779 Apr  9 09:15 31f7f899.py
+-rw-rw-rw-+  1 lixinyu lixinyu 17290 Apr  6 03:00 332f06d7.py
+-rw-rw-rw-+  1 lixinyu lixinyu 19616 Apr 14 03:50 35ab12c3.py
+-rw-rw-rw-+  1 lixinyu lixinyu 11732 May 15 09:37 36a08778.py
+-rw-rw-rw-+  1 lixinyu lixinyu  5947 Apr  9 23:32 38007db0.py
+-rw-rw-rw-+  1 lixinyu lixinyu 25674 Apr 10 09:46 3a25b0d8.py
+-rw-rw-rw-+  1 lixinyu lixinyu 18907 Apr 11 08:35 3dc255db.py
+-rw-rw-rw-+  1 lixinyu lixinyu 15861 Apr 15 01:09 3e6067c3.py
+-rw-rw-rw-+  1 lixinyu lixinyu 16001 Apr 14 03:49 409aa875.py
+-rw-rw-rw-+  1 lixinyu lixinyu 23894 Apr  5 10:34 446ef5d2.py
+-rw-rw-rw-+  1 lixinyu lixinyu  2434 Apr  9 06:36 45a5af55.py
+-rw-rw-rw-+  1 lixinyu lixinyu 17975 Apr  9 23:32 4a21e3da.py
+-rw-rw-rw-+  1 lixinyu lixinyu 10395 Apr 14 03:48 4c3d4a41.py
+-rw-rw-rw-+  1 lixinyu lixinyu 16896 Apr 20 19:56 4c416de3.py
+-rw-rw-rw-+  1 lixinyu lixinyu 40800 Apr 14 04:02 4c7dc4dd.py
+-rw-rw-rw-+  1 lixinyu lixinyu 16093 Apr 20 09:08 53fb4810.py
+-rw-rw-rw-+  1 lixinyu lixinyu 19669 Apr 18 06:18 5545f144.py
+-rw-rw-rw-+  1 lixinyu lixinyu 19778 May  1 00:05 581f7754.py
+-rw-rw-rw-+  1 lixinyu lixinyu  9308 May  1 00:05 58490d8a.py
+-rw-rw-rw-+  1 lixinyu lixinyu 16626 May  1 00:05 58f5dbd5.py
+-rw-rw-rw-+  1 lixinyu lixinyu 20609 May  3 22:33 5961cc34.py
+-rw-rw-rw-+  1 lixinyu lixinyu 16000 May  4 06:26 5dbc8537.py
+-rw-rw-rw-+  1 lixinyu lixinyu 13642 May 15 09:50 62593bfd.py
+-rw-rw-r--+  1 lixinyu lixinyu 15188 May  4 06:23 64efde09.py
+-rw-rw-rw-+  1 lixinyu lixinyu  8268 May  4 06:23 65b59efc.py
+-rw-rw-rw-+  1 lixinyu lixinyu 16191 May  4 06:25 67e490f4.py
+-rw-rw-rw-+  1 lixinyu lixinyu 12816 May  4 06:23 6e453dd6.py
+-rw-rw-rw-+  1 lixinyu lixinyu 35014 May  4 06:25 6e4f6532.py
+-rw-rw-rw-+  1 lixinyu lixinyu 16573 May  4 06:24 6ffbe589.py
+-rw-rw-rw-+  1 lixinyu lixinyu 15783 May  4 06:24 71e489b6.py
+-rw-rw-rw-+  1 lixinyu lixinyu 11389 Apr 21 20:21 7491f3cf.py
+-rw-rw-rw-+  1 lixinyu lixinyu 10402 Apr 21 10:50 7666fa5d.py
+-rw-rw-rw-+  1 lixinyu lixinyu 13959 Apr 21 10:50 78332cb0.py
+-rw-rw-rw-+  1 lixinyu lixinyu 21213 Apr 21 10:52 7b0280bc.py
+-rw-rw-rw-+  1 lixinyu lixinyu 16553 Apr 21 10:51 7b3084d4.py
+-rw-rw-rw-+  1 lixinyu lixinyu  6716 Apr  9 09:15 7b5033c1.py
+-rw-rw-rw-+  1 lixinyu lixinyu 24489 Apr 22 01:52 7b80bb43.py
+-rw-rw-rw-+  1 lixinyu lixinyu 12565 Apr 21 10:50 7c66cb00.py
+-rw-rw-rw-+  1 lixinyu lixinyu 17244 Apr 21 10:50 7ed72f31.py
+-rw-rw-rw-+  1 lixinyu lixinyu 20559 Apr 21 22:46 800d221b.py
+-rw-rw-rw-+  1 lixinyu lixinyu 13739 Apr 21 10:51 80a900e0.py
+-rw-rw-rw-+  1 lixinyu lixinyu 13832 Apr 22 05:42 8698868d.py
+-rw-rw-rw-+  1 lixinyu lixinyu 29087 Apr 23 01:04 88bcf3b4.py
+-rw-rw-rw-+  1 lixinyu lixinyu 23201 Apr 23 02:52 88e364bc.py
+-rw-rw-r--+  1 lixinyu lixinyu 17975 May  3 23:28 89565ca0.py
+-rw-rw-rw-+  1 lixinyu lixinyu 19532 Apr 23 02:52 898e7135.py
+-rw-rw-rw-+  1 lixinyu lixinyu 19444 Apr 23 04:16 8b7bacbf.py
+-rw-rw-rw-+  1 lixinyu lixinyu 17969 Apr 23 01:34 8b9c3697.py
+-rw-rw-rw-+  1 lixinyu lixinyu 13809 Apr 23 01:35 8e5c0c38.py
+-rw-rw-rw-+  1 lixinyu lixinyu  7948 Apr 23 01:32 8f215267.py
+-rw-rw-rw-+  1 lixinyu lixinyu 15212 Apr 23 03:45 8f3a5a89.py
+-rw-rw-rw-+  1 lixinyu lixinyu 15380 Apr 24 12:19 9385bd28.py
+-rw-rw-rw-+  1 lixinyu lixinyu  9305 Apr 24 12:19 97d7923e.py
+-rw-rw-rw-+  1 lixinyu lixinyu 11139 Apr 24 12:19 9aaea919.py
+-rw-rw-rw-+  1 lixinyu lixinyu 15019 Apr 24 12:07 9bbf930d.py
+drwxrwxr-x+  2 lixinyu lixinyu  4096 May 15 09:50 __pycache__
+-rw-rw-rw-+  1 lixinyu lixinyu 18605 Apr 24 12:21 a251c730.py
+-rw-rw-rw-+  1 lixinyu lixinyu 30535 Apr 24 12:23 a25697e4.py
+-rw-rw-rw-+  1 lixinyu lixinyu 24887 Apr 25 12:17 a32d8b75.py
+-rw-rw-rw-+  1 lixinyu lixinyu 10276 Apr 26 04:17 a395ee82.py
+-rw-rw-rw-+  1 lixinyu lixinyu 23607 Apr 26 04:05 a47bf94d.py
+-rw-rw-rw-+  1 lixinyu lixinyu 23206 Apr 26 07:15 a6f40cea.py
+-rw-rw-r--+  1 lixinyu lixinyu 16089 May  6 03:04 aa4ec2a5.py
+-rw-rw-r--+  1 lixinyu lixinyu 12333 May  6 03:04 abc82100.py
+-rw-rwxr--+  1 lixinyu lixinyu 54577 Mar 26 10:08 arc_utils.py
+-rw-rw-r--+  1 lixinyu lixinyu  7962 May  6 03:04 b0039139.py
+-rw-rw-rw-+  1 lixinyu lixinyu 15359 May  6 03:04 b10624e5.py
+-rw-rw-rw-+  1 lixinyu lixinyu 11635 May  6 03:04 b5ca7ac4.py
+-rw-rw-rw-+  1 lixinyu lixinyu 10921 May  6 03:04 b99e7126.py
+-rw-rw-rw-+  1 lixinyu lixinyu 19585 May  6 03:06 b9e38dc0.py
+-rw-rw-rw-+  1 lixinyu lixinyu  8734 Apr  9 09:15 bf45cf4b.py
+-rw-rw-rw-+  1 lixinyu lixinyu 12026 May  6 03:03 c4d067a0.py
+-rw-rw-rw-+  1 lixinyu lixinyu 12377 May  6 03:04 c7f57c3e.py
+-rw-rw-rw-+  1 lixinyu lixinyu 10405 May  6 03:03 cb2d8a2c.py
+-rw-rw-rw-+  1 lixinyu lixinyu 18626 May  7 02:09 cbebaa4b.py
+-rw-rw-rw-+  1 lixinyu lixinyu 22016 May  7 02:09 d35bdbdc.py
+-rw-rw-rw-+  1 lixinyu lixinyu  6863 May  7 02:08 d59b0160.py
+-rw-rw-r--+  1 lixinyu lixinyu 11377 May  7 02:08 d8e07eb2.py
+-rw-rw-rw-+  1 lixinyu lixinyu  9372 May  7 02:07 da515329.py
+-rw-rw-r--+  1 lixinyu lixinyu 10385 May  7 02:09 db0c5428.py
+-rw-rw-rw-+  1 lixinyu lixinyu 10497 May  7 02:08 db695cfb.py
+-rw-rw-rw-+  1 lixinyu lixinyu 19573 May  7 02:09 dbff022c.py
+-rw-rw-rw-+  1 lixinyu lixinyu 11786 May  7 02:08 dd6b8c4b.py
+-rw-rw-r--+  1 lixinyu lixinyu 15981 May  7 02:12 de809cff.py
+-rw-rw-r--+  1 lixinyu lixinyu  3192 Apr 26 05:16 dfadab01.py
+-rw-rw-rw-+  1 lixinyu lixinyu 28970 May  7 02:09 e12f9a14.py
+-rw-rw-rw-+  1 lixinyu lixinyu 23278 May  7 02:12 e3721c99.py
+-rw-rw-rw-+  1 lixinyu lixinyu 12886 May  7 02:08 e376de54.py
+-rw-rw-rw-+  1 lixinyu lixinyu 20391 May  7 02:10 e8686506.py
+-rw-rw-rw-+  1 lixinyu lixinyu 21301 May  7 02:09 e87109e9.py
+-rw-rw-rw-+  1 lixinyu lixinyu 18915 May  7 02:10 edb79dae.py
+-rw-rw-r--+  1 lixinyu lixinyu  4151 May  7 02:07 eee78d87.py
+-rw-rw-rw-+  1 lixinyu lixinyu 22110 May  7 02:10 f560132c.py
+-rw-rw-r--+  1 lixinyu lixinyu 12272 May  7 02:09 f931b4a8.py
+-rw-rw-r--+  1 lixinyu lixinyu 35698 May  7 02:34 faa9f03d.py
+-rw-rw-rw-+  1 lixinyu lixinyu 10097 Apr  9 09:15 fc7cae8d.py
+total 28
+drwxrwxr-x+ 3 lixinyu lixinyu  4096 May 14 05:53 .
+drwxrwxr-x+ 3 lixinyu lixinyu  4096 May 14 05:51 ..
+drwxrwxr-x+ 2 lixinyu lixinyu  4096 May 14 05:53 __pycache__
+-rw-rw-r--+ 1 lixinyu lixinyu 14906 May 14 05:53 code.py
+total 12
+drwxrwxr-x+   3 lixinyu lixinyu 4096 May 17 04:34 .
+drwxrwxr-x+ 116 lixinyu lixinyu 4096 May 17 04:34 ..
+drwxrwxr-x+   2 lixinyu lixinyu 4096 May 17 04:34 _logs
+
+exec
+/bin/bash -lc "sed -n '1,360p' /home/lixinyu/snap/new/ceshi/code/dd6b8c4b/D5/1/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Variant of dd6b8c4b
+# Dimension: D5 — 源对象（被收集的对象） (src)
+# Change: 栗色（maroon/9）散布像素——散落在网格各处的单个栗色像素，作为被收集的目标... → 多种颜色的待收集像素
+
+import random
+from collections import deque
+
+import numpy as np
+
+from arc_utils import neighbors4
+
+
+# Design analysis for the D5 variant
+# ----------------------------------
+# a) Concrete behavior:
+#    - Keep the original 11x11 scene, fixed 3x3 destination at the red center, orange floor,
+#      optional magenta walls, and single-pixel source tokens scattered on floor cells.
+#    - The only semantic change is that source tokens are no longer all maroon. Each puzzle now
+#      uses 2-3 colors chosen from a small palette such as blue/yellow/azure/maroon.
+#    - Solver behavior stays "reachable via floor flood-fill -> sort by (distance,row,col) ->
+#      place into destination row-major", but each destination cell receives the chosen token's
+#      own color instead of a uniform maroon.
+#    - Example trace: if reachable tokens sorted by the original rule are
+#      [(d=0,r=3,c=5,color=1), (d=1,r=6,c=5,color=4), (d=1,r=7,c=5,color=9)],
+#      then the first three destination cells become [1,4,9]. The old task would have written
+#      [9,9,9] instead. This is the exact locus of change.
+# b) Complexity calibration:
+#    - Limit token colors to a small visible palette {1,4,8,9}; each sample activates only 2-3
+#      of them. This is enough to make the variant obvious while avoiding an unstructured color soup.
+#    - Tokens remain single pixels, so the original reasoning burden (connectivity + ordering) is
+#      preserved; only color tracking is added.
+# c) Original implicit assumptions that break under D5:
+#    - `passable = {floor, 9}` assumed 9 was the only movable source color; now every token color
+#      must be passable.
+#    - `np.argwhere(grid == 9)` assumed candidate detection was color-specific; now candidates are
+#      all non-structural token colors.
+#    - `out[r, c] = 9` for destination fill assumed all moved tokens share one color; now fill must
+#      use the chosen tokens' individual colors in sorted order.
+#    - Floor inference in the original solver relied on 9 being the only non-structural color.
+#      For this controlled variant we keep the original structural colors fixed, so the solver can
+#      use explicit constants and avoid confusing token colors with terrain.
+# d) Placement legality:
+#    - Generator samples source and distractor cells only from floor cells outside the destination.
+#    - Reachable sources are sampled from the BFS-reachable floor component; distractors come from
+#      unreachable floor cells, so no overlap or out-of-bounds cases can occur.
+#    - Validation still uses output-first checking: build the expected output, run `main(input)`,
+#      and accept only exact matches.
+# e) Visual observability:
+#    - Every accepted sample has at least two distinct reachable token colors, so the destination
+#      visibly contains multiple colors after the move.
+#    - Ordering never depends on color id, only on visible geometry (distance then row-major ties).
+# f) Visual cleanliness:
+#    - Reuse the original sparse single-pixel layout and small color set. Structural colors remain
+#      unchanged, so the new information is isolated to the moved tokens.
+# g) Color inference:
+#    - There is no hidden recoloring map. A token keeps its color when moved, which is directly
+#      inferable across a few examples.
+# h) New solver assumptions and generator guarantees:
+#    - Assumption: all movable tokens use colors outside {2,3,6,7}. Generator enforces this.
+#    - Assumption: at least one floor/token cell touches the destination from outside. Generator
+#      rejects layouts with no BFS start.
+#    - Assumption: all reachable tokens should be moved because the generator places exactly `k`
+#      reachable tokens and `k <= 9`. Generator enforces this and validates by exact solve-check.
+# i) Reference-task calibration:
+#    - The source task `b5ca7ac4` preserves each square's interior color pattern while moving the
+#      square by a structural rule. This variant mirrors that complexity level: motion is still
+#      governed by geometry, but color content must be preserved instead of collapsed to one color.
+
+
+GRID_H, GRID_W = 11, 11
+CENTER_R, CENTER_C = 5, 5
+FLOOR_COLOR, WALL_COLOR = 7, 6
+DEST_COLOR, RED_CENTER = 3, 2
+SOURCE_PALETTE = (1, 4, 8, 9)
+
+WALL_PROB = 0.75
+RING_GAP_RANGE = (1, 4)
+WALL_STYLES = ["arms", "frame", "mixed"]
+
+ARM_EXTEND_PROB = 0.5
+ARM_LENGTH_RANGE = (1, 5)
+FRAME_DIST_RANGE = (3, 4)
+FRAME_CONNECT_PROB = 0.4
+FRAME_GAP_REMOVE_PROB = 0.3
+MIXED_EXTEND_PROB = 0.6
+
+FILL_K_RANGE = (2, 9)
+DISTRACTOR_MAX = 10
+TOTAL_TOKEN_RANGE = (4, 16)
+MIN_REACHABLE = 2
+GEN_RETRIES = 300
+INF = 10**9
+
+
+def _dest_cells(cr: int, cc: int, h: int, w: int) -> list[tuple[int, int]]:
+    cells = []
+    for r in range(cr - 1, cr + 2):
+        for c in range(cc - 1, cc + 2):
+            if 0 <= r < h and 0 <= c < w:
+                cells.append((r, c))
+    cells.sort()
+    return cells
+
+
+def _distance_map(
+    grid: np.ndarray,
+    dest_cells: list[tuple[int, int]],
+    passable: set[int],
+) -> np.ndarray:
+    h, w = grid.shape
+    dest_set = set(dest_cells)
+    dist = np.full((h, w), INF, dtype=int)
+    queue = deque()
+
+    for r, c in dest_cells:
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
+                if int(grid[rr, cc]) in passable and dist[rr, cc] == INF:
+                    dist[rr, cc] = 0
+                    queue.append((rr, cc))
+
+    assert queue, "there must be at least one passable cell adjacent to the destination block"
+
+    while queue:
+        r, c = queue.popleft()
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == INF:
+                if int(grid[rr, cc]) in passable:
+                    dist[rr, cc] = int(dist[r, c]) + 1
+                    queue.append((rr, cc))
+
+    return dist
+
+
+def _sorted_reachable_tokens(
+    grid: np.ndarray,
+    dist: np.ndarray,
+    token_colors: set[int],
+) -> list[tuple[int, int, int, int]]:
+    tokens = []
+    for r in range(grid.shape[0]):
+        for c in range(grid.shape[1]):
+            color = int(grid[r, c])
+            if color in token_colors and int(dist[r, c]) < INF:
+                tokens.append((int(dist[r, c]), int(r), int(c), color))
+    tokens.sort()
+    return tokens
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Move the closest reachable colored pixels into the 3×3 block around the unique red center.
+
+    Input structure:
+    - Orange floor and optional magenta walls surround a fixed green 3×3 destination with one red center.
+    - Single-pixel source tokens of several colors are scattered on floor cells outside that block.
+
+    Rule:
+    - Flood-fill outward from floor/token cells touching the destination, moving only through floor or token cells.
+    - Collect every reachable colored token, sort them by distance to the destination and then by row/column, and write their colors into the destination in row-major order.
+    - Erase the moved source tokens back to floor, while unreachable colored tokens stay where they are.
+
+    Key insight: The geometry is still controlled by wall-restricted reachability, but now the solver must preserve the color sequence of the selected tokens instead of collapsing everything to one color.
+    """
+
+    grid = np.asarray(grid, dtype=int)
+    h, w = grid.shape
+    out = grid.copy()
+
+    centers = np.argwhere(grid == RED_CENTER)
+    assert len(centers) == 1, "grid must have exactly one red center pixel"
+    cr, cc = map(int, centers[0])
+
+    dest_cells = _dest_cells(cr, cc, h, w)
+    token_colors = {
+        int(color) for color in np.unique(grid)
+        if int(color) not in {FLOOR_COLOR, WALL_COLOR, DEST_COLOR, RED_CENTER}
+    }
+    assert token_colors, "grid must contain at least one non-structural token color"
+
+    passable = {FLOOR_COLOR, *token_colors}
+    dist = _distance_map(grid, dest_cells, passable)
+    tokens = _sorted_reachable_tokens(grid, dist, token_colors)
+
+    k = min(len(dest_cells), len(tokens))
+    chosen = tokens[:k]
+
+    for _, r, c, _ in chosen:
+        out[r, c] = FLOOR_COLOR
+
+    for (r, c), (_, _, _, color) in zip(dest_cells[:k], chosen):
+        out[r, c] = color
+
+    return out
+
+
+def _bfs_reachable_floor(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> tuple[set[tuple[int, int]], np.ndarray]:
+    dist = _distance_map(grid, sorted(dest_set), {FLOOR_COLOR})
+    reachable = {
+        (r, c)
+        for r in range(GRID_H)
+        for c in range(GRID_W)
+        if (r, c) not in dest_set and grid[r, c] == FLOOR_COLOR and int(dist[r, c]) < INF
+    }
+    return reachable, dist
+
+
+def _outward_dirs(r: int, c: int) -> list[tuple[int, int]]:
+    dirs = []
+    if r < CENTER_R:
+        dirs.append((-1, 0))
+    if r > CENTER_R:
+        dirs.append((1, 0))
+    if c < CENTER_C:
+        dirs.append((0, -1))
+    if c > CENTER_C:
+        dirs.append((0, 1))
+    return dirs
+
+
+def _extend_arm(wall_cells: set[tuple[int, int]], dest_set: set[tuple[int, int]], r: int, c: int, max_len: int) -> None:
+    dirs = _outward_dirs(r, c)
+    if not dirs:
+        return
+    dr, dc = random.choice(dirs)
+    nr, nc = r, c
+    for _ in range(random.randint(1, max_len)):
+        nr += dr
+        nc += dc
+        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+            wall_cells.add((nr, nc))
+        else:
+            break
+
+
+def _build_walls(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> None:
+    ring = set()
+    for r, c in dest_set:
+        for nr, nc in neighbors4(r, c):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                ring.add((nr, nc))
+    ring = sorted(ring)
+
+    gap_cells = set(random.sample(ring, random.randint(*RING_GAP_RANGE)))
+    wall_ring = [cell for cell in ring if cell not in gap_cells]
+    wall_cells = set(wall_ring)
+    style = random.choice(WALL_STYLES)
+
+    if style == "arms":
+        for r, c in wall_ring:
+            if random.random() < ARM_EXTEND_PROB:
+                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
+    elif style == "frame":
+        dist2 = random.randint(*FRAME_DIST_RANGE)
+        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
+            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
+                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
+                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
+                        wall_cells.add((r, c))
+        for r, c in wall_ring:
+            dirs = _outward_dirs(r, c)
+            if dirs and random.random() < FRAME_CONNECT_PROB:
+                dr, dc = random.choice(dirs)
+                nr, nc = r + dr, c + dc
+                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                    wall_cells.add((nr, nc))
+                    nr += dr
+                    nc += dc
+        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
+        if outer_frame:
+            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
+            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
+                if random.random() < FRAME_GAP_REMOVE_PROB:
+                    wall_cells.discard(rc)
+    else:
+        for r, c in wall_ring:
+            if random.random() < MIXED_EXTEND_PROB:
+                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
+                _extend_arm(wall_cells, dest_set, r, c, max_len)
+
+    for r, c in wall_cells:
+        grid[r, c] = WALL_COLOR
+
+
+def _assign_colors(count: int, active_colors: list[int]) -> list[int]:
+    colors = list(active_colors)
+    while len(colors) < count:
+        colors.append(random.choice(active_colors))
+    random.shuffle(colors)
+    return colors
+
+
+def _gen_attempt() -> np.ndarray | None:
+    dest_cells = _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W)
+    dest_set = set(dest_cells)
+
+    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
+    for r, c in dest_cells:
+        base[r, c] = DEST_COLOR
+    base[CENTER_R, CENTER_C] = RED_CENTER
+
+    if random.random() < WALL_PROB:
+        _build_walls(base, dest_set)
+
+    reachable_floor, dist = _bfs_reachable_floor(base, dest_set)
+    if len(reachable_floor) < MIN_REACHABLE:
+        return None
+
+    all_floor = {
+        (r, c)
+        for r in range(GRID_H)
+        for c in range(GRID_W)
+        if base[r, c] == FLOOR_COLOR and (r, c) not in dest_set
+    }
+    unreachable_floor = all_floor - reachable_floor
+
+    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
+    if max_k < FILL_K_RANGE[0]:
+        return None
+    k = random.randint(FILL_K_RANGE[0], max_k)
+
+    max_dist = min(DISTRACTOR_MAX, len(unreachable_floor))
+    num_distractors = random.randint(0, max_dist) if max_dist > 0 else 0
+
+    total = k + num_distractors
+    if total < TOTAL_TOKEN_RANGE[0]:
+        needed = TOTAL_TOKEN_RANGE[0] - total
+        if len(unreachable_floor) >= num_distractors + needed:
+            num_distractors += needed
+        elif max_k >= k + needed:
+            k += needed
+        else:
+            return None
+    if k + num_distractors > TOTAL_TOKEN_RANGE[1]:
+        num_distractors = max(0, TOTAL_TOKEN_RANGE[1] - k)
+
+    source_cells = random.sample(list(reachable_floor), k)
+    distractor_cells = random.sample(list(unreachable_floor), num_distractors)
+
+    active_count = random.randint(2, min(3, k, len(SOURCE_PALETTE)))
+    active_colors = random.sample(list(SOURCE_PALETTE), active_count)
+    source_colors = _assign_colors(k, active_colors)
+    if len(set(source_colors)) < 2:
+        return None
+    distractor_colors = [random.choice(active_colors) for _ in range(num_distractors)]
+
+    inp = base.copy()
+    for (r, c), color in zip(source_cells, source_colors):
+        inp[r, c] = color
+    for (r, c), color in zip(distractor_cells, distractor_colors):
+        inp[r, c] = color
+
+    ordered_sources = sorted(
+        [(int(dist[r, c]), int(r), int(c), color) for (r, c), color in zip(source_cells, source_colors)]
+    )
+
+    out = base.copy()
+    for (r, c), color in zip(distractor_cells, distractor_colors):
+        out[r, c] = color
+    for (r, c), (_, _, _, color) in zip(dest_cells[:k], ordered_sources):
+
+codex
+规则已经定下来了：输入里用 2 种源颜色做可收集像素，输出里不用源色，而是把每个被收集像素按 BFS 距离映射到固定的 3 档梯度色；我会把这个设计分析写进文件顶部注释，并同时改 solver / generator 保证样本里至少出现 2 档距离色。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/9' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/9/code.py
+diff --git a/ceshi/code_combo/dd6b8c4b/9/code.py b/ceshi/code_combo/dd6b8c4b/9/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..10281b7b73268553891b777fff1baefe576732f4
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/9/code.py
+@@ -0,0 +1,441 @@
++# Combo variant of dd6b8c4b (index 9)
++# combo_spec: D5/1+D8/2
++# Name: 多色像素+距离梯度填充色
++
++import random
++import sys
++from collections import deque
++from pathlib import Path
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[4]
++ARC_UTILS_DIR = ROOT / "arc2_solver_select"
++if str(ARC_UTILS_DIR) not in sys.path:
++    sys.path.append(str(ARC_UTILS_DIR))
++
++from arc_utils import neighbors4
++
++
++# Design analysis for the combo variant
++# -------------------------------------
++# a) Concrete behavior:
++#    - Keep the original 11x11 scene, fixed 3x3 destination centered on the unique red pixel,
++#      orange floor, and optional magenta wall corridors.
++#    - Replace the single maroon source class with multicolor single-pixel sources. This combo
++#      uses only blue(1) and azure(8) as source colors so the input visibly contains multiple
++#      movable colors without becoming noisy.
++#    - The collectible set is still defined by wall-restricted BFS reachability. Example:
++#      if reachable tokens sorted by (distance,row,col) are
++#      [(0,3,5,color=1), (2,6,5,color=8), (5,7,8,color=1)],
++#      then the original task would write [9,9,9], the D5-only variant would write [1,8,1],
++#      but this combo writes the distance gradient [9,5,4]. Source color matters only for
++#      identifying movable tokens and for showing that multiple token colors can be reachable;
++#      once moved, the destination color is determined solely by distance.
++# b) Complexity calibration:
++#    - Source colors are limited to two recurring colors {1,8}. This is enough to make the
++#      D5 change obvious while keeping the scene legible.
++#    - Distance recoloring is limited to three fixed tiers:
++#      dist 0-1 -> maroon(9), dist 2-3 -> gray(5), dist 4+ -> yellow(4).
++#      A small repeated palette makes the heat-map rule inferable from a few examples.
++# c) Original implicit assumptions that break:
++#    - `passable = {floor, 9}` no longer works because movable tokens are not color-9 only.
++#    - `np.argwhere(grid == 9)` no longer finds all candidates; every non-structural token color
++#      must be collected.
++#    - Writing the chosen token's own color into the destination is wrong for this combo because
++#      D8/2 overrides token identity with a distance-dependent gradient.
++#    - The original floor-color inference relied on maroon being the only non-structural color.
++#      Here the structural colors are fixed by construction, so the solver uses constants.
++# d) Placement legality:
++#    - Generator samples all sources and distractors from floor cells outside the destination.
++#    - Reachable sources come only from the BFS-reachable floor component; distractors come only
++#      from unreachable floor cells. This prevents overlap, wall placement conflicts, and
++#      out-of-bounds placement.
++# e) Visual observability:
++#    - Each accepted sample has both source colors among the reachable tokens and at least two
++#      distinct distance tiers among the selected tokens, so both halves of the combo are visible.
++#    - Gradient color depends on visible geometric distance through corridors, not on hidden color
++#      ids or arbitrary per-example mappings.
++# f) Visual cleanliness:
++#    - Structural colors stay unchanged. Only two input token colors and three output gradient
++#      colors are used, all confined to sparse floor pixels and the 3x3 destination block.
++# g) Change inferability:
++#    - Source colors and fill colors are intentionally disjoint: input uses {1,8}, output fill
++#      uses {9,5,4}. This makes it obvious that tokens are being collected by location, but their
++#      original colors are not preserved in the destination.
++# h) New solver assumptions and generator guarantees:
++#    - Assumption: all movable tokens use colors outside {2,3,6,7}. Generator enforces this.
++#    - Assumption: at least one passable exterior cell touches the destination. Wall generation
++#      always leaves 1-4 ring gaps, and validation rejects any broken layout.
++#    - Assumption: reachable tokens span at least two gradient tiers. Generator seeds source
++#      placement from multiple distance buckets and rejects degenerate single-tier cases.
++
++
++GRID_H, GRID_W = 11, 11
++CENTER_R, CENTER_C = 5, 5
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++
++SOURCE_PALETTE = (1, 8)
++GRADIENT_COLORS = (9, 5, 4)
++
++WALL_PROB = 0.75
++RING_GAP_RANGE = (1, 4)
++WALL_STYLES = ["arms", "frame", "mixed"]
++
++ARM_EXTEND_PROB = 0.5
++ARM_LENGTH_RANGE = (1, 5)
++FRAME_DIST_RANGE = (3, 4)
++FRAME_CONNECT_PROB = 0.4
++FRAME_GAP_REMOVE_PROB = 0.3
++MIXED_EXTEND_PROB = 0.6
++
++FILL_K_RANGE = (3, 9)
++DISTRACTOR_MAX = 10
++TOTAL_TOKEN_RANGE = (4, 16)
++MIN_REACHABLE = 4
++GEN_RETRIES = 400
++INF = 10**9
++
++
++def _dest_cells(cr: int, cc: int, h: int, w: int) -> list[tuple[int, int]]:
++    cells = []
++    for r in range(cr - 1, cr + 2):
++        for c in range(cc - 1, cc + 2):
++            if 0 <= r < h and 0 <= c < w:
++                cells.append((r, c))
++    cells.sort()
++    return cells
++
++
++def _distance_bucket(distance: int) -> int:
++    if distance <= 1:
++        return 0
++    if distance <= 3:
++        return 1
++    return 2
++
++
++def _gradient_color(distance: int) -> int:
++    return GRADIENT_COLORS[_distance_bucket(distance)]
++
++
++def _distance_map(
++    grid: np.ndarray,
++    dest_cells: list[tuple[int, int]],
++    passable: set[int],
++) -> np.ndarray:
++    h, w = grid.shape
++    dest_set = set(dest_cells)
++    dist = np.full((h, w), INF, dtype=int)
++    queue = deque()
++
++    for r, c in dest_cells:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
++                if int(grid[rr, cc]) in passable and dist[rr, cc] == INF:
++                    dist[rr, cc] = 0
++                    queue.append((rr, cc))
++
++    assert queue, "there must be at least one passable cell adjacent to the destination block"
++
++    while queue:
++        r, c = queue.popleft()
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == INF:
++                if int(grid[rr, cc]) in passable:
++                    dist[rr, cc] = int(dist[r, c]) + 1
++                    queue.append((rr, cc))
++
++    return dist
++
++
++def _sorted_reachable_tokens(
++    grid: np.ndarray,
++    dist: np.ndarray,
++    token_colors: set[int],
++) -> list[tuple[int, int, int, int]]:
++    tokens = []
++    for r in range(grid.shape[0]):
++        for c in range(grid.shape[1]):
++            color = int(grid[r, c])
++            if color in token_colors and int(dist[r, c]) < INF:
++                tokens.append((int(dist[r, c]), int(r), int(c), color))
++    tokens.sort()
++    return tokens
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Move the closest reachable colored pixels into the 3x3 block around the unique red center, then recolor them by distance.
++
++    Input structure:
++    - Orange floor and optional magenta walls surround a fixed green 3x3 destination whose center is a single red pixel.
++    - Blue and azure single-pixel source tokens are scattered on floor cells outside that block.
++
++    Rule:
++    - Flood-fill outward from passable cells touching the destination, moving through floor or any source token color.
++    - Collect every reachable source token, sort them by distance to the destination and then by row/column, and place the first ones into the destination in row-major order.
++    - Erase the moved source tokens back to floor, but fill each destination cell with a gradient color based on that token's BFS distance rather than its original source color.
++
++    Key insight: The source colors still tell you which pixels are collectible and which corridor cells stay passable, but the destination ignores those source colors and instead encodes near/mid/far reachability as a small distance heat map.
++    """
++
++    grid = np.asarray(grid, dtype=int)
++    h, w = grid.shape
++    out = grid.copy()
++
++    centers = np.argwhere(grid == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center pixel"
++    cr, cc = map(int, centers[0])
++
++    dest_cells = _dest_cells(cr, cc, h, w)
++    token_colors = {
++        int(color)
++        for color in np.unique(grid)
++        if int(color) not in {FLOOR_COLOR, WALL_COLOR, DEST_COLOR, RED_CENTER}
++    }
++    assert token_colors, "grid must contain at least one non-structural token color"
++
++    passable = {FLOOR_COLOR, *token_colors}
++    dist = _distance_map(grid, dest_cells, passable)
++    tokens = _sorted_reachable_tokens(grid, dist, token_colors)
++
++    k = min(len(dest_cells), len(tokens))
++    chosen = tokens[:k]
++
++    for _, r, c, _ in chosen:
++        out[r, c] = FLOOR_COLOR
++
++    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], chosen):
++        out[r, c] = _gradient_color(distance)
++
++    return out
++
++
++def _reachable_floor_and_dist(
++    grid: np.ndarray,
++    dest_cells: list[tuple[int, int]],
++) -> tuple[set[tuple[int, int]], np.ndarray]:
++    dist = _distance_map(grid, dest_cells, {FLOOR_COLOR})
++    dest_set = set(dest_cells)
++    reachable = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if (r, c) not in dest_set and grid[r, c] == FLOOR_COLOR and int(dist[r, c]) < INF
++    }
++    return reachable, dist
++
++
++def _outward_dirs(r: int, c: int) -> list[tuple[int, int]]:
++    dirs = []
++    if r < CENTER_R:
++        dirs.append((-1, 0))
++    if r > CENTER_R:
++        dirs.append((1, 0))
++    if c < CENTER_C:
++        dirs.append((0, -1))
++    if c > CENTER_C:
++        dirs.append((0, 1))
++    return dirs
++
++
++def _extend_arm(
++    wall_cells: set[tuple[int, int]],
++    dest_set: set[tuple[int, int]],
++    r: int,
++    c: int,
++    max_len: int,
++) -> None:
++    dirs = _outward_dirs(r, c)
++    if not dirs:
++        return
++    dr, dc = random.choice(dirs)
++    nr, nc = r, c
++    for _ in range(random.randint(1, max_len)):
++        nr += dr
++        nc += dc
++        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++            wall_cells.add((nr, nc))
++        else:
++            break
++
++
++def _build_walls(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> None:
++    ring = set()
++    for r, c in dest_set:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                ring.add((nr, nc))
++    ring = sorted(ring)
++
++    gap_cells = set(random.sample(ring, random.randint(*RING_GAP_RANGE)))
++    wall_ring = [cell for cell in ring if cell not in gap_cells]
++    wall_cells = set(wall_ring)
++    style = random.choice(WALL_STYLES)
++
++    if style == "arms":
++        for r, c in wall_ring:
++            if random.random() < ARM_EXTEND_PROB:
++                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
++    elif style == "frame":
++        dist2 = random.randint(*FRAME_DIST_RANGE)
++        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
++            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
++                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
++                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
++                        wall_cells.add((r, c))
++        for r, c in wall_ring:
++            dirs = _outward_dirs(r, c)
++            if dirs and random.random() < FRAME_CONNECT_PROB:
++                dr, dc = random.choice(dirs)
++                nr, nc = r + dr, c + dc
++                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                    wall_cells.add((nr, nc))
++                    nr += dr
++                    nc += dc
++        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
++        if outer_frame:
++            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
++            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
++                if random.random() < FRAME_GAP_REMOVE_PROB:
++                    wall_cells.discard(rc)
++    else:
++        for r, c in wall_ring:
++            if random.random() < MIXED_EXTEND_PROB:
++                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
++                _extend_arm(wall_cells, dest_set, r, c, max_len)
++
++    for r, c in wall_cells:
++        grid[r, c] = WALL_COLOR
++
++
++def _assign_source_colors(count: int) -> list[int]:
++    colors = [SOURCE_PALETTE[i % len(SOURCE_PALETTE)] for i in range(count)]
++    random.shuffle(colors)
++    return colors
++
++
++def _sample_reachable_sources(
++    reachable_floor: set[tuple[int, int]],
++    dist: np.ndarray,
++    k: int,
++) -> list[tuple[int, int]]:
++    bucket_cells: dict[int, list[tuple[int, int]]] = {0: [], 1: [], 2: []}
++    for r, c in reachable_floor:
++        bucket_cells[_distance_bucket(int(dist[r, c]))].append((r, c))
++
++    nonempty = [bucket for bucket, cells in bucket_cells.items() if cells]
++    if len(nonempty) < 2:
++        return []
++
++    target_bucket_count = 3 if len(nonempty) >= 3 and k >= 3 and random.random() < 0.7 else 2
++    target_bucket_count = min(target_bucket_count, len(nonempty), k)
++    active_buckets = random.sample(nonempty, target_bucket_count)
++
++    chosen = []
++    used = set()
++    for bucket in active_buckets:
++        cell = random.choice(bucket_cells[bucket])
++        chosen.append(cell)
++        used.add(cell)
++
++    remaining = [cell for cell in reachable_floor if cell not in used]
++    if len(chosen) + len(remaining) < k:
++        return []
++
++    chosen.extend(random.sample(remaining, k - len(chosen)))
++    return chosen
++
++
++def _gen_attempt() -> np.ndarray | None:
++    dest_cells = _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W)
++    dest_set = set(dest_cells)
++
++    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in dest_cells:
++        base[r, c] = DEST_COLOR
++    base[CENTER_R, CENTER_C] = RED_CENTER
++
++    if random.random() < WALL_PROB:
++        _build_walls(base, dest_set)
++
++    reachable_floor, dist = _reachable_floor_and_dist(base, dest_cells)
++    if len(reachable_floor) < MIN_REACHABLE:
++        return None
++
++    all_floor = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if base[r, c] == FLOOR_COLOR and (r, c) not in dest_set
++    }
++    unreachable_floor = all_floor - reachable_floor
++
++    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
++    if max_k < FILL_K_RANGE[0]:
++        return None
++    k = random.randint(FILL_K_RANGE[0], max_k)
++
++    source_cells = _sample_reachable_sources(reachable_floor, dist, k)
++    if len(source_cells) != k:
++        return None
++
++    ordered_distances = sorted(int(dist[r, c]) for r, c in source_cells)
++    if len({_gradient_color(distance) for distance in ordered_distances}) < 2:
++        return None
++
++    max_dist = min(DISTRACTOR_MAX, len(unreachable_floor))
++    num_distractors = random.randint(0, max_dist) if max_dist > 0 else 0
++
++    total = k + num_distractors
++    if total < TOTAL_TOKEN_RANGE[0]:
++        needed = TOTAL_TOKEN_RANGE[0] - total
++        if len(unreachable_floor) >= num_distractors + needed:
++            num_distractors += needed
++        else:
++            return None
++    if k + num_distractors > TOTAL_TOKEN_RANGE[1]:
++        num_distractors = max(0, TOTAL_TOKEN_RANGE[1] - k)
++
++    distractor_cells = random.sample(list(unreachable_floor), num_distractors)
++
++    source_colors = _assign_source_colors(k)
++    distractor_colors = [random.choice(SOURCE_PALETTE) for _ in range(num_distractors)]
++
++    if len(set(source_colors)) < 2:
++        return None
++
++    inp = base.copy()
++    for (r, c), color in zip(source_cells, source_colors):
++        inp[r, c] = color
++    for (r, c), color in zip(distractor_cells, distractor_colors):
++        inp[r, c] = color
++
++    ordered_sources = sorted(
++        (int(dist[r, c]), int(r), int(c), color)
++        for (r, c), color in zip(source_cells, source_colors)
++    )
++
++    out = base.copy()
++    for (r, c), color in zip(distractor_cells, distractor_colors):
++        out[r, c] = color
++    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], ordered_sources):
++        out[r, c] = _gradient_color(distance)
++
++    try:
++        result = main(inp)
++        if np.array_equal(result, out):
++            return inp
++    except Exception:
++        return None
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+diff --git a/ceshi/code_combo/dd6b8c4b/9/code.py b/ceshi/code_combo/dd6b8c4b/9/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..10281b7b73268553891b777fff1baefe576732f4
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/9/code.py
+@@ -0,0 +1,441 @@
++# Combo variant of dd6b8c4b (index 9)
++# combo_spec: D5/1+D8/2
++# Name: 多色像素+距离梯度填充色
++
++import random
++import sys
++from collections import deque
++from pathlib import Path
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[4]
++ARC_UTILS_DIR = ROOT / "arc2_solver_select"
++if str(ARC_UTILS_DIR) not in sys.path:
++    sys.path.append(str(ARC_UTILS_DIR))
++
++from arc_utils import neighbors4
++
++
++# Design analysis for the combo variant
++# -------------------------------------
++# a) Concrete behavior:
++#    - Keep the original 11x11 scene, fixed 3x3 destination centered on the unique red pixel,
++#      orange floor, and optional magenta wall corridors.
++#    - Replace the single maroon source class with multicolor single-pixel sources. This combo
++#      uses only blue(1) and azure(8) as source colors so the input visibly contains multiple
++#      movable colors without becoming noisy.
++#    - The collectible set is still defined by wall-restricted BFS reachability. Example:
++#      if reachable tokens sorted by (distance,row,col) are
++#      [(0,3,5,color=1), (2,6,5,color=8), (5,7,8,color=1)],
++#      then the original task would write [9,9,9], the D5-only variant would write [1,8,1],
++#      but this combo writes the distance gradient [9,5,4]. Source color matters only for
++#      identifying movable tokens and for showing that multiple token colors can be reachable;
++#      once moved, the destination color is determined solely by distance.
++# b) Complexity calibration:
++#    - Source colors are limited to two recurring colors {1,8}. This is enough to make the
++#      D5 change obvious while keeping the scene legible.
++#    - Distance recoloring is limited to three fixed tiers:
++#      dist 0-1 -> maroon(9), dist 2-3 -> gray(5), dist 4+ -> yellow(4).
++#      A small repeated palette makes the heat-map rule inferable from a few examples.
++# c) Original implicit assumptions that break:
++#    - `passable = {floor, 9}` no longer works because movable tokens are not color-9 only.
++#    - `np.argwhere(grid == 9)` no longer finds all candidates; every non-structural token color
++#      must be collected.
++#    - Writing the chosen token's own color into the destination is wrong for this combo because
++#      D8/2 overrides token identity with a distance-dependent gradient.
++#    - The original floor-color inference relied on maroon being the only non-structural color.
++#      Here the structural colors are fixed by construction, so the solver uses constants.
++# d) Placement legality:
++#    - Generator samples all sources and distractors from floor cells outside the destination.
++#    - Reachable sources come only from the BFS-reachable floor component; distractors come only
++#      from unreachable floor cells. This prevents overlap, wall placement conflicts, and
++#      out-of-bounds placement.
++# e) Visual observability:
++#    - Each accepted sample has both source colors among the reachable tokens and at least two
++#      distinct distance tiers among the selected tokens, so both halves of the combo are visible.
++#    - Gradient color depends on visible geometric distance through corridors, not on hidden color
++#      ids or arbitrary per-example mappings.
++# f) Visual cleanliness:
++#    - Structural colors stay unchanged. Only two input token colors and three output gradient
++#      colors are used, all confined to sparse floor pixels and the 3x3 destination block.
++# g) Change inferability:
++#    - Source colors and fill colors are intentionally disjoint: input uses {1,8}, output fill
++#      uses {9,5,4}. This makes it obvious that tokens are being collected by location, but their
++#      original colors are not preserved in the destination.
++# h) New solver assumptions and generator guarantees:
++#    - Assumption: all movable tokens use colors outside {2,3,6,7}. Generator enforces this.
++#    - Assumption: at least one passable exterior cell touches the destination. Wall generation
++#      always leaves 1-4 ring gaps, and validation rejects any broken layout.
++#    - Assumption: reachable tokens span at least two gradient tiers. Generator seeds source
++#      placement from multiple distance buckets and rejects degenerate single-tier cases.
++
++
++GRID_H, GRID_W = 11, 11
++CENTER_R, CENTER_C = 5, 5
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++
++SOURCE_PALETTE = (1, 8)
++GRADIENT_COLORS = (9, 5, 4)
++
++WALL_PROB = 0.75
++RING_GAP_RANGE = (1, 4)
++WALL_STYLES = ["arms", "frame", "mixed"]
++
++ARM_EXTEND_PROB = 0.5
++ARM_LENGTH_RANGE = (1, 5)
++FRAME_DIST_RANGE = (3, 4)
++FRAME_CONNECT_PROB = 0.4
++FRAME_GAP_REMOVE_PROB = 0.3
++MIXED_EXTEND_PROB = 0.6
++
++FILL_K_RANGE = (3, 9)
++DISTRACTOR_MAX = 10
++TOTAL_TOKEN_RANGE = (4, 16)
++MIN_REACHABLE = 4
++GEN_RETRIES = 400
++INF = 10**9
++
++
++def _dest_cells(cr: int, cc: int, h: int, w: int) -> list[tuple[int, int]]:
++    cells = []
++    for r in range(cr - 1, cr + 2):
++        for c in range(cc - 1, cc + 2):
++            if 0 <= r < h and 0 <= c < w:
++                cells.append((r, c))
++    cells.sort()
++    return cells
++
++
++def _distance_bucket(distance: int) -> int:
++    if distance <= 1:
++        return 0
++    if distance <= 3:
++        return 1
++    return 2
++
++
++def _gradient_color(distance: int) -> int:
++    return GRADIENT_COLORS[_distance_bucket(distance)]
++
++
++def _distance_map(
++    grid: np.ndarray,
++    dest_cells: list[tuple[int, int]],
++    passable: set[int],
++) -> np.ndarray:
++    h, w = grid.shape
++    dest_set = set(dest_cells)
++    dist = np.full((h, w), INF, dtype=int)
++    queue = deque()
++
++    for r, c in dest_cells:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
++                if int(grid[rr, cc]) in passable and dist[rr, cc] == INF:
++                    dist[rr, cc] = 0
++                    queue.append((rr, cc))
++
++    assert queue, "there must be at least one passable cell adjacent to the destination block"
++
++    while queue:
++        r, c = queue.popleft()
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == INF:
++                if int(grid[rr, cc]) in passable:
++                    dist[rr, cc] = int(dist[r, c]) + 1
++                    queue.append((rr, cc))
++
++    return dist
++
++
++def _sorted_reachable_tokens(
++    grid: np.ndarray,
++    dist: np.ndarray,
++    token_colors: set[int],
++) -> list[tuple[int, int, int, int]]:
++    tokens = []
++    for r in range(grid.shape[0]):
++        for c in range(grid.shape[1]):
++            color = int(grid[r, c])
++            if color in token_colors and int(dist[r, c]) < INF:
++                tokens.append((int(dist[r, c]), int(r), int(c), color))
++    tokens.sort()
++    return tokens
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Move the closest reachable colored pixels into the 3x3 block around the unique red center, then recolor them by distance.
++
++    Input structure:
++    - Orange floor and optional magenta walls surround a fixed green 3x3 destination whose center is a single red pixel.
++    - Blue and azure single-pixel source tokens are scattered on floor cells outside that block.
++
++    Rule:
++    - Flood-fill outward from passable cells touching the destination, moving through floor or any source token color.
++    - Collect every reachable source token, sort them by distance to the destination and then by row/column, and place the first ones into the destination in row-major order.
++    - Erase the moved source tokens back to floor, but fill each destination cell with a gradient color based on that token's BFS distance rather than its original source color.
++
++    Key insight: The source colors still tell you which pixels are collectible and which corridor cells stay passable, but the destination ignores those source colors and instead encodes near/mid/far reachability as a small distance heat map.
++    """
++
++    grid = np.asarray(grid, dtype=int)
++    h, w = grid.shape
++    out = grid.copy()
++
++    centers = np.argwhere(grid == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center pixel"
++    cr, cc = map(int, centers[0])
++
++    dest_cells = _dest_cells(cr, cc, h, w)
++    token_colors = {
++        int(color)
++        for color in np.unique(grid)
++        if int(color) not in {FLOOR_COLOR, WALL_COLOR, DEST_COLOR, RED_CENTER}
++    }
++    assert token_colors, "grid must contain at least one non-structural token color"
++
++    passable = {FLOOR_COLOR, *token_colors}
++    dist = _distance_map(grid, dest_cells, passable)
++    tokens = _sorted_reachable_tokens(grid, dist, token_colors)
++
++    k = min(len(dest_cells), len(tokens))
++    chosen = tokens[:k]
++
++    for _, r, c, _ in chosen:
++        out[r, c] = FLOOR_COLOR
++
++    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], chosen):
++        out[r, c] = _gradient_color(distance)
++
++    return out
++
++
++def _reachable_floor_and_dist(
++    grid: np.ndarray,
++    dest_cells: list[tuple[int, int]],
++) -> tuple[set[tuple[int, int]], np.ndarray]:
++    dist = _distance_map(grid, dest_cells, {FLOOR_COLOR})
++    dest_set = set(dest_cells)
++    reachable = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if (r, c) not in dest_set and grid[r, c] == FLOOR_COLOR and int(dist[r, c]) < INF
++    }
++    return reachable, dist
++
++
++def _outward_dirs(r: int, c: int) -> list[tuple[int, int]]:
++    dirs = []
++    if r < CENTER_R:
++        dirs.append((-1, 0))
++    if r > CENTER_R:
++        dirs.append((1, 0))
++    if c < CENTER_C:
++        dirs.append((0, -1))
++    if c > CENTER_C:
++        dirs.append((0, 1))
++    return dirs
++
++
++def _extend_arm(
++    wall_cells: set[tuple[int, int]],
++    dest_set: set[tuple[int, int]],
++    r: int,
++    c: int,
++    max_len: int,
++) -> None:
++    dirs = _outward_dirs(r, c)
++    if not dirs:
++        return
++    dr, dc = random.choice(dirs)
++    nr, nc = r, c
++    for _ in range(random.randint(1, max_len)):
++        nr += dr
++        nc += dc
++        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++            wall_cells.add((nr, nc))
++        else:
++            break
++
++
++def _build_walls(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> None:
++    ring = set()
++    for r, c in dest_set:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                ring.add((nr, nc))
++    ring = sorted(ring)
++
++    gap_cells = set(random.sample(ring, random.randint(*RING_GAP_RANGE)))
++    wall_ring = [cell for cell in ring if cell not in gap_cells]
++    wall_cells = set(wall_ring)
++    style = random.choice(WALL_STYLES)
++
++    if style == "arms":
++        for r, c in wall_ring:
++            if random.random() < ARM_EXTEND_PROB:
++                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
++    elif style == "frame":
++        dist2 = random.randint(*FRAME_DIST_RANGE)
++        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
++            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
++                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
++                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
++                        wall_cells.add((r, c))
++        for r, c in wall_ring:
++            dirs = _outward_dirs(r, c)
++            if dirs and random.random() < FRAME_CONNECT_PROB:
++                dr, dc = random.choice(dirs)
++                nr, nc = r + dr, c + dc
++                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                    wall_cells.add((nr, nc))
++                    nr += dr
++                    nc += dc
++        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
++        if outer_frame:
++            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
++            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
++                if random.random() < FRAME_GAP_REMOVE_PROB:
++                    wall_cells.discard(rc)
++    else:
++        for r, c in wall_ring:
++            if random.random() < MIXED_EXTEND_PROB:
++                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
++                _extend_arm(wall_cells, dest_set, r, c, max_len)
++
++    for r, c in wall_cells:
++        grid[r, c] = WALL_COLOR
++
++
++def _assign_source_colors(count: int) -> list[int]:
++    colors = [SOURCE_PALETTE[i % len(SOURCE_PALETTE)] for i in range(count)]
++    random.shuffle(colors)
++    return colors
++
++
++def _sample_reachable_sources(
++    reachable_floor: set[tuple[int, int]],
++    dist: np.ndarray,
++    k: int,
++) -> list[tuple[int, int]]:
++    bucket_cells: dict[int, list[tuple[int, int]]] = {0: [], 1: [], 2: []}
++    for r, c in reachable_floor:
++        bucket_cells[_distance_bucket(int(dist[r, c]))].append((r, c))
++
++    nonempty = [bucket for bucket, cells in bucket_cells.items() if cells]
++    if len(nonempty) < 2:
++        return []
++
++    target_bucket_count = 3 if len(nonempty) >= 3 and k >= 3 and random.random() < 0.7 else 2
++    target_bucket_count = min(target_bucket_count, len(nonempty), k)
++    active_buckets = random.sample(nonempty, target_bucket_count)
++
++    chosen = []
++    used = set()
++    for bucket in active_buckets:
++        cell = random.choice(bucket_cells[bucket])
++        chosen.append(cell)
++        used.add(cell)
++
++    remaining = [cell for cell in reachable_floor if cell not in used]
++    if len(chosen) + len(remaining) < k:
++        return []
++
++    chosen.extend(random.sample(remaining, k - len(chosen)))
++    return chosen
++
++
++def _gen_attempt() -> np.ndarray | None:
++    dest_cells = _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W)
++    dest_set = set(dest_cells)
++
++    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in dest_cells:
++        base[r, c] = DEST_COLOR
++    base[CENTER_R, CENTER_C] = RED_CENTER
++
++    if random.random() < WALL_PROB:
++        _build_walls(base, dest_set)
++
++    reachable_floor, dist = _reachable_floor_and_dist(base, dest_cells)
++    if len(reachable_floor) < MIN_REACHABLE:
++        return None
++
++    all_floor = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if base[r, c] == FLOOR_COLOR and (r, c) not in dest_set
++    }
++    unreachable_floor = all_floor - reachable_floor
++
++    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
++    if max_k < FILL_K_RANGE[0]:
++        return None
++    k = random.randint(FILL_K_RANGE[0], max_k)
++
++    source_cells = _sample_reachable_sources(reachable_floor, dist, k)
++    if len(source_cells) != k:
++        return None
++
++    ordered_distances = sorted(int(dist[r, c]) for r, c in source_cells)
++    if len({_gradient_color(distance) for distance in ordered_distances}) < 2:
++        return None
++
++    max_dist = min(DISTRACTOR_MAX, len(unreachable_floor))
++    num_distractors = random.randint(0, max_dist) if max_dist > 0 else 0
++
++    total = k + num_distractors
++    if total < TOTAL_TOKEN_RANGE[0]:
++        needed = TOTAL_TOKEN_RANGE[0] - total
++        if len(unreachable_floor) >= num_distractors + needed:
++            num_distractors += needed
++        else:
++            return None
++    if k + num_distractors > TOTAL_TOKEN_RANGE[1]:
++        num_distractors = max(0, TOTAL_TOKEN_RANGE[1] - k)
++
++    distractor_cells = random.sample(list(unreachable_floor), num_distractors)
++
++    source_colors = _assign_source_colors(k)
++    distractor_colors = [random.choice(SOURCE_PALETTE) for _ in range(num_distractors)]
++
++    if len(set(source_colors)) < 2:
++        return None
++
++    inp = base.copy()
++    for (r, c), color in zip(source_cells, source_colors):
++        inp[r, c] = color
++    for (r, c), color in zip(distractor_cells, distractor_colors):
++        inp[r, c] = color
++
++    ordered_sources = sorted(
++        (int(dist[r, c]), int(r), int(c), color)
++        for (r, c), color in zip(source_cells, source_colors)
++    )
++
++    out = base.copy()
++    for (r, c), color in zip(distractor_cells, distractor_colors):
++        out[r, c] = color
++    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], ordered_sources):
++        out[r, c] = _gradient_color(distance)
++
++    try:
++        result = main(inp)
++        if np.array_equal(result, out):
++            return inp
++    except Exception:
++        return None
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+codex
+代码已经写入，先做导入和几次快速采样，检查路径导入、BFS、以及输出是否真在用距离梯度而不是源色直拷贝。
+exec
+/bin/bash -lc "sed -n '1,320p' /home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/9/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Combo variant of dd6b8c4b (index 9)
+# combo_spec: D5/1+D8/2
+# Name: 多色像素+距离梯度填充色
+
+import random
+import sys
+from collections import deque
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[4]
+ARC_UTILS_DIR = ROOT / "arc2_solver_select"
+if str(ARC_UTILS_DIR) not in sys.path:
+    sys.path.append(str(ARC_UTILS_DIR))
+
+from arc_utils import neighbors4
+
+
+# Design analysis for the combo variant
+# -------------------------------------
+# a) Concrete behavior:
+#    - Keep the original 11x11 scene, fixed 3x3 destination centered on the unique red pixel,
+#      orange floor, and optional magenta wall corridors.
+#    - Replace the single maroon source class with multicolor single-pixel sources. This combo
+#      uses only blue(1) and azure(8) as source colors so the input visibly contains multiple
+#      movable colors without becoming noisy.
+#    - The collectible set is still defined by wall-restricted BFS reachability. Example:
+#      if reachable tokens sorted by (distance,row,col) are
+#      [(0,3,5,color=1), (2,6,5,color=8), (5,7,8,color=1)],
+#      then the original task would write [9,9,9], the D5-only variant would write [1,8,1],
+#      but this combo writes the distance gradient [9,5,4]. Source color matters only for
+#      identifying movable tokens and for showing that multiple token colors can be reachable;
+#      once moved, the destination color is determined solely by distance.
+# b) Complexity calibration:
+#    - Source colors are limited to two recurring colors {1,8}. This is enough to make the
+#      D5 change obvious while keeping the scene legible.
+#    - Distance recoloring is limited to three fixed tiers:
+#      dist 0-1 -> maroon(9), dist 2-3 -> gray(5), dist 4+ -> yellow(4).
+#      A small repeated palette makes the heat-map rule inferable from a few examples.
+# c) Original implicit assumptions that break:
+#    - `passable = {floor, 9}` no longer works because movable tokens are not color-9 only.
+#    - `np.argwhere(grid == 9)` no longer finds all candidates; every non-structural token color
+#      must be collected.
+#    - Writing the chosen token's own color into the destination is wrong for this combo because
+#      D8/2 overrides token identity with a distance-dependent gradient.
+#    - The original floor-color inference relied on maroon being the only non-structural color.
+#      Here the structural colors are fixed by construction, so the solver uses constants.
+# d) Placement legality:
+#    - Generator samples all sources and distractors from floor cells outside the destination.
+#    - Reachable sources come only from the BFS-reachable floor component; distractors come only
+#      from unreachable floor cells. This prevents overlap, wall placement conflicts, and
+#      out-of-bounds placement.
+# e) Visual observability:
+#    - Each accepted sample has both source colors among the reachable tokens and at least two
+#      distinct distance tiers among the selected tokens, so both halves of the combo are visible.
+#    - Gradient color depends on visible geometric distance through corridors, not on hidden color
+#      ids or arbitrary per-example mappings.
+# f) Visual cleanliness:
+#    - Structural colors stay unchanged. Only two input token colors and three output gradient
+#      colors are used, all confined to sparse floor pixels and the 3x3 destination block.
+# g) Change inferability:
+#    - Source colors and fill colors are intentionally disjoint: input uses {1,8}, output fill
+#      uses {9,5,4}. This makes it obvious that tokens are being collected by location, but their
+#      original colors are not preserved in the destination.
+# h) New solver assumptions and generator guarantees:
+#    - Assumption: all movable tokens use colors outside {2,3,6,7}. Generator enforces this.
+#    - Assumption: at least one passable exterior cell touches the destination. Wall generation
+#      always leaves 1-4 ring gaps, and validation rejects any broken layout.
+#    - Assumption: reachable tokens span at least two gradient tiers. Generator seeds source
+#      placement from multiple distance buckets and rejects degenerate single-tier cases.
+
+
+GRID_H, GRID_W = 11, 11
+CENTER_R, CENTER_C = 5, 5
+FLOOR_COLOR, WALL_COLOR = 7, 6
+DEST_COLOR, RED_CENTER = 3, 2
+
+SOURCE_PALETTE = (1, 8)
+GRADIENT_COLORS = (9, 5, 4)
+
+WALL_PROB = 0.75
+RING_GAP_RANGE = (1, 4)
+WALL_STYLES = ["arms", "frame", "mixed"]
+
+ARM_EXTEND_PROB = 0.5
+ARM_LENGTH_RANGE = (1, 5)
+FRAME_DIST_RANGE = (3, 4)
+FRAME_CONNECT_PROB = 0.4
+FRAME_GAP_REMOVE_PROB = 0.3
+MIXED_EXTEND_PROB = 0.6
+
+FILL_K_RANGE = (3, 9)
+DISTRACTOR_MAX = 10
+TOTAL_TOKEN_RANGE = (4, 16)
+MIN_REACHABLE = 4
+GEN_RETRIES = 400
+INF = 10**9
+
+
+def _dest_cells(cr: int, cc: int, h: int, w: int) -> list[tuple[int, int]]:
+    cells = []
+    for r in range(cr - 1, cr + 2):
+        for c in range(cc - 1, cc + 2):
+            if 0 <= r < h and 0 <= c < w:
+                cells.append((r, c))
+    cells.sort()
+    return cells
+
+
+def _distance_bucket(distance: int) -> int:
+    if distance <= 1:
+        return 0
+    if distance <= 3:
+        return 1
+    return 2
+
+
+def _gradient_color(distance: int) -> int:
+    return GRADIENT_COLORS[_distance_bucket(distance)]
+
+
+def _distance_map(
+    grid: np.ndarray,
+    dest_cells: list[tuple[int, int]],
+    passable: set[int],
+) -> np.ndarray:
+    h, w = grid.shape
+    dest_set = set(dest_cells)
+    dist = np.full((h, w), INF, dtype=int)
+    queue = deque()
+
+    for r, c in dest_cells:
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
+                if int(grid[rr, cc]) in passable and dist[rr, cc] == INF:
+                    dist[rr, cc] = 0
+                    queue.append((rr, cc))
+
+    assert queue, "there must be at least one passable cell adjacent to the destination block"
+
+    while queue:
+        r, c = queue.popleft()
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == INF:
+                if int(grid[rr, cc]) in passable:
+                    dist[rr, cc] = int(dist[r, c]) + 1
+                    queue.append((rr, cc))
+
+    return dist
+
+
+def _sorted_reachable_tokens(
+    grid: np.ndarray,
+    dist: np.ndarray,
+    token_colors: set[int],
+) -> list[tuple[int, int, int, int]]:
+    tokens = []
+    for r in range(grid.shape[0]):
+        for c in range(grid.shape[1]):
+            color = int(grid[r, c])
+            if color in token_colors and int(dist[r, c]) < INF:
+                tokens.append((int(dist[r, c]), int(r), int(c), color))
+    tokens.sort()
+    return tokens
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Move the closest reachable colored pixels into the 3x3 block around the unique red center, then recolor them by distance.
+
+    Input structure:
+    - Orange floor and optional magenta walls surround a fixed green 3x3 destination whose center is a single red pixel.
+    - Blue and azure single-pixel source tokens are scattered on floor cells outside that block.
+
+    Rule:
+    - Flood-fill outward from passable cells touching the destination, moving through floor or any source token color.
+    - Collect every reachable source token, sort them by distance to the destination and then by row/column, and place the first ones into the destination in row-major order.
+    - Erase the moved source tokens back to floor, but fill each destination cell with a gradient color based on that token's BFS distance rather than its original source color.
+
+    Key insight: The source colors still tell you which pixels are collectible and which corridor cells stay passable, but the destination ignores those source colors and instead encodes near/mid/far reachability as a small distance heat map.
+    """
+
+    grid = np.asarray(grid, dtype=int)
+    h, w = grid.shape
+    out = grid.copy()
+
+    centers = np.argwhere(grid == RED_CENTER)
+    assert len(centers) == 1, "grid must have exactly one red center pixel"
+    cr, cc = map(int, centers[0])
+
+    dest_cells = _dest_cells(cr, cc, h, w)
+    token_colors = {
+        int(color)
+        for color in np.unique(grid)
+        if int(color) not in {FLOOR_COLOR, WALL_COLOR, DEST_COLOR, RED_CENTER}
+    }
+    assert token_colors, "grid must contain at least one non-structural token color"
+
+    passable = {FLOOR_COLOR, *token_colors}
+    dist = _distance_map(grid, dest_cells, passable)
+    tokens = _sorted_reachable_tokens(grid, dist, token_colors)
+
+    k = min(len(dest_cells), len(tokens))
+    chosen = tokens[:k]
+
+    for _, r, c, _ in chosen:
+        out[r, c] = FLOOR_COLOR
+
+    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], chosen):
+        out[r, c] = _gradient_color(distance)
+
+    return out
+
+
+def _reachable_floor_and_dist(
+    grid: np.ndarray,
+    dest_cells: list[tuple[int, int]],
+) -> tuple[set[tuple[int, int]], np.ndarray]:
+    dist = _distance_map(grid, dest_cells, {FLOOR_COLOR})
+    dest_set = set(dest_cells)
+    reachable = {
+        (r, c)
+        for r in range(GRID_H)
+        for c in range(GRID_W)
+        if (r, c) not in dest_set and grid[r, c] == FLOOR_COLOR and int(dist[r, c]) < INF
+    }
+    return reachable, dist
+
+
+def _outward_dirs(r: int, c: int) -> list[tuple[int, int]]:
+    dirs = []
+    if r < CENTER_R:
+        dirs.append((-1, 0))
+    if r > CENTER_R:
+        dirs.append((1, 0))
+    if c < CENTER_C:
+        dirs.append((0, -1))
+    if c > CENTER_C:
+        dirs.append((0, 1))
+    return dirs
+
+
+def _extend_arm(
+    wall_cells: set[tuple[int, int]],
+    dest_set: set[tuple[int, int]],
+    r: int,
+    c: int,
+    max_len: int,
+) -> None:
+    dirs = _outward_dirs(r, c)
+    if not dirs:
+        return
+    dr, dc = random.choice(dirs)
+    nr, nc = r, c
+    for _ in range(random.randint(1, max_len)):
+        nr += dr
+        nc += dc
+        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+            wall_cells.add((nr, nc))
+        else:
+            break
+
+
+def _build_walls(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> None:
+    ring = set()
+    for r, c in dest_set:
+        for nr, nc in neighbors4(r, c):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                ring.add((nr, nc))
+    ring = sorted(ring)
+
+    gap_cells = set(random.sample(ring, random.randint(*RING_GAP_RANGE)))
+    wall_ring = [cell for cell in ring if cell not in gap_cells]
+    wall_cells = set(wall_ring)
+    style = random.choice(WALL_STYLES)
+
+    if style == "arms":
+        for r, c in wall_ring:
+            if random.random() < ARM_EXTEND_PROB:
+                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
+    elif style == "frame":
+        dist2 = random.randint(*FRAME_DIST_RANGE)
+        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
+            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
+                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
+                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
+                        wall_cells.add((r, c))
+        for r, c in wall_ring:
+            dirs = _outward_dirs(r, c)
+            if dirs and random.random() < FRAME_CONNECT_PROB:
+                dr, dc = random.choice(dirs)
+                nr, nc = r + dr, c + dc
+                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                    wall_cells.add((nr, nc))
+                    nr += dr
+                    nc += dc
+        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
+        if outer_frame:
+            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
+            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
+                if random.random() < FRAME_GAP_REMOVE_PROB:
+                    wall_cells.discard(rc)
+    else:
+        for r, c in wall_ring:
+            if random.random() < MIXED_EXTEND_PROB:
+                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
+                _extend_arm(wall_cells, dest_set, r, c, max_len)
+
+    for r, c in wall_cells:
+        grid[r, c] = WALL_COLOR
+
+
+def _assign_source_colors(count: int) -> list[int]:
+    colors = [SOURCE_PALETTE[i % len(SOURCE_PALETTE)] for i in range(count)]
+    random.shuffle(colors)
+    return colors
+
+
+def _sample_reachable_sources(
+
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util, numpy as np
+path = '/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/9/code.py'
+spec = importlib.util.spec_from_file_location('variant', path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+for i in range(5):
+    inp = mod.generate_input()
+    out = mod.main(inp)
+    print(i, inp.shape, out.shape, sorted(set(inp.ravel())) , sorted(set(out.ravel())))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dd6b8c4b/9/code.py b/ceshi/code_combo/dd6b8c4b/9/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..10281b7b73268553891b777fff1baefe576732f4
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/9/code.py
+@@ -0,0 +1,441 @@
++# Combo variant of dd6b8c4b (index 9)
++# combo_spec: D5/1+D8/2
++# Name: 多色像素+距离梯度填充色
++
++import random
++import sys
++from collections import deque
++from pathlib import Path
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[4]
++ARC_UTILS_DIR = ROOT / "arc2_solver_select"
++if str(ARC_UTILS_DIR) not in sys.path:
++    sys.path.append(str(ARC_UTILS_DIR))
++
++from arc_utils import neighbors4
++
++
++# Design analysis for the combo variant
++# -------------------------------------
++# a) Concrete behavior:
++#    - Keep the original 11x11 scene, fixed 3x3 destination centered on the unique red pixel,
++#      orange floor, and optional magenta wall corridors.
++#    - Replace the single maroon source class with multicolor single-pixel sources. This combo
++#      uses only blue(1) and azure(8) as source colors so the input visibly contains multiple
++#      movable colors without becoming noisy.
++#    - The collectible set is still defined by wall-restricted BFS reachability. Example:
++#      if reachable tokens sorted by (distance,row,col) are
++#      [(0,3,5,color=1), (2,6,5,color=8), (5,7,8,color=1)],
++#      then the original task would write [9,9,9], the D5-only variant would write [1,8,1],
++#      but this combo writes the distance gradient [9,5,4]. Source color matters only for
++#      identifying movable tokens and for showing that multiple token colors can be reachable;
++#      once moved, the destination color is determined solely by distance.
++# b) Complexity calibration:
++#    - Source colors are limited to two recurring colors {1,8}. This is enough to make the
++#      D5 change obvious while keeping the scene legible.
++#    - Distance recoloring is limited to three fixed tiers:
++#      dist 0-1 -> maroon(9), dist 2-3 -> gray(5), dist 4+ -> yellow(4).
++#      A small repeated palette makes the heat-map rule inferable from a few examples.
++# c) Original implicit assumptions that break:
++#    - `passable = {floor, 9}` no longer works because movable tokens are not color-9 only.
++#    - `np.argwhere(grid == 9)` no longer finds all candidates; every non-structural token color
++#      must be collected.
++#    - Writing the chosen token's own color into the destination is wrong for this combo because
++#      D8/2 overrides token identity with a distance-dependent gradient.
++#    - The original floor-color inference relied on maroon being the only non-structural color.
++#      Here the structural colors are fixed by construction, so the solver uses constants.
++# d) Placement legality:
++#    - Generator samples all sources and distractors from floor cells outside the destination.
++#    - Reachable sources come only from the BFS-reachable floor component; distractors come only
++#      from unreachable floor cells. This prevents overlap, wall placement conflicts, and
++#      out-of-bounds placement.
++# e) Visual observability:
++#    - Each accepted sample has both source colors among the reachable tokens and at least two
++#      distinct distance tiers among the selected tokens, so both halves of the combo are visible.
++#    - Gradient color depends on visible geometric distance through corridors, not on hidden color
++#      ids or arbitrary per-example mappings.
++# f) Visual cleanliness:
++#    - Structural colors stay unchanged. Only two input token colors and three output gradient
++#      colors are used, all confined to sparse floor pixels and the 3x3 destination block.
++# g) Change inferability:
++#    - Source colors and fill colors are intentionally disjoint: input uses {1,8}, output fill
++#      uses {9,5,4}. This makes it obvious that tokens are being collected by location, but their
++#      original colors are not preserved in the destination.
++# h) New solver assumptions and generator guarantees:
++#    - Assumption: all movable tokens use colors outside {2,3,6,7}. Generator enforces this.
++#    - Assumption: at least one passable exterior cell touches the destination. Wall generation
++#      always leaves 1-4 ring gaps, and validation rejects any broken layout.
++#    - Assumption: reachable tokens span at least two gradient tiers. Generator seeds source
++#      placement from multiple distance buckets and rejects degenerate single-tier cases.
++
++
++GRID_H, GRID_W = 11, 11
++CENTER_R, CENTER_C = 5, 5
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++
++SOURCE_PALETTE = (1, 8)
++GRADIENT_COLORS = (9, 5, 4)
++
++WALL_PROB = 0.75
++RING_GAP_RANGE = (1, 4)
++WALL_STYLES = ["arms", "frame", "mixed"]
++
++ARM_EXTEND_PROB = 0.5
++ARM_LENGTH_RANGE = (1, 5)
++FRAME_DIST_RANGE = (3, 4)
++FRAME_CONNECT_PROB = 0.4
++FRAME_GAP_REMOVE_PROB = 0.3
++MIXED_EXTEND_PROB = 0.6
++
++FILL_K_RANGE = (3, 9)
++DISTRACTOR_MAX = 10
++TOTAL_TOKEN_RANGE = (4, 16)
++MIN_REACHABLE = 4
++GEN_RETRIES = 400
++INF = 10**9
++
++
++def _dest_cells(cr: int, cc: int, h: int, w: int) -> list[tuple[int, int]]:
++    cells = []
++    for r in range(cr - 1, cr + 2):
++        for c in range(cc - 1, cc + 2):
++            if 0 <= r < h and 0 <= c < w:
++                cells.append((r, c))
++    cells.sort()
++    return cells
++
++
++def _distance_bucket(distance: int) -> int:
++    if distance <= 1:
++        return 0
++    if distance <= 3:
++        return 1
++    return 2
++
++
++def _gradient_color(distance: int) -> int:
++    return GRADIENT_COLORS[_distance_bucket(distance)]
++
++
++def _distance_map(
++    grid: np.ndarray,
++    dest_cells: list[tuple[int, int]],
++    passable: set[int],
++) -> np.ndarray:
++    h, w = grid.shape
++    dest_set = set(dest_cells)
++    dist = np.full((h, w), INF, dtype=int)
++    queue = deque()
++
++    for r, c in dest_cells:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
++                if int(grid[rr, cc]) in passable and dist[rr, cc] == INF:
++                    dist[rr, cc] = 0
++                    queue.append((rr, cc))
++
++    assert queue, "there must be at least one passable cell adjacent to the destination block"
++
++    while queue:
++        r, c = queue.popleft()
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == INF:
++                if int(grid[rr, cc]) in passable:
++                    dist[rr, cc] = int(dist[r, c]) + 1
++                    queue.append((rr, cc))
++
++    return dist
++
++
++def _sorted_reachable_tokens(
++    grid: np.ndarray,
++    dist: np.ndarray,
++    token_colors: set[int],
++) -> list[tuple[int, int, int, int]]:
++    tokens = []
++    for r in range(grid.shape[0]):
++        for c in range(grid.shape[1]):
++            color = int(grid[r, c])
++            if color in token_colors and int(dist[r, c]) < INF:
++                tokens.append((int(dist[r, c]), int(r), int(c), color))
++    tokens.sort()
++    return tokens
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Move the closest reachable colored pixels into the 3x3 block around the unique red center, then recolor them by distance.
++
++    Input structure:
++    - Orange floor and optional magenta walls surround a fixed green 3x3 destination whose center is a single red pixel.
++    - Blue and azure single-pixel source tokens are scattered on floor cells outside that block.
++
++    Rule:
++    - Flood-fill outward from passable cells touching the destination, moving through floor or any source token color.
++    - Collect every reachable source token, sort them by distance to the destination and then by row/column, and place the first ones into the destination in row-major order.
++    - Erase the moved source tokens back to floor, but fill each destination cell with a gradient color based on that token's BFS distance rather than its original source color.
++
++    Key insight: The source colors still tell you which pixels are collectible and which corridor cells stay passable, but the destination ignores those source colors and instead encodes near/mid/far reachability as a small distance heat map.
++    """
++
++    grid = np.asarray(grid, dtype=int)
++    h, w = grid.shape
++    out = grid.copy()
++
++    centers = np.argwhere(grid == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center pixel"
++    cr, cc = map(int, centers[0])
++
++    dest_cells = _dest_cells(cr, cc, h, w)
++    token_colors = {
++        int(color)
++        for color in np.unique(grid)
++        if int(color) not in {FLOOR_COLOR, WALL_COLOR, DEST_COLOR, RED_CENTER}
++    }
++    assert token_colors, "grid must contain at least one non-structural token color"
++
++    passable = {FLOOR_COLOR, *token_colors}
++    dist = _distance_map(grid, dest_cells, passable)
++    tokens = _sorted_reachable_tokens(grid, dist, token_colors)
++
++    k = min(len(dest_cells), len(tokens))
++    chosen = tokens[:k]
++
++    for _, r, c, _ in chosen:
++        out[r, c] = FLOOR_COLOR
++
++    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], chosen):
++        out[r, c] = _gradient_color(distance)
++
++    return out
++
++
++def _reachable_floor_and_dist(
++    grid: np.ndarray,
++    dest_cells: list[tuple[int, int]],
++) -> tuple[set[tuple[int, int]], np.ndarray]:
++    dist = _distance_map(grid, dest_cells, {FLOOR_COLOR})
++    dest_set = set(dest_cells)
++    reachable = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if (r, c) not in dest_set and grid[r, c] == FLOOR_COLOR and int(dist[r, c]) < INF
++    }
++    return reachable, dist
++
++
++def _outward_dirs(r: int, c: int) -> list[tuple[int, int]]:
++    dirs = []
++    if r < CENTER_R:
++        dirs.append((-1, 0))
++    if r > CENTER_R:
++        dirs.append((1, 0))
++    if c < CENTER_C:
++        dirs.append((0, -1))
++    if c > CENTER_C:
++        dirs.append((0, 1))
++    return dirs
++
++
++def _extend_arm(
++    wall_cells: set[tuple[int, int]],
++    dest_set: set[tuple[int, int]],
++    r: int,
++    c: int,
++    max_len: int,
++) -> None:
++    dirs = _outward_dirs(r, c)
++    if not dirs:
++        return
++    dr, dc = random.choice(dirs)
++    nr, nc = r, c
++    for _ in range(random.randint(1, max_len)):
++        nr += dr
++        nc += dc
++        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++            wall_cells.add((nr, nc))
++        else:
++            break
++
++
++def _build_walls(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> None:
++    ring = set()
++    for r, c in dest_set:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                ring.add((nr, nc))
++    ring = sorted(ring)
++
++    gap_cells = set(random.sample(ring, random.randint(*RING_GAP_RANGE)))
++    wall_ring = [cell for cell in ring if cell not in gap_cells]
++    wall_cells = set(wall_ring)
++    style = random.choice(WALL_STYLES)
++
++    if style == "arms":
++        for r, c in wall_ring:
++            if random.random() < ARM_EXTEND_PROB:
++                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
++    elif style == "frame":
++        dist2 = random.randint(*FRAME_DIST_RANGE)
++        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
++            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
++                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
++                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
++                        wall_cells.add((r, c))
++        for r, c in wall_ring:
++            dirs = _outward_dirs(r, c)
++            if dirs and random.random() < FRAME_CONNECT_PROB:
++                dr, dc = random.choice(dirs)
++                nr, nc = r + dr, c + dc
++                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                    wall_cells.add((nr, nc))
++                    nr += dr
++                    nc += dc
++        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
++        if outer_frame:
++            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
++            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
++                if random.random() < FRAME_GAP_REMOVE_PROB:
++                    wall_cells.discard(rc)
++    else:
++        for r, c in wall_ring:
++            if random.random() < MIXED_EXTEND_PROB:
++                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
++                _extend_arm(wall_cells, dest_set, r, c, max_len)
++
++    for r, c in wall_cells:
++        grid[r, c] = WALL_COLOR
++
++
++def _assign_source_colors(count: int) -> list[int]:
++    colors = [SOURCE_PALETTE[i % len(SOURCE_PALETTE)] for i in range(count)]
++    random.shuffle(colors)
++    return colors
++
++
++def _sample_reachable_sources(
++    reachable_floor: set[tuple[int, int]],
++    dist: np.ndarray,
++    k: int,
++) -> list[tuple[int, int]]:
++    bucket_cells: dict[int, list[tuple[int, int]]] = {0: [], 1: [], 2: []}
++    for r, c in reachable_floor:
++        bucket_cells[_distance_bucket(int(dist[r, c]))].append((r, c))
++
++    nonempty = [bucket for bucket, cells in bucket_cells.items() if cells]
++    if len(nonempty) < 2:
++        return []
++
++    target_bucket_count = 3 if len(nonempty) >= 3 and k >= 3 and random.random() < 0.7 else 2
++    target_bucket_count = min(target_bucket_count, len(nonempty), k)
++    active_buckets = random.sample(nonempty, target_bucket_count)
++
++    chosen = []
++    used = set()
++    for bucket in active_buckets:
++        cell = random.choice(bucket_cells[bucket])
++        chosen.append(cell)
++        used.add(cell)
++
++    remaining = [cell for cell in reachable_floor if cell not in used]
++    if len(chosen) + len(remaining) < k:
++        return []
++
++    chosen.extend(random.sample(remaining, k - len(chosen)))
++    return chosen
++
++
++def _gen_attempt() -> np.ndarray | None:
++    dest_cells = _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W)
++    dest_set = set(dest_cells)
++
++    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in dest_cells:
++        base[r, c] = DEST_COLOR
++    base[CENTER_R, CENTER_C] = RED_CENTER
++
++    if random.random() < WALL_PROB:
++        _build_walls(base, dest_set)
++
++    reachable_floor, dist = _reachable_floor_and_dist(base, dest_cells)
++    if len(reachable_floor) < MIN_REACHABLE:
++        return None
++
++    all_floor = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if base[r, c] == FLOOR_COLOR and (r, c) not in dest_set
++    }
++    unreachable_floor = all_floor - reachable_floor
++
++    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
++    if max_k < FILL_K_RANGE[0]:
++        return None
++    k = random.randint(FILL_K_RANGE[0], max_k)
++
++    source_cells = _sample_reachable_sources(reachable_floor, dist, k)
++    if len(source_cells) != k:
++        return None
++
++    ordered_distances = sorted(int(dist[r, c]) for r, c in source_cells)
++    if len({_gradient_color(distance) for distance in ordered_distances}) < 2:
++        return None
++
++    max_dist = min(DISTRACTOR_MAX, len(unreachable_floor))
++    num_distractors = random.randint(0, max_dist) if max_dist > 0 else 0
++
++    total = k + num_distractors
++    if total < TOTAL_TOKEN_RANGE[0]:
++        needed = TOTAL_TOKEN_RANGE[0] - total
++        if len(unreachable_floor) >= num_distractors + needed:
++            num_distractors += needed
++        else:
++            return None
++    if k + num_distractors > TOTAL_TOKEN_RANGE[1]:
++        num_distractors = max(0, TOTAL_TOKEN_RANGE[1] - k)
++
++    distractor_cells = random.sample(list(unreachable_floor), num_distractors)
++
++    source_colors = _assign_source_colors(k)
++    distractor_colors = [random.choice(SOURCE_PALETTE) for _ in range(num_distractors)]
++
++    if len(set(source_colors)) < 2:
++        return None
++
++    inp = base.copy()
++    for (r, c), color in zip(source_cells, source_colors):
++        inp[r, c] = color
++    for (r, c), color in zip(distractor_cells, distractor_colors):
++        inp[r, c] = color
++
++    ordered_sources = sorted(
++        (int(dist[r, c]), int(r), int(c), color)
++        for (r, c), color in zip(source_cells, source_colors)
++    )
++
++    out = base.copy()
++    for (r, c), color in zip(distractor_cells, distractor_colors):
++        out[r, c] = color
++    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], ordered_sources):
++        out[r, c] = _gradient_color(distance)
++
++    try:
++        result = main(inp)
++        if np.array_equal(result, out):
++            return inp
++    except Exception:
++        return None
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+ succeeded in 271ms:
+0 (11, 11) (11, 11) [1, 2, 3, 6, 7, 8] [1, 3, 4, 5, 6, 7, 8]
+1 (11, 11) (11, 11) [1, 2, 3, 7, 8] [3, 4, 5, 7, 9]
+2 (11, 11) (11, 11) [1, 2, 3, 6, 7, 8] [1, 4, 5, 6, 7, 8, 9]
+3 (11, 11) (11, 11) [1, 2, 3, 7, 8] [3, 4, 5, 7, 9]
+4 (11, 11) (11, 11) [1, 2, 3, 6, 7, 8] [3, 4, 5, 6, 7, 9]
+
+codex
+快速采样正常，开始跑要求里的 50 次稳定性测试；如果有断点，我会按失败模式回改生成器。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"
+import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/9/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dd6b8c4b/9/code.py b/ceshi/code_combo/dd6b8c4b/9/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..10281b7b73268553891b777fff1baefe576732f4
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/9/code.py
+@@ -0,0 +1,441 @@
++# Combo variant of dd6b8c4b (index 9)
++# combo_spec: D5/1+D8/2
++# Name: 多色像素+距离梯度填充色
++
++import random
++import sys
++from collections import deque
++from pathlib import Path
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[4]
++ARC_UTILS_DIR = ROOT / "arc2_solver_select"
++if str(ARC_UTILS_DIR) not in sys.path:
++    sys.path.append(str(ARC_UTILS_DIR))
++
++from arc_utils import neighbors4
++
++
++# Design analysis for the combo variant
++# -------------------------------------
++# a) Concrete behavior:
++#    - Keep the original 11x11 scene, fixed 3x3 destination centered on the unique red pixel,
++#      orange floor, and optional magenta wall corridors.
++#    - Replace the single maroon source class with multicolor single-pixel sources. This combo
++#      uses only blue(1) and azure(8) as source colors so the input visibly contains multiple
++#      movable colors without becoming noisy.
++#    - The collectible set is still defined by wall-restricted BFS reachability. Example:
++#      if reachable tokens sorted by (distance,row,col) are
++#      [(0,3,5,color=1), (2,6,5,color=8), (5,7,8,color=1)],
++#      then the original task would write [9,9,9], the D5-only variant would write [1,8,1],
++#      but this combo writes the distance gradient [9,5,4]. Source color matters only for
++#      identifying movable tokens and for showing that multiple token colors can be reachable;
++#      once moved, the destination color is determined solely by distance.
++# b) Complexity calibration:
++#    - Source colors are limited to two recurring colors {1,8}. This is enough to make the
++#      D5 change obvious while keeping the scene legible.
++#    - Distance recoloring is limited to three fixed tiers:
++#      dist 0-1 -> maroon(9), dist 2-3 -> gray(5), dist 4+ -> yellow(4).
++#      A small repeated palette makes the heat-map rule inferable from a few examples.
++# c) Original implicit assumptions that break:
++#    - `passable = {floor, 9}` no longer works because movable tokens are not color-9 only.
++#    - `np.argwhere(grid == 9)` no longer finds all candidates; every non-structural token color
++#      must be collected.
++#    - Writing the chosen token's own color into the destination is wrong for this combo because
++#      D8/2 overrides token identity with a distance-dependent gradient.
++#    - The original floor-color inference relied on maroon being the only non-structural color.
++#      Here the structural colors are fixed by construction, so the solver uses constants.
++# d) Placement legality:
++#    - Generator samples all sources and distractors from floor cells outside the destination.
++#    - Reachable sources come only from the BFS-reachable floor component; distractors come only
++#      from unreachable floor cells. This prevents overlap, wall placement conflicts, and
++#      out-of-bounds placement.
++# e) Visual observability:
++#    - Each accepted sample has both source colors among the reachable tokens and at least two
++#      distinct distance tiers among the selected tokens, so both halves of the combo are visible.
++#    - Gradient color depends on visible geometric distance through corridors, not on hidden color
++#      ids or arbitrary per-example mappings.
++# f) Visual cleanliness:
++#    - Structural colors stay unchanged. Only two input token colors and three output gradient
++#      colors are used, all confined to sparse floor pixels and the 3x3 destination block.
++# g) Change inferability:
++#    - Source colors and fill colors are intentionally disjoint: input uses {1,8}, output fill
++#      uses {9,5,4}. This makes it obvious that tokens are being collected by location, but their
++#      original colors are not preserved in the destination.
++# h) New solver assumptions and generator guarantees:
++#    - Assumption: all movable tokens use colors outside {2,3,6,7}. Generator enforces this.
++#    - Assumption: at least one passable exterior cell touches the destination. Wall generation
++#      always leaves 1-4 ring gaps, and validation rejects any broken layout.
++#    - Assumption: reachable tokens span at least two gradient tiers. Generator seeds source
++#      placement from multiple distance buckets and rejects degenerate single-tier cases.
++
++
++GRID_H, GRID_W = 11, 11
++CENTER_R, CENTER_C = 5, 5
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++
++SOURCE_PALETTE = (1, 8)
++GRADIENT_COLORS = (9, 5, 4)
++
++WALL_PROB = 0.75
++RING_GAP_RANGE = (1, 4)
++WALL_STYLES = ["arms", "frame", "mixed"]
++
++ARM_EXTEND_PROB = 0.5
++ARM_LENGTH_RANGE = (1, 5)
++FRAME_DIST_RANGE = (3, 4)
++FRAME_CONNECT_PROB = 0.4
++FRAME_GAP_REMOVE_PROB = 0.3
++MIXED_EXTEND_PROB = 0.6
++
++FILL_K_RANGE = (3, 9)
++DISTRACTOR_MAX = 10
++TOTAL_TOKEN_RANGE = (4, 16)
++MIN_REACHABLE = 4
++GEN_RETRIES = 400
++INF = 10**9
++
++
++def _dest_cells(cr: int, cc: int, h: int, w: int) -> list[tuple[int, int]]:
++    cells = []
++    for r in range(cr - 1, cr + 2):
++        for c in range(cc - 1, cc + 2):
++            if 0 <= r < h and 0 <= c < w:
++                cells.append((r, c))
++    cells.sort()
++    return cells
++
++
++def _distance_bucket(distance: int) -> int:
++    if distance <= 1:
++        return 0
++    if distance <= 3:
++        return 1
++    return 2
++
++
++def _gradient_color(distance: int) -> int:
++    return GRADIENT_COLORS[_distance_bucket(distance)]
++
++
++def _distance_map(
++    grid: np.ndarray,
++    dest_cells: list[tuple[int, int]],
++    passable: set[int],
++) -> np.ndarray:
++    h, w = grid.shape
++    dest_set = set(dest_cells)
++    dist = np.full((h, w), INF, dtype=int)
++    queue = deque()
++
++    for r, c in dest_cells:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
++                if int(grid[rr, cc]) in passable and dist[rr, cc] == INF:
++                    dist[rr, cc] = 0
++                    queue.append((rr, cc))
++
++    assert queue, "there must be at least one passable cell adjacent to the destination block"
++
++    while queue:
++        r, c = queue.popleft()
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == INF:
++                if int(grid[rr, cc]) in passable:
++                    dist[rr, cc] = int(dist[r, c]) + 1
++                    queue.append((rr, cc))
++
++    return dist
++
++
++def _sorted_reachable_tokens(
++    grid: np.ndarray,
++    dist: np.ndarray,
++    token_colors: set[int],
++) -> list[tuple[int, int, int, int]]:
++    tokens = []
++    for r in range(grid.shape[0]):
++        for c in range(grid.shape[1]):
++            color = int(grid[r, c])
++            if color in token_colors and int(dist[r, c]) < INF:
++                tokens.append((int(dist[r, c]), int(r), int(c), color))
++    tokens.sort()
++    return tokens
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Move the closest reachable colored pixels into the 3x3 block around the unique red center, then recolor them by distance.
++
++    Input structure:
++    - Orange floor and optional magenta walls surround a fixed green 3x3 destination whose center is a single red pixel.
++    - Blue and azure single-pixel source tokens are scattered on floor cells outside that block.
++
++    Rule:
++    - Flood-fill outward from passable cells touching the destination, moving through floor or any source token color.
++    - Collect every reachable source token, sort them by distance to the destination and then by row/column, and place the first ones into the destination in row-major order.
++    - Erase the moved source tokens back to floor, but fill each destination cell with a gradient color based on that token's BFS distance rather than its original source color.
++
++    Key insight: The source colors still tell you which pixels are collectible and which corridor cells stay passable, but the destination ignores those source colors and instead encodes near/mid/far reachability as a small distance heat map.
++    """
++
++    grid = np.asarray(grid, dtype=int)
++    h, w = grid.shape
++    out = grid.copy()
++
++    centers = np.argwhere(grid == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center pixel"
++    cr, cc = map(int, centers[0])
++
++    dest_cells = _dest_cells(cr, cc, h, w)
++    token_colors = {
++        int(color)
++        for color in np.unique(grid)
++        if int(color) not in {FLOOR_COLOR, WALL_COLOR, DEST_COLOR, RED_CENTER}
++    }
++    assert token_colors, "grid must contain at least one non-structural token color"
++
++    passable = {FLOOR_COLOR, *token_colors}
++    dist = _distance_map(grid, dest_cells, passable)
++    tokens = _sorted_reachable_tokens(grid, dist, token_colors)
++
++    k = min(len(dest_cells), len(tokens))
++    chosen = tokens[:k]
++
++    for _, r, c, _ in chosen:
++        out[r, c] = FLOOR_COLOR
++
++    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], chosen):
++        out[r, c] = _gradient_color(distance)
++
++    return out
++
++
++def _reachable_floor_and_dist(
++    grid: np.ndarray,
++    dest_cells: list[tuple[int, int]],
++) -> tuple[set[tuple[int, int]], np.ndarray]:
++    dist = _distance_map(grid, dest_cells, {FLOOR_COLOR})
++    dest_set = set(dest_cells)
++    reachable = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if (r, c) not in dest_set and grid[r, c] == FLOOR_COLOR and int(dist[r, c]) < INF
++    }
++    return reachable, dist
++
++
++def _outward_dirs(r: int, c: int) -> list[tuple[int, int]]:
++    dirs = []
++    if r < CENTER_R:
++        dirs.append((-1, 0))
++    if r > CENTER_R:
++        dirs.append((1, 0))
++    if c < CENTER_C:
++        dirs.append((0, -1))
++    if c > CENTER_C:
++        dirs.append((0, 1))
++    return dirs
++
++
++def _extend_arm(
++    wall_cells: set[tuple[int, int]],
++    dest_set: set[tuple[int, int]],
++    r: int,
++    c: int,
++    max_len: int,
++) -> None:
++    dirs = _outward_dirs(r, c)
++    if not dirs:
++        return
++    dr, dc = random.choice(dirs)
++    nr, nc = r, c
++    for _ in range(random.randint(1, max_len)):
++        nr += dr
++        nc += dc
++        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++            wall_cells.add((nr, nc))
++        else:
++            break
++
++
++def _build_walls(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> None:
++    ring = set()
++    for r, c in dest_set:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                ring.add((nr, nc))
++    ring = sorted(ring)
++
++    gap_cells = set(random.sample(ring, random.randint(*RING_GAP_RANGE)))
++    wall_ring = [cell for cell in ring if cell not in gap_cells]
++    wall_cells = set(wall_ring)
++    style = random.choice(WALL_STYLES)
++
++    if style == "arms":
++        for r, c in wall_ring:
++            if random.random() < ARM_EXTEND_PROB:
++                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
++    elif style == "frame":
++        dist2 = random.randint(*FRAME_DIST_RANGE)
++        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
++            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
++                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
++                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
++                        wall_cells.add((r, c))
++        for r, c in wall_ring:
++            dirs = _outward_dirs(r, c)
++            if dirs and random.random() < FRAME_CONNECT_PROB:
++                dr, dc = random.choice(dirs)
++                nr, nc = r + dr, c + dc
++                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                    wall_cells.add((nr, nc))
++                    nr += dr
++                    nc += dc
++        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
++        if outer_frame:
++            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
++            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
++                if random.random() < FRAME_GAP_REMOVE_PROB:
++                    wall_cells.discard(rc)
++    else:
++        for r, c in wall_ring:
++            if random.random() < MIXED_EXTEND_PROB:
++                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
++                _extend_arm(wall_cells, dest_set, r, c, max_len)
++
++    for r, c in wall_cells:
++        grid[r, c] = WALL_COLOR
++
++
++def _assign_source_colors(count: int) -> list[int]:
++    colors = [SOURCE_PALETTE[i % len(SOURCE_PALETTE)] for i in range(count)]
++    random.shuffle(colors)
++    return colors
++
++
++def _sample_reachable_sources(
++    reachable_floor: set[tuple[int, int]],
++    dist: np.ndarray,
++    k: int,
++) -> list[tuple[int, int]]:
++    bucket_cells: dict[int, list[tuple[int, int]]] = {0: [], 1: [], 2: []}
++    for r, c in reachable_floor:
++        bucket_cells[_distance_bucket(int(dist[r, c]))].append((r, c))
++
++    nonempty = [bucket for bucket, cells in bucket_cells.items() if cells]
++    if len(nonempty) < 2:
++        return []
++
++    target_bucket_count = 3 if len(nonempty) >= 3 and k >= 3 and random.random() < 0.7 else 2
++    target_bucket_count = min(target_bucket_count, len(nonempty), k)
++    active_buckets = random.sample(nonempty, target_bucket_count)
++
++    chosen = []
++    used = set()
++    for bucket in active_buckets:
++        cell = random.choice(bucket_cells[bucket])
++        chosen.append(cell)
++        used.add(cell)
++
++    remaining = [cell for cell in reachable_floor if cell not in used]
++    if len(chosen) + len(remaining) < k:
++        return []
++
++    chosen.extend(random.sample(remaining, k - len(chosen)))
++    return chosen
++
++
++def _gen_attempt() -> np.ndarray | None:
++    dest_cells = _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W)
++    dest_set = set(dest_cells)
++
++    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in dest_cells:
++        base[r, c] = DEST_COLOR
++    base[CENTER_R, CENTER_C] = RED_CENTER
++
++    if random.random() < WALL_PROB:
++        _build_walls(base, dest_set)
++
++    reachable_floor, dist = _reachable_floor_and_dist(base, dest_cells)
++    if len(reachable_floor) < MIN_REACHABLE:
++        return None
++
++    all_floor = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if base[r, c] == FLOOR_COLOR and (r, c) not in dest_set
++    }
++    unreachable_floor = all_floor - reachable_floor
++
++    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
++    if max_k < FILL_K_RANGE[0]:
++        return None
++    k = random.randint(FILL_K_RANGE[0], max_k)
++
++    source_cells = _sample_reachable_sources(reachable_floor, dist, k)
++    if len(source_cells) != k:
++        return None
++
++    ordered_distances = sorted(int(dist[r, c]) for r, c in source_cells)
++    if len({_gradient_color(distance) for distance in ordered_distances}) < 2:
++        return None
++
++    max_dist = min(DISTRACTOR_MAX, len(unreachable_floor))
++    num_distractors = random.randint(0, max_dist) if max_dist > 0 else 0
++
++    total = k + num_distractors
++    if total < TOTAL_TOKEN_RANGE[0]:
++        needed = TOTAL_TOKEN_RANGE[0] - total
++        if len(unreachable_floor) >= num_distractors + needed:
++            num_distractors += needed
++        else:
++            return None
++    if k + num_distractors > TOTAL_TOKEN_RANGE[1]:
++        num_distractors = max(0, TOTAL_TOKEN_RANGE[1] - k)
++
++    distractor_cells = random.sample(list(unreachable_floor), num_distractors)
++
++    source_colors = _assign_source_colors(k)
++    distractor_colors = [random.choice(SOURCE_PALETTE) for _ in range(num_distractors)]
++
++    if len(set(source_colors)) < 2:
++        return None
++
++    inp = base.copy()
++    for (r, c), color in zip(source_cells, source_colors):
++        inp[r, c] = color
++    for (r, c), color in zip(distractor_cells, distractor_colors):
++        inp[r, c] = color
++
++    ordered_sources = sorted(
++        (int(dist[r, c]), int(r), int(c), color)
++        for (r, c), color in zip(source_cells, source_colors)
++    )
++
++    out = base.copy()
++    for (r, c), color in zip(distractor_cells, distractor_colors):
++        out[r, c] = color
++    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], ordered_sources):
++        out[r, c] = _gradient_color(distance)
++
++    try:
++        result = main(inp)
++        if np.array_equal(result, out):
++            return inp
++    except Exception:
++        return None
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+ succeeded in 284ms:
+Success: 50/50, Time: 0.1s (1ms/call)
+
+codex
+稳定性过关了。现在做退化检查：量化“输出是否真的按距离重着色而不是退回原题/单变体”，并统计梯度层数分布。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util
+from collections import Counter
+import numpy as np
+
+path = '/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/9/code.py'
+spec = importlib.util.spec_from_file_location('variant', path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+samples = 200
+stats = Counter()
+ks = []
+for _ in range(samples):
+    inp = mod.generate_input()
+    out = mod.main(inp)
+    centers = np.argwhere(inp == mod.RED_CENTER)
+    cr, cc = map(int, centers[0])
+    dest = mod._dest_cells(cr, cc, *inp.shape)
+    token_colors = {int(c) for c in np.unique(inp) if int(c) not in {mod.FLOOR_COLOR, mod.WALL_COLOR, mod.DEST_COLOR, mod.RED_CENTER}}
+    dist = mod._distance_map(inp, dest, {mod.FLOOR_COLOR, *token_colors})
+    tokens = mod._sorted_reachable_tokens(inp, dist, token_colors)
+    k = min(len(dest), len(tokens))
+    chosen = tokens[:k]
+    out_colors = [int(out[r, c]) for r, c in dest[:k]]
+    src_colors = [color for _, _, _, color in chosen]
+    grad_colors = [mod._gradient_color(d) for d, _, _, _ in chosen]
+    stats['samples'] += 1
+    stats[f'gradient_levels_{len(set(grad_colors))}'] += 1
+    stats[f'source_levels_{len(set(src_colors))}'] += 1
+    stats['recolored_cells_total'] += sum(int(o "'!= s) for o, s in zip(out_colors, src_colors))
+    stats['"'vs_original_diff_samples'] += int(any(color "'!= 9 for color in out_colors))
+    stats['"'vs_d5_diff_samples'] += int(any(o "'!= s for o, s in zip(out_colors, src_colors)))
+    stats['"'filled_cells_total'] += k
+    ks.append(k)
+
+print('samples', stats['samples'])
+print('k_range', min(ks), max(ks), 'avg', round(sum(ks)/len(ks), 2))
+print('gradient_levels', {k: stats[k] for k in sorted(stats) if k.startswith('gradient_levels_')})
+print('source_levels', {k: stats[k] for k in sorted(stats) if k.startswith('source_levels_')})
+print('vs_original_diff_samples', stats['vs_original_diff_samples'])
+print('vs_d5_diff_samples', stats['vs_d5_diff_samples'])
+print('recolored_fraction', round(stats['recolored_cells_total'] / stats['filled_cells_total'], 3))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dd6b8c4b/9/code.py b/ceshi/code_combo/dd6b8c4b/9/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..10281b7b73268553891b777fff1baefe576732f4
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/9/code.py
+@@ -0,0 +1,441 @@
++# Combo variant of dd6b8c4b (index 9)
++# combo_spec: D5/1+D8/2
++# Name: 多色像素+距离梯度填充色
++
++import random
++import sys
++from collections import deque
++from pathlib import Path
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[4]
++ARC_UTILS_DIR = ROOT / "arc2_solver_select"
++if str(ARC_UTILS_DIR) not in sys.path:
++    sys.path.append(str(ARC_UTILS_DIR))
++
++from arc_utils import neighbors4
++
++
++# Design analysis for the combo variant
++# -------------------------------------
++# a) Concrete behavior:
++#    - Keep the original 11x11 scene, fixed 3x3 destination centered on the unique red pixel,
++#      orange floor, and optional magenta wall corridors.
++#    - Replace the single maroon source class with multicolor single-pixel sources. This combo
++#      uses only blue(1) and azure(8) as source colors so the input visibly contains multiple
++#      movable colors without becoming noisy.
++#    - The collectible set is still defined by wall-restricted BFS reachability. Example:
++#      if reachable tokens sorted by (distance,row,col) are
++#      [(0,3,5,color=1), (2,6,5,color=8), (5,7,8,color=1)],
++#      then the original task would write [9,9,9], the D5-only variant would write [1,8,1],
++#      but this combo writes the distance gradient [9,5,4]. Source color matters only for
++#      identifying movable tokens and for showing that multiple token colors can be reachable;
++#      once moved, the destination color is determined solely by distance.
++# b) Complexity calibration:
++#    - Source colors are limited to two recurring colors {1,8}. This is enough to make the
++#      D5 change obvious while keeping the scene legible.
++#    - Distance recoloring is limited to three fixed tiers:
++#      dist 0-1 -> maroon(9), dist 2-3 -> gray(5), dist 4+ -> yellow(4).
++#      A small repeated palette makes the heat-map rule inferable from a few examples.
++# c) Original implicit assumptions that break:
++#    - `passable = {floor, 9}` no longer works because movable tokens are not color-9 only.
++#    - `np.argwhere(grid == 9)` no longer finds all candidates; every non-structural token color
++#      must be collected.
++#    - Writing the chosen token's own color into the destination is wrong for this combo because
++#      D8/2 overrides token identity with a distance-dependent gradient.
++#    - The original floor-color inference relied on maroon being the only non-structural color.
++#      Here the structural colors are fixed by construction, so the solver uses constants.
++# d) Placement legality:
++#    - Generator samples all sources and distractors from floor cells outside the destination.
++#    - Reachable sources come only from the BFS-reachable floor component; distractors come only
++#      from unreachable floor cells. This prevents overlap, wall placement conflicts, and
++#      out-of-bounds placement.
++# e) Visual observability:
++#    - Each accepted sample has both source colors among the reachable tokens and at least two
++#      distinct distance tiers among the selected tokens, so both halves of the combo are visible.
++#    - Gradient color depends on visible geometric distance through corridors, not on hidden color
++#      ids or arbitrary per-example mappings.
++# f) Visual cleanliness:
++#    - Structural colors stay unchanged. Only two input token colors and three output gradient
++#      colors are used, all confined to sparse floor pixels and the 3x3 destination block.
++# g) Change inferability:
++#    - Source colors and fill colors are intentionally disjoint: input uses {1,8}, output fill
++#      uses {9,5,4}. This makes it obvious that tokens are being collected by location, but their
++#      original colors are not preserved in the destination.
++# h) New solver assumptions and generator guarantees:
++#    - Assumption: all movable tokens use colors outside {2,3,6,7}. Generator enforces this.
++#    - Assumption: at least one passable exterior cell touches the destination. Wall generation
++#      always leaves 1-4 ring gaps, and validation rejects any broken layout.
++#    - Assumption: reachable tokens span at least two gradient tiers. Generator seeds source
++#      placement from multiple distance buckets and rejects degenerate single-tier cases.
++
++
++GRID_H, GRID_W = 11, 11
++CENTER_R, CENTER_C = 5, 5
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++
++SOURCE_PALETTE = (1, 8)
++GRADIENT_COLORS = (9, 5, 4)
++
++WALL_PROB = 0.75
++RING_GAP_RANGE = (1, 4)
++WALL_STYLES = ["arms", "frame", "mixed"]
++
++ARM_EXTEND_PROB = 0.5
++ARM_LENGTH_RANGE = (1, 5)
++FRAME_DIST_RANGE = (3, 4)
++FRAME_CONNECT_PROB = 0.4
++FRAME_GAP_REMOVE_PROB = 0.3
++MIXED_EXTEND_PROB = 0.6
++
++FILL_K_RANGE = (3, 9)
++DISTRACTOR_MAX = 10
++TOTAL_TOKEN_RANGE = (4, 16)
++MIN_REACHABLE = 4
++GEN_RETRIES = 400
++INF = 10**9
++
++
++def _dest_cells(cr: int, cc: int, h: int, w: int) -> list[tuple[int, int]]:
++    cells = []
++    for r in range(cr - 1, cr + 2):
++        for c in range(cc - 1, cc + 2):
++            if 0 <= r < h and 0 <= c < w:
++                cells.append((r, c))
++    cells.sort()
++    return cells
++
++
++def _distance_bucket(distance: int) -> int:
++    if distance <= 1:
++        return 0
++    if distance <= 3:
++        return 1
++    return 2
++
++
++def _gradient_color(distance: int) -> int:
++    return GRADIENT_COLORS[_distance_bucket(distance)]
++
++
++def _distance_map(
++    grid: np.ndarray,
++    dest_cells: list[tuple[int, int]],
++    passable: set[int],
++) -> np.ndarray:
++    h, w = grid.shape
++    dest_set = set(dest_cells)
++    dist = np.full((h, w), INF, dtype=int)
++    queue = deque()
++
++    for r, c in dest_cells:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
++                if int(grid[rr, cc]) in passable and dist[rr, cc] == INF:
++                    dist[rr, cc] = 0
++                    queue.append((rr, cc))
++
++    assert queue, "there must be at least one passable cell adjacent to the destination block"
++
++    while queue:
++        r, c = queue.popleft()
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == INF:
++                if int(grid[rr, cc]) in passable:
++                    dist[rr, cc] = int(dist[r, c]) + 1
++                    queue.append((rr, cc))
++
++    return dist
++
++
++def _sorted_reachable_tokens(
++    grid: np.ndarray,
++    dist: np.ndarray,
++    token_colors: set[int],
++) -> list[tuple[int, int, int, int]]:
++    tokens = []
++    for r in range(grid.shape[0]):
++        for c in range(grid.shape[1]):
++            color = int(grid[r, c])
++            if color in token_colors and int(dist[r, c]) < INF:
++                tokens.append((int(dist[r, c]), int(r), int(c), color))
++    tokens.sort()
++    return tokens
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Move the closest reachable colored pixels into the 3x3 block around the unique red center, then recolor them by distance.
++
++    Input structure:
++    - Orange floor and optional magenta walls surround a fixed green 3x3 destination whose center is a single red pixel.
++    - Blue and azure single-pixel source tokens are scattered on floor cells outside that block.
++
++    Rule:
++    - Flood-fill outward from passable cells touching the destination, moving through floor or any source token color.
++    - Collect every reachable source token, sort them by distance to the destination and then by row/column, and place the first ones into the destination in row-major order.
++    - Erase the moved source tokens back to floor, but fill each destination cell with a gradient color based on that token's BFS distance rather than its original source color.
++
++    Key insight: The source colors still tell you which pixels are collectible and which corridor cells stay passable, but the destination ignores those source colors and instead encodes near/mid/far reachability as a small distance heat map.
++    """
++
++    grid = np.asarray(grid, dtype=int)
++    h, w = grid.shape
++    out = grid.copy()
++
++    centers = np.argwhere(grid == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center pixel"
++    cr, cc = map(int, centers[0])
++
++    dest_cells = _dest_cells(cr, cc, h, w)
++    token_colors = {
++        int(color)
++        for color in np.unique(grid)
++        if int(color) not in {FLOOR_COLOR, WALL_COLOR, DEST_COLOR, RED_CENTER}
++    }
++    assert token_colors, "grid must contain at least one non-structural token color"
++
++    passable = {FLOOR_COLOR, *token_colors}
++    dist = _distance_map(grid, dest_cells, passable)
++    tokens = _sorted_reachable_tokens(grid, dist, token_colors)
++
++    k = min(len(dest_cells), len(tokens))
++    chosen = tokens[:k]
++
++    for _, r, c, _ in chosen:
++        out[r, c] = FLOOR_COLOR
++
++    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], chosen):
++        out[r, c] = _gradient_color(distance)
++
++    return out
++
++
++def _reachable_floor_and_dist(
++    grid: np.ndarray,
++    dest_cells: list[tuple[int, int]],
++) -> tuple[set[tuple[int, int]], np.ndarray]:
++    dist = _distance_map(grid, dest_cells, {FLOOR_COLOR})
++    dest_set = set(dest_cells)
++    reachable = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if (r, c) not in dest_set and grid[r, c] == FLOOR_COLOR and int(dist[r, c]) < INF
++    }
++    return reachable, dist
++
++
++def _outward_dirs(r: int, c: int) -> list[tuple[int, int]]:
++    dirs = []
++    if r < CENTER_R:
++        dirs.append((-1, 0))
++    if r > CENTER_R:
++        dirs.append((1, 0))
++    if c < CENTER_C:
++        dirs.append((0, -1))
++    if c > CENTER_C:
++        dirs.append((0, 1))
++    return dirs
++
++
++def _extend_arm(
++    wall_cells: set[tuple[int, int]],
++    dest_set: set[tuple[int, int]],
++    r: int,
++    c: int,
++    max_len: int,
++) -> None:
++    dirs = _outward_dirs(r, c)
++    if not dirs:
++        return
++    dr, dc = random.choice(dirs)
++    nr, nc = r, c
++    for _ in range(random.randint(1, max_len)):
++        nr += dr
++        nc += dc
++        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++            wall_cells.add((nr, nc))
++        else:
++            break
++
++
++def _build_walls(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> None:
++    ring = set()
++    for r, c in dest_set:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                ring.add((nr, nc))
++    ring = sorted(ring)
++
++    gap_cells = set(random.sample(ring, random.randint(*RING_GAP_RANGE)))
++    wall_ring = [cell for cell in ring if cell not in gap_cells]
++    wall_cells = set(wall_ring)
++    style = random.choice(WALL_STYLES)
++
++    if style == "arms":
++        for r, c in wall_ring:
++            if random.random() < ARM_EXTEND_PROB:
++                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
++    elif style == "frame":
++        dist2 = random.randint(*FRAME_DIST_RANGE)
++        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
++            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
++                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
++                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
++                        wall_cells.add((r, c))
++        for r, c in wall_ring:
++            dirs = _outward_dirs(r, c)
++            if dirs and random.random() < FRAME_CONNECT_PROB:
++                dr, dc = random.choice(dirs)
++                nr, nc = r + dr, c + dc
++                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                    wall_cells.add((nr, nc))
++                    nr += dr
++                    nc += dc
++        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
++        if outer_frame:
++            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
++            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
++                if random.random() < FRAME_GAP_REMOVE_PROB:
++                    wall_cells.discard(rc)
++    else:
++        for r, c in wall_ring:
++            if random.random() < MIXED_EXTEND_PROB:
++                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
++                _extend_arm(wall_cells, dest_set, r, c, max_len)
++
++    for r, c in wall_cells:
++        grid[r, c] = WALL_COLOR
++
++
++def _assign_source_colors(count: int) -> list[int]:
++    colors = [SOURCE_PALETTE[i % len(SOURCE_PALETTE)] for i in range(count)]
++    random.shuffle(colors)
++    return colors
++
++
++def _sample_reachable_sources(
++    reachable_floor: set[tuple[int, int]],
++    dist: np.ndarray,
++    k: int,
++) -> list[tuple[int, int]]:
++    bucket_cells: dict[int, list[tuple[int, int]]] = {0: [], 1: [], 2: []}
++    for r, c in reachable_floor:
++        bucket_cells[_distance_bucket(int(dist[r, c]))].append((r, c))
++
++    nonempty = [bucket for bucket, cells in bucket_cells.items() if cells]
++    if len(nonempty) < 2:
++        return []
++
++    target_bucket_count = 3 if len(nonempty) >= 3 and k >= 3 and random.random() < 0.7 else 2
++    target_bucket_count = min(target_bucket_count, len(nonempty), k)
++    active_buckets = random.sample(nonempty, target_bucket_count)
++
++    chosen = []
++    used = set()
++    for bucket in active_buckets:
++        cell = random.choice(bucket_cells[bucket])
++        chosen.append(cell)
++        used.add(cell)
++
++    remaining = [cell for cell in reachable_floor if cell not in used]
++    if len(chosen) + len(remaining) < k:
++        return []
++
++    chosen.extend(random.sample(remaining, k - len(chosen)))
++    return chosen
++
++
++def _gen_attempt() -> np.ndarray | None:
++    dest_cells = _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W)
++    dest_set = set(dest_cells)
++
++    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in dest_cells:
++        base[r, c] = DEST_COLOR
++    base[CENTER_R, CENTER_C] = RED_CENTER
++
++    if random.random() < WALL_PROB:
++        _build_walls(base, dest_set)
++
++    reachable_floor, dist = _reachable_floor_and_dist(base, dest_cells)
++    if len(reachable_floor) < MIN_REACHABLE:
++        return None
++
++    all_floor = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if base[r, c] == FLOOR_COLOR and (r, c) not in dest_set
++    }
++    unreachable_floor = all_floor - reachable_floor
++
++    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
++    if max_k < FILL_K_RANGE[0]:
++        return None
++    k = random.randint(FILL_K_RANGE[0], max_k)
++
++    source_cells = _sample_reachable_sources(reachable_floor, dist, k)
++    if len(source_cells) != k:
++        return None
++
++    ordered_distances = sorted(int(dist[r, c]) for r, c in source_cells)
++    if len({_gradient_color(distance) for distance in ordered_distances}) < 2:
++        return None
++
++    max_dist = min(DISTRACTOR_MAX, len(unreachable_floor))
++    num_distractors = random.randint(0, max_dist) if max_dist > 0 else 0
++
++    total = k + num_distractors
++    if total < TOTAL_TOKEN_RANGE[0]:
++        needed = TOTAL_TOKEN_RANGE[0] - total
++        if len(unreachable_floor) >= num_distractors + needed:
++            num_distractors += needed
++        else:
++            return None
++    if k + num_distractors > TOTAL_TOKEN_RANGE[1]:
++        num_distractors = max(0, TOTAL_TOKEN_RANGE[1] - k)
++
++    distractor_cells = random.sample(list(unreachable_floor), num_distractors)
++
++    source_colors = _assign_source_colors(k)
++    distractor_colors = [random.choice(SOURCE_PALETTE) for _ in range(num_distractors)]
++
++    if len(set(source_colors)) < 2:
++        return None
++
++    inp = base.copy()
++    for (r, c), color in zip(source_cells, source_colors):
++        inp[r, c] = color
++    for (r, c), color in zip(distractor_cells, distractor_colors):
++        inp[r, c] = color
++
++    ordered_sources = sorted(
++        (int(dist[r, c]), int(r), int(c), color)
++        for (r, c), color in zip(source_cells, source_colors)
++    )
++
++    out = base.copy()
++    for (r, c), color in zip(distractor_cells, distractor_colors):
++        out[r, c] = color
++    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], ordered_sources):
++        out[r, c] = _gradient_color(distance)
++
++    try:
++        result = main(inp)
++        if np.array_equal(result, out):
++            return inp
++    except Exception:
++        return None
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+ succeeded in 564ms:
+samples 200
+k_range 3 9 avg 6.17
+gradient_levels {'gradient_levels_2': 28, 'gradient_levels_3': 172}
+source_levels {'source_levels_2': 200}
+vs_original_diff_samples 200
+vs_d5_diff_samples 200
+recolored_fraction 1.0
+
+codex
+融合变体代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/9/code.py)。
+
+这版实现了两件事的联动：输入里可收集像素改成多色源 `1/8`，但填入 3x3 目标块时不保留源色，而是按 BFS 距离映射到固定梯度色 `9/5/4`。`main()` 上方保留并重写了四段式说明，同时把设计分析写进了文件顶部注释；`generate_input()` 也保证样本里同时出现多色源和至少两档距离梯度，避免退化回原题或 D5 单变体。
+
+验证结果：
+- 规定的 50 次稳定性测试：`Success: 50/50`
+- 额外 200 样本退化检查：
+  - 梯度层数分布：`2层=28, 3层=172`
+  - 多色源分布：`200/200` 样本都有两种源色
+  - 与原题输出不同：`200/200`
+  - 与“保留源色”的 D5-only 行为不同：`200/200`
+  - 被填入目标块的像素重着色比例：`1.0`
+
+当前没有发现生成器退化或 solver/generator 约束不一致的问题。
+diff --git a/ceshi/code_combo/dd6b8c4b/9/code.py b/ceshi/code_combo/dd6b8c4b/9/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..10281b7b73268553891b777fff1baefe576732f4
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/9/code.py
+@@ -0,0 +1,441 @@
++# Combo variant of dd6b8c4b (index 9)
++# combo_spec: D5/1+D8/2
++# Name: 多色像素+距离梯度填充色
++
++import random
++import sys
++from collections import deque
++from pathlib import Path
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[4]
++ARC_UTILS_DIR = ROOT / "arc2_solver_select"
++if str(ARC_UTILS_DIR) not in sys.path:
++    sys.path.append(str(ARC_UTILS_DIR))
++
++from arc_utils import neighbors4
++
++
++# Design analysis for the combo variant
++# -------------------------------------
++# a) Concrete behavior:
++#    - Keep the original 11x11 scene, fixed 3x3 destination centered on the unique red pixel,
++#      orange floor, and optional magenta wall corridors.
++#    - Replace the single maroon source class with multicolor single-pixel sources. This combo
++#      uses only blue(1) and azure(8) as source colors so the input visibly contains multiple
++#      movable colors without becoming noisy.
++#    - The collectible set is still defined by wall-restricted BFS reachability. Example:
++#      if reachable tokens sorted by (distance,row,col) are
++#      [(0,3,5,color=1), (2,6,5,color=8), (5,7,8,color=1)],
++#      then the original task would write [9,9,9], the D5-only variant would write [1,8,1],
++#      but this combo writes the distance gradient [9,5,4]. Source color matters only for
++#      identifying movable tokens and for showing that multiple token colors can be reachable;
++#      once moved, the destination color is determined solely by distance.
++# b) Complexity calibration:
++#    - Source colors are limited to two recurring colors {1,8}. This is enough to make the
++#      D5 change obvious while keeping the scene legible.
++#    - Distance recoloring is limited to three fixed tiers:
++#      dist 0-1 -> maroon(9), dist 2-3 -> gray(5), dist 4+ -> yellow(4).
++#      A small repeated palette makes the heat-map rule inferable from a few examples.
++# c) Original implicit assumptions that break:
++#    - `passable = {floor, 9}` no longer works because movable tokens are not color-9 only.
++#    - `np.argwhere(grid == 9)` no longer finds all candidates; every non-structural token color
++#      must be collected.
++#    - Writing the chosen token's own color into the destination is wrong for this combo because
++#      D8/2 overrides token identity with a distance-dependent gradient.
++#    - The original floor-color inference relied on maroon being the only non-structural color.
++#      Here the structural colors are fixed by construction, so the solver uses constants.
++# d) Placement legality:
++#    - Generator samples all sources and distractors from floor cells outside the destination.
++#    - Reachable sources come only from the BFS-reachable floor component; distractors come only
++#      from unreachable floor cells. This prevents overlap, wall placement conflicts, and
++#      out-of-bounds placement.
++# e) Visual observability:
++#    - Each accepted sample has both source colors among the reachable tokens and at least two
++#      distinct distance tiers among the selected tokens, so both halves of the combo are visible.
++#    - Gradient color depends on visible geometric distance through corridors, not on hidden color
++#      ids or arbitrary per-example mappings.
++# f) Visual cleanliness:
++#    - Structural colors stay unchanged. Only two input token colors and three output gradient
++#      colors are used, all confined to sparse floor pixels and the 3x3 destination block.
++# g) Change inferability:
++#    - Source colors and fill colors are intentionally disjoint: input uses {1,8}, output fill
++#      uses {9,5,4}. This makes it obvious that tokens are being collected by location, but their
++#      original colors are not preserved in the destination.
++# h) New solver assumptions and generator guarantees:
++#    - Assumption: all movable tokens use colors outside {2,3,6,7}. Generator enforces this.
++#    - Assumption: at least one passable exterior cell touches the destination. Wall generation
++#      always leaves 1-4 ring gaps, and validation rejects any broken layout.
++#    - Assumption: reachable tokens span at least two gradient tiers. Generator seeds source
++#      placement from multiple distance buckets and rejects degenerate single-tier cases.
++
++
++GRID_H, GRID_W = 11, 11
++CENTER_R, CENTER_C = 5, 5
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++
++SOURCE_PALETTE = (1, 8)
++GRADIENT_COLORS = (9, 5, 4)
++
++WALL_PROB = 0.75
++RING_GAP_RANGE = (1, 4)
++WALL_STYLES = ["arms", "frame", "mixed"]
++
++ARM_EXTEND_PROB = 0.5
++ARM_LENGTH_RANGE = (1, 5)
++FRAME_DIST_RANGE = (3, 4)
++FRAME_CONNECT_PROB = 0.4
++FRAME_GAP_REMOVE_PROB = 0.3
++MIXED_EXTEND_PROB = 0.6
++
++FILL_K_RANGE = (3, 9)
++DISTRACTOR_MAX = 10
++TOTAL_TOKEN_RANGE = (4, 16)
++MIN_REACHABLE = 4
++GEN_RETRIES = 400
++INF = 10**9
++
++
++def _dest_cells(cr: int, cc: int, h: int, w: int) -> list[tuple[int, int]]:
++    cells = []
++    for r in range(cr - 1, cr + 2):
++        for c in range(cc - 1, cc + 2):
++            if 0 <= r < h and 0 <= c < w:
++                cells.append((r, c))
++    cells.sort()
++    return cells
++
++
++def _distance_bucket(distance: int) -> int:
++    if distance <= 1:
++        return 0
++    if distance <= 3:
++        return 1
++    return 2
++
++
++def _gradient_color(distance: int) -> int:
++    return GRADIENT_COLORS[_distance_bucket(distance)]
++
++
++def _distance_map(
++    grid: np.ndarray,
++    dest_cells: list[tuple[int, int]],
++    passable: set[int],
++) -> np.ndarray:
++    h, w = grid.shape
++    dest_set = set(dest_cells)
++    dist = np.full((h, w), INF, dtype=int)
++    queue = deque()
++
++    for r, c in dest_cells:
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in dest_set:
++                if int(grid[rr, cc]) in passable and dist[rr, cc] == INF:
++                    dist[rr, cc] = 0
++                    queue.append((rr, cc))
++
++    assert queue, "there must be at least one passable cell adjacent to the destination block"
++
++    while queue:
++        r, c = queue.popleft()
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == INF:
++                if int(grid[rr, cc]) in passable:
++                    dist[rr, cc] = int(dist[r, c]) + 1
++                    queue.append((rr, cc))
++
++    return dist
++
++
++def _sorted_reachable_tokens(
++    grid: np.ndarray,
++    dist: np.ndarray,
++    token_colors: set[int],
++) -> list[tuple[int, int, int, int]]:
++    tokens = []
++    for r in range(grid.shape[0]):
++        for c in range(grid.shape[1]):
++            color = int(grid[r, c])
++            if color in token_colors and int(dist[r, c]) < INF:
++                tokens.append((int(dist[r, c]), int(r), int(c), color))
++    tokens.sort()
++    return tokens
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Move the closest reachable colored pixels into the 3x3 block around the unique red center, then recolor them by distance.
++
++    Input structure:
++    - Orange floor and optional magenta walls surround a fixed green 3x3 destination whose center is a single red pixel.
++    - Blue and azure single-pixel source tokens are scattered on floor cells outside that block.
++
++    Rule:
++    - Flood-fill outward from passable cells touching the destination, moving through floor or any source token color.
++    - Collect every reachable source token, sort them by distance to the destination and then by row/column, and place the first ones into the destination in row-major order.
++    - Erase the moved source tokens back to floor, but fill each destination cell with a gradient color based on that token's BFS distance rather than its original source color.
++
++    Key insight: The source colors still tell you which pixels are collectible and which corridor cells stay passable, but the destination ignores those source colors and instead encodes near/mid/far reachability as a small distance heat map.
++    """
++
++    grid = np.asarray(grid, dtype=int)
++    h, w = grid.shape
++    out = grid.copy()
++
++    centers = np.argwhere(grid == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center pixel"
++    cr, cc = map(int, centers[0])
++
++    dest_cells = _dest_cells(cr, cc, h, w)
++    token_colors = {
++        int(color)
++        for color in np.unique(grid)
++        if int(color) not in {FLOOR_COLOR, WALL_COLOR, DEST_COLOR, RED_CENTER}
++    }
++    assert token_colors, "grid must contain at least one non-structural token color"
++
++    passable = {FLOOR_COLOR, *token_colors}
++    dist = _distance_map(grid, dest_cells, passable)
++    tokens = _sorted_reachable_tokens(grid, dist, token_colors)
++
++    k = min(len(dest_cells), len(tokens))
++    chosen = tokens[:k]
++
++    for _, r, c, _ in chosen:
++        out[r, c] = FLOOR_COLOR
++
++    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], chosen):
++        out[r, c] = _gradient_color(distance)
++
++    return out
++
++
++def _reachable_floor_and_dist(
++    grid: np.ndarray,
++    dest_cells: list[tuple[int, int]],
++) -> tuple[set[tuple[int, int]], np.ndarray]:
++    dist = _distance_map(grid, dest_cells, {FLOOR_COLOR})
++    dest_set = set(dest_cells)
++    reachable = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if (r, c) not in dest_set and grid[r, c] == FLOOR_COLOR and int(dist[r, c]) < INF
++    }
++    return reachable, dist
++
++
++def _outward_dirs(r: int, c: int) -> list[tuple[int, int]]:
++    dirs = []
++    if r < CENTER_R:
++        dirs.append((-1, 0))
++    if r > CENTER_R:
++        dirs.append((1, 0))
++    if c < CENTER_C:
++        dirs.append((0, -1))
++    if c > CENTER_C:
++        dirs.append((0, 1))
++    return dirs
++
++
++def _extend_arm(
++    wall_cells: set[tuple[int, int]],
++    dest_set: set[tuple[int, int]],
++    r: int,
++    c: int,
++    max_len: int,
++) -> None:
++    dirs = _outward_dirs(r, c)
++    if not dirs:
++        return
++    dr, dc = random.choice(dirs)
++    nr, nc = r, c
++    for _ in range(random.randint(1, max_len)):
++        nr += dr
++        nc += dc
++        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++            wall_cells.add((nr, nc))
++        else:
++            break
++
++
++def _build_walls(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> None:
++    ring = set()
++    for r, c in dest_set:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                ring.add((nr, nc))
++    ring = sorted(ring)
++
++    gap_cells = set(random.sample(ring, random.randint(*RING_GAP_RANGE)))
++    wall_ring = [cell for cell in ring if cell not in gap_cells]
++    wall_cells = set(wall_ring)
++    style = random.choice(WALL_STYLES)
++
++    if style == "arms":
++        for r, c in wall_ring:
++            if random.random() < ARM_EXTEND_PROB:
++                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
++    elif style == "frame":
++        dist2 = random.randint(*FRAME_DIST_RANGE)
++        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
++            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
++                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
++                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
++                        wall_cells.add((r, c))
++        for r, c in wall_ring:
++            dirs = _outward_dirs(r, c)
++            if dirs and random.random() < FRAME_CONNECT_PROB:
++                dr, dc = random.choice(dirs)
++                nr, nc = r + dr, c + dc
++                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                    wall_cells.add((nr, nc))
++                    nr += dr
++                    nc += dc
++        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
++        if outer_frame:
++            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
++            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
++                if random.random() < FRAME_GAP_REMOVE_PROB:
++                    wall_cells.discard(rc)
++    else:
++        for r, c in wall_ring:
++            if random.random() < MIXED_EXTEND_PROB:
++                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
++                _extend_arm(wall_cells, dest_set, r, c, max_len)
++
++    for r, c in wall_cells:
++        grid[r, c] = WALL_COLOR
++
++
++def _assign_source_colors(count: int) -> list[int]:
++    colors = [SOURCE_PALETTE[i % len(SOURCE_PALETTE)] for i in range(count)]
++    random.shuffle(colors)
++    return colors
++
++
++def _sample_reachable_sources(
++    reachable_floor: set[tuple[int, int]],
++    dist: np.ndarray,
++    k: int,
++) -> list[tuple[int, int]]:
++    bucket_cells: dict[int, list[tuple[int, int]]] = {0: [], 1: [], 2: []}
++    for r, c in reachable_floor:
++        bucket_cells[_distance_bucket(int(dist[r, c]))].append((r, c))
++
++    nonempty = [bucket for bucket, cells in bucket_cells.items() if cells]
++    if len(nonempty) < 2:
++        return []
++
++    target_bucket_count = 3 if len(nonempty) >= 3 and k >= 3 and random.random() < 0.7 else 2
++    target_bucket_count = min(target_bucket_count, len(nonempty), k)
++    active_buckets = random.sample(nonempty, target_bucket_count)
++
++    chosen = []
++    used = set()
++    for bucket in active_buckets:
++        cell = random.choice(bucket_cells[bucket])
++        chosen.append(cell)
++        used.add(cell)
++
++    remaining = [cell for cell in reachable_floor if cell not in used]
++    if len(chosen) + len(remaining) < k:
++        return []
++
++    chosen.extend(random.sample(remaining, k - len(chosen)))
++    return chosen
++
++
++def _gen_attempt() -> np.ndarray | None:
++    dest_cells = _dest_cells(CENTER_R, CENTER_C, GRID_H, GRID_W)
++    dest_set = set(dest_cells)
++
++    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in dest_cells:
++        base[r, c] = DEST_COLOR
++    base[CENTER_R, CENTER_C] = RED_CENTER
++
++    if random.random() < WALL_PROB:
++        _build_walls(base, dest_set)
++
++    reachable_floor, dist = _reachable_floor_and_dist(base, dest_cells)
++    if len(reachable_floor) < MIN_REACHABLE:
++        return None
++
++    all_floor = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if base[r, c] == FLOOR_COLOR and (r, c) not in dest_set
++    }
++    unreachable_floor = all_floor - reachable_floor
++
++    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
++    if max_k < FILL_K_RANGE[0]:
++        return None
++    k = random.randint(FILL_K_RANGE[0], max_k)
++
++    source_cells = _sample_reachable_sources(reachable_floor, dist, k)
++    if len(source_cells) != k:
++        return None
++
++    ordered_distances = sorted(int(dist[r, c]) for r, c in source_cells)
++    if len({_gradient_color(distance) for distance in ordered_distances}) < 2:
++        return None
++
++    max_dist = min(DISTRACTOR_MAX, len(unreachable_floor))
++    num_distractors = random.randint(0, max_dist) if max_dist > 0 else 0
++
++    total = k + num_distractors
++    if total < TOTAL_TOKEN_RANGE[0]:
++        needed = TOTAL_TOKEN_RANGE[0] - total
++        if len(unreachable_floor) >= num_distractors + needed:
++            num_distractors += needed
++        else:
++            return None
++    if k + num_distractors > TOTAL_TOKEN_RANGE[1]:
++        num_distractors = max(0, TOTAL_TOKEN_RANGE[1] - k)
++
++    distractor_cells = random.sample(list(unreachable_floor), num_distractors)
++
++    source_colors = _assign_source_colors(k)
++    distractor_colors = [random.choice(SOURCE_PALETTE) for _ in range(num_distractors)]
++
++    if len(set(source_colors)) < 2:
++        return None
++
++    inp = base.copy()
++    for (r, c), color in zip(source_cells, source_colors):
++        inp[r, c] = color
++    for (r, c), color in zip(distractor_cells, distractor_colors):
++        inp[r, c] = color
++
++    ordered_sources = sorted(
++        (int(dist[r, c]), int(r), int(c), color)
++        for (r, c), color in zip(source_cells, source_colors)
++    )
++
++    out = base.copy()
++    for (r, c), color in zip(distractor_cells, distractor_colors):
++        out[r, c] = color
++    for (r, c), (distance, _, _, _) in zip(dest_cells[:k], ordered_sources):
++        out[r, c] = _gradient_color(distance)
++
++    try:
++        result = main(inp)
++        if np.array_equal(result, out):
++            return inp
++    except Exception:
++        return None
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+tokens used
+90,179
+融合变体代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/9/code.py)。
+
+这版实现了两件事的联动：输入里可收集像素改成多色源 `1/8`，但填入 3x3 目标块时不保留源色，而是按 BFS 距离映射到固定梯度色 `9/5/4`。`main()` 上方保留并重写了四段式说明，同时把设计分析写进了文件顶部注释；`generate_input()` 也保证样本里同时出现多色源和至少两档距离梯度，避免退化回原题或 D5 单变体。
+
+验证结果：
+- 规定的 50 次稳定性测试：`Success: 50/50`
+- 额外 200 样本退化检查：
+  - 梯度层数分布：`2层=28, 3层=172`
+  - 多色源分布：`200/200` 样本都有两种源色
+  - 与原题输出不同：`200/200`
+  - 与“保留源色”的 D5-only 行为不同：`200/200`
+  - 被填入目标块的像素重着色比例：`1.0`
+
+当前没有发现生成器退化或 solver/generator 约束不一致的问题。

@@ -1,0 +1,3952 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e2f75-d0e6-7203-a1fd-d68971fdf6be
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: b0039139
+    **摘要**: 输入被蓝色分隔线划分为四个区段：形状模板、组件计数板、前景色色板、背景色色板；将模板裁剪到外接矩形后用色板重新着色，再按计数板中连通分量数量平铺副本，副本之间用背景色分隔列/行隔开
+
+    ## 要实现的融合组合
+    - **组合名称**: 8-连通计数配分量面积分隔
+    - **combo_spec**: D3/0+D5/3
+
+    ### 融合描述（实现规格）
+
+    使用8-连通(D3/0)代替4-连通来计算分量数(可能减少分量数)，分隔带宽度由对应连通分量的像素面积决定(D5/3)。8-连通合并对角相邻的分量会改变各分量的面积，从而改变分隔带宽度。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D3/0** — 连通分量计数方式 (`src`)
+  - 当前值: 计算区段2中色3像素的4-连通分量数量，该数量决定模板副本的重复次数
+  - 改为: 使用8-连通而非4-连通计数 — 将连通性从4-连通改为8-连通（含对角线相邻）。对角线接触的色块会被合并为一个分量，导致计数减少。解题者需要从训练样例中推断使用的是8-连通规则而非更常见的4-连通。
+  - 来源: inversion（参考任务: None）
+- **D5/3** — 副本之间的分隔方式 (`grid_shape`)
+  - 当前值: 相邻副本之间有一行/列宽的分隔带，填充区段4的颜色（背景色板色）
+  - 改为: 分隔带宽度随连通分量面积变化 — 每两个相邻副本之间的分隔带宽度等于对应连通分量的像素面积。不同副本间的分隔宽度可能不同，解题者需要建立分量面积与分隔宽度的对应关系。
+  - 来源: creative（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/b0039139.py`
+
+    ```python
+    from __future__ import annotations
+
+import numpy as np
+
+from arc_utils import bbox, components_mask, crop_bbox, random_sprite
+import random
+
+
+def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
+    h, w = grid.shape
+    sep = 1
+
+    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == sep))]
+    if sep_rows:
+        cuts = [-1] + sep_rows + [h]
+        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == sep))]
+    cuts = [-1] + sep_cols + [w]
+    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+
+def _solid_color(block: np.ndarray) -> int:
+    vals, counts = np.unique(block, return_counts=True)
+    return int(vals[int(np.argmax(counts))])
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Recolor a cropped template and repeat it according to a component-count stencil.
+
+    Input structure:
+    - Solid blue (1) separator rows or columns split the grid into four sections.
+    - Section 1 is a black-background shape template; section 2 is a component-count stencil.
+    - Sections 3 and 4 are solid color swatches for output foreground and background.
+
+    Rule:
+    - Crop section 1 to the bbox of its non-black pixels and recolor it with the two swatches.
+    - Count 4-connected non-black components in section 2.
+    - Repeat the recolored crop that many times, inserting one background-colored row/column between copies.
+
+    Key insight: The second section encodes only the repeat count; the output orientation
+    is inherited from whether the input separators are columns or rows.
+    """
+    g = np.asarray(grid, dtype=int)
+    orientation, sections = _split_sections(g)
+    template, repetition_pattern, foreground_block, background_block = sections[:4]
+
+    template_mask = template != 0
+    template_bbox = bbox(template_mask)
+    if template_bbox is None:
+        return np.empty((0, 0), dtype=int)
+
+    foreground = _solid_color(foreground_block)
+    background = _solid_color(background_block)
+    tile_mask = crop_bbox(template_mask, template_bbox)
+    tile = np.where(tile_mask, foreground, background).astype(int)
+
+    n_repeats = len(components_mask(repetition_pattern != 0, connectivity=4))
+    if n_repeats <= 1:
+        return tile
+
+    if orientation == "horizontal":
+        sep = np.full((tile.shape[0], 1), background, dtype=int)
+        pieces = [tile] + [x for _ in range(n_repeats - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+
+    sep = np.full((1, tile.shape[1]), background, dtype=int)
+    pieces = [tile] + [x for _ in range(n_repeats - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+# --------------- generator (c) ---------------
+
+# --- CFG: tunable generation parameters ---
+REPEAT_COUNT_RANGE = (2, 6)          # blob count N (= tile repetitions)
+CROP_SIZE_RANGE = (2, 5)             # crop height/width bounds
+DENSITY_RANGE = (0.55, 0.85)         # fill ratio of shape bounding box
+COLOR_POOL = list(range(2, 10))      # fg/bg color choices (2-9 inclusive)
+TEMPLATE_COLOR = 4                   # shape drawn in yellow inside template
+STENCIL_COLOR = 3                    # blob color in stencil section
+SEPARATOR_COLOR = 1                  # blue separator rows/cols
+SWATCH_DIM_RANGE = (3, 8)           # varying-axis size for color swatches
+STENCIL_VARYING_EXTRA = 4            # max extra cells beyond minimum stencil size
+BLOB_PLACE_RETRIES = 200             # per-blob placement attempts in stencil
+GEN_RETRIES = 300                    # outer generate_input retry limit
+
+
+def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
+    """Repeat `tile` n times along the given axis with 1-pixel bg_color separator."""
+    if horizontal:
+        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
+        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
+    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+
+def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
+    """Create a solid color swatch. shared_dim is the fixed axis; varying axis is random."""
+    varying = random.randint(*SWATCH_DIM_RANGE)
+    if horizontal:
+        return np.full((shared_dim, varying), color, dtype=int)
+    return np.full((varying, shared_dim), color, dtype=int)
+
+
+def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
+    """Join sections with single-pixel separator lines of SEPARATOR_COLOR."""
+    if horizontal:
+        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
+        parts = [sections[0]]
+        for s in sections[1:]:
+            parts.extend([sep, s])
+        return np.hstack(parts)
+    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
+    parts = [sections[0]]
+    for s in sections[1:]:
+        parts.extend([sep, s])
+    return np.vstack(parts)
+
+
+def _build_stencil(n_blobs: int, shared_dim: int, horizontal: bool) -> np.ndarray | None:
+    """Place n_blobs 2-cell blobs (1x2 or 2x1) of STENCIL_COLOR on a black grid.
+    Blobs are separated by >=1 cell of black in all directions."""
+    min_varying = max(4, n_blobs * 2 + 2)
+    varying_dim = random.randint(min_varying, min_varying + STENCIL_VARYING_EXTRA)
+
+    h, w = (shared_dim, varying_dim) if horizontal else (varying_dim, shared_dim)
+    grid = np.zeros((h, w), dtype=int)
+
+    placed = 0
+    for _ in range(BLOB_PLACE_RETRIES):
+        if placed >= n_blobs:
+            break
+        br, bc = (1, 2) if random.choice([True, False]) else (2, 1)
+
+        if h - 1 - br < 1 or w - 1 - bc < 1:
+            continue
+        r = random.randint(1, h - 1 - br)
+        c = random.randint(1, w - 1 - bc)
+
+        # Check blob cells + 1-cell neighborhood are all black
+        r0, c0 = max(0, r - 1), max(0, c - 1)
+        r1, c1 = min(h, r + br + 1), min(w, c + bc + 1)
+        if np.any(grid[r0:r1, c0:c1] != 0):
+            continue
+
+        grid[r:r + br, c:c + bc] = STENCIL_COLOR
+        placed += 1
+
+    return grid if placed == n_blobs else None
+
+
+def _gen_attempt() -> np.ndarray | None:
+    horizontal = random.choice([True, False])
+    N = random.randint(*REPEAT_COUNT_RANGE)
+
+    # Generate connected tile shape
+    crop_h = random.randint(*CROP_SIZE_RANGE)
+    crop_w = random.randint(*CROP_SIZE_RANGE)
+    density = random.uniform(*DENSITY_RANGE)
+    shape = random_sprite(crop_h, crop_w, density=density, color_palette=[TEMPLATE_COLOR],
+                          connectivity=4, symmetry="not_symmetric")
+
+    # Pick distinct fg/bg colors
+    fg_color, bg_color = random.sample(COLOR_POOL, 2)
+
+    # Build output
+    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
+    output = _tile_repeat(tile, N, bg_color, horizontal)
+
+    # Build template: shape in (crop_h+2) x (crop_w+2) black border
+    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
+    template[1:crop_h + 1, 1:crop_w + 1] = shape
+
+    # Build stencil
+    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
+    stencil = _build_stencil(N, shared_dim, horizontal)
+    if stencil is None:
+        return None
+
+    # Assemble: template | stencil | fg_swatch | bg_swatch
+    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
+    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
+    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
+
+    # Oracle check
+    try:
+        if np.array_equal(main(inp), output):
+            return inp
+    except Exception:
+        pass
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        result = _gen_attempt()
+        if result is not None:
+            return result
+    raise RuntimeError("Failed to generate valid input after %d attempts" % GEN_RETRIES)
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  layout:
+    orientation: horizontal (column separators) or vertical (row separators), chosen randomly
+    separator_color: 1 (blue), single-pixel-wide rows or columns
+    sections: 4, separated by 3 blue separator lines; order is template, stencil, fg_swatch, bg_swatch
+  template:
+    section_size: (crop_h + 2) x (crop_w + 2); 1-pixel black border on all sides around the shape bbox
+    shape_color: 4 (yellow) on black (0) background
+    crop_size: 2-5 rows x 2-5 cols
+    connectivity: single 4-connected component
+    fill_ratio: 0.55-0.85 of bounding box
+  stencil:
+    background: black (0); blobs drawn in color 3 (green)
+    each blob is exactly 2 cells (either 1x2 or 2x1), 4-connected
+    blob_count: 2-6; this encodes the repeat count N for the output
+    blobs separated by >=1 cell of black in all directions
+    section_size: loosely sized, at least large enough to hold the blobs with 1-cell border
+  swatches:
+    fg_swatch and bg_swatch are each a solid rectangle of a single color
+    fg_color != bg_color; both from {2-9} excluding 3 and 4 [observed: fg,bg can be 3 or 4]
+    swatch dimensions: >=3 in varying axis; shared axis matches all sections
+  output:
+    tile: crop recolored so shape pixels -> fg_color, background pixels -> bg_color
+    tile repeated N times along layout axis, with 1 bg_color separator row/col between copies
+    output_size: along repeat axis = crop_dim * N + (N-1); cross axis = crop_dim
+
+generation_strategy:
+  approach: output-first
+  steps:
+    1. Pick orientation (horizontal or vertical) and N (repeat count, 2-6).
+    2. Generate tile shape: random connected binary mask of size crop_h x crop_w (each 2-5), fill ratio 0.55-0.85.
+    3. Pick fg_color and bg_color (distinct, from 2-9).
+    4. Build output by tiling recolored shape N times with bg_color separator.
+    5. Build template section: embed shape (drawn in color 4) centered in (crop_h+2) x (crop_w+2) black grid.
+    6. Build stencil section: place N 2-cell blobs (1x2 or 2x1) of color 3 on a black grid, spaced apart.
+    7. Build fg_swatch and bg_swatch: solid rectangles of their colors (>=3 in varying dim).
+    8. Assemble input: join 4 sections with blue (1) separator rows/cols matching orientation.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+## 已有单变体参考代码
+
+以下组成项已有单变体实现，可作为融合时的参考：
+
+            ### 参考代码: D3/0
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/b0039139/D3/0/code.py`
+
+            ```python
+            # Variant of b0039139
+# Dimension: D3 — 连通分量计数方式 (src)
+# Change: 计算区段2中色3像素的4-连通分量数量，该数量决定模板副本的重复次数... → 使用8-连通而非4-连通计数
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+from arc_utils import bbox, components_mask, crop_bbox, random_sprite
+
+
+# Design analysis for the D3 variant
+# ==================================
+# concretization_and_trace:
+# - Layout stays identical to the source task: four sections split by blue (1)
+#   full rows or columns, in the order template / stencil / fg swatch / bg swatch.
+# - The only semantic change is in section 2. Instead of counting orthogonally
+#   separated green pieces with 4-connectivity, we now count 8-connected green
+#   groups, so diagonal corner-touching pieces merge.
+# - To make that visible, each intended repeat is encoded as one diagonal cluster
+#   made from two separate 2-cell mini-blobs, e.g.
+#       330
+#       003
+#       003
+#   Here the left horizontal domino and the right vertical domino touch only at a
+#   corner. Old logic: 2 components. New logic: 1 component.
+# - Small trace: if section 2 contains three such diagonal clusters separated from
+#   each other by black gaps, the original solver would produce 6 copies while the
+#   variant must produce 3 copies. All other steps (crop template, recolor with
+#   swatches, tile with bg separators along the layout axis) are unchanged.
+#
+# complexity_calibration:
+# - The variant needs a stable visual cue, not random accidental diagonal contacts.
+# - Generator therefore uses a small family of repeated diagonal-cluster motifs.
+#   This keeps the puzzle readable: humans can see "paired green bits that belong
+#   together by diagonal touch", while 4-connected counting would clearly overcount.
+# - We keep freedom limited to orientation, template shape, colors, cluster flips,
+#   and cross-axis offsets. The core counting rule has repeated support in every
+#   sample instead of depending on one brittle special case.
+#
+# implicit_assumption_audit_for_main:
+# - `_split_sections` assumes no internal section contains a full blue row/column.
+#   Generator preserves that by never using color 1 except separators.
+# - `template_mask = template != 0` assumes template foreground is the only
+#   non-black content in section 1. That remains true.
+# - `bbox(template_mask)` assumes the template has at least one foreground cell.
+#   `random_sprite` is used with connected non-empty sprites, so this holds.
+# - Counting now depends on `repetition_pattern == 3`, not merely non-black.
+#   This matches the task statement exactly and avoids hidden dependence on other
+#   possible colors inside section 2.
+# - Tiling logic still assumes the count is >= 1. Generator keeps repeat counts in
+#   2..6, so the degenerate zero-template path remains unused but harmless.
+#
+# placement_legality:
+# - Each diagonal cluster is placed wholly inside the stencil bounds.
+# - Clusters are separated by at least two empty columns/rows along the varying
+#   axis, which is enough to prevent accidental 8-neighborhood merging between
+#   different clusters even when their cross-axis offsets differ.
+# - The cluster's shared-axis size is at most 3, so it always fits because the
+#   shared dimension is `crop_dim + 2`, and `crop_dim` is at least 2.
+#
+# observability_and_cleanliness:
+# - Every generated stencil satisfies `count4 > count8`, usually `count4 = 2*count8`.
+#   So the new rule is not a silent internal change; it changes the visible repeat
+#   count relative to the number of apparent mini-blobs in section 2.
+# - Sections remain visually separated, the stencil uses only black and green, and
+#   clusters never overlap or interleave. The puzzle stays neat and local.
+#
+# new_solver_assumptions_after_change:
+# - `main()` now assumes the intended counted pixels are specifically color 3.
+#   `generate_input()` guarantees that all stencil foreground cells use color 3.
+# - `main()` also assumes diagonal-only joins are meaningful. Generator enforces
+#   that by constructing section 2 from explicit diagonal clusters instead of
+#   relying on random placement that might collapse back to the 4-connected case.
+
+
+TEMPLATE_COLOR = 4
+STENCIL_COLOR = 3
+SEPARATOR_COLOR = 1
+
+
+def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
+    h, w = grid.shape
+
+    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == SEPARATOR_COLOR))]
+    if sep_rows:
+        cuts = [-1] + sep_rows + [h]
+        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == SEPARATOR_COLOR))]
+    cuts = [-1] + sep_cols + [w]
+    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+
+def _solid_color(block: np.ndarray) -> int:
+    vals, counts = np.unique(block, return_counts=True)
+    return int(vals[int(np.argmax(counts))])
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Recolor a cropped template and repeat it using an 8-connected stencil count.
+
+    Input structure:
+    - Blue (1) full separator rows or columns divide the input into four sections.
+    - Section 1 is a black template with a yellow shape; section 2 is a green stencil.
+    - Sections 3 and 4 are solid swatches that provide the output foreground and background colors.
+
+    Rule:
+    - Crop section 1 to the bounding box of its non-black shape pixels and recolor the crop with the two swatches.
+    - In section 2, count the 8-connected components formed by green (3) pixels, so diagonal corner contacts also join pieces.
+    - Repeat the recolored crop that many times along the layout axis, separating neighboring copies by one row or column of the background color.
+
+    Key insight:
+    - The stencil does not count isolated orthogonal blobs; diagonal green groups in section 2 each stand for one copy, and the separator orientation tells you whether copies stack vertically or horizontally.
+    """
+    g = np.asarray(grid, dtype=int)
+    orientation, sections = _split_sections(g)
+    template, repetition_pattern, foreground_block, background_block = sections[:4]
+
+    template_mask = template != 0
+    template_bbox = bbox(template_mask)
+    if template_bbox is None:
+        return np.empty((0, 0), dtype=int)
+
+    foreground = _solid_color(foreground_block)
+    background = _solid_color(background_block)
+    tile_mask = crop_bbox(template_mask, template_bbox)
+    tile = np.where(tile_mask, foreground, background).astype(int)
+
+    n_repeats = len(components_mask(repetition_pattern == STENCIL_COLOR, connectivity=8))
+    if n_repeats <= 1:
+        return tile
+
+    if orientation == "horizontal":
+        sep = np.full((tile.shape[0], 1), background, dtype=int)
+        pieces = [tile] + [x for _ in range(n_repeats - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+
+    sep = np.full((1, tile.shape[1]), background, dtype=int)
+    pieces = [tile] + [x for _ in range(n_repeats - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+
+# --------------- generator (c) ---------------
+
+REPEAT_COUNT_RANGE = (2, 6)
+CROP_SIZE_RANGE = (2, 5)
+DENSITY_RANGE = (0.55, 0.85)
+COLOR_POOL = list(range(2, 10))
+SWATCH_DIM_RANGE = (3, 8)
+STENCIL_GAP_RANGE = (2, 4)
+GEN_RETRIES = 300
+
+
+BASE_DIAGONAL_CLUSTER = np.array(
+    [
+        [1, 1, 0],
+        [0, 0, 1],
+        [0, 0, 1],
+    ],
+    dtype=bool,
+)
+
+
+def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
+    """Repeat `tile` n times along the given axis with a 1-pixel bg separator."""
+    if horizontal:
+        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
+        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
+    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+
+def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
+    varying = random.randint(*SWATCH_DIM_RANGE)
+    if horizontal:
+        return np.full((shared_dim, varying), color, dtype=int)
+    return np.full((varying, shared_dim), color, dtype=int)
+
+
+def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
+    if horizontal:
+        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
+        parts = [sections[0]]
+        for s in sections[1:]:
+            parts.extend([sep, s])
+        return np.hstack(parts)
+    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
+    parts = [sections[0]]
+    for s in sections[1:]:
+        parts.extend([sep, s])
+    return np.vstack(parts)
+
+
+def _make_diagonal_cluster(horizontal: bool) -> np.ndarray:
+    cluster = BASE_DIAGONAL_CLUSTER.copy()
+    if random.choice([True, False]):
+        cluster = np.fliplr(cluster)
+    if random.choice([True, False]):
+        cluster = np.flipud(cluster)
+    if not horizontal:
+        cluster = cluster.T
+    return np.ascontiguousarray(cluster)
+
+
+def _build_stencil(n_groups: int, shared_dim: int, horizontal: bool) -> np.ndarray:
+    clusters = [_make_diagonal_cluster(horizontal) for _ in range(n_groups)]
+    gaps = [random.randint(*STENCIL_GAP_RANGE) for _ in range(max(0, n_groups - 1))]
+    lead_margin = random.randint(1, 2)
+    tail_margin = random.randint(1, 2)
+
+    varying_extent = lead_margin + tail_margin
+    varying_extent += sum(cluster.shape[1] if horizontal else cluster.shape[0] for cluster in clusters)
+    varying_extent += sum(gaps)
+
+    h, w = (shared_dim, varying_extent) if horizontal else (varying_extent, shared_dim)
+    grid = np.zeros((h, w), dtype=int)
+
+    cursor = lead_margin
+    for i, cluster in enumerate(clusters):
+        ch, cw = cluster.shape
+        if horizontal:
+            r0 = random.randint(0, shared_dim - ch)
+            view = grid[r0 : r0 + ch, cursor : cursor + cw]
+            view[cluster] = STENCIL_COLOR
+            cursor += cw
+        else:
+            c0 = random.randint(0, shared_dim - cw)
+            view = grid[cursor : cursor + ch, c0 : c0 + cw]
+            view[cluster] = STENCIL_COLOR
+            cursor += ch
+        if i < len(gaps):
+            cursor += gaps[i]
+
+    return grid
+
+
+def _gen_attempt() -> np.ndarray | None:
+    horizontal = random.choice([True, False])
+    n_repeats = random.randint(*REPEAT_COUNT_RANGE)
+
+    crop_h = random.randint(*CROP_SIZE_RANGE)
+    crop_w = random.randint(*CROP_SIZE_RANGE)
+    density = random.uniform(*DENSITY_RANGE)
+    shape = random_sprite(
+        crop_h,
+        crop_w,
+        density=density,
+        color_palette=[TEMPLATE_COLOR],
+        connectivity=4,
+        symmetry="not_symmetric",
+    )
+
+    fg_color, bg_color = random.sample(COLOR_POOL, 2)
+    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
+    output = _tile_repeat(tile, n_repeats, bg_color, horizontal)
+
+    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
+    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
+
+    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
+    stencil = _build_stencil(n_repeats, shared_dim, horizontal)
+
+    count8 = len(components_mask(stencil == STENCIL_COLOR, connectivity=8))
+    count4 = len(components_mask(stencil == STENCIL_COLOR, connectivity=4))
+    if count8 != n_repeats or count4 <= count8:
+        return None
+
+    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
+    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
+    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
+
+    try:
+        if np.array_equal(main(inp), output):
+            return inp
+    except Exception:
+        pass
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        result = _gen_attempt()
+        if result is not None:
+            return result
+    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+            ```
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/b0039139.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of b0039139 (index 10)
+    # combo_spec: D3/0+D5/3
+    # Name: 8-连通计数配分量面积分隔
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10` 存在（如不存在则创建）。
+codex
+我先核对原题代码、参考单变体和 `arc_utils` 的接口，再据此把融合规则落实到 solver/generator 设计里。随后我会直接在目标路径写入代码并跑 50 次稳定性测试。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/b0039139.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+
+import numpy as np
+
+from arc_utils import bbox, components_mask, crop_bbox, random_sprite
+import random
+
+
+def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
+    h, w = grid.shape
+    sep = 1
+
+    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == sep))]
+    if sep_rows:
+        cuts = [-1] + sep_rows + [h]
+        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == sep))]
+    cuts = [-1] + sep_cols + [w]
+    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+
+def _solid_color(block: np.ndarray) -> int:
+    vals, counts = np.unique(block, return_counts=True)
+    return int(vals[int(np.argmax(counts))])
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Recolor a cropped template and repeat it according to a component-count stencil.
+
+    Input structure:
+    - Solid blue (1) separator rows or columns split the grid into four sections.
+    - Section 1 is a black-background shape template; section 2 is a component-count stencil.
+    - Sections 3 and 4 are solid color swatches for output foreground and background.
+
+    Rule:
+    - Crop section 1 to the bbox of its non-black pixels and recolor it with the two swatches.
+    - Count 4-connected non-black components in section 2.
+    - Repeat the recolored crop that many times, inserting one background-colored row/column between copies.
+
+    Key insight: The second section encodes only the repeat count; the output orientation
+    is inherited from whether the input separators are columns or rows.
+    """
+    g = np.asarray(grid, dtype=int)
+    orientation, sections = _split_sections(g)
+    template, repetition_pattern, foreground_block, background_block = sections[:4]
+
+    template_mask = template != 0
+    template_bbox = bbox(template_mask)
+    if template_bbox is None:
+        return np.empty((0, 0), dtype=int)
+
+    foreground = _solid_color(foreground_block)
+    background = _solid_color(background_block)
+    tile_mask = crop_bbox(template_mask, template_bbox)
+    tile = np.where(tile_mask, foreground, background).astype(int)
+
+    n_repeats = len(components_mask(repetition_pattern != 0, connectivity=4))
+    if n_repeats <= 1:
+        return tile
+
+    if orientation == "horizontal":
+        sep = np.full((tile.shape[0], 1), background, dtype=int)
+        pieces = [tile] + [x for _ in range(n_repeats - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+
+    sep = np.full((1, tile.shape[1]), background, dtype=int)
+    pieces = [tile] + [x for _ in range(n_repeats - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+# --------------- generator (c) ---------------
+
+# --- CFG: tunable generation parameters ---
+REPEAT_COUNT_RANGE = (2, 6)          # blob count N (= tile repetitions)
+CROP_SIZE_RANGE = (2, 5)             # crop height/width bounds
+DENSITY_RANGE = (0.55, 0.85)         # fill ratio of shape bounding box
+COLOR_POOL = list(range(2, 10))      # fg/bg color choices (2-9 inclusive)
+TEMPLATE_COLOR = 4                   # shape drawn in yellow inside template
+STENCIL_COLOR = 3                    # blob color in stencil section
+SEPARATOR_COLOR = 1                  # blue separator rows/cols
+SWATCH_DIM_RANGE = (3, 8)           # varying-axis size for color swatches
+STENCIL_VARYING_EXTRA = 4            # max extra cells beyond minimum stencil size
+BLOB_PLACE_RETRIES = 200             # per-blob placement attempts in stencil
+GEN_RETRIES = 300                    # outer generate_input retry limit
+
+
+def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
+    """Repeat `tile` n times along the given axis with 1-pixel bg_color separator."""
+    if horizontal:
+        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
+        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
+    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+
+def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
+    """Create a solid color swatch. shared_dim is the fixed axis; varying axis is random."""
+    varying = random.randint(*SWATCH_DIM_RANGE)
+    if horizontal:
+        return np.full((shared_dim, varying), color, dtype=int)
+    return np.full((varying, shared_dim), color, dtype=int)
+
+
+def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
+    """Join sections with single-pixel separator lines of SEPARATOR_COLOR."""
+    if horizontal:
+        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
+        parts = [sections[0]]
+        for s in sections[1:]:
+            parts.extend([sep, s])
+        return np.hstack(parts)
+    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
+    parts = [sections[0]]
+    for s in sections[1:]:
+        parts.extend([sep, s])
+    return np.vstack(parts)
+
+
+def _build_stencil(n_blobs: int, shared_dim: int, horizontal: bool) -> np.ndarray | None:
+    """Place n_blobs 2-cell blobs (1x2 or 2x1) of STENCIL_COLOR on a black grid.
+    Blobs are separated by >=1 cell of black in all directions."""
+    min_varying = max(4, n_blobs * 2 + 2)
+    varying_dim = random.randint(min_varying, min_varying + STENCIL_VARYING_EXTRA)
+
+    h, w = (shared_dim, varying_dim) if horizontal else (varying_dim, shared_dim)
+    grid = np.zeros((h, w), dtype=int)
+
+    placed = 0
+    for _ in range(BLOB_PLACE_RETRIES):
+        if placed >= n_blobs:
+            break
+        br, bc = (1, 2) if random.choice([True, False]) else (2, 1)
+
+        if h - 1 - br < 1 or w - 1 - bc < 1:
+            continue
+        r = random.randint(1, h - 1 - br)
+        c = random.randint(1, w - 1 - bc)
+
+        # Check blob cells + 1-cell neighborhood are all black
+        r0, c0 = max(0, r - 1), max(0, c - 1)
+        r1, c1 = min(h, r + br + 1), min(w, c + bc + 1)
+        if np.any(grid[r0:r1, c0:c1] != 0):
+            continue
+
+        grid[r:r + br, c:c + bc] = STENCIL_COLOR
+        placed += 1
+
+    return grid if placed == n_blobs else None
+
+
+def _gen_attempt() -> np.ndarray | None:
+    horizontal = random.choice([True, False])
+    N = random.randint(*REPEAT_COUNT_RANGE)
+
+    # Generate connected tile shape
+    crop_h = random.randint(*CROP_SIZE_RANGE)
+    crop_w = random.randint(*CROP_SIZE_RANGE)
+    density = random.uniform(*DENSITY_RANGE)
+    shape = random_sprite(crop_h, crop_w, density=density, color_palette=[TEMPLATE_COLOR],
+                          connectivity=4, symmetry="not_symmetric")
+
+    # Pick distinct fg/bg colors
+    fg_color, bg_color = random.sample(COLOR_POOL, 2)
+
+    # Build output
+    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
+    output = _tile_repeat(tile, N, bg_color, horizontal)
+
+    # Build template: shape in (crop_h+2) x (crop_w+2) black border
+    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
+    template[1:crop_h + 1, 1:crop_w + 1] = shape
+
+    # Build stencil
+    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
+    stencil = _build_stencil(N, shared_dim, horizontal)
+    if stencil is None:
+        return None
+
+    # Assemble: template | stencil | fg_swatch | bg_swatch
+    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
+    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
+    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
+
+    # Oracle check
+    try:
+        if np.array_equal(main(inp), output):
+            return inp
+    except Exception:
+        pass
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        result = _gen_attempt()
+        if result is not None:
+            return result
+    raise RuntimeError("Failed to generate valid input after %d attempts" % GEN_RETRIES)
+
+exec
+/bin/bash -lc "sed -n '1,360p' /home/lixinyu/snap/new/ceshi/code/b0039139/D3/0/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Variant of b0039139
+# Dimension: D3 — 连通分量计数方式 (src)
+# Change: 计算区段2中色3像素的4-连通分量数量，该数量决定模板副本的重复次数... → 使用8-连通而非4-连通计数
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+from arc_utils import bbox, components_mask, crop_bbox, random_sprite
+
+
+# Design analysis for the D3 variant
+# ==================================
+# concretization_and_trace:
+# - Layout stays identical to the source task: four sections split by blue (1)
+#   full rows or columns, in the order template / stencil / fg swatch / bg swatch.
+# - The only semantic change is in section 2. Instead of counting orthogonally
+#   separated green pieces with 4-connectivity, we now count 8-connected green
+#   groups, so diagonal corner-touching pieces merge.
+# - To make that visible, each intended repeat is encoded as one diagonal cluster
+#   made from two separate 2-cell mini-blobs, e.g.
+#       330
+#       003
+#       003
+#   Here the left horizontal domino and the right vertical domino touch only at a
+#   corner. Old logic: 2 components. New logic: 1 component.
+# - Small trace: if section 2 contains three such diagonal clusters separated from
+#   each other by black gaps, the original solver would produce 6 copies while the
+#   variant must produce 3 copies. All other steps (crop template, recolor with
+#   swatches, tile with bg separators along the layout axis) are unchanged.
+#
+# complexity_calibration:
+# - The variant needs a stable visual cue, not random accidental diagonal contacts.
+# - Generator therefore uses a small family of repeated diagonal-cluster motifs.
+#   This keeps the puzzle readable: humans can see "paired green bits that belong
+#   together by diagonal touch", while 4-connected counting would clearly overcount.
+# - We keep freedom limited to orientation, template shape, colors, cluster flips,
+#   and cross-axis offsets. The core counting rule has repeated support in every
+#   sample instead of depending on one brittle special case.
+#
+# implicit_assumption_audit_for_main:
+# - `_split_sections` assumes no internal section contains a full blue row/column.
+#   Generator preserves that by never using color 1 except separators.
+# - `template_mask = template != 0` assumes template foreground is the only
+#   non-black content in section 1. That remains true.
+# - `bbox(template_mask)` assumes the template has at least one foreground cell.
+#   `random_sprite` is used with connected non-empty sprites, so this holds.
+# - Counting now depends on `repetition_pattern == 3`, not merely non-black.
+#   This matches the task statement exactly and avoids hidden dependence on other
+#   possible colors inside section 2.
+# - Tiling logic still assumes the count is >= 1. Generator keeps repeat counts in
+#   2..6, so the degenerate zero-template path remains unused but harmless.
+#
+# placement_legality:
+# - Each diagonal cluster is placed wholly inside the stencil bounds.
+# - Clusters are separated by at least two empty columns/rows along the varying
+#   axis, which is enough to prevent accidental 8-neighborhood merging between
+#   different clusters even when their cross-axis offsets differ.
+# - The cluster's shared-axis size is at most 3, so it always fits because the
+#   shared dimension is `crop_dim + 2`, and `crop_dim` is at least 2.
+#
+# observability_and_cleanliness:
+# - Every generated stencil satisfies `count4 > count8`, usually `count4 = 2*count8`.
+#   So the new rule is not a silent internal change; it changes the visible repeat
+#   count relative to the number of apparent mini-blobs in section 2.
+# - Sections remain visually separated, the stencil uses only black and green, and
+#   clusters never overlap or interleave. The puzzle stays neat and local.
+#
+# new_solver_assumptions_after_change:
+# - `main()` now assumes the intended counted pixels are specifically color 3.
+#   `generate_input()` guarantees that all stencil foreground cells use color 3.
+# - `main()` also assumes diagonal-only joins are meaningful. Generator enforces
+#   that by constructing section 2 from explicit diagonal clusters instead of
+#   relying on random placement that might collapse back to the 4-connected case.
+
+
+TEMPLATE_COLOR = 4
+STENCIL_COLOR = 3
+SEPARATOR_COLOR = 1
+
+
+def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
+    h, w = grid.shape
+
+    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == SEPARATOR_COLOR))]
+    if sep_rows:
+        cuts = [-1] + sep_rows + [h]
+        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == SEPARATOR_COLOR))]
+    cuts = [-1] + sep_cols + [w]
+    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+
+def _solid_color(block: np.ndarray) -> int:
+    vals, counts = np.unique(block, return_counts=True)
+    return int(vals[int(np.argmax(counts))])
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Recolor a cropped template and repeat it using an 8-connected stencil count.
+
+    Input structure:
+    - Blue (1) full separator rows or columns divide the input into four sections.
+    - Section 1 is a black template with a yellow shape; section 2 is a green stencil.
+    - Sections 3 and 4 are solid swatches that provide the output foreground and background colors.
+
+    Rule:
+    - Crop section 1 to the bounding box of its non-black shape pixels and recolor the crop with the two swatches.
+    - In section 2, count the 8-connected components formed by green (3) pixels, so diagonal corner contacts also join pieces.
+    - Repeat the recolored crop that many times along the layout axis, separating neighboring copies by one row or column of the background color.
+
+    Key insight:
+    - The stencil does not count isolated orthogonal blobs; diagonal green groups in section 2 each stand for one copy, and the separator orientation tells you whether copies stack vertically or horizontally.
+    """
+    g = np.asarray(grid, dtype=int)
+    orientation, sections = _split_sections(g)
+    template, repetition_pattern, foreground_block, background_block = sections[:4]
+
+    template_mask = template != 0
+    template_bbox = bbox(template_mask)
+    if template_bbox is None:
+        return np.empty((0, 0), dtype=int)
+
+    foreground = _solid_color(foreground_block)
+    background = _solid_color(background_block)
+    tile_mask = crop_bbox(template_mask, template_bbox)
+    tile = np.where(tile_mask, foreground, background).astype(int)
+
+    n_repeats = len(components_mask(repetition_pattern == STENCIL_COLOR, connectivity=8))
+    if n_repeats <= 1:
+        return tile
+
+    if orientation == "horizontal":
+        sep = np.full((tile.shape[0], 1), background, dtype=int)
+        pieces = [tile] + [x for _ in range(n_repeats - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+
+    sep = np.full((1, tile.shape[1]), background, dtype=int)
+    pieces = [tile] + [x for _ in range(n_repeats - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+
+# --------------- generator (c) ---------------
+
+REPEAT_COUNT_RANGE = (2, 6)
+CROP_SIZE_RANGE = (2, 5)
+DENSITY_RANGE = (0.55, 0.85)
+COLOR_POOL = list(range(2, 10))
+SWATCH_DIM_RANGE = (3, 8)
+STENCIL_GAP_RANGE = (2, 4)
+GEN_RETRIES = 300
+
+
+BASE_DIAGONAL_CLUSTER = np.array(
+    [
+        [1, 1, 0],
+        [0, 0, 1],
+        [0, 0, 1],
+    ],
+    dtype=bool,
+)
+
+
+def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
+    """Repeat `tile` n times along the given axis with a 1-pixel bg separator."""
+    if horizontal:
+        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
+        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
+    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+
+def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
+    varying = random.randint(*SWATCH_DIM_RANGE)
+    if horizontal:
+        return np.full((shared_dim, varying), color, dtype=int)
+    return np.full((varying, shared_dim), color, dtype=int)
+
+
+def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
+    if horizontal:
+        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
+        parts = [sections[0]]
+        for s in sections[1:]:
+            parts.extend([sep, s])
+        return np.hstack(parts)
+    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
+    parts = [sections[0]]
+    for s in sections[1:]:
+        parts.extend([sep, s])
+    return np.vstack(parts)
+
+
+def _make_diagonal_cluster(horizontal: bool) -> np.ndarray:
+    cluster = BASE_DIAGONAL_CLUSTER.copy()
+    if random.choice([True, False]):
+        cluster = np.fliplr(cluster)
+    if random.choice([True, False]):
+        cluster = np.flipud(cluster)
+    if not horizontal:
+        cluster = cluster.T
+    return np.ascontiguousarray(cluster)
+
+
+def _build_stencil(n_groups: int, shared_dim: int, horizontal: bool) -> np.ndarray:
+    clusters = [_make_diagonal_cluster(horizontal) for _ in range(n_groups)]
+    gaps = [random.randint(*STENCIL_GAP_RANGE) for _ in range(max(0, n_groups - 1))]
+    lead_margin = random.randint(1, 2)
+    tail_margin = random.randint(1, 2)
+
+    varying_extent = lead_margin + tail_margin
+    varying_extent += sum(cluster.shape[1] if horizontal else cluster.shape[0] for cluster in clusters)
+    varying_extent += sum(gaps)
+
+    h, w = (shared_dim, varying_extent) if horizontal else (varying_extent, shared_dim)
+    grid = np.zeros((h, w), dtype=int)
+
+    cursor = lead_margin
+    for i, cluster in enumerate(clusters):
+        ch, cw = cluster.shape
+        if horizontal:
+            r0 = random.randint(0, shared_dim - ch)
+            view = grid[r0 : r0 + ch, cursor : cursor + cw]
+            view[cluster] = STENCIL_COLOR
+            cursor += cw
+        else:
+            c0 = random.randint(0, shared_dim - cw)
+            view = grid[cursor : cursor + ch, c0 : c0 + cw]
+            view[cluster] = STENCIL_COLOR
+            cursor += ch
+        if i < len(gaps):
+            cursor += gaps[i]
+
+    return grid
+
+
+def _gen_attempt() -> np.ndarray | None:
+    horizontal = random.choice([True, False])
+    n_repeats = random.randint(*REPEAT_COUNT_RANGE)
+
+    crop_h = random.randint(*CROP_SIZE_RANGE)
+    crop_w = random.randint(*CROP_SIZE_RANGE)
+    density = random.uniform(*DENSITY_RANGE)
+    shape = random_sprite(
+        crop_h,
+        crop_w,
+        density=density,
+        color_palette=[TEMPLATE_COLOR],
+        connectivity=4,
+        symmetry="not_symmetric",
+    )
+
+    fg_color, bg_color = random.sample(COLOR_POOL, 2)
+    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
+    output = _tile_repeat(tile, n_repeats, bg_color, horizontal)
+
+    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
+    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
+
+    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
+    stencil = _build_stencil(n_repeats, shared_dim, horizontal)
+
+    count8 = len(components_mask(stencil == STENCIL_COLOR, connectivity=8))
+    count4 = len(components_mask(stencil == STENCIL_COLOR, connectivity=4))
+    if count8 != n_repeats or count4 <= count8:
+        return None
+
+    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
+    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
+    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
+
+    try:
+        if np.array_equal(main(inp), output):
+            return inp
+    except Exception:
+        pass
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        result = _gen_attempt()
+        if result is not None:
+            return result
+    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+    r0 = min(b[0] for b in bbs)
+    c0 = min(b[1] for b in bbs)
+    r1 = max(b[2] for b in bbs)
+    c1 = max(b[3] for b in bbs)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox_h(b: BBox) -> int:
+    r0, _c0, r1, _c1 = b
+    return int(r1 - r0 + 1)
+
+
+def bbox_w(b: BBox) -> int:
+    _r0, c0, _r1, c1 = b
+    return int(c1 - c0 + 1)
+
+
+def bbox_anchor(b: BBox, *, anchor: str = "upper left") -> Coord:
+    """
+    Return an anchor point (r,c) for a bbox.
+
+exec
+/bin/bash -lc 'ls -la /home/lixinyu/snap/new/ceshi/code_combo/b0039139' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+total 132
+drwxrwxr-x+ 33 lixinyu lixinyu 4096 May 16 02:24 .
+drwxrwxr-x+ 94 lixinyu lixinyu 4096 May 16 02:24 ..
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 1
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 10
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 11
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 12
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 13
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 14
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 15
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 16
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 17
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 18
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 19
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 2
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 20
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 21
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 22
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 23
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 24
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 25
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 26
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 27
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 28
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 29
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 3
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 30
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 4
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 5
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 6
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 7
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 8
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 9
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:25 _logs
+
+codex
+我已经确认原题和 D3 单变体的骨架。下一步会把 D5/3 的“分隔宽度=8 连通分量面积”并入，同步重写生成器，让每个样例都稳定展示“对角合并同时改变重复次数和分隔宽度”这两个联动效果。
+exec
+/bin/bash -lc "rg -n \"def components_mask|components_mask\\(\" /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+398:def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+444:                comps = components_mask(mask, connectivity=connectivity)
+
+exec
+/bin/bash -lc "ls -la /home/lixinyu/snap/new/ceshi/code_combo/b0039139/10 && sed -n '1,260p' /home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py" in /home/lixinyu/snap/new
+ exited 2 in 0ms:
+total 8
+drwxrwxr-x+  2 lixinyu lixinyu 4096 May 16 02:24 .
+drwxrwxr-x+ 33 lixinyu lixinyu 4096 May 16 02:24 ..
+sed: can't read /home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py: No such file or directory
+
+exec
+/bin/bash -lc "sed -n '398,440p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+    """List of components from a boolean mask, each as an (N,2) coords array."""
+    lab, n = label_mask(mask, connectivity=connectivity)
+    return [np.argwhere(lab == k) for k in range(1, n + 1)]
+
+
+def find_components(
+    grid: np.ndarray,
+    *,
+    bg: int | None = None,
+    connectivity: int = 4,
+    monochromatic: bool = True,
+    colors: Sequence[int] | None = None,
+    min_area: int = 1,
+    return_format: str = "dict",
+) -> list[dict] | list[np.ndarray]:
+    """
+    Find connected components in a grid (unified API for ARC-2 + migrated seeds).
+
+    return_format:
+      - \"dict\": list of dicts {color, coords, bbox, area}
+      - \"objects\": list of full-grid arrays containing exactly one component
+    """
+    if bg is None:
+        bg = get_bg(grid)
+    bg = int(bg)
+
+    return_format = str(return_format).lower().strip()
+    if return_format not in {"dict", "objects"}:
+        raise ValueError("find_components: return_format must be 'dict' or 'objects'")
+
+    if colors is None:
+        colors_set = None
+        colors_iter = sorted(set(map(int, grid.flatten())) - {bg})
+    else:
+        colors_set = {int(c) for c in colors}
+        colors_iter = [int(c) for c in colors_set if int(c) != bg]
+
+    # Monochromatic = label per-color
+    if monochromatic:
+        if return_format == "dict":
+            out: list[dict] = []
+            for col in colors_iter:
+
+codex
+设计已经收敛了：我会把区段2做成 3 个按顺序摆放的对角 8-连通绿色组，每组面积只取 `3` 或 `4`。这样新规则会同时造成两件可见变化：`6` 个 4 连通小块被并成 `3` 个 8 连通组，而且输出里两条内部分隔带会稳定呈现宽 `3` 与宽 `4`。
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py
+diff --git a/ceshi/code_combo/b0039139/10/code.py b/ceshi/code_combo/b0039139/10/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..19210c75bcfc85bc60768d2e353b798e87e5587d
+--- /dev/null
++++ b/ceshi/code_combo/b0039139/10/code.py
+@@ -0,0 +1,324 @@
++# Combo variant of b0039139 (index 10)
++# combo_spec: D3/0+D5/3
++# Name: 8-连通计数配分量面积分隔
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import bbox, components_mask, crop_bbox, random_sprite
++
++
++# Design analysis for the combo variant
++# =====================================
++# concretization_and_trace:
++# - The input still has four sections split by blue (1) full rows/columns in the
++#   order template / stencil / fg swatch / bg swatch.
++# - The fusion changes section 2 in two linked ways. We no longer read green pixels
++#   with 4-connectivity; we read 8-connected green groups. Also, the width of each
++#   internal separator in the output is the pixel area of the corresponding ordered
++#   8-connected group.
++# - A concrete stencil example for a horizontal layout is:
++#       110  110  110
++#       001  000  001
++#            011  001
++#   with black gaps between the three clusters. Interpreting each cluster:
++#   first area = 3, second area = 4, third area = 4. Under the source task, these
++#   are six 4-connected mini-pieces, so the output would repeat the tile six times
++#   with 1-cell separators. Under this combo, they become three 8-connected groups,
++#   so the output has three copies; the first separator is 3 cells wide and the
++#   second separator is 4 cells wide. The last group's area is still visible in the
++#   stencil and still contributes to the repeat count, but there is no separator
++#   after the final copy because only internal gaps are drawn.
++#
++# complexity_calibration:
++# - The generator uses exactly two area families, 3 and 4, built from diagonal-only
++#   joins. This keeps the rule easy to observe: humans can count green pixels inside
++#   each diagonal cluster and compare them against separator widths.
++# - Freedom is intentionally limited. Every sample contains three ordered 8-connected
++#   groups, and the first two visible separators are always widths 3 and 4 in some
++#   order. That repeated support makes the fused rule inferable from few examples.
++# - The cluster shapes differ only in height, not width, so input size stays compact
++#   while the relevant area change remains visually legible.
++#
++# implicit_assumption_audit_for_main:
++# - `_split_sections` assumes only the true separators are full blue rows/columns.
++#   The generator never uses color 1 inside any section.
++# - `template_mask = template != 0` assumes section 1 contains only black background
++#   plus one non-black template shape. The generator preserves that.
++# - `bbox(template_mask)` assumes the template is non-empty. `random_sprite` provides
++#   a non-empty connected shape, so the bbox always exists in generated samples.
++# - `_ordered_components` assumes the intended stencil objects are green (3) and are
++#   spatially ordered along the repeat axis without ties. The generator places each
++#   cluster in a left-to-right or top-to-bottom sequence with fixed blank gaps.
++# - `_repeat_with_component_gaps` assumes the gap widths come from the first N-1
++#   ordered 8-connected components. This is the only non-symmetric part of the rule;
++#   the final component still affects the copy count but cannot create an external
++#   trailing gap because the output only contains separators between adjacent copies.
++#
++# placement_legality:
++# - Each stencil cluster is a small boolean mask placed wholly inside the stencil.
++# - Consecutive clusters are separated by two blank columns/rows along the layout
++#   axis, so no accidental 8-neighbor merge can occur across different components.
++# - Cluster heights/widths are at most 3, while the shared axis is `crop_dim + 2`
++#   with `crop_dim` in 2..3, so every placement fits comfortably.
++# - The generator rejects any sample whose final input or output would exceed a
++#   30x30 grid, keeping the construction inside ordinary ARC size limits.
++#
++# observability_and_cleanliness:
++# - The stencil is clean: black background plus three green diagonal clusters with
++#   obvious empty gaps between them. Nothing overlaps, and each cluster can be
++#   counted both by group count and by pixel area with the naked eye.
++# - The output is equally clean because only one template crop is repeated, and the
++#   only varying feature is the thickness of the background-colored separator bands.
++# - Because the visible separators are always one width-3 band and one width-4 band,
++#   the area-to-gap correspondence has repeated support instead of appearing only as
++#   a rare accidental size difference.
++#
++# new_solver_assumptions_after_change:
++# - `main()` now depends on the ordered 8-connected green components being the true
++#   control signal. The generator guarantees this with dedicated color 3 clusters.
++# - `main()` also assumes diagonal touching is meaningful rather than accidental. The
++#   generator constructs every component from explicit diagonal-only joins, so 8- and
++#   4-connectivity produce different readings in every sample.
++
++
++TEMPLATE_COLOR = 4
++STENCIL_COLOR = 3
++SEPARATOR_COLOR = 1
++
++REPEAT_COUNT = 3
++CROP_SIZE_RANGE = (2, 3)
++DENSITY_RANGE = (0.55, 0.85)
++COLOR_POOL = list(range(2, 10))
++SWATCH_DIM_RANGE = (3, 3)
++STENCIL_GAP = 2
++GEN_RETRIES = 300
++
++BASE_CLUSTER_BY_AREA = {
++    3: np.array(
++        [
++            [1, 1, 0],
++            [0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++    4: np.array(
++        [
++            [1, 1, 0],
++            [0, 0, 1],
++            [0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++
++def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
++    h, w = grid.shape
++
++    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == SEPARATOR_COLOR))]
++    if sep_rows:
++        cuts = [-1] + sep_rows + [h]
++        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == SEPARATOR_COLOR))]
++    cuts = [-1] + sep_cols + [w]
++    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++
++def _solid_color(block: np.ndarray) -> int:
++    vals, counts = np.unique(block, return_counts=True)
++    return int(vals[int(np.argmax(counts))])
++
++
++def _ordered_components(mask: np.ndarray, horizontal: bool) -> list[np.ndarray]:
++    comps = components_mask(mask, connectivity=8)
++    axis = 1 if horizontal else 0
++    return sorted(comps, key=lambda coords: int(np.min(coords[:, axis])))
++
++
++def _repeat_with_component_gaps(
++    tile: np.ndarray, component_areas: list[int], bg_color: int, horizontal: bool
++) -> np.ndarray:
++    if len(component_areas) <= 1:
++        return tile
++
++    gap_widths = component_areas[:-1]
++    pieces = [tile]
++    for width in gap_widths:
++        if horizontal:
++            gap = np.full((tile.shape[0], width), bg_color, dtype=int)
++            pieces.extend([gap, tile])
++        else:
++            gap = np.full((width, tile.shape[1]), bg_color, dtype=int)
++            pieces.extend([gap, tile])
++
++    return np.hstack(pieces) if horizontal else np.vstack(pieces)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Crop and recolor a template, then space its repeats using 8-connected stencil areas.
++
++    Input structure:
++    - Blue (1) full rows or columns split the input into four consecutive sections.
++    - Section 1 is a black template holding one non-black sprite; section 2 is a green stencil on black.
++    - Sections 3 and 4 are solid color swatches that supply the output foreground and background.
++
++    Rule:
++    - Trim section 1 to the bbox of its non-black pixels and recolor that crop with the two swatch colors.
++    - In section 2, find the green (3) components using 8-connectivity and order them along the repeat axis.
++    - Make one copy of the recolored crop per ordered 8-connected component; between copy i and copy i+1,
++      insert a background-colored band whose thickness equals the area of component i.
++
++    Key insight:
++    - Diagonal joins in the stencil matter twice: they collapse several apparent mini-pieces into one repeat,
++      and the total number of pixels in each merged group becomes the width of the next separator band.
++    """
++    g = np.asarray(grid, dtype=int)
++    orientation, sections = _split_sections(g)
++    horizontal = orientation == "horizontal"
++    template, repetition_pattern, foreground_block, background_block = sections[:4]
++
++    template_mask = template != 0
++    template_bbox = bbox(template_mask)
++    if template_bbox is None:
++        return np.empty((0, 0), dtype=int)
++
++    foreground = _solid_color(foreground_block)
++    background = _solid_color(background_block)
++    tile_mask = crop_bbox(template_mask, template_bbox)
++    tile = np.where(tile_mask, foreground, background).astype(int)
++
++    comps = _ordered_components(repetition_pattern == STENCIL_COLOR, horizontal)
++    if not comps:
++        return tile
++    component_areas = [int(len(comp)) for comp in comps]
++    return _repeat_with_component_gaps(tile, component_areas, background, horizontal)
++
++
++def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
++    varying = random.randint(*SWATCH_DIM_RANGE)
++    if horizontal:
++        return np.full((shared_dim, varying), color, dtype=int)
++    return np.full((varying, shared_dim), color, dtype=int)
++
++
++def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
++    if horizontal:
++        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
++        parts = [sections[0]]
++        for section in sections[1:]:
++            parts.extend([sep, section])
++        return np.hstack(parts)
++
++    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
++    parts = [sections[0]]
++    for section in sections[1:]:
++        parts.extend([sep, section])
++    return np.vstack(parts)
++
++
++def _make_cluster(area: int, horizontal: bool) -> np.ndarray:
++    cluster = BASE_CLUSTER_BY_AREA[area].copy()
++    if random.choice([True, False]):
++        cluster = np.fliplr(cluster)
++    if random.choice([True, False]):
++        cluster = np.flipud(cluster)
++    if not horizontal:
++        cluster = cluster.T
++    return np.ascontiguousarray(cluster)
++
++
++def _sample_component_areas() -> list[int]:
++    visible = [3, 4]
++    random.shuffle(visible)
++    tail = random.choice([3, 4])
++    return visible + [tail]
++
++
++def _build_stencil(component_areas: list[int], shared_dim: int, horizontal: bool) -> np.ndarray:
++    clusters = [_make_cluster(area, horizontal) for area in component_areas]
++    margins = 2
++    varying_extent = margins + STENCIL_GAP * (len(clusters) - 1)
++    varying_extent += sum(cluster.shape[1] if horizontal else cluster.shape[0] for cluster in clusters)
++
++    h, w = (shared_dim, varying_extent) if horizontal else (varying_extent, shared_dim)
++    grid = np.zeros((h, w), dtype=int)
++
++    cursor = 1
++    for idx, cluster in enumerate(clusters):
++        ch, cw = cluster.shape
++        if horizontal:
++            r0 = random.randint(0, shared_dim - ch)
++            view = grid[r0 : r0 + ch, cursor : cursor + cw]
++            view[cluster] = STENCIL_COLOR
++            cursor += cw
++        else:
++            c0 = random.randint(0, shared_dim - cw)
++            view = grid[cursor : cursor + ch, c0 : c0 + cw]
++            view[cluster] = STENCIL_COLOR
++            cursor += ch
++        if idx < len(clusters) - 1:
++            cursor += STENCIL_GAP
++
++    return grid
++
++
++def _gen_attempt() -> np.ndarray | None:
++    horizontal = random.choice([True, False])
++
++    crop_h = random.randint(*CROP_SIZE_RANGE)
++    crop_w = random.randint(*CROP_SIZE_RANGE)
++    density = random.uniform(*DENSITY_RANGE)
++    shape = random_sprite(
++        crop_h,
++        crop_w,
++        density=density,
++        color_palette=[TEMPLATE_COLOR],
++        connectivity=4,
++        symmetry="not_symmetric",
++    )
++
++    fg_color, bg_color = random.sample(COLOR_POOL, 2)
++    component_areas = _sample_component_areas()
++    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
++    output = _repeat_with_component_gaps(tile, component_areas, bg_color, horizontal)
++
++    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
++    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
++
++    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
++    stencil = _build_stencil(component_areas, shared_dim, horizontal)
++
++    ordered = _ordered_components(stencil == STENCIL_COLOR, horizontal)
++    ordered_areas = [int(len(comp)) for comp in ordered]
++    count4 = len(components_mask(stencil == STENCIL_COLOR, connectivity=4))
++    count8 = len(ordered)
++    if ordered_areas != component_areas or count8 != REPEAT_COUNT or count4 <= count8:
++        return None
++
++    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
++    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
++    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
++
++    if max(inp.shape) > 30 or max(output.shape) > 30:
++        return None
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        pass
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+diff --git a/ceshi/code_combo/b0039139/10/code.py b/ceshi/code_combo/b0039139/10/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..19210c75bcfc85bc60768d2e353b798e87e5587d
+--- /dev/null
++++ b/ceshi/code_combo/b0039139/10/code.py
+@@ -0,0 +1,324 @@
++# Combo variant of b0039139 (index 10)
++# combo_spec: D3/0+D5/3
++# Name: 8-连通计数配分量面积分隔
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import bbox, components_mask, crop_bbox, random_sprite
++
++
++# Design analysis for the combo variant
++# =====================================
++# concretization_and_trace:
++# - The input still has four sections split by blue (1) full rows/columns in the
++#   order template / stencil / fg swatch / bg swatch.
++# - The fusion changes section 2 in two linked ways. We no longer read green pixels
++#   with 4-connectivity; we read 8-connected green groups. Also, the width of each
++#   internal separator in the output is the pixel area of the corresponding ordered
++#   8-connected group.
++# - A concrete stencil example for a horizontal layout is:
++#       110  110  110
++#       001  000  001
++#            011  001
++#   with black gaps between the three clusters. Interpreting each cluster:
++#   first area = 3, second area = 4, third area = 4. Under the source task, these
++#   are six 4-connected mini-pieces, so the output would repeat the tile six times
++#   with 1-cell separators. Under this combo, they become three 8-connected groups,
++#   so the output has three copies; the first separator is 3 cells wide and the
++#   second separator is 4 cells wide. The last group's area is still visible in the
++#   stencil and still contributes to the repeat count, but there is no separator
++#   after the final copy because only internal gaps are drawn.
++#
++# complexity_calibration:
++# - The generator uses exactly two area families, 3 and 4, built from diagonal-only
++#   joins. This keeps the rule easy to observe: humans can count green pixels inside
++#   each diagonal cluster and compare them against separator widths.
++# - Freedom is intentionally limited. Every sample contains three ordered 8-connected
++#   groups, and the first two visible separators are always widths 3 and 4 in some
++#   order. That repeated support makes the fused rule inferable from few examples.
++# - The cluster shapes differ only in height, not width, so input size stays compact
++#   while the relevant area change remains visually legible.
++#
++# implicit_assumption_audit_for_main:
++# - `_split_sections` assumes only the true separators are full blue rows/columns.
++#   The generator never uses color 1 inside any section.
++# - `template_mask = template != 0` assumes section 1 contains only black background
++#   plus one non-black template shape. The generator preserves that.
++# - `bbox(template_mask)` assumes the template is non-empty. `random_sprite` provides
++#   a non-empty connected shape, so the bbox always exists in generated samples.
++# - `_ordered_components` assumes the intended stencil objects are green (3) and are
++#   spatially ordered along the repeat axis without ties. The generator places each
++#   cluster in a left-to-right or top-to-bottom sequence with fixed blank gaps.
++# - `_repeat_with_component_gaps` assumes the gap widths come from the first N-1
++#   ordered 8-connected components. This is the only non-symmetric part of the rule;
++#   the final component still affects the copy count but cannot create an external
++#   trailing gap because the output only contains separators between adjacent copies.
++#
++# placement_legality:
++# - Each stencil cluster is a small boolean mask placed wholly inside the stencil.
++# - Consecutive clusters are separated by two blank columns/rows along the layout
++#   axis, so no accidental 8-neighbor merge can occur across different components.
++# - Cluster heights/widths are at most 3, while the shared axis is `crop_dim + 2`
++#   with `crop_dim` in 2..3, so every placement fits comfortably.
++# - The generator rejects any sample whose final input or output would exceed a
++#   30x30 grid, keeping the construction inside ordinary ARC size limits.
++#
++# observability_and_cleanliness:
++# - The stencil is clean: black background plus three green diagonal clusters with
++#   obvious empty gaps between them. Nothing overlaps, and each cluster can be
++#   counted both by group count and by pixel area with the naked eye.
++# - The output is equally clean because only one template crop is repeated, and the
++#   only varying feature is the thickness of the background-colored separator bands.
++# - Because the visible separators are always one width-3 band and one width-4 band,
++#   the area-to-gap correspondence has repeated support instead of appearing only as
++#   a rare accidental size difference.
++#
++# new_solver_assumptions_after_change:
++# - `main()` now depends on the ordered 8-connected green components being the true
++#   control signal. The generator guarantees this with dedicated color 3 clusters.
++# - `main()` also assumes diagonal touching is meaningful rather than accidental. The
++#   generator constructs every component from explicit diagonal-only joins, so 8- and
++#   4-connectivity produce different readings in every sample.
++
++
++TEMPLATE_COLOR = 4
++STENCIL_COLOR = 3
++SEPARATOR_COLOR = 1
++
++REPEAT_COUNT = 3
++CROP_SIZE_RANGE = (2, 3)
++DENSITY_RANGE = (0.55, 0.85)
++COLOR_POOL = list(range(2, 10))
++SWATCH_DIM_RANGE = (3, 3)
++STENCIL_GAP = 2
++GEN_RETRIES = 300
++
++BASE_CLUSTER_BY_AREA = {
++    3: np.array(
++        [
++            [1, 1, 0],
++            [0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++    4: np.array(
++        [
++            [1, 1, 0],
++            [0, 0, 1],
++            [0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++
++def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
++    h, w = grid.shape
++
++    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == SEPARATOR_COLOR))]
++    if sep_rows:
++        cuts = [-1] + sep_rows + [h]
++        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == SEPARATOR_COLOR))]
++    cuts = [-1] + sep_cols + [w]
++    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++
++def _solid_color(block: np.ndarray) -> int:
++    vals, counts = np.unique(block, return_counts=True)
++    return int(vals[int(np.argmax(counts))])
++
++
++def _ordered_components(mask: np.ndarray, horizontal: bool) -> list[np.ndarray]:
++    comps = components_mask(mask, connectivity=8)
++    axis = 1 if horizontal else 0
++    return sorted(comps, key=lambda coords: int(np.min(coords[:, axis])))
++
++
++def _repeat_with_component_gaps(
++    tile: np.ndarray, component_areas: list[int], bg_color: int, horizontal: bool
++) -> np.ndarray:
++    if len(component_areas) <= 1:
++        return tile
++
++    gap_widths = component_areas[:-1]
++    pieces = [tile]
++    for width in gap_widths:
++        if horizontal:
++            gap = np.full((tile.shape[0], width), bg_color, dtype=int)
++            pieces.extend([gap, tile])
++        else:
++            gap = np.full((width, tile.shape[1]), bg_color, dtype=int)
++            pieces.extend([gap, tile])
++
++    return np.hstack(pieces) if horizontal else np.vstack(pieces)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Crop and recolor a template, then space its repeats using 8-connected stencil areas.
++
++    Input structure:
++    - Blue (1) full rows or columns split the input into four consecutive sections.
++    - Section 1 is a black template holding one non-black sprite; section 2 is a green stencil on black.
++    - Sections 3 and 4 are solid color swatches that supply the output foreground and background.
++
++    Rule:
++    - Trim section 1 to the bbox of its non-black pixels and recolor that crop with the two swatch colors.
++    - In section 2, find the green (3) components using 8-connectivity and order them along the repeat axis.
++    - Make one copy of the recolored crop per ordered 8-connected component; between copy i and copy i+1,
++      insert a background-colored band whose thickness equals the area of component i.
++
++    Key insight:
++    - Diagonal joins in the stencil matter twice: they collapse several apparent mini-pieces into one repeat,
++      and the total number of pixels in each merged group becomes the width of the next separator band.
++    """
++    g = np.asarray(grid, dtype=int)
++    orientation, sections = _split_sections(g)
++    horizontal = orientation == "horizontal"
++    template, repetition_pattern, foreground_block, background_block = sections[:4]
++
++    template_mask = template != 0
++    template_bbox = bbox(template_mask)
++    if template_bbox is None:
++        return np.empty((0, 0), dtype=int)
++
++    foreground = _solid_color(foreground_block)
++    background = _solid_color(background_block)
++    tile_mask = crop_bbox(template_mask, template_bbox)
++    tile = np.where(tile_mask, foreground, background).astype(int)
++
++    comps = _ordered_components(repetition_pattern == STENCIL_COLOR, horizontal)
++    if not comps:
++        return tile
++    component_areas = [int(len(comp)) for comp in comps]
++    return _repeat_with_component_gaps(tile, component_areas, background, horizontal)
++
++
++def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
++    varying = random.randint(*SWATCH_DIM_RANGE)
++    if horizontal:
++        return np.full((shared_dim, varying), color, dtype=int)
++    return np.full((varying, shared_dim), color, dtype=int)
++
++
++def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
++    if horizontal:
++        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
++        parts = [sections[0]]
++        for section in sections[1:]:
++            parts.extend([sep, section])
++        return np.hstack(parts)
++
++    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
++    parts = [sections[0]]
++    for section in sections[1:]:
++        parts.extend([sep, section])
++    return np.vstack(parts)
++
++
++def _make_cluster(area: int, horizontal: bool) -> np.ndarray:
++    cluster = BASE_CLUSTER_BY_AREA[area].copy()
++    if random.choice([True, False]):
++        cluster = np.fliplr(cluster)
++    if random.choice([True, False]):
++        cluster = np.flipud(cluster)
++    if not horizontal:
++        cluster = cluster.T
++    return np.ascontiguousarray(cluster)
++
++
++def _sample_component_areas() -> list[int]:
++    visible = [3, 4]
++    random.shuffle(visible)
++    tail = random.choice([3, 4])
++    return visible + [tail]
++
++
++def _build_stencil(component_areas: list[int], shared_dim: int, horizontal: bool) -> np.ndarray:
++    clusters = [_make_cluster(area, horizontal) for area in component_areas]
++    margins = 2
++    varying_extent = margins + STENCIL_GAP * (len(clusters) - 1)
++    varying_extent += sum(cluster.shape[1] if horizontal else cluster.shape[0] for cluster in clusters)
++
++    h, w = (shared_dim, varying_extent) if horizontal else (varying_extent, shared_dim)
++    grid = np.zeros((h, w), dtype=int)
++
++    cursor = 1
++    for idx, cluster in enumerate(clusters):
++        ch, cw = cluster.shape
++        if horizontal:
++            r0 = random.randint(0, shared_dim - ch)
++            view = grid[r0 : r0 + ch, cursor : cursor + cw]
++            view[cluster] = STENCIL_COLOR
++            cursor += cw
++        else:
++            c0 = random.randint(0, shared_dim - cw)
++            view = grid[cursor : cursor + ch, c0 : c0 + cw]
++            view[cluster] = STENCIL_COLOR
++            cursor += ch
++        if idx < len(clusters) - 1:
++            cursor += STENCIL_GAP
++
++    return grid
++
++
++def _gen_attempt() -> np.ndarray | None:
++    horizontal = random.choice([True, False])
++
++    crop_h = random.randint(*CROP_SIZE_RANGE)
++    crop_w = random.randint(*CROP_SIZE_RANGE)
++    density = random.uniform(*DENSITY_RANGE)
++    shape = random_sprite(
++        crop_h,
++        crop_w,
++        density=density,
++        color_palette=[TEMPLATE_COLOR],
++        connectivity=4,
++        symmetry="not_symmetric",
++    )
++
++    fg_color, bg_color = random.sample(COLOR_POOL, 2)
++    component_areas = _sample_component_areas()
++    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
++    output = _repeat_with_component_gaps(tile, component_areas, bg_color, horizontal)
++
++    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
++    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
++
++    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
++    stencil = _build_stencil(component_areas, shared_dim, horizontal)
++
++    ordered = _ordered_components(stencil == STENCIL_COLOR, horizontal)
++    ordered_areas = [int(len(comp)) for comp in ordered]
++    count4 = len(components_mask(stencil == STENCIL_COLOR, connectivity=4))
++    count8 = len(ordered)
++    if ordered_areas != component_areas or count8 != REPEAT_COUNT or count4 <= count8:
++        return None
++
++    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
++    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
++    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
++
++    if max(inp.shape) > 30 or max(output.shape) > 30:
++        return None
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        pass
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+codex
+代码已写入目标文件。现在开始跑 50 次生成/求解稳定性测试；如果有失败，我会先定位是导入、尺寸约束还是组件排序的问题，再继续修。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys; spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py'); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); ok, fail = 0, 0; t0 = time.time();
+for i in range(50):
+    try:
+        inp = mod.generate_input(); out = mod.main(inp); ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0; print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)');
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+ succeeded in 312ms:
+Success: 50/50, Time: 0.1s (1ms/call)
+
+diff --git a/ceshi/code_combo/b0039139/10/code.py b/ceshi/code_combo/b0039139/10/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..19210c75bcfc85bc60768d2e353b798e87e5587d
+--- /dev/null
++++ b/ceshi/code_combo/b0039139/10/code.py
+@@ -0,0 +1,324 @@
++# Combo variant of b0039139 (index 10)
++# combo_spec: D3/0+D5/3
++# Name: 8-连通计数配分量面积分隔
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import bbox, components_mask, crop_bbox, random_sprite
++
++
++# Design analysis for the combo variant
++# =====================================
++# concretization_and_trace:
++# - The input still has four sections split by blue (1) full rows/columns in the
++#   order template / stencil / fg swatch / bg swatch.
++# - The fusion changes section 2 in two linked ways. We no longer read green pixels
++#   with 4-connectivity; we read 8-connected green groups. Also, the width of each
++#   internal separator in the output is the pixel area of the corresponding ordered
++#   8-connected group.
++# - A concrete stencil example for a horizontal layout is:
++#       110  110  110
++#       001  000  001
++#            011  001
++#   with black gaps between the three clusters. Interpreting each cluster:
++#   first area = 3, second area = 4, third area = 4. Under the source task, these
++#   are six 4-connected mini-pieces, so the output would repeat the tile six times
++#   with 1-cell separators. Under this combo, they become three 8-connected groups,
++#   so the output has three copies; the first separator is 3 cells wide and the
++#   second separator is 4 cells wide. The last group's area is still visible in the
++#   stencil and still contributes to the repeat count, but there is no separator
++#   after the final copy because only internal gaps are drawn.
++#
++# complexity_calibration:
++# - The generator uses exactly two area families, 3 and 4, built from diagonal-only
++#   joins. This keeps the rule easy to observe: humans can count green pixels inside
++#   each diagonal cluster and compare them against separator widths.
++# - Freedom is intentionally limited. Every sample contains three ordered 8-connected
++#   groups, and the first two visible separators are always widths 3 and 4 in some
++#   order. That repeated support makes the fused rule inferable from few examples.
++# - The cluster shapes differ only in height, not width, so input size stays compact
++#   while the relevant area change remains visually legible.
++#
++# implicit_assumption_audit_for_main:
++# - `_split_sections` assumes only the true separators are full blue rows/columns.
++#   The generator never uses color 1 inside any section.
++# - `template_mask = template != 0` assumes section 1 contains only black background
++#   plus one non-black template shape. The generator preserves that.
++# - `bbox(template_mask)` assumes the template is non-empty. `random_sprite` provides
++#   a non-empty connected shape, so the bbox always exists in generated samples.
++# - `_ordered_components` assumes the intended stencil objects are green (3) and are
++#   spatially ordered along the repeat axis without ties. The generator places each
++#   cluster in a left-to-right or top-to-bottom sequence with fixed blank gaps.
++# - `_repeat_with_component_gaps` assumes the gap widths come from the first N-1
++#   ordered 8-connected components. This is the only non-symmetric part of the rule;
++#   the final component still affects the copy count but cannot create an external
++#   trailing gap because the output only contains separators between adjacent copies.
++#
++# placement_legality:
++# - Each stencil cluster is a small boolean mask placed wholly inside the stencil.
++# - Consecutive clusters are separated by two blank columns/rows along the layout
++#   axis, so no accidental 8-neighbor merge can occur across different components.
++# - Cluster heights/widths are at most 3, while the shared axis is `crop_dim + 2`
++#   with `crop_dim` in 2..3, so every placement fits comfortably.
++# - The generator rejects any sample whose final input or output would exceed a
++#   30x30 grid, keeping the construction inside ordinary ARC size limits.
++#
++# observability_and_cleanliness:
++# - The stencil is clean: black background plus three green diagonal clusters with
++#   obvious empty gaps between them. Nothing overlaps, and each cluster can be
++#   counted both by group count and by pixel area with the naked eye.
++# - The output is equally clean because only one template crop is repeated, and the
++#   only varying feature is the thickness of the background-colored separator bands.
++# - Because the visible separators are always one width-3 band and one width-4 band,
++#   the area-to-gap correspondence has repeated support instead of appearing only as
++#   a rare accidental size difference.
++#
++# new_solver_assumptions_after_change:
++# - `main()` now depends on the ordered 8-connected green components being the true
++#   control signal. The generator guarantees this with dedicated color 3 clusters.
++# - `main()` also assumes diagonal touching is meaningful rather than accidental. The
++#   generator constructs every component from explicit diagonal-only joins, so 8- and
++#   4-connectivity produce different readings in every sample.
++
++
++TEMPLATE_COLOR = 4
++STENCIL_COLOR = 3
++SEPARATOR_COLOR = 1
++
++REPEAT_COUNT = 3
++CROP_SIZE_RANGE = (2, 3)
++DENSITY_RANGE = (0.55, 0.85)
++COLOR_POOL = list(range(2, 10))
++SWATCH_DIM_RANGE = (3, 3)
++STENCIL_GAP = 2
++GEN_RETRIES = 300
++
++BASE_CLUSTER_BY_AREA = {
++    3: np.array(
++        [
++            [1, 1, 0],
++            [0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++    4: np.array(
++        [
++            [1, 1, 0],
++            [0, 0, 1],
++            [0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++
++def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
++    h, w = grid.shape
++
++    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == SEPARATOR_COLOR))]
++    if sep_rows:
++        cuts = [-1] + sep_rows + [h]
++        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == SEPARATOR_COLOR))]
++    cuts = [-1] + sep_cols + [w]
++    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++
++def _solid_color(block: np.ndarray) -> int:
++    vals, counts = np.unique(block, return_counts=True)
++    return int(vals[int(np.argmax(counts))])
++
++
++def _ordered_components(mask: np.ndarray, horizontal: bool) -> list[np.ndarray]:
++    comps = components_mask(mask, connectivity=8)
++    axis = 1 if horizontal else 0
++    return sorted(comps, key=lambda coords: int(np.min(coords[:, axis])))
++
++
++def _repeat_with_component_gaps(
++    tile: np.ndarray, component_areas: list[int], bg_color: int, horizontal: bool
++) -> np.ndarray:
++    if len(component_areas) <= 1:
++        return tile
++
++    gap_widths = component_areas[:-1]
++    pieces = [tile]
++    for width in gap_widths:
++        if horizontal:
++            gap = np.full((tile.shape[0], width), bg_color, dtype=int)
++            pieces.extend([gap, tile])
++        else:
++            gap = np.full((width, tile.shape[1]), bg_color, dtype=int)
++            pieces.extend([gap, tile])
++
++    return np.hstack(pieces) if horizontal else np.vstack(pieces)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Crop and recolor a template, then space its repeats using 8-connected stencil areas.
++
++    Input structure:
++    - Blue (1) full rows or columns split the input into four consecutive sections.
++    - Section 1 is a black template holding one non-black sprite; section 2 is a green stencil on black.
++    - Sections 3 and 4 are solid color swatches that supply the output foreground and background.
++
++    Rule:
++    - Trim section 1 to the bbox of its non-black pixels and recolor that crop with the two swatch colors.
++    - In section 2, find the green (3) components using 8-connectivity and order them along the repeat axis.
++    - Make one copy of the recolored crop per ordered 8-connected component; between copy i and copy i+1,
++      insert a background-colored band whose thickness equals the area of component i.
++
++    Key insight:
++    - Diagonal joins in the stencil matter twice: they collapse several apparent mini-pieces into one repeat,
++      and the total number of pixels in each merged group becomes the width of the next separator band.
++    """
++    g = np.asarray(grid, dtype=int)
++    orientation, sections = _split_sections(g)
++    horizontal = orientation == "horizontal"
++    template, repetition_pattern, foreground_block, background_block = sections[:4]
++
++    template_mask = template != 0
++    template_bbox = bbox(template_mask)
++    if template_bbox is None:
++        return np.empty((0, 0), dtype=int)
++
++    foreground = _solid_color(foreground_block)
++    background = _solid_color(background_block)
++    tile_mask = crop_bbox(template_mask, template_bbox)
++    tile = np.where(tile_mask, foreground, background).astype(int)
++
++    comps = _ordered_components(repetition_pattern == STENCIL_COLOR, horizontal)
++    if not comps:
++        return tile
++    component_areas = [int(len(comp)) for comp in comps]
++    return _repeat_with_component_gaps(tile, component_areas, background, horizontal)
++
++
++def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
++    varying = random.randint(*SWATCH_DIM_RANGE)
++    if horizontal:
++        return np.full((shared_dim, varying), color, dtype=int)
++    return np.full((varying, shared_dim), color, dtype=int)
++
++
++def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
++    if horizontal:
++        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
++        parts = [sections[0]]
++        for section in sections[1:]:
++            parts.extend([sep, section])
++        return np.hstack(parts)
++
++    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
++    parts = [sections[0]]
++    for section in sections[1:]:
++        parts.extend([sep, section])
++    return np.vstack(parts)
++
++
++def _make_cluster(area: int, horizontal: bool) -> np.ndarray:
++    cluster = BASE_CLUSTER_BY_AREA[area].copy()
++    if random.choice([True, False]):
++        cluster = np.fliplr(cluster)
++    if random.choice([True, False]):
++        cluster = np.flipud(cluster)
++    if not horizontal:
++        cluster = cluster.T
++    return np.ascontiguousarray(cluster)
++
++
++def _sample_component_areas() -> list[int]:
++    visible = [3, 4]
++    random.shuffle(visible)
++    tail = random.choice([3, 4])
++    return visible + [tail]
++
++
++def _build_stencil(component_areas: list[int], shared_dim: int, horizontal: bool) -> np.ndarray:
++    clusters = [_make_cluster(area, horizontal) for area in component_areas]
++    margins = 2
++    varying_extent = margins + STENCIL_GAP * (len(clusters) - 1)
++    varying_extent += sum(cluster.shape[1] if horizontal else cluster.shape[0] for cluster in clusters)
++
++    h, w = (shared_dim, varying_extent) if horizontal else (varying_extent, shared_dim)
++    grid = np.zeros((h, w), dtype=int)
++
++    cursor = 1
++    for idx, cluster in enumerate(clusters):
++        ch, cw = cluster.shape
++        if horizontal:
++            r0 = random.randint(0, shared_dim - ch)
++            view = grid[r0 : r0 + ch, cursor : cursor + cw]
++            view[cluster] = STENCIL_COLOR
++            cursor += cw
++        else:
++            c0 = random.randint(0, shared_dim - cw)
++            view = grid[cursor : cursor + ch, c0 : c0 + cw]
++            view[cluster] = STENCIL_COLOR
++            cursor += ch
++        if idx < len(clusters) - 1:
++            cursor += STENCIL_GAP
++
++    return grid
++
++
++def _gen_attempt() -> np.ndarray | None:
++    horizontal = random.choice([True, False])
++
++    crop_h = random.randint(*CROP_SIZE_RANGE)
++    crop_w = random.randint(*CROP_SIZE_RANGE)
++    density = random.uniform(*DENSITY_RANGE)
++    shape = random_sprite(
++        crop_h,
++        crop_w,
++        density=density,
++        color_palette=[TEMPLATE_COLOR],
++        connectivity=4,
++        symmetry="not_symmetric",
++    )
++
++    fg_color, bg_color = random.sample(COLOR_POOL, 2)
++    component_areas = _sample_component_areas()
++    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
++    output = _repeat_with_component_gaps(tile, component_areas, bg_color, horizontal)
++
++    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
++    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
++
++    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
++    stencil = _build_stencil(component_areas, shared_dim, horizontal)
++
++    ordered = _ordered_components(stencil == STENCIL_COLOR, horizontal)
++    ordered_areas = [int(len(comp)) for comp in ordered]
++    count4 = len(components_mask(stencil == STENCIL_COLOR, connectivity=4))
++    count8 = len(ordered)
++    if ordered_areas != component_areas or count8 != REPEAT_COUNT or count4 <= count8:
++        return None
++
++    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
++    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
++    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
++
++    if max(inp.shape) > 30 or max(output.shape) > 30:
++        return None
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        pass
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+codex
+稳定性已经通过。接下来做退化检查：我会量化 `count4-count8`、8 连通分量面积序列，以及“按原规则生成的输出是否会与新规则相同”，确认样本确实触发了融合行为，而不是碰巧与原题等价。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util
+import numpy as np
+from collections import Counter
+
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+count_deltas = []
+area_patterns = Counter()
+sep_patterns = Counter()
+same_as_original = 0
+
+for _ in range(100):
+    inp = mod.generate_input()
+    out = mod.main(inp)
+    orientation, sections = mod._split_sections(inp)
+    horizontal = orientation == 'horizontal'
+    template, stencil, fg_block, bg_block = sections[:4]
+    comps8 = mod._ordered_components(stencil == mod.STENCIL_COLOR, horizontal)
+    areas8 = tuple(len(c) for c in comps8)
+    count8 = len(comps8)
+    count4 = len(mod.components_mask(stencil == mod.STENCIL_COLOR, connectivity=4))
+    count_deltas.append(count4 - count8)
+    area_patterns[areas8] += 1
+    sep_patterns[areas8[:-1]] += 1
+
+    template_mask = template "'!= 0
+    tile = np.where(mod.crop_bbox(template_mask, mod.bbox(template_mask)), mod._solid_color(fg_block), mod._solid_color(bg_block)).astype(int)
+    original = mod._repeat_with_component_gaps(tile, [1] * count4, mod._solid_color(bg_block), horizontal)
+    if np.array_equal(original, out):
+        same_as_original += 1
+
+print('"'count4-count8 distribution:', dict(sorted(Counter(count_deltas).items())))
+print('8-connected area patterns:', dict(area_patterns))
+print('visible separator width patterns:', dict(sep_patterns))
+print('same_as_original:', same_as_original)
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/b0039139/10/code.py b/ceshi/code_combo/b0039139/10/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..19210c75bcfc85bc60768d2e353b798e87e5587d
+--- /dev/null
++++ b/ceshi/code_combo/b0039139/10/code.py
+@@ -0,0 +1,324 @@
++# Combo variant of b0039139 (index 10)
++# combo_spec: D3/0+D5/3
++# Name: 8-连通计数配分量面积分隔
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import bbox, components_mask, crop_bbox, random_sprite
++
++
++# Design analysis for the combo variant
++# =====================================
++# concretization_and_trace:
++# - The input still has four sections split by blue (1) full rows/columns in the
++#   order template / stencil / fg swatch / bg swatch.
++# - The fusion changes section 2 in two linked ways. We no longer read green pixels
++#   with 4-connectivity; we read 8-connected green groups. Also, the width of each
++#   internal separator in the output is the pixel area of the corresponding ordered
++#   8-connected group.
++# - A concrete stencil example for a horizontal layout is:
++#       110  110  110
++#       001  000  001
++#            011  001
++#   with black gaps between the three clusters. Interpreting each cluster:
++#   first area = 3, second area = 4, third area = 4. Under the source task, these
++#   are six 4-connected mini-pieces, so the output would repeat the tile six times
++#   with 1-cell separators. Under this combo, they become three 8-connected groups,
++#   so the output has three copies; the first separator is 3 cells wide and the
++#   second separator is 4 cells wide. The last group's area is still visible in the
++#   stencil and still contributes to the repeat count, but there is no separator
++#   after the final copy because only internal gaps are drawn.
++#
++# complexity_calibration:
++# - The generator uses exactly two area families, 3 and 4, built from diagonal-only
++#   joins. This keeps the rule easy to observe: humans can count green pixels inside
++#   each diagonal cluster and compare them against separator widths.
++# - Freedom is intentionally limited. Every sample contains three ordered 8-connected
++#   groups, and the first two visible separators are always widths 3 and 4 in some
++#   order. That repeated support makes the fused rule inferable from few examples.
++# - The cluster shapes differ only in height, not width, so input size stays compact
++#   while the relevant area change remains visually legible.
++#
++# implicit_assumption_audit_for_main:
++# - `_split_sections` assumes only the true separators are full blue rows/columns.
++#   The generator never uses color 1 inside any section.
++# - `template_mask = template != 0` assumes section 1 contains only black background
++#   plus one non-black template shape. The generator preserves that.
++# - `bbox(template_mask)` assumes the template is non-empty. `random_sprite` provides
++#   a non-empty connected shape, so the bbox always exists in generated samples.
++# - `_ordered_components` assumes the intended stencil objects are green (3) and are
++#   spatially ordered along the repeat axis without ties. The generator places each
++#   cluster in a left-to-right or top-to-bottom sequence with fixed blank gaps.
++# - `_repeat_with_component_gaps` assumes the gap widths come from the first N-1
++#   ordered 8-connected components. This is the only non-symmetric part of the rule;
++#   the final component still affects the copy count but cannot create an external
++#   trailing gap because the output only contains separators between adjacent copies.
++#
++# placement_legality:
++# - Each stencil cluster is a small boolean mask placed wholly inside the stencil.
++# - Consecutive clusters are separated by two blank columns/rows along the layout
++#   axis, so no accidental 8-neighbor merge can occur across different components.
++# - Cluster heights/widths are at most 3, while the shared axis is `crop_dim + 2`
++#   with `crop_dim` in 2..3, so every placement fits comfortably.
++# - The generator rejects any sample whose final input or output would exceed a
++#   30x30 grid, keeping the construction inside ordinary ARC size limits.
++#
++# observability_and_cleanliness:
++# - The stencil is clean: black background plus three green diagonal clusters with
++#   obvious empty gaps between them. Nothing overlaps, and each cluster can be
++#   counted both by group count and by pixel area with the naked eye.
++# - The output is equally clean because only one template crop is repeated, and the
++#   only varying feature is the thickness of the background-colored separator bands.
++# - Because the visible separators are always one width-3 band and one width-4 band,
++#   the area-to-gap correspondence has repeated support instead of appearing only as
++#   a rare accidental size difference.
++#
++# new_solver_assumptions_after_change:
++# - `main()` now depends on the ordered 8-connected green components being the true
++#   control signal. The generator guarantees this with dedicated color 3 clusters.
++# - `main()` also assumes diagonal touching is meaningful rather than accidental. The
++#   generator constructs every component from explicit diagonal-only joins, so 8- and
++#   4-connectivity produce different readings in every sample.
++
++
++TEMPLATE_COLOR = 4
++STENCIL_COLOR = 3
++SEPARATOR_COLOR = 1
++
++REPEAT_COUNT = 3
++CROP_SIZE_RANGE = (2, 3)
++DENSITY_RANGE = (0.55, 0.85)
++COLOR_POOL = list(range(2, 10))
++SWATCH_DIM_RANGE = (3, 3)
++STENCIL_GAP = 2
++GEN_RETRIES = 300
++
++BASE_CLUSTER_BY_AREA = {
++    3: np.array(
++        [
++            [1, 1, 0],
++            [0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++    4: np.array(
++        [
++            [1, 1, 0],
++            [0, 0, 1],
++            [0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++
++def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
++    h, w = grid.shape
++
++    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == SEPARATOR_COLOR))]
++    if sep_rows:
++        cuts = [-1] + sep_rows + [h]
++        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == SEPARATOR_COLOR))]
++    cuts = [-1] + sep_cols + [w]
++    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++
++def _solid_color(block: np.ndarray) -> int:
++    vals, counts = np.unique(block, return_counts=True)
++    return int(vals[int(np.argmax(counts))])
++
++
++def _ordered_components(mask: np.ndarray, horizontal: bool) -> list[np.ndarray]:
++    comps = components_mask(mask, connectivity=8)
++    axis = 1 if horizontal else 0
++    return sorted(comps, key=lambda coords: int(np.min(coords[:, axis])))
++
++
++def _repeat_with_component_gaps(
++    tile: np.ndarray, component_areas: list[int], bg_color: int, horizontal: bool
++) -> np.ndarray:
++    if len(component_areas) <= 1:
++        return tile
++
++    gap_widths = component_areas[:-1]
++    pieces = [tile]
++    for width in gap_widths:
++        if horizontal:
++            gap = np.full((tile.shape[0], width), bg_color, dtype=int)
++            pieces.extend([gap, tile])
++        else:
++            gap = np.full((width, tile.shape[1]), bg_color, dtype=int)
++            pieces.extend([gap, tile])
++
++    return np.hstack(pieces) if horizontal else np.vstack(pieces)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Crop and recolor a template, then space its repeats using 8-connected stencil areas.
++
++    Input structure:
++    - Blue (1) full rows or columns split the input into four consecutive sections.
++    - Section 1 is a black template holding one non-black sprite; section 2 is a green stencil on black.
++    - Sections 3 and 4 are solid color swatches that supply the output foreground and background.
++
++    Rule:
++    - Trim section 1 to the bbox of its non-black pixels and recolor that crop with the two swatch colors.
++    - In section 2, find the green (3) components using 8-connectivity and order them along the repeat axis.
++    - Make one copy of the recolored crop per ordered 8-connected component; between copy i and copy i+1,
++      insert a background-colored band whose thickness equals the area of component i.
++
++    Key insight:
++    - Diagonal joins in the stencil matter twice: they collapse several apparent mini-pieces into one repeat,
++      and the total number of pixels in each merged group becomes the width of the next separator band.
++    """
++    g = np.asarray(grid, dtype=int)
++    orientation, sections = _split_sections(g)
++    horizontal = orientation == "horizontal"
++    template, repetition_pattern, foreground_block, background_block = sections[:4]
++
++    template_mask = template != 0
++    template_bbox = bbox(template_mask)
++    if template_bbox is None:
++        return np.empty((0, 0), dtype=int)
++
++    foreground = _solid_color(foreground_block)
++    background = _solid_color(background_block)
++    tile_mask = crop_bbox(template_mask, template_bbox)
++    tile = np.where(tile_mask, foreground, background).astype(int)
++
++    comps = _ordered_components(repetition_pattern == STENCIL_COLOR, horizontal)
++    if not comps:
++        return tile
++    component_areas = [int(len(comp)) for comp in comps]
++    return _repeat_with_component_gaps(tile, component_areas, background, horizontal)
++
++
++def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
++    varying = random.randint(*SWATCH_DIM_RANGE)
++    if horizontal:
++        return np.full((shared_dim, varying), color, dtype=int)
++    return np.full((varying, shared_dim), color, dtype=int)
++
++
++def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
++    if horizontal:
++        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
++        parts = [sections[0]]
++        for section in sections[1:]:
++            parts.extend([sep, section])
++        return np.hstack(parts)
++
++    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
++    parts = [sections[0]]
++    for section in sections[1:]:
++        parts.extend([sep, section])
++    return np.vstack(parts)
++
++
++def _make_cluster(area: int, horizontal: bool) -> np.ndarray:
++    cluster = BASE_CLUSTER_BY_AREA[area].copy()
++    if random.choice([True, False]):
++        cluster = np.fliplr(cluster)
++    if random.choice([True, False]):
++        cluster = np.flipud(cluster)
++    if not horizontal:
++        cluster = cluster.T
++    return np.ascontiguousarray(cluster)
++
++
++def _sample_component_areas() -> list[int]:
++    visible = [3, 4]
++    random.shuffle(visible)
++    tail = random.choice([3, 4])
++    return visible + [tail]
++
++
++def _build_stencil(component_areas: list[int], shared_dim: int, horizontal: bool) -> np.ndarray:
++    clusters = [_make_cluster(area, horizontal) for area in component_areas]
++    margins = 2
++    varying_extent = margins + STENCIL_GAP * (len(clusters) - 1)
++    varying_extent += sum(cluster.shape[1] if horizontal else cluster.shape[0] for cluster in clusters)
++
++    h, w = (shared_dim, varying_extent) if horizontal else (varying_extent, shared_dim)
++    grid = np.zeros((h, w), dtype=int)
++
++    cursor = 1
++    for idx, cluster in enumerate(clusters):
++        ch, cw = cluster.shape
++        if horizontal:
++            r0 = random.randint(0, shared_dim - ch)
++            view = grid[r0 : r0 + ch, cursor : cursor + cw]
++            view[cluster] = STENCIL_COLOR
++            cursor += cw
++        else:
++            c0 = random.randint(0, shared_dim - cw)
++            view = grid[cursor : cursor + ch, c0 : c0 + cw]
++            view[cluster] = STENCIL_COLOR
++            cursor += ch
++        if idx < len(clusters) - 1:
++            cursor += STENCIL_GAP
++
++    return grid
++
++
++def _gen_attempt() -> np.ndarray | None:
++    horizontal = random.choice([True, False])
++
++    crop_h = random.randint(*CROP_SIZE_RANGE)
++    crop_w = random.randint(*CROP_SIZE_RANGE)
++    density = random.uniform(*DENSITY_RANGE)
++    shape = random_sprite(
++        crop_h,
++        crop_w,
++        density=density,
++        color_palette=[TEMPLATE_COLOR],
++        connectivity=4,
++        symmetry="not_symmetric",
++    )
++
++    fg_color, bg_color = random.sample(COLOR_POOL, 2)
++    component_areas = _sample_component_areas()
++    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
++    output = _repeat_with_component_gaps(tile, component_areas, bg_color, horizontal)
++
++    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
++    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
++
++    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
++    stencil = _build_stencil(component_areas, shared_dim, horizontal)
++
++    ordered = _ordered_components(stencil == STENCIL_COLOR, horizontal)
++    ordered_areas = [int(len(comp)) for comp in ordered]
++    count4 = len(components_mask(stencil == STENCIL_COLOR, connectivity=4))
++    count8 = len(ordered)
++    if ordered_areas != component_areas or count8 != REPEAT_COUNT or count4 <= count8:
++        return None
++
++    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
++    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
++    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
++
++    if max(inp.shape) > 30 or max(output.shape) > 30:
++        return None
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        pass
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+ succeeded in 463ms:
+count4-count8 distribution: {3: 100}
+8-connected area patterns: {(3, 4, 4): 20, (3, 4, 3): 27, (4, 3, 4): 31, (4, 3, 3): 22}
+visible separator width patterns: {(3, 4): 47, (4, 3): 53}
+same_as_original: 0
+
+codex
+退化检查结果是干净的：100 个样本里 `count4-count8` 恒为 `3`，可见分隔宽度恒为 `(3,4)` 或 `(4,3)`，并且没有任何一个样本会与“原题的 4 连通 + 1 像素分隔”输出相同。最后我再快速核对目标文件的关键段落和行号，方便你审阅。
+exec
+/bin/bash -lc "nl -ba /home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py | sed -n '1,320p'" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+     1	# Combo variant of b0039139 (index 10)
+     2	# combo_spec: D3/0+D5/3
+     3	# Name: 8-连通计数配分量面积分隔
+     4	
+     5	from __future__ import annotations
+     6	
+     7	import random
+     8	
+     9	import numpy as np
+    10	
+    11	from arc_utils import bbox, components_mask, crop_bbox, random_sprite
+    12	
+    13	
+    14	# Design analysis for the combo variant
+    15	# =====================================
+    16	# concretization_and_trace:
+    17	# - The input still has four sections split by blue (1) full rows/columns in the
+    18	#   order template / stencil / fg swatch / bg swatch.
+    19	# - The fusion changes section 2 in two linked ways. We no longer read green pixels
+    20	#   with 4-connectivity; we read 8-connected green groups. Also, the width of each
+    21	#   internal separator in the output is the pixel area of the corresponding ordered
+    22	#   8-connected group.
+    23	# - A concrete stencil example for a horizontal layout is:
+    24	#       110  110  110
+    25	#       001  000  001
+    26	#            011  001
+    27	#   with black gaps between the three clusters. Interpreting each cluster:
+    28	#   first area = 3, second area = 4, third area = 4. Under the source task, these
+    29	#   are six 4-connected mini-pieces, so the output would repeat the tile six times
+    30	#   with 1-cell separators. Under this combo, they become three 8-connected groups,
+    31	#   so the output has three copies; the first separator is 3 cells wide and the
+    32	#   second separator is 4 cells wide. The last group's area is still visible in the
+    33	#   stencil and still contributes to the repeat count, but there is no separator
+    34	#   after the final copy because only internal gaps are drawn.
+    35	#
+    36	# complexity_calibration:
+    37	# - The generator uses exactly two area families, 3 and 4, built from diagonal-only
+    38	#   joins. This keeps the rule easy to observe: humans can count green pixels inside
+    39	#   each diagonal cluster and compare them against separator widths.
+    40	# - Freedom is intentionally limited. Every sample contains three ordered 8-connected
+    41	#   groups, and the first two visible separators are always widths 3 and 4 in some
+    42	#   order. That repeated support makes the fused rule inferable from few examples.
+    43	# - The cluster shapes differ only in height, not width, so input size stays compact
+    44	#   while the relevant area change remains visually legible.
+    45	#
+    46	# implicit_assumption_audit_for_main:
+    47	# - `_split_sections` assumes only the true separators are full blue rows/columns.
+    48	#   The generator never uses color 1 inside any section.
+    49	# - `template_mask = template != 0` assumes section 1 contains only black background
+    50	#   plus one non-black template shape. The generator preserves that.
+    51	# - `bbox(template_mask)` assumes the template is non-empty. `random_sprite` provides
+    52	#   a non-empty connected shape, so the bbox always exists in generated samples.
+    53	# - `_ordered_components` assumes the intended stencil objects are green (3) and are
+    54	#   spatially ordered along the repeat axis without ties. The generator places each
+    55	#   cluster in a left-to-right or top-to-bottom sequence with fixed blank gaps.
+    56	# - `_repeat_with_component_gaps` assumes the gap widths come from the first N-1
+    57	#   ordered 8-connected components. This is the only non-symmetric part of the rule;
+    58	#   the final component still affects the copy count but cannot create an external
+    59	#   trailing gap because the output only contains separators between adjacent copies.
+    60	#
+    61	# placement_legality:
+    62	# - Each stencil cluster is a small boolean mask placed wholly inside the stencil.
+    63	# - Consecutive clusters are separated by two blank columns/rows along the layout
+    64	#   axis, so no accidental 8-neighbor merge can occur across different components.
+    65	# - Cluster heights/widths are at most 3, while the shared axis is `crop_dim + 2`
+    66	#   with `crop_dim` in 2..3, so every placement fits comfortably.
+    67	# - The generator rejects any sample whose final input or output would exceed a
+    68	#   30x30 grid, keeping the construction inside ordinary ARC size limits.
+    69	#
+    70	# observability_and_cleanliness:
+    71	# - The stencil is clean: black background plus three green diagonal clusters with
+    72	#   obvious empty gaps between them. Nothing overlaps, and each cluster can be
+    73	#   counted both by group count and by pixel area with the naked eye.
+    74	# - The output is equally clean because only one template crop is repeated, and the
+    75	#   only varying feature is the thickness of the background-colored separator bands.
+    76	# - Because the visible separators are always one width-3 band and one width-4 band,
+    77	#   the area-to-gap correspondence has repeated support instead of appearing only as
+    78	#   a rare accidental size difference.
+    79	#
+    80	# new_solver_assumptions_after_change:
+    81	# - `main()` now depends on the ordered 8-connected green components being the true
+    82	#   control signal. The generator guarantees this with dedicated color 3 clusters.
+    83	# - `main()` also assumes diagonal touching is meaningful rather than accidental. The
+    84	#   generator constructs every component from explicit diagonal-only joins, so 8- and
+    85	#   4-connectivity produce different readings in every sample.
+    86	
+    87	
+    88	TEMPLATE_COLOR = 4
+    89	STENCIL_COLOR = 3
+    90	SEPARATOR_COLOR = 1
+    91	
+    92	REPEAT_COUNT = 3
+    93	CROP_SIZE_RANGE = (2, 3)
+    94	DENSITY_RANGE = (0.55, 0.85)
+    95	COLOR_POOL = list(range(2, 10))
+    96	SWATCH_DIM_RANGE = (3, 3)
+    97	STENCIL_GAP = 2
+    98	GEN_RETRIES = 300
+    99	
+   100	BASE_CLUSTER_BY_AREA = {
+   101	    3: np.array(
+   102	        [
+   103	            [1, 1, 0],
+   104	            [0, 0, 1],
+   105	        ],
+   106	        dtype=bool,
+   107	    ),
+   108	    4: np.array(
+   109	        [
+   110	            [1, 1, 0],
+   111	            [0, 0, 1],
+   112	            [0, 0, 1],
+   113	        ],
+   114	        dtype=bool,
+   115	    ),
+   116	}
+   117	
+   118	
+   119	def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
+   120	    h, w = grid.shape
+   121	
+   122	    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == SEPARATOR_COLOR))]
+   123	    if sep_rows:
+   124	        cuts = [-1] + sep_rows + [h]
+   125	        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+   126	
+   127	    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == SEPARATOR_COLOR))]
+   128	    cuts = [-1] + sep_cols + [w]
+   129	    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+   130	
+   131	
+   132	def _solid_color(block: np.ndarray) -> int:
+   133	    vals, counts = np.unique(block, return_counts=True)
+   134	    return int(vals[int(np.argmax(counts))])
+   135	
+   136	
+   137	def _ordered_components(mask: np.ndarray, horizontal: bool) -> list[np.ndarray]:
+   138	    comps = components_mask(mask, connectivity=8)
+   139	    axis = 1 if horizontal else 0
+   140	    return sorted(comps, key=lambda coords: int(np.min(coords[:, axis])))
+   141	
+   142	
+   143	def _repeat_with_component_gaps(
+   144	    tile: np.ndarray, component_areas: list[int], bg_color: int, horizontal: bool
+   145	) -> np.ndarray:
+   146	    if len(component_areas) <= 1:
+   147	        return tile
+   148	
+   149	    gap_widths = component_areas[:-1]
+   150	    pieces = [tile]
+   151	    for width in gap_widths:
+   152	        if horizontal:
+   153	            gap = np.full((tile.shape[0], width), bg_color, dtype=int)
+   154	            pieces.extend([gap, tile])
+   155	        else:
+   156	            gap = np.full((width, tile.shape[1]), bg_color, dtype=int)
+   157	            pieces.extend([gap, tile])
+   158	
+   159	    return np.hstack(pieces) if horizontal else np.vstack(pieces)
+   160	
+   161	
+   162	def main(grid: np.ndarray) -> np.ndarray:
+   163	    """
+   164	    Crop and recolor a template, then space its repeats using 8-connected stencil areas.
+   165	
+   166	    Input structure:
+   167	    - Blue (1) full rows or columns split the input into four consecutive sections.
+   168	    - Section 1 is a black template holding one non-black sprite; section 2 is a green stencil on black.
+   169	    - Sections 3 and 4 are solid color swatches that supply the output foreground and background.
+   170	
+   171	    Rule:
+   172	    - Trim section 1 to the bbox of its non-black pixels and recolor that crop with the two swatch colors.
+   173	    - In section 2, find the green (3) components using 8-connectivity and order them along the repeat axis.
+   174	    - Make one copy of the recolored crop per ordered 8-connected component; between copy i and copy i+1,
+   175	      insert a background-colored band whose thickness equals the area of component i.
+   176	
+   177	    Key insight:
+   178	    - Diagonal joins in the stencil matter twice: they collapse several apparent mini-pieces into one repeat,
+   179	      and the total number of pixels in each merged group becomes the width of the next separator band.
+   180	    """
+   181	    g = np.asarray(grid, dtype=int)
+   182	    orientation, sections = _split_sections(g)
+   183	    horizontal = orientation == "horizontal"
+   184	    template, repetition_pattern, foreground_block, background_block = sections[:4]
+   185	
+   186	    template_mask = template != 0
+   187	    template_bbox = bbox(template_mask)
+   188	    if template_bbox is None:
+   189	        return np.empty((0, 0), dtype=int)
+   190	
+   191	    foreground = _solid_color(foreground_block)
+   192	    background = _solid_color(background_block)
+   193	    tile_mask = crop_bbox(template_mask, template_bbox)
+   194	    tile = np.where(tile_mask, foreground, background).astype(int)
+   195	
+   196	    comps = _ordered_components(repetition_pattern == STENCIL_COLOR, horizontal)
+   197	    if not comps:
+   198	        return tile
+   199	    component_areas = [int(len(comp)) for comp in comps]
+   200	    return _repeat_with_component_gaps(tile, component_areas, background, horizontal)
+   201	
+   202	
+   203	def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
+   204	    varying = random.randint(*SWATCH_DIM_RANGE)
+   205	    if horizontal:
+   206	        return np.full((shared_dim, varying), color, dtype=int)
+   207	    return np.full((varying, shared_dim), color, dtype=int)
+   208	
+   209	
+   210	def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
+   211	    if horizontal:
+   212	        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
+   213	        parts = [sections[0]]
+   214	        for section in sections[1:]:
+   215	            parts.extend([sep, section])
+   216	        return np.hstack(parts)
+   217	
+   218	    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
+   219	    parts = [sections[0]]
+   220	    for section in sections[1:]:
+   221	        parts.extend([sep, section])
+   222	    return np.vstack(parts)
+   223	
+   224	
+   225	def _make_cluster(area: int, horizontal: bool) -> np.ndarray:
+   226	    cluster = BASE_CLUSTER_BY_AREA[area].copy()
+   227	    if random.choice([True, False]):
+   228	        cluster = np.fliplr(cluster)
+   229	    if random.choice([True, False]):
+   230	        cluster = np.flipud(cluster)
+   231	    if not horizontal:
+   232	        cluster = cluster.T
+   233	    return np.ascontiguousarray(cluster)
+   234	
+   235	
+   236	def _sample_component_areas() -> list[int]:
+   237	    visible = [3, 4]
+   238	    random.shuffle(visible)
+   239	    tail = random.choice([3, 4])
+   240	    return visible + [tail]
+   241	
+   242	
+   243	def _build_stencil(component_areas: list[int], shared_dim: int, horizontal: bool) -> np.ndarray:
+   244	    clusters = [_make_cluster(area, horizontal) for area in component_areas]
+   245	    margins = 2
+   246	    varying_extent = margins + STENCIL_GAP * (len(clusters) - 1)
+   247	    varying_extent += sum(cluster.shape[1] if horizontal else cluster.shape[0] for cluster in clusters)
+   248	
+   249	    h, w = (shared_dim, varying_extent) if horizontal else (varying_extent, shared_dim)
+   250	    grid = np.zeros((h, w), dtype=int)
+   251	
+   252	    cursor = 1
+   253	    for idx, cluster in enumerate(clusters):
+   254	        ch, cw = cluster.shape
+   255	        if horizontal:
+   256	            r0 = random.randint(0, shared_dim - ch)
+   257	            view = grid[r0 : r0 + ch, cursor : cursor + cw]
+   258	            view[cluster] = STENCIL_COLOR
+   259	            cursor += cw
+   260	        else:
+   261	            c0 = random.randint(0, shared_dim - cw)
+   262	            view = grid[cursor : cursor + ch, c0 : c0 + cw]
+   263	            view[cluster] = STENCIL_COLOR
+   264	            cursor += ch
+   265	        if idx < len(clusters) - 1:
+   266	            cursor += STENCIL_GAP
+   267	
+   268	    return grid
+   269	
+   270	
+   271	def _gen_attempt() -> np.ndarray | None:
+   272	    horizontal = random.choice([True, False])
+   273	
+   274	    crop_h = random.randint(*CROP_SIZE_RANGE)
+   275	    crop_w = random.randint(*CROP_SIZE_RANGE)
+   276	    density = random.uniform(*DENSITY_RANGE)
+   277	    shape = random_sprite(
+   278	        crop_h,
+   279	        crop_w,
+   280	        density=density,
+   281	        color_palette=[TEMPLATE_COLOR],
+   282	        connectivity=4,
+   283	        symmetry="not_symmetric",
+   284	    )
+   285	
+   286	    fg_color, bg_color = random.sample(COLOR_POOL, 2)
+   287	    component_areas = _sample_component_areas()
+   288	    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
+   289	    output = _repeat_with_component_gaps(tile, component_areas, bg_color, horizontal)
+   290	
+   291	    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
+   292	    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
+   293	
+   294	    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
+   295	    stencil = _build_stencil(component_areas, shared_dim, horizontal)
+   296	
+   297	    ordered = _ordered_components(stencil == STENCIL_COLOR, horizontal)
+   298	    ordered_areas = [int(len(comp)) for comp in ordered]
+   299	    count4 = len(components_mask(stencil == STENCIL_COLOR, connectivity=4))
+   300	    count8 = len(ordered)
+   301	    if ordered_areas != component_areas or count8 != REPEAT_COUNT or count4 <= count8:
+   302	        return None
+   303	
+   304	    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
+   305	    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
+   306	    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
+   307	
+   308	    if max(inp.shape) > 30 or max(output.shape) > 30:
+   309	        return None
+   310	
+   311	    try:
+   312	        if np.array_equal(main(inp), output):
+   313	            return inp
+   314	    except Exception:
+   315	        pass
+   316	    return None
+   317	
+   318	
+   319	def generate_input() -> np.ndarray:
+   320	    for _ in range(GEN_RETRIES):
+
+diff --git a/ceshi/code_combo/b0039139/10/code.py b/ceshi/code_combo/b0039139/10/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..19210c75bcfc85bc60768d2e353b798e87e5587d
+--- /dev/null
++++ b/ceshi/code_combo/b0039139/10/code.py
+@@ -0,0 +1,324 @@
++# Combo variant of b0039139 (index 10)
++# combo_spec: D3/0+D5/3
++# Name: 8-连通计数配分量面积分隔
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import bbox, components_mask, crop_bbox, random_sprite
++
++
++# Design analysis for the combo variant
++# =====================================
++# concretization_and_trace:
++# - The input still has four sections split by blue (1) full rows/columns in the
++#   order template / stencil / fg swatch / bg swatch.
++# - The fusion changes section 2 in two linked ways. We no longer read green pixels
++#   with 4-connectivity; we read 8-connected green groups. Also, the width of each
++#   internal separator in the output is the pixel area of the corresponding ordered
++#   8-connected group.
++# - A concrete stencil example for a horizontal layout is:
++#       110  110  110
++#       001  000  001
++#            011  001
++#   with black gaps between the three clusters. Interpreting each cluster:
++#   first area = 3, second area = 4, third area = 4. Under the source task, these
++#   are six 4-connected mini-pieces, so the output would repeat the tile six times
++#   with 1-cell separators. Under this combo, they become three 8-connected groups,
++#   so the output has three copies; the first separator is 3 cells wide and the
++#   second separator is 4 cells wide. The last group's area is still visible in the
++#   stencil and still contributes to the repeat count, but there is no separator
++#   after the final copy because only internal gaps are drawn.
++#
++# complexity_calibration:
++# - The generator uses exactly two area families, 3 and 4, built from diagonal-only
++#   joins. This keeps the rule easy to observe: humans can count green pixels inside
++#   each diagonal cluster and compare them against separator widths.
++# - Freedom is intentionally limited. Every sample contains three ordered 8-connected
++#   groups, and the first two visible separators are always widths 3 and 4 in some
++#   order. That repeated support makes the fused rule inferable from few examples.
++# - The cluster shapes differ only in height, not width, so input size stays compact
++#   while the relevant area change remains visually legible.
++#
++# implicit_assumption_audit_for_main:
++# - `_split_sections` assumes only the true separators are full blue rows/columns.
++#   The generator never uses color 1 inside any section.
++# - `template_mask = template != 0` assumes section 1 contains only black background
++#   plus one non-black template shape. The generator preserves that.
++# - `bbox(template_mask)` assumes the template is non-empty. `random_sprite` provides
++#   a non-empty connected shape, so the bbox always exists in generated samples.
++# - `_ordered_components` assumes the intended stencil objects are green (3) and are
++#   spatially ordered along the repeat axis without ties. The generator places each
++#   cluster in a left-to-right or top-to-bottom sequence with fixed blank gaps.
++# - `_repeat_with_component_gaps` assumes the gap widths come from the first N-1
++#   ordered 8-connected components. This is the only non-symmetric part of the rule;
++#   the final component still affects the copy count but cannot create an external
++#   trailing gap because the output only contains separators between adjacent copies.
++#
++# placement_legality:
++# - Each stencil cluster is a small boolean mask placed wholly inside the stencil.
++# - Consecutive clusters are separated by two blank columns/rows along the layout
++#   axis, so no accidental 8-neighbor merge can occur across different components.
++# - Cluster heights/widths are at most 3, while the shared axis is `crop_dim + 2`
++#   with `crop_dim` in 2..3, so every placement fits comfortably.
++# - The generator rejects any sample whose final input or output would exceed a
++#   30x30 grid, keeping the construction inside ordinary ARC size limits.
++#
++# observability_and_cleanliness:
++# - The stencil is clean: black background plus three green diagonal clusters with
++#   obvious empty gaps between them. Nothing overlaps, and each cluster can be
++#   counted both by group count and by pixel area with the naked eye.
++# - The output is equally clean because only one template crop is repeated, and the
++#   only varying feature is the thickness of the background-colored separator bands.
++# - Because the visible separators are always one width-3 band and one width-4 band,
++#   the area-to-gap correspondence has repeated support instead of appearing only as
++#   a rare accidental size difference.
++#
++# new_solver_assumptions_after_change:
++# - `main()` now depends on the ordered 8-connected green components being the true
++#   control signal. The generator guarantees this with dedicated color 3 clusters.
++# - `main()` also assumes diagonal touching is meaningful rather than accidental. The
++#   generator constructs every component from explicit diagonal-only joins, so 8- and
++#   4-connectivity produce different readings in every sample.
++
++
++TEMPLATE_COLOR = 4
++STENCIL_COLOR = 3
++SEPARATOR_COLOR = 1
++
++REPEAT_COUNT = 3
++CROP_SIZE_RANGE = (2, 3)
++DENSITY_RANGE = (0.55, 0.85)
++COLOR_POOL = list(range(2, 10))
++SWATCH_DIM_RANGE = (3, 3)
++STENCIL_GAP = 2
++GEN_RETRIES = 300
++
++BASE_CLUSTER_BY_AREA = {
++    3: np.array(
++        [
++            [1, 1, 0],
++            [0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++    4: np.array(
++        [
++            [1, 1, 0],
++            [0, 0, 1],
++            [0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++
++def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
++    h, w = grid.shape
++
++    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == SEPARATOR_COLOR))]
++    if sep_rows:
++        cuts = [-1] + sep_rows + [h]
++        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == SEPARATOR_COLOR))]
++    cuts = [-1] + sep_cols + [w]
++    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++
++def _solid_color(block: np.ndarray) -> int:
++    vals, counts = np.unique(block, return_counts=True)
++    return int(vals[int(np.argmax(counts))])
++
++
++def _ordered_components(mask: np.ndarray, horizontal: bool) -> list[np.ndarray]:
++    comps = components_mask(mask, connectivity=8)
++    axis = 1 if horizontal else 0
++    return sorted(comps, key=lambda coords: int(np.min(coords[:, axis])))
++
++
++def _repeat_with_component_gaps(
++    tile: np.ndarray, component_areas: list[int], bg_color: int, horizontal: bool
++) -> np.ndarray:
++    if len(component_areas) <= 1:
++        return tile
++
++    gap_widths = component_areas[:-1]
++    pieces = [tile]
++    for width in gap_widths:
++        if horizontal:
++            gap = np.full((tile.shape[0], width), bg_color, dtype=int)
++            pieces.extend([gap, tile])
++        else:
++            gap = np.full((width, tile.shape[1]), bg_color, dtype=int)
++            pieces.extend([gap, tile])
++
++    return np.hstack(pieces) if horizontal else np.vstack(pieces)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Crop and recolor a template, then space its repeats using 8-connected stencil areas.
++
++    Input structure:
++    - Blue (1) full rows or columns split the input into four consecutive sections.
++    - Section 1 is a black template holding one non-black sprite; section 2 is a green stencil on black.
++    - Sections 3 and 4 are solid color swatches that supply the output foreground and background.
++
++    Rule:
++    - Trim section 1 to the bbox of its non-black pixels and recolor that crop with the two swatch colors.
++    - In section 2, find the green (3) components using 8-connectivity and order them along the repeat axis.
++    - Make one copy of the recolored crop per ordered 8-connected component; between copy i and copy i+1,
++      insert a background-colored band whose thickness equals the area of component i.
++
++    Key insight:
++    - Diagonal joins in the stencil matter twice: they collapse several apparent mini-pieces into one repeat,
++      and the total number of pixels in each merged group becomes the width of the next separator band.
++    """
++    g = np.asarray(grid, dtype=int)
++    orientation, sections = _split_sections(g)
++    horizontal = orientation == "horizontal"
++    template, repetition_pattern, foreground_block, background_block = sections[:4]
++
++    template_mask = template != 0
++    template_bbox = bbox(template_mask)
++    if template_bbox is None:
++        return np.empty((0, 0), dtype=int)
++
++    foreground = _solid_color(foreground_block)
++    background = _solid_color(background_block)
++    tile_mask = crop_bbox(template_mask, template_bbox)
++    tile = np.where(tile_mask, foreground, background).astype(int)
++
++    comps = _ordered_components(repetition_pattern == STENCIL_COLOR, horizontal)
++    if not comps:
++        return tile
++    component_areas = [int(len(comp)) for comp in comps]
++    return _repeat_with_component_gaps(tile, component_areas, background, horizontal)
++
++
++def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
++    varying = random.randint(*SWATCH_DIM_RANGE)
++    if horizontal:
++        return np.full((shared_dim, varying), color, dtype=int)
++    return np.full((varying, shared_dim), color, dtype=int)
++
++
++def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
++    if horizontal:
++        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
++        parts = [sections[0]]
++        for section in sections[1:]:
++            parts.extend([sep, section])
++        return np.hstack(parts)
++
++    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
++    parts = [sections[0]]
++    for section in sections[1:]:
++        parts.extend([sep, section])
++    return np.vstack(parts)
++
++
++def _make_cluster(area: int, horizontal: bool) -> np.ndarray:
++    cluster = BASE_CLUSTER_BY_AREA[area].copy()
++    if random.choice([True, False]):
++        cluster = np.fliplr(cluster)
++    if random.choice([True, False]):
++        cluster = np.flipud(cluster)
++    if not horizontal:
++        cluster = cluster.T
++    return np.ascontiguousarray(cluster)
++
++
++def _sample_component_areas() -> list[int]:
++    visible = [3, 4]
++    random.shuffle(visible)
++    tail = random.choice([3, 4])
++    return visible + [tail]
++
++
++def _build_stencil(component_areas: list[int], shared_dim: int, horizontal: bool) -> np.ndarray:
++    clusters = [_make_cluster(area, horizontal) for area in component_areas]
++    margins = 2
++    varying_extent = margins + STENCIL_GAP * (len(clusters) - 1)
++    varying_extent += sum(cluster.shape[1] if horizontal else cluster.shape[0] for cluster in clusters)
++
++    h, w = (shared_dim, varying_extent) if horizontal else (varying_extent, shared_dim)
++    grid = np.zeros((h, w), dtype=int)
++
++    cursor = 1
++    for idx, cluster in enumerate(clusters):
++        ch, cw = cluster.shape
++        if horizontal:
++            r0 = random.randint(0, shared_dim - ch)
++            view = grid[r0 : r0 + ch, cursor : cursor + cw]
++            view[cluster] = STENCIL_COLOR
++            cursor += cw
++        else:
++            c0 = random.randint(0, shared_dim - cw)
++            view = grid[cursor : cursor + ch, c0 : c0 + cw]
++            view[cluster] = STENCIL_COLOR
++            cursor += ch
++        if idx < len(clusters) - 1:
++            cursor += STENCIL_GAP
++
++    return grid
++
++
++def _gen_attempt() -> np.ndarray | None:
++    horizontal = random.choice([True, False])
++
++    crop_h = random.randint(*CROP_SIZE_RANGE)
++    crop_w = random.randint(*CROP_SIZE_RANGE)
++    density = random.uniform(*DENSITY_RANGE)
++    shape = random_sprite(
++        crop_h,
++        crop_w,
++        density=density,
++        color_palette=[TEMPLATE_COLOR],
++        connectivity=4,
++        symmetry="not_symmetric",
++    )
++
++    fg_color, bg_color = random.sample(COLOR_POOL, 2)
++    component_areas = _sample_component_areas()
++    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
++    output = _repeat_with_component_gaps(tile, component_areas, bg_color, horizontal)
++
++    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
++    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
++
++    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
++    stencil = _build_stencil(component_areas, shared_dim, horizontal)
++
++    ordered = _ordered_components(stencil == STENCIL_COLOR, horizontal)
++    ordered_areas = [int(len(comp)) for comp in ordered]
++    count4 = len(components_mask(stencil == STENCIL_COLOR, connectivity=4))
++    count8 = len(ordered)
++    if ordered_areas != component_areas or count8 != REPEAT_COUNT or count4 <= count8:
++        return None
++
++    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
++    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
++    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
++
++    if max(inp.shape) > 30 or max(output.shape) > 30:
++        return None
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        pass
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+codex
+融合变体代码已写入 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py:1)。`main()` 在 [162](/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py:162) 开始，按新规则读取区段2的绿色 `8` 连通分量，按布局轴排序，并把前 `N-1` 个分量的面积作为内部背景分隔带宽度；对应的重复拼接逻辑在 [143](/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py:143)。生成器在 [271](/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py:271) 开始，构造 3 个对角相接的绿色簇，面积只取 `3` 或 `4`，保证 4 连通和 8 连通读法稳定不同，同时把输入/输出尺寸限制在 `30x30` 以内。
+
+验证结果：
+- 50 次稳定性测试：`Success: 50/50`
+- 100 个样本的融合行为统计：`count4-count8` 恒为 `3`
+- 可见分隔宽度模式只出现 `(3,4)` 或 `(4,3)`
+- 与原题“4 连通 + 1 像素分隔”输出相同的样本数：`0`
+
+这说明生成器没有退化回原任务，8 连通合并和“面积决定分隔宽度”都被稳定触发了。
+diff --git a/ceshi/code_combo/b0039139/10/code.py b/ceshi/code_combo/b0039139/10/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..19210c75bcfc85bc60768d2e353b798e87e5587d
+--- /dev/null
++++ b/ceshi/code_combo/b0039139/10/code.py
+@@ -0,0 +1,324 @@
++# Combo variant of b0039139 (index 10)
++# combo_spec: D3/0+D5/3
++# Name: 8-连通计数配分量面积分隔
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import bbox, components_mask, crop_bbox, random_sprite
++
++
++# Design analysis for the combo variant
++# =====================================
++# concretization_and_trace:
++# - The input still has four sections split by blue (1) full rows/columns in the
++#   order template / stencil / fg swatch / bg swatch.
++# - The fusion changes section 2 in two linked ways. We no longer read green pixels
++#   with 4-connectivity; we read 8-connected green groups. Also, the width of each
++#   internal separator in the output is the pixel area of the corresponding ordered
++#   8-connected group.
++# - A concrete stencil example for a horizontal layout is:
++#       110  110  110
++#       001  000  001
++#            011  001
++#   with black gaps between the three clusters. Interpreting each cluster:
++#   first area = 3, second area = 4, third area = 4. Under the source task, these
++#   are six 4-connected mini-pieces, so the output would repeat the tile six times
++#   with 1-cell separators. Under this combo, they become three 8-connected groups,
++#   so the output has three copies; the first separator is 3 cells wide and the
++#   second separator is 4 cells wide. The last group's area is still visible in the
++#   stencil and still contributes to the repeat count, but there is no separator
++#   after the final copy because only internal gaps are drawn.
++#
++# complexity_calibration:
++# - The generator uses exactly two area families, 3 and 4, built from diagonal-only
++#   joins. This keeps the rule easy to observe: humans can count green pixels inside
++#   each diagonal cluster and compare them against separator widths.
++# - Freedom is intentionally limited. Every sample contains three ordered 8-connected
++#   groups, and the first two visible separators are always widths 3 and 4 in some
++#   order. That repeated support makes the fused rule inferable from few examples.
++# - The cluster shapes differ only in height, not width, so input size stays compact
++#   while the relevant area change remains visually legible.
++#
++# implicit_assumption_audit_for_main:
++# - `_split_sections` assumes only the true separators are full blue rows/columns.
++#   The generator never uses color 1 inside any section.
++# - `template_mask = template != 0` assumes section 1 contains only black background
++#   plus one non-black template shape. The generator preserves that.
++# - `bbox(template_mask)` assumes the template is non-empty. `random_sprite` provides
++#   a non-empty connected shape, so the bbox always exists in generated samples.
++# - `_ordered_components` assumes the intended stencil objects are green (3) and are
++#   spatially ordered along the repeat axis without ties. The generator places each
++#   cluster in a left-to-right or top-to-bottom sequence with fixed blank gaps.
++# - `_repeat_with_component_gaps` assumes the gap widths come from the first N-1
++#   ordered 8-connected components. This is the only non-symmetric part of the rule;
++#   the final component still affects the copy count but cannot create an external
++#   trailing gap because the output only contains separators between adjacent copies.
++#
++# placement_legality:
++# - Each stencil cluster is a small boolean mask placed wholly inside the stencil.
++# - Consecutive clusters are separated by two blank columns/rows along the layout
++#   axis, so no accidental 8-neighbor merge can occur across different components.
++# - Cluster heights/widths are at most 3, while the shared axis is `crop_dim + 2`
++#   with `crop_dim` in 2..3, so every placement fits comfortably.
++# - The generator rejects any sample whose final input or output would exceed a
++#   30x30 grid, keeping the construction inside ordinary ARC size limits.
++#
++# observability_and_cleanliness:
++# - The stencil is clean: black background plus three green diagonal clusters with
++#   obvious empty gaps between them. Nothing overlaps, and each cluster can be
++#   counted both by group count and by pixel area with the naked eye.
++# - The output is equally clean because only one template crop is repeated, and the
++#   only varying feature is the thickness of the background-colored separator bands.
++# - Because the visible separators are always one width-3 band and one width-4 band,
++#   the area-to-gap correspondence has repeated support instead of appearing only as
++#   a rare accidental size difference.
++#
++# new_solver_assumptions_after_change:
++# - `main()` now depends on the ordered 8-connected green components being the true
++#   control signal. The generator guarantees this with dedicated color 3 clusters.
++# - `main()` also assumes diagonal touching is meaningful rather than accidental. The
++#   generator constructs every component from explicit diagonal-only joins, so 8- and
++#   4-connectivity produce different readings in every sample.
++
++
++TEMPLATE_COLOR = 4
++STENCIL_COLOR = 3
++SEPARATOR_COLOR = 1
++
++REPEAT_COUNT = 3
++CROP_SIZE_RANGE = (2, 3)
++DENSITY_RANGE = (0.55, 0.85)
++COLOR_POOL = list(range(2, 10))
++SWATCH_DIM_RANGE = (3, 3)
++STENCIL_GAP = 2
++GEN_RETRIES = 300
++
++BASE_CLUSTER_BY_AREA = {
++    3: np.array(
++        [
++            [1, 1, 0],
++            [0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++    4: np.array(
++        [
++            [1, 1, 0],
++            [0, 0, 1],
++            [0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++
++def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
++    h, w = grid.shape
++
++    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == SEPARATOR_COLOR))]
++    if sep_rows:
++        cuts = [-1] + sep_rows + [h]
++        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == SEPARATOR_COLOR))]
++    cuts = [-1] + sep_cols + [w]
++    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++
++def _solid_color(block: np.ndarray) -> int:
++    vals, counts = np.unique(block, return_counts=True)
++    return int(vals[int(np.argmax(counts))])
++
++
++def _ordered_components(mask: np.ndarray, horizontal: bool) -> list[np.ndarray]:
++    comps = components_mask(mask, connectivity=8)
++    axis = 1 if horizontal else 0
++    return sorted(comps, key=lambda coords: int(np.min(coords[:, axis])))
++
++
++def _repeat_with_component_gaps(
++    tile: np.ndarray, component_areas: list[int], bg_color: int, horizontal: bool
++) -> np.ndarray:
++    if len(component_areas) <= 1:
++        return tile
++
++    gap_widths = component_areas[:-1]
++    pieces = [tile]
++    for width in gap_widths:
++        if horizontal:
++            gap = np.full((tile.shape[0], width), bg_color, dtype=int)
++            pieces.extend([gap, tile])
++        else:
++            gap = np.full((width, tile.shape[1]), bg_color, dtype=int)
++            pieces.extend([gap, tile])
++
++    return np.hstack(pieces) if horizontal else np.vstack(pieces)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Crop and recolor a template, then space its repeats using 8-connected stencil areas.
++
++    Input structure:
++    - Blue (1) full rows or columns split the input into four consecutive sections.
++    - Section 1 is a black template holding one non-black sprite; section 2 is a green stencil on black.
++    - Sections 3 and 4 are solid color swatches that supply the output foreground and background.
++
++    Rule:
++    - Trim section 1 to the bbox of its non-black pixels and recolor that crop with the two swatch colors.
++    - In section 2, find the green (3) components using 8-connectivity and order them along the repeat axis.
++    - Make one copy of the recolored crop per ordered 8-connected component; between copy i and copy i+1,
++      insert a background-colored band whose thickness equals the area of component i.
++
++    Key insight:
++    - Diagonal joins in the stencil matter twice: they collapse several apparent mini-pieces into one repeat,
++      and the total number of pixels in each merged group becomes the width of the next separator band.
++    """
++    g = np.asarray(grid, dtype=int)
++    orientation, sections = _split_sections(g)
++    horizontal = orientation == "horizontal"
++    template, repetition_pattern, foreground_block, background_block = sections[:4]
++
++    template_mask = template != 0
++    template_bbox = bbox(template_mask)
++    if template_bbox is None:
++        return np.empty((0, 0), dtype=int)
++
++    foreground = _solid_color(foreground_block)
++    background = _solid_color(background_block)
++    tile_mask = crop_bbox(template_mask, template_bbox)
++    tile = np.where(tile_mask, foreground, background).astype(int)
++
++    comps = _ordered_components(repetition_pattern == STENCIL_COLOR, horizontal)
++    if not comps:
++        return tile
++    component_areas = [int(len(comp)) for comp in comps]
++    return _repeat_with_component_gaps(tile, component_areas, background, horizontal)
++
++
++def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
++    varying = random.randint(*SWATCH_DIM_RANGE)
++    if horizontal:
++        return np.full((shared_dim, varying), color, dtype=int)
++    return np.full((varying, shared_dim), color, dtype=int)
++
++
++def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
++    if horizontal:
++        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
++        parts = [sections[0]]
++        for section in sections[1:]:
++            parts.extend([sep, section])
++        return np.hstack(parts)
++
++    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
++    parts = [sections[0]]
++    for section in sections[1:]:
++        parts.extend([sep, section])
++    return np.vstack(parts)
++
++
++def _make_cluster(area: int, horizontal: bool) -> np.ndarray:
++    cluster = BASE_CLUSTER_BY_AREA[area].copy()
++    if random.choice([True, False]):
++        cluster = np.fliplr(cluster)
++    if random.choice([True, False]):
++        cluster = np.flipud(cluster)
++    if not horizontal:
++        cluster = cluster.T
++    return np.ascontiguousarray(cluster)
++
++
++def _sample_component_areas() -> list[int]:
++    visible = [3, 4]
++    random.shuffle(visible)
++    tail = random.choice([3, 4])
++    return visible + [tail]
++
++
++def _build_stencil(component_areas: list[int], shared_dim: int, horizontal: bool) -> np.ndarray:
++    clusters = [_make_cluster(area, horizontal) for area in component_areas]
++    margins = 2
++    varying_extent = margins + STENCIL_GAP * (len(clusters) - 1)
++    varying_extent += sum(cluster.shape[1] if horizontal else cluster.shape[0] for cluster in clusters)
++
++    h, w = (shared_dim, varying_extent) if horizontal else (varying_extent, shared_dim)
++    grid = np.zeros((h, w), dtype=int)
++
++    cursor = 1
++    for idx, cluster in enumerate(clusters):
++        ch, cw = cluster.shape
++        if horizontal:
++            r0 = random.randint(0, shared_dim - ch)
++            view = grid[r0 : r0 + ch, cursor : cursor + cw]
++            view[cluster] = STENCIL_COLOR
++            cursor += cw
++        else:
++            c0 = random.randint(0, shared_dim - cw)
++            view = grid[cursor : cursor + ch, c0 : c0 + cw]
++            view[cluster] = STENCIL_COLOR
++            cursor += ch
++        if idx < len(clusters) - 1:
++            cursor += STENCIL_GAP
++
++    return grid
++
++
++def _gen_attempt() -> np.ndarray | None:
++    horizontal = random.choice([True, False])
++
++    crop_h = random.randint(*CROP_SIZE_RANGE)
++    crop_w = random.randint(*CROP_SIZE_RANGE)
++    density = random.uniform(*DENSITY_RANGE)
++    shape = random_sprite(
++        crop_h,
++        crop_w,
++        density=density,
++        color_palette=[TEMPLATE_COLOR],
++        connectivity=4,
++        symmetry="not_symmetric",
++    )
++
++    fg_color, bg_color = random.sample(COLOR_POOL, 2)
++    component_areas = _sample_component_areas()
++    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
++    output = _repeat_with_component_gaps(tile, component_areas, bg_color, horizontal)
++
++    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
++    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
++
++    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
++    stencil = _build_stencil(component_areas, shared_dim, horizontal)
++
++    ordered = _ordered_components(stencil == STENCIL_COLOR, horizontal)
++    ordered_areas = [int(len(comp)) for comp in ordered]
++    count4 = len(components_mask(stencil == STENCIL_COLOR, connectivity=4))
++    count8 = len(ordered)
++    if ordered_areas != component_areas or count8 != REPEAT_COUNT or count4 <= count8:
++        return None
++
++    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
++    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
++    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
++
++    if max(inp.shape) > 30 or max(output.shape) > 30:
++        return None
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        pass
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+tokens used
+56,439
+融合变体代码已写入 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py:1)。`main()` 在 [162](/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py:162) 开始，按新规则读取区段2的绿色 `8` 连通分量，按布局轴排序，并把前 `N-1` 个分量的面积作为内部背景分隔带宽度；对应的重复拼接逻辑在 [143](/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py:143)。生成器在 [271](/home/lixinyu/snap/new/ceshi/code_combo/b0039139/10/code.py:271) 开始，构造 3 个对角相接的绿色簇，面积只取 `3` 或 `4`，保证 4 连通和 8 连通读法稳定不同，同时把输入/输出尺寸限制在 `30x30` 以内。
+
+验证结果：
+- 50 次稳定性测试：`Success: 50/50`
+- 100 个样本的融合行为统计：`count4-count8` 恒为 `3`
+- 可见分隔宽度模式只出现 `(3,4)` 或 `(4,3)`
+- 与原题“4 连通 + 1 像素分隔”输出相同的样本数：`0`
+
+这说明生成器没有退化回原任务，8 连通合并和“面积决定分隔宽度”都被稳定触发了。

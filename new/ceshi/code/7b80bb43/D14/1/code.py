@@ -1,0 +1,725 @@
+# Variant of 7b80bb43
+# Dimension: D14 — 间隙填充的触发条件 (transform)
+# Change: 间隙附近（切比雪夫距离1范围内）存在对角提示像素时触发填充... → 仅当两侧线段长度比满足条件时填充
+
+from __future__ import annotations
+
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[5]
+SOLVER_DIR = ROOT / "solvers"
+if str(SOLVER_DIR) not in sys.path:
+    sys.path.append(str(SOLVER_DIR))
+
+from arc_utils import components_mask, draw_line, find_components, get_bg
+
+# Design analysis for the D14 variant
+# -----------------------------------
+# spec_variant:
+#   preserved_visual_language:
+#     - one foreground color on one background color
+#     - output is still an axis-aligned line network with optional isolated collinear pairs
+#     - input still contains diagonal-only staircase pixels that are always deleted
+#   new_core_rule:
+#     - after deleting diagonal-only pixels, examine every horizontal/vertical gap of size <= 3
+#     - let the two surviving collinear segment lengths be L1 and L2
+#     - fill the gap iff abs(L1 - L2) <= 2
+#     - diagonal hints are not consulted for this decision
+#   concrete_behavior_trace:
+#     - original behavior on row: `####...####` plus a nearby 2-pixel diagonal hint -> fill because the hint is adjacent
+#     - new behavior on row: if the left/right lengths are 4 and 5, fill; if they are 2 and 8, do not fill even with the same diagonal hint
+#     - therefore the generator must include both balanced and imbalanced hinted gaps, otherwise the new rule is not observable
+#   complexity_calibration:
+#     - the solver only has one extra discriminator: segment-length balance
+#     - the generator enforces a clear separation:
+#         fillable gaps use length difference <= 2
+#         non-fillable pseudo-gaps use length difference >= 4
+#     - this avoids ambiguous near-threshold cases and makes the rule visible from a few examples
+#   hidden_assumption_audit:
+#     - diagonal detection/removal logic remains valid because D14 changes only the fill trigger
+#     - the original fill loops assumed "nearby diagonal implies fill"; that assumption is no longer valid and is removed
+#     - the new fill loops assume that any short balanced gap is intentional, so the generator must avoid accidental balanced 3-cell gaps elsewhere
+#     - pruning still acts only near former diagonal pixels; the generator keeps diagonal chains short enough that pruning does not erase intended line endpoints
+#   placement_legality:
+#     - real corrupted gaps are cut only at positions where both sides of the original segment remain length >= 2 and balanced
+#     - imbalanced pseudo-gaps are added in open space with a wide moat around existing fg so they cannot merge with the base network or create accidental secondary gaps
+#     - every generated sample is oracle-checked with `main(input) == output`
+#   observability:
+#     - both balanced and imbalanced gaps can carry visually identical diagonal hints
+#     - the only stable cue across samples is the relative line-piece lengths, which matches the intended D14 innovation
+#   cleanliness:
+#     - imbalanced pseudo-gaps are sparse (1-2 per sample) and isolated by padding, so they read as deliberate objects rather than clutter
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Remove diagonal staircase noise. Then fill only those short axis-aligned gaps whose
+    two opposing segment lengths are balanced (difference <= 2).
+    """
+    g = np.array(grid, dtype=int)
+    bg = int(get_bg(g))
+
+    colors = {int(x) for x in np.unique(g)}
+    colors.discard(int(bg))
+    assert colors
+    fg = int(next(iter(colors)))
+
+    mask = g == int(fg)
+    H, W = g.shape
+
+    def deg4(m: np.ndarray, r: int, c: int) -> int:
+        d = 0
+        if r > 0 and bool(m[int(r - 1), int(c)]):
+            d += 1
+        if r + 1 < H and bool(m[int(r + 1), int(c)]):
+            d += 1
+        if c > 0 and bool(m[int(r), int(c - 1)]):
+            d += 1
+        if c + 1 < W and bool(m[int(r), int(c + 1)]):
+            d += 1
+        return int(d)
+
+    def has_diag(m: np.ndarray, r: int, c: int) -> bool:
+        if r > 0 and c > 0 and bool(m[int(r - 1), int(c - 1)]):
+            return True
+        if r > 0 and c + 1 < W and bool(m[int(r - 1), int(c + 1)]):
+            return True
+        if r + 1 < H and c > 0 and bool(m[int(r + 1), int(c - 1)]):
+            return True
+        if r + 1 < H and c + 1 < W and bool(m[int(r + 1), int(c + 1)]):
+            return True
+        return False
+
+    diag = np.zeros((H, W), dtype=bool)
+    for r in range(H):
+        for c in range(W):
+            if bool(mask[int(r), int(c)]) and deg4(mask, int(r), int(c)) == 0 and has_diag(mask, int(r), int(c)):
+                diag[int(r), int(c)] = True
+
+    near = np.zeros((H, W), dtype=bool)
+    for r in range(H):
+        for c in range(W):
+            if not bool(diag[int(r), int(c)]):
+                continue
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    rr = int(r + dr)
+                    cc = int(c + dc)
+                    if 0 <= rr < H and 0 <= cc < W:
+                        near[rr, cc] = True
+
+    out = g.copy()
+    out[diag] = int(bg)
+
+    max_gap = 3
+    if bool(diag.any()):
+        for coords in components_mask(diag, connectivity=8):
+            if coords.size == 0:
+                continue
+            roots = set()
+            for r, c in coords:
+                for dr, dc in ((-1, -1), (-1, 1), (1, -1), (1, 1)):
+                    rr, cc = int(r + dr), int(c + dc)
+                    if 0 <= rr < H and 0 <= cc < W and bool(mask[rr, cc]) and not bool(diag[rr, cc]):
+                        roots.add((rr, cc))
+            assert len(coords) + len(roots) <= 3, f"diagonal chain too large ({len(coords)} diag + {len(roots)} root)"
+
+    base = mask & (~diag)
+
+    for r in range(H):
+        cols = np.where(base[int(r), :])[0]
+        if cols.size == 0:
+            continue
+        segs: list[tuple[int, int]] = []
+        start = int(cols[0])
+        prev = int(cols[0])
+        for c in cols[1:]:
+            c = int(c)
+            if c == prev + 1:
+                prev = c
+            else:
+                segs.append((int(start), int(prev)))
+                start = prev = c
+        segs.append((int(start), int(prev)))
+
+        for (a1, b1), (a2, b2) in zip(segs, segs[1:]):
+            gap0 = int(b1 + 1)
+            gap1 = int(a2 - 1)
+            gap_len = int(gap1 - gap0 + 1)
+            if gap1 < gap0 or gap_len > int(max_gap):
+                continue
+            left_len = int(b1 - a1 + 1)
+            right_len = int(b2 - a2 + 1)
+            if abs(left_len - right_len) <= 2:
+                out[int(r), int(gap0) : int(gap1) + 1] = int(fg)
+
+    for c in range(W):
+        rows = np.where(base[:, int(c)])[0]
+        if rows.size == 0:
+            continue
+        segs: list[tuple[int, int]] = []
+        start = int(rows[0])
+        prev = int(rows[0])
+        for r in rows[1:]:
+            r = int(r)
+            if r == prev + 1:
+                prev = r
+            else:
+                segs.append((int(start), int(prev)))
+                start = prev = r
+        segs.append((int(start), int(prev)))
+
+        for (a1, b1), (a2, b2) in zip(segs, segs[1:]):
+            gap0 = int(b1 + 1)
+            gap1 = int(a2 - 1)
+            gap_len = int(gap1 - gap0 + 1)
+            if gap1 < gap0 or gap_len > int(max_gap):
+                continue
+            top_len = int(b1 - a1 + 1)
+            bottom_len = int(b2 - a2 + 1)
+            if abs(top_len - bottom_len) <= 2:
+                out[int(gap0) : int(gap1) + 1, int(c)] = int(fg)
+
+    m = out == int(fg)
+    changed = True
+    while changed:
+        changed = False
+        to_clear: list[tuple[int, int]] = []
+        for r in range(H):
+            for c in range(W):
+                if not bool(m[int(r), int(c)]) or not bool(near[int(r), int(c)]):
+                    continue
+                if deg4(m, int(r), int(c)) != 1:
+                    continue
+                if not has_diag(m, int(r), int(c)):
+                    continue
+                to_clear.append((int(r), int(c)))
+        if to_clear:
+            changed = True
+            for r, c in to_clear:
+                m[int(r), int(c)] = False
+
+    out2 = np.full((H, W), int(bg), dtype=int)
+    out2[m] = int(fg)
+    return out2
+
+
+# --------------- generator ---------------
+
+GRID_H_RANGE = (16, 29)
+GRID_W_RANGE = (17, 30)
+N_COLORS = 10
+
+VALID_CONFIGS = [
+    {"segments": 6, "h": 2, "v": 4, "junctions": 2},
+    {"segments": 6, "h": 3, "v": 3, "junctions": 2},
+    {"segments": 6, "h": 3, "v": 3, "junctions": 3},
+    {"segments": 7, "h": 2, "v": 5, "junctions": 2},
+    {"segments": 7, "h": 3, "v": 4, "junctions": 2},
+    {"segments": 7, "h": 4, "v": 3, "junctions": 2},
+    {"segments": 7, "h": 3, "v": 4, "junctions": 3},
+    {"segments": 7, "h": 4, "v": 3, "junctions": 3},
+    {"segments": 8, "h": 3, "v": 5, "junctions": 3},
+    {"segments": 8, "h": 4, "v": 4, "junctions": 3},
+    {"segments": 8, "h": 5, "v": 3, "junctions": 3},
+]
+T_SLOTS = ("LT", "RT", "LB", "RB")
+
+EDGE_MARGIN = 3
+ROW_COL_GAP = 2
+T_BRANCH_OFFSET_MIN = 3
+T_BRANCH_OFFSET_MAX = 9
+H_SEG_END_MARGIN = 4
+H_SEG_MAX_END = 25
+
+SIMPLE_H_LEN_MIN = 7
+SIMPLE_H_LEN_MAX = 11
+SIMPLE_V_MARGIN_NEAR = 7
+SIMPLE_V_MARGIN_FAR = 3
+
+GAP_SIZE = 3
+CHAIN_LENGTH = 2
+GAP_BLOCKED_LO = 2
+GAP_BLOCKED_HI = 4
+GAP_SEG_INSET = 2
+BALANCE_TOL = 2
+
+DISTRACTOR_LENGTHS = (3, 2)
+DISTRACTOR_MARGIN = 1
+
+IMBALANCED_PAIR_COUNT = (1, 2)
+PAIR_SHORT_RANGE = (2, 4)
+PAIR_LONG_RANGE = (7, 10)
+PAIR_DIFF_MIN = 4
+PAIR_RESERVE_RADIUS = GAP_SIZE + 1
+
+GEN_RETRIES = 2000
+
+
+def _pick_distinct(rng: random.Random, values: list[int], k: int, gap: int = ROW_COL_GAP) -> list[int]:
+    vals = values[:]
+    rng.shuffle(vals)
+    picked: list[int] = []
+    for v in vals:
+        if all(abs(v - p) >= gap for p in picked):
+            picked.append(v)
+            if len(picked) == k:
+                return sorted(picked)
+    return []
+
+
+def _chain_coords(row: int, gap_start: int, anchor: str) -> list[tuple[int, int]]:
+    if anchor == "left":
+        return [(row + i, gap_start - 1 + i) for i in range(1, CHAIN_LENGTH + 1)]
+    return [(row + i, gap_start + GAP_SIZE - i) for i in range(1, CHAIN_LENGTH + 1)]
+
+
+def _v_chain_coords(col: int, gap_start: int, anchor: str, dc: int) -> list[tuple[int, int]]:
+    if anchor == "top":
+        return [(gap_start + i, col + dc * (i + 1)) for i in range(CHAIN_LENGTH)]
+    return [(gap_start + GAP_SIZE - 1 - i, col + dc * (i + 1)) for i in range(CHAIN_LENGTH)]
+
+
+def _cells_are_color(grid: np.ndarray, coords: list[tuple[int, int]], color: int) -> bool:
+    h, w = grid.shape
+    for r, c in coords:
+        if not (0 <= r < h and 0 <= c < w) or grid[r, c] != color:
+            return False
+    return True
+
+
+def _validate_chain(grid: np.ndarray, coords: list[tuple[int, int]], fg: int, occupied: set[tuple[int, int]]) -> bool:
+    h, w = grid.shape
+    coord_set = set(coords)
+    if any(cell in occupied for cell in coords):
+        return False
+    for r, c in coords:
+        for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+            if (rr, cc) in coord_set:
+                return False
+            if 0 <= rr < h and 0 <= cc < w and grid[rr, cc] == fg:
+                return False
+        has_diag = False
+        for rr, cc in ((r - 1, c - 1), (r - 1, c + 1), (r + 1, c - 1), (r + 1, c + 1)):
+            if (rr, cc) in coord_set or (0 <= rr < h and 0 <= cc < w and grid[rr, cc] == fg):
+                has_diag = True
+                break
+        if not has_diag:
+            return False
+    return True
+
+
+def _place_t_component(out: np.ndarray, fg: int, slot: str, row: int, branch_col: int, end_col: int) -> tuple[dict, dict]:
+    H, W = out.shape
+    h_c0 = 0 if slot[0] == "L" else end_col
+    h_c1 = end_col if slot[0] == "L" else W - 1
+    v_r0 = 0 if slot[1] == "T" else row
+    v_r1 = row if slot[1] == "T" else H - 1
+    draw_line(out, row, h_c0, end_r=row, end_c=h_c1, color=fg)
+    draw_line(out, v_r0, branch_col, end_r=v_r1, end_c=branch_col, color=fg)
+    h_seg = {"row": row, "c0": h_c0, "c1": h_c1, "blocked": {branch_col}}
+    v_seg = {"col": branch_col, "r0": v_r0, "r1": v_r1, "blocked": {row}}
+    return h_seg, v_seg
+
+
+def _place_simple_h(out: np.ndarray, fg: int, side: str, row: int, length: int) -> dict:
+    W = out.shape[1]
+    c0 = 0 if side == "left" else W - length
+    c1 = length - 1 if side == "left" else W - 1
+    draw_line(out, row, c0, end_r=row, end_c=c1, color=fg)
+    return {"row": row, "c0": c0, "c1": c1, "blocked": set()}
+
+
+def _place_simple_v(out: np.ndarray, fg: int, side: str, col: int, length: int) -> dict:
+    H = out.shape[0]
+    r0 = 0 if side == "top" else H - length
+    r1 = length - 1 if side == "top" else H - 1
+    draw_line(out, r0, col, end_r=r1, end_c=col, color=fg)
+    return {"col": col, "r0": r0, "r1": r1, "blocked": set()}
+
+
+def _is_balanced_pair(left_len: int, right_len: int) -> bool:
+    return abs(int(left_len) - int(right_len)) <= BALANCE_TOL
+
+
+def _h_gap_options(seg: dict, out: np.ndarray, fg: int, bg: int, occupied: set[tuple[int, int]]) -> list[tuple[int, str]]:
+    row, c0, c1 = seg["row"], seg["c0"], seg["c1"]
+    blocked = seg["blocked"]
+    options: list[tuple[int, str]] = []
+    for g in range(c0 + GAP_SEG_INSET, c1 - GAP_SIZE - 1):
+        left_len = int(g - c0)
+        right_len = int(c1 - (g + GAP_SIZE) + 1)
+        if not _is_balanced_pair(left_len, right_len):
+            continue
+        if any(g - GAP_BLOCKED_LO <= b <= g + GAP_BLOCKED_HI for b in blocked):
+            continue
+        temp = out.copy()
+        temp[row, g : g + GAP_SIZE] = bg
+        for anchor in ("left", "right"):
+            coords = _chain_coords(row, g, anchor)
+            if not _cells_are_color(temp, coords, bg):
+                continue
+            if not _validate_chain(temp, coords, fg, occupied):
+                continue
+            options.append((g, anchor))
+    return options
+
+
+def _v_gap_options(seg: dict, out: np.ndarray, fg: int, bg: int, occupied: set[tuple[int, int]]) -> list[tuple[int, str, int]]:
+    col, r0, r1 = seg["col"], seg["r0"], seg["r1"]
+    blocked = seg["blocked"]
+    options: list[tuple[int, str, int]] = []
+    for g in range(r0 + GAP_SEG_INSET, r1 - GAP_SIZE - 1):
+        top_len = int(g - r0)
+        bottom_len = int(r1 - (g + GAP_SIZE) + 1)
+        if not _is_balanced_pair(top_len, bottom_len):
+            continue
+        if any(g - GAP_BLOCKED_LO <= b <= g + GAP_BLOCKED_HI for b in blocked):
+            continue
+        temp = out.copy()
+        temp[g : g + GAP_SIZE, col] = bg
+        for anchor in ("top", "bottom"):
+            for dc in (-1, 1):
+                coords = _v_chain_coords(col, g, anchor, dc)
+                if not _cells_are_color(temp, coords, bg):
+                    continue
+                if not _validate_chain(temp, coords, fg, occupied):
+                    continue
+                options.append((g, anchor, dc))
+    return options
+
+
+def _reserve_radius(cells: set[tuple[int, int]], coords, radius: int) -> None:
+    for r, c in coords:
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                cells.add((int(r + dr), int(c + dc)))
+
+
+def _distractor_options(inp: np.ndarray, bg: int, forbidden: set[tuple[int, int]]) -> list[list[tuple[int, int]]]:
+    h, w = inp.shape
+    options: list[list[tuple[int, int]]] = []
+    for length in DISTRACTOR_LENGTHS:
+        for r in range(DISTRACTOR_MARGIN, h - length):
+            for c in range(DISTRACTOR_MARGIN, w - DISTRACTOR_MARGIN):
+                for direction in (-1, 1):
+                    coords = [(r + i, c + direction * i) for i in range(length)]
+                    if not _cells_are_color(inp, coords, bg):
+                        continue
+                    if any(cell in forbidden for cell in coords):
+                        continue
+                    options.append(coords)
+    return options
+
+
+def _build_output(rng: random.Random, h: int, w: int, bg: int, fg: int, cfg: dict) -> tuple[np.ndarray, list[dict], list[dict]] | None:
+    out = np.full((h, w), bg, dtype=int)
+    h_segments: list[dict] = []
+    v_segments: list[dict] = []
+
+    h_simple = cfg["h"] - cfg["junctions"]
+    v_simple = cfg["v"] - cfg["junctions"]
+    t_slots = rng.sample(list(T_SLOTS), cfg["junctions"])
+
+    top_slots = [s for s in t_slots if s[1] == "T"]
+    bottom_slots = [s for s in t_slots if s[1] == "B"]
+    top_pool = list(range(EDGE_MARGIN, max(EDGE_MARGIN + 1, h // 2 - 2)))
+    bottom_pool = list(range(max(h // 2 + 1, EDGE_MARGIN + 2), h - EDGE_MARGIN))
+    top_rows = _pick_distinct(rng, top_pool, len(top_slots))
+    bottom_rows = _pick_distinct(rng, bottom_pool, len(bottom_slots))
+    if len(top_rows) != len(top_slots) or len(bottom_rows) != len(bottom_slots):
+        return None
+    row_by_slot = dict(zip(top_slots, top_rows)) | dict(zip(bottom_slots, bottom_rows))
+
+    branch_cols = _pick_distinct(rng, list(range(EDGE_MARGIN, w - EDGE_MARGIN)), len(t_slots))
+    if len(branch_cols) != len(t_slots):
+        return None
+    rng.shuffle(branch_cols)
+    branch_by_slot = dict(zip(t_slots, branch_cols))
+
+    for slot in t_slots:
+        branch_col = branch_by_slot[slot]
+        row = row_by_slot[slot]
+        if slot[0] == "L":
+            min_end = max(SIMPLE_H_LEN_MIN + 1, branch_col + T_BRANCH_OFFSET_MIN)
+            max_end = min(w - H_SEG_END_MARGIN, branch_col + T_BRANCH_OFFSET_MAX, H_SEG_MAX_END)
+        else:
+            min_end = max(2, branch_col - T_BRANCH_OFFSET_MAX, w - H_SEG_MAX_END - 1)
+            max_end = min(w - SIMPLE_H_LEN_MIN - 1, branch_col - T_BRANCH_OFFSET_MIN)
+        if min_end > max_end:
+            return None
+        end_col = rng.randint(min_end, max_end)
+        h_seg, v_seg = _place_t_component(out, fg, slot, row, branch_col, end_col)
+        h_segments.append(h_seg)
+        v_segments.append(v_seg)
+
+    center_start = max(top_rows + [1]) + 2
+    center_end = min(bottom_rows + [h - 2]) - 2
+    if h_simple > 0 and center_start > center_end:
+        return None
+
+    simple_h_rows = _pick_distinct(rng, list(range(center_start, center_end + 1)), h_simple) if h_simple else []
+    if len(simple_h_rows) != h_simple:
+        return None
+    if h_simple == 0:
+        h_sides: list[str] = []
+    elif h_simple == 1:
+        h_sides = [rng.choice(["left", "right"])]
+    else:
+        h_sides = ["left", "right"]
+        rng.shuffle(h_sides)
+
+    simple_v_cols: list[int] = []
+    used_branch_cols = set(branch_by_slot.values())
+    if v_simple:
+        has_left = "left" in h_sides
+        has_right = "right" in h_sides
+        if has_left and has_right:
+            col_pool = list(range(SIMPLE_V_MARGIN_NEAR, w - SIMPLE_V_MARGIN_NEAR))
+        elif has_left:
+            col_pool = list(range(SIMPLE_V_MARGIN_NEAR, w - SIMPLE_V_MARGIN_FAR))
+        elif has_right:
+            col_pool = list(range(2, w - SIMPLE_V_MARGIN_NEAR))
+        else:
+            col_pool = list(range(2, w - 2))
+        col_pool = [c for c in col_pool if c not in used_branch_cols]
+        simple_v_cols = _pick_distinct(rng, col_pool, v_simple)
+        if len(simple_v_cols) != v_simple:
+            return None
+
+    for row, side in zip(simple_h_rows, h_sides):
+        if side == "left":
+            max_len = (min(simple_v_cols) if simple_v_cols else w - EDGE_MARGIN) - 1
+        else:
+            max_len = w - (max(simple_v_cols) if simple_v_cols else 2) - 2
+        max_len = min(SIMPLE_H_LEN_MAX, max_len)
+        if max_len < SIMPLE_H_LEN_MIN:
+            return None
+        h_segments.append(_place_simple_h(out, fg, side, row, rng.randint(SIMPLE_H_LEN_MIN, max_len)))
+
+    top_v = min(2, v_simple)
+    top_v_cols = simple_v_cols[:top_v]
+    bottom_v_cols = simple_v_cols[top_v:]
+    top_limit = min(min(top_rows) - 2 if top_rows else center_start - 2, center_start - 2)
+    bottom_start = max(max(bottom_rows) + 2 if bottom_rows else center_end + 2, center_end + 2)
+    for col in top_v_cols:
+        if top_limit < 2:
+            return None
+        v_segments.append(_place_simple_v(out, fg, "top", col, rng.randint(2, top_limit)))
+    for col in bottom_v_cols:
+        max_len = h - bottom_start
+        if max_len < 2:
+            return None
+        v_segments.append(_place_simple_v(out, fg, "bottom", col, rng.randint(2, max_len)))
+
+    comps = find_components(out, bg=bg, connectivity=4, monochromatic=True, return_format="dict")
+    if len(comps) != cfg["segments"] - cfg["junctions"]:
+        return None
+    return out, h_segments, v_segments
+
+
+def _pair_search_order(rng: random.Random) -> list[str]:
+    order = ["h", "v"]
+    rng.shuffle(order)
+    return order
+
+
+def _place_imbalanced_pair(
+    rng: random.Random,
+    out: np.ndarray,
+    fg: int,
+    bg: int,
+    forbidden: set[tuple[int, int]],
+    occupied: set[tuple[int, int]],
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]] | None:
+    h, w = out.shape
+    candidates: list[tuple[list[tuple[int, int]], list[tuple[int, int]]]] = []
+
+    for orient in _pair_search_order(rng):
+        if orient == "h":
+            for row in range(0, h - CHAIN_LENGTH):
+                for left_len in range(PAIR_SHORT_RANGE[0], PAIR_LONG_RANGE[1] + 1):
+                    for right_len in range(PAIR_SHORT_RANGE[0], PAIR_LONG_RANGE[1] + 1):
+                        if abs(left_len - right_len) < PAIR_DIFF_MIN:
+                            continue
+                        total = left_len + GAP_SIZE + right_len
+                        if total > w:
+                            continue
+                        for c0 in range(0, w - total + 1):
+                            gap_start = c0 + left_len
+                            seg_a = [(row, c) for c in range(c0, c0 + left_len)]
+                            seg_b = [(row, c) for c in range(gap_start + GAP_SIZE, gap_start + GAP_SIZE + right_len)]
+                            cells = seg_a + seg_b
+                            if any(cell in forbidden for cell in cells):
+                                continue
+                            if not _cells_are_color(out, cells, bg):
+                                continue
+                            temp = out.copy()
+                            for rr, cc in cells:
+                                temp[rr, cc] = fg
+                            for anchor in ("left", "right"):
+                                chain = _chain_coords(row, gap_start, anchor)
+                                if any(cell in forbidden for cell in chain):
+                                    continue
+                                if not _cells_are_color(temp, chain, bg):
+                                    continue
+                                if not _validate_chain(temp, chain, fg, occupied):
+                                    continue
+                                candidates.append((cells, chain))
+        else:
+            for col in range(1, w - 1):
+                for top_len in range(PAIR_SHORT_RANGE[0], PAIR_LONG_RANGE[1] + 1):
+                    for bottom_len in range(PAIR_SHORT_RANGE[0], PAIR_LONG_RANGE[1] + 1):
+                        if abs(top_len - bottom_len) < PAIR_DIFF_MIN:
+                            continue
+                        total = top_len + GAP_SIZE + bottom_len
+                        if total > h:
+                            continue
+                        for r0 in range(0, h - total + 1):
+                            gap_start = r0 + top_len
+                            seg_a = [(r, col) for r in range(r0, r0 + top_len)]
+                            seg_b = [(r, col) for r in range(gap_start + GAP_SIZE, gap_start + GAP_SIZE + bottom_len)]
+                            cells = seg_a + seg_b
+                            if any(cell in forbidden for cell in cells):
+                                continue
+                            if not _cells_are_color(out, cells, bg):
+                                continue
+                            temp = out.copy()
+                            for rr, cc in cells:
+                                temp[rr, cc] = fg
+                            for anchor in ("top", "bottom"):
+                                for dc in (-1, 1):
+                                    chain = _v_chain_coords(col, gap_start, anchor, dc)
+                                    if any(cell in forbidden for cell in chain):
+                                        continue
+                                    if not _cells_are_color(temp, chain, bg):
+                                        continue
+                                    if not _validate_chain(temp, chain, fg, occupied):
+                                        continue
+                                    candidates.append((cells, chain))
+        if candidates:
+            break
+
+    if not candidates:
+        return None
+
+    seg_cells, chain = rng.choice(candidates)
+    for r, c in seg_cells:
+        out[r, c] = fg
+    return seg_cells, chain
+
+
+def _gen_attempt() -> np.ndarray | None:
+    rng = random.Random()
+    h = rng.randint(*GRID_H_RANGE)
+    w = rng.randint(*GRID_W_RANGE)
+    bg = rng.randrange(N_COLORS)
+    fg = rng.choice([c for c in range(N_COLORS) if c != bg])
+    cfg = rng.choice(VALID_CONFIGS)
+    gap_count = rng.choice([2, 3])
+    distractor_count = rng.randint(0, 2)
+    imbalanced_count = rng.randint(*IMBALANCED_PAIR_COUNT)
+
+    built = _build_output(rng, h, w, bg, fg, cfg)
+    if built is None:
+        return None
+    out, h_segments, v_segments = built
+
+    occupied: set[tuple[int, int]] = set()
+    pair_forbidden: set[tuple[int, int]] = set()
+    _reserve_radius(pair_forbidden, list(map(tuple, np.argwhere(out == fg))), PAIR_RESERVE_RADIUS)
+
+    imbalanced_chains: list[list[tuple[int, int]]] = []
+    for _ in range(imbalanced_count):
+        placed = _place_imbalanced_pair(rng, out, fg, bg, pair_forbidden, occupied)
+        if placed is None:
+            if not imbalanced_chains:
+                return None
+            break
+        seg_cells, chain = placed
+        imbalanced_chains.append(chain)
+        occupied.update(chain)
+        _reserve_radius(pair_forbidden, seg_cells, PAIR_RESERVE_RADIUS)
+        _reserve_radius(pair_forbidden, chain, PAIR_RESERVE_RADIUS)
+
+    if not imbalanced_chains:
+        return None
+
+    inp = out.copy()
+
+    h_ready = [(seg, opts) for seg in h_segments for opts in [_h_gap_options(seg, out, fg, bg, occupied)] if opts]
+    v_ready = [(seg, opts) for seg in v_segments for opts in [_v_gap_options(seg, out, fg, bg, occupied)] if opts]
+    ready = [("h", seg, opts) for seg, opts in h_ready] + [("v", seg, opts) for seg, opts in v_ready]
+    if len(ready) < gap_count:
+        return None
+
+    by_orient = {"h": [item for item in ready if item[0] == "h"], "v": [item for item in ready if item[0] == "v"]}
+    picked: list[tuple[str, dict, list]] = []
+    if by_orient["h"]:
+        picked.append(rng.choice(by_orient["h"]))
+    if by_orient["v"] and len(picked) < gap_count:
+        picked.append(rng.choice(by_orient["v"]))
+    remaining = [item for item in ready if item not in picked]
+    rng.shuffle(remaining)
+    while len(picked) < gap_count and remaining:
+        item = remaining.pop()
+        if item not in picked:
+            picked.append(item)
+    if len(picked) < gap_count:
+        return None
+
+    for orient, seg, initial_opts in picked:
+        if orient == "h":
+            opts = _h_gap_options(seg, out, fg, bg, occupied) or initial_opts
+            gap_start, anchor = rng.choice(opts)
+            row = seg["row"]
+            chain = _chain_coords(row, gap_start, anchor)
+            inp[row, gap_start : gap_start + GAP_SIZE] = bg
+        else:
+            opts = _v_gap_options(seg, out, fg, bg, occupied) or initial_opts
+            gap_start, anchor, dc = rng.choice(opts)
+            col = seg["col"]
+            chain = _v_chain_coords(col, gap_start, anchor, dc)
+            inp[gap_start : gap_start + GAP_SIZE, col] = bg
+        for r, c in chain:
+            inp[r, c] = fg
+        occupied.update(chain)
+
+    for chain in imbalanced_chains:
+        for r, c in chain:
+            inp[r, c] = fg
+
+    forbidden: set[tuple[int, int]] = set()
+    _reserve_radius(forbidden, list(map(tuple, np.argwhere(inp == fg))), 1)
+    _reserve_radius(forbidden, list(occupied), 1)
+    distractors = _distractor_options(inp, bg, forbidden)
+    rng.shuffle(distractors)
+    placed = 0
+    for coords in distractors:
+        if placed >= distractor_count:
+            break
+        if any(cell in forbidden for cell in coords):
+            continue
+        for r, c in coords:
+            inp[r, c] = fg
+        _reserve_radius(forbidden, coords, 1)
+        placed += 1
+
+    try:
+        if not np.array_equal(main(inp), out):
+            return None
+    except Exception:
+        return None
+    return inp
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate valid input for 7b80bb43 D14")

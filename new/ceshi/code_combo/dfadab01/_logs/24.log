@@ -1,0 +1,3491 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e2baf-ff18-7132-9e67-589243a11bfd
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: dfadab01
+    **摘要**: 输入中的单像素标记按固定字形字典被替换为对应的4x4图案（标记色->图案色），样本字形及其右下标签在输出中消失，超出网格边缘的部分被裁剪
+
+    ## 要实现的融合组合
+    - **组合名称**: 2x2色块标记+可变尺寸字形
+    - **combo_spec**: D3/0+D5/2
+
+    ### 融合描述（实现规格）
+
+    标记由2x2同色色块替代单像素，字形放置位置以色块左上角为准。 不同标记色对应不同大小的字形（如色2→3x3，色3→4x4，色5→5x5，色8→6x6）。 解题者需要先识别2x2色块为标记（而非字形的一部分），再推断颜色→尺寸映射。 标记尺度（2x2）与字形尺度（3x3到6x6）形成尺度层级关系。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D3/0** — 标记来源对象 (`src`)
+  - 当前值: 散布在网格中的单像素标记，使用字形字典中的颜色（2、3、5、8），标记位置即字形放置的左上角
+  - 改为: 2x2色块标记 — 标记不再是单像素，而是2x2同色色块。字形放置位置仍以色块左上角为准，但字形大小可能需调整以适配更大的标记。解题者需识别色块-字形的尺度关系。
+  - 来源: creative（参考任务: None）
+- **D5/2** — 字形的固定几何形状 (`meta`)
+  - 当前值: 四种固定4x4字形图案：空心方块（边框填充）、菱形（对角连接环）、对角块（2x2块对角排列）、X形（角和中心交叉）
+  - 改为: 字形大小可变 — 不同标记色对应不同大小的字形（如色2对应3x3，色3对应4x4，色5对应5x5）。解题者需要同时推断颜色-图案映射和颜色-尺寸映射，增加了维度。
+  - 来源: size_encoded_parameter（参考任务: 6ffbe589）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/dfadab01.py`
+
+    ```python
+    from __future__ import annotations
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding fixed 4x4 glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show a sample 4x4 glyph in the output color, with a same-rule marker just below-right of the sample.
+
+    Rule:
+    - Replace each marker color by its learned 4x4 glyph: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping at the grid boundary.
+    - Remove the sample glyphs and skip their below-right label markers.
+
+    Key insight:
+    - The colored pixels are control pixels for a fixed glyph alphabet; non-control sample glyphs are only legend entries, not preserved scene objects.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            # Legend labels appear one cell below-right of the sample glyph bbox.
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 10x10 or 20x20 [observed]; must accommodate marker_grid_rows * row_spacing + glyph_size(4)
+  glyph_alphabet:
+    fixed 4x4 patterns, each 8 filled pixels out of 16:
+      marker 2 (red) -> color 4 (yellow) solid frame
+      marker 3 (green) -> color 1 (blue) open ring
+      marker 5 (gray) -> color 6 (magenta) diagonal blocks
+      marker 8 (azure) -> color 7 (orange) X-shape
+  marker_grid:
+    markers placed on a regular grid of positions (rows x cols)
+    shape: 2x2 to 5x5; rows and cols chosen independently
+    row_spacing: 4-6, uniform within example [observed]
+    col_spacing: 4-6, may be non-uniform across columns
+    fill_rate: 60-100% of grid cells contain a marker; unfilled cells are empty (black)
+    marker_types_used: 1-4 distinct types from {2,3,5,8}; each cell assigned one type
+  legend:
+    0 or 1 legend entry per input [observed]; shows one glyph type's mapping
+    structure: the 4x4 glyph drawn in output color + a label marker of matching type at (glyph_row+4, glyph_col+4)
+    legend glyph may overlap a grid cell position (the marker pixel sits where glyph mask has 0)
+    label marker is skipped in output (not expanded)
+  output:
+    black background; each real marker replaced by its 4x4 glyph in the mapped output color
+    glyph top-left at marker position; clipped at grid boundary
+    legend glyph and label removed; no glyph painted for label markers
+    glyphs never overlap (guaranteed by spacing >= 4)
+
+generation_strategy:
+  approach: direct construction (constraints are easy to satisfy constructively)
+  steps:
+    1. Pick grid dimensions ensuring rows * row_spacing and cols * col_spacing fit (with room for 4-cell glyph); e.g. for 5x5 grid with spacing 4, need >= 20.
+    2. Choose 1-4 marker types from {2,3,5,8}. Choose grid shape (R x C, each 2-5). Choose row_spacing and col_spacing (4-6 each).
+    3. Compute marker row/col positions; first row/col >= 0, last row + 3 <= H, last col + 3 <= W (or allow clipping for edge markers).
+    4. Fill grid cells: assign a random marker type to each cell; optionally leave some cells empty (fill_rate >= 60%).
+    5. Optionally add one legend entry: pick a used marker type, find a location where the 4x4 glyph + label at (+4,+4) fits without conflicting with real markers. Draw glyph in output color; place label marker pixel.
+    6. Build input grid: black background + single marker pixels at filled grid cells + legend if present.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+## 已有单变体参考代码
+
+以下组成项已有单变体实现，可作为融合时的参考：
+
+            ### 参考代码: D5/2
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/dfadab01/D5/2/code.py`
+
+            ```python
+            # Variant of dfadab01
+# Dimension: D5 — 字形的固定几何形状 (meta)
+# Change: 四种固定4x4字形图案：空心方块（边框填充）、菱形（对角连接环）、对角块（2x2块对角排列）、X形（角和中心交叉）... → 字形大小可变
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+
+"""
+design_analysis:
+  a_concretization_and_trace:
+    original_scene:
+      - 输入里的真实对象只有单像素标记；输出把每个标记扩成固定 4x4 字形。
+      - 若输入额外出现一个样本字形，则它只是图例；其右下角的同色标记是标签，不参与输出。
+    variant_scene:
+      - 保留四种标记色 -> 四种输出色/图案家族的对应关系，但把字形边界框尺寸改成依颜色而定：
+        2 -> 3x3 空心方块, 3 -> 4x4 菱形环, 5 -> 5x5 对角块, 8 -> 6x6 X。
+      - 图例标签不再固定在 (+4,+4)，而是位于该颜色样本字形的右下外侧一格，即 (+size,+size)。
+      - 输出仍以标记像素为字形左上角，仍允许超出网格时裁剪。
+    concrete_trace:
+      - 原逻辑中，若输入在 (7, 8) 放一个颜色 5 标记，就总是在输出的 [7:11, 8:12] 里画固定 4x4 的两块对角 2x2。
+      - 变体中，同样位置的颜色 5 标记要在 [7:12, 8:13] 里画 5x5 字形；颜色 2 则只画 3x3。
+      - 因此差异不只是 mask 内容，还包括 label 偏移、边界裁剪范围、以及“不会重叠”的最小间距。
+  b_complexity_calibration:
+    - 只让尺寸在四个离散档位 {3,4,5,6} 中变化，避免自由度过多。
+    - 同一输入至少使用两种标记色，并尽量让每种已使用颜色出现至少两次，保证人类能看到重复支撑。
+    - 保留原题图例机制，用可见样本把“颜色 -> 图案/尺寸”联立提示出来，而不是引入不可见编码。
+  c_implicit_assumption_review_of_main:
+    - 原 _has_source_glyph() 假设 bbox 恒为 4x4；变体里必须改成使用 mask.shape。
+    - 原 _paint_clipped() 固定循环 4 次；变体里必须按实际 size 循环，否则会漏画或越界。
+    - 原 main() 用 (r-4, c-4) 检查图例标签；变体里必须改成 (r-size, c-size)。
+    - 原“不重叠”只需要 spacing >= 4；变体里若仍用 4，会导致 5x5/6x6 字形互相覆盖，所以 generator 必须升级 spacing 下界。
+    - 原 assert 的允许颜色集合不变，因为仍然只有背景、四种标记色、四种输出色。
+  d_placement_legality:
+    - 真实标记放在规则网格上，行列间距只从 {6,7} 选取，确保最大 6x6 字形也不会与相邻字形重叠。
+    - 图例样本要求完整落在网格内，且其整块 bbox 与标签像素都落在当前空白区域，避免与真实标记或其他图例纠缠。
+    - 真实标记允许靠近下边/右边，以保留“裁剪”这一原题行为。
+  e_visual_observability:
+    - 尺寸变化是直接可见的几何差异，不依赖颜色 id 的排序或数值运算。
+    - 采用固定四档尺寸并复用原图案家族，解题者能从少量样例观察到：相同标记色总是扩成同一种颜色、同一种图案、同一种大小。
+  f_visual_tidiness:
+    - 图例不与真实标记混叠，真实输出字形之间也不重叠，因此每个对象的来源都清楚。
+    - 小尺寸只分配给视觉上仍然清晰的图案：3x3 给边框方块，4x4 给菱形环，5x5 给对角块，6x6 给 X。
+  g_color_change_inferability:
+    - 颜色映射仍保持原题的一一对应，没有增加额外颜色机制。
+    - 变体的新增信息完全由可见几何尺寸承载，所以不会出现“颜色变了但无结构线索”的问题。
+  generator_guarantees_for_new_main:
+    - 每个输入至少有一个真实标记，因此 main() 的 seen_marker 断言可满足。
+    - 每个输入至少包含两种真实标记色，因此新维度 D5 在绝大多数样本里都可观察。
+    - 所有图例标签都严格位于对应样本字形的 (+size,+size)，因此 main() 的 skip 条件有构造性保证。
+"""
+
+
+def _frame_mask(size: int) -> np.ndarray:
+    rr, cc = np.indices((size, size))
+    return (rr == 0) | (rr == size - 1) | (cc == 0) | (cc == size - 1)
+
+
+def _diamond_ring_mask(size: int) -> np.ndarray:
+    center = (size - 1) / 2.0
+    radius = (size - 1) / 2.0
+    rr, cc = np.indices((size, size))
+    dist = np.abs(rr - center) + np.abs(cc - center)
+    return (dist >= radius - 0.5) & (dist <= radius + 0.5)
+
+
+def _diag_blocks_mask(size: int) -> np.ndarray:
+    block = max(1, size // 2)
+    mask = np.zeros((size, size), dtype=bool)
+    mask[:block, :block] = True
+    mask[size - block :, size - block :] = True
+    return mask
+
+
+def _x_mask(size: int) -> np.ndarray:
+    rr, cc = np.indices((size, size))
+    return (rr == cc) | (rr + cc == size - 1)
+
+
+GLYPHS: dict[int, tuple[int, int, np.ndarray]] = {
+    2: (4, 3, _frame_mask(3)),
+    3: (1, 4, _diamond_ring_mask(4)),
+    5: (6, 5, _diag_blocks_mask(5)),
+    8: (7, 6, _x_mask(6)),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    gh, gw = mask.shape
+    if r0 < 0 or c0 < 0 or r0 + gh > h or c0 + gw > w:
+        return False
+    patch = g[r0 : r0 + gh, c0 : c0 + gw]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    gh, gw = mask.shape
+    for dr in range(gh):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(gw):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding size-coded glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show legend samples: a glyph already drawn in its output color, plus a same-type marker one cell below-right of that sample's own bounding box.
+
+    Rule:
+    - Replace each real marker by the glyph tied to its color, using both that color's output hue and that color's dedicated size: 2->3x3 frame, 3->4x4 diamond ring, 5->5x5 diagonal blocks, 8->6x6 X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping anything that extends past the grid edge.
+    - Remove legend samples and skip the label markers that sit at (+size, +size) from their matching sample glyphs.
+
+    Key insight:
+    - Marker color now encodes two visible parameters at once: which glyph family to draw and how large its bounding box should be; the legend offset changes with that size instead of staying fixed at 4.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, size, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            if _has_source_glyph(g, int(r) - size, int(c) - size, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+
+GRID_SIZE_OPTIONS = (20, 24)
+ROWCOL_COUNT_RANGE = (2, 4)
+SPACING_OPTIONS = (6, 7)
+FILL_RATE_RANGE = (0.65, 1.0)
+GEN_RETRIES = 400
+
+
+def _all_top_left_positions(height: int, width: int, size: int) -> list[tuple[int, int]]:
+    return [(r, c) for r in range(height - size) for c in range(width - size)]
+
+
+def _choose_real_markers(
+    anchors: list[tuple[int, int]],
+    used_colors: list[int],
+) -> list[tuple[int, int, int]]:
+    cell_count = len(anchors)
+    min_fill = max(len(used_colors) * 2, int(np.ceil(cell_count * random.uniform(*FILL_RATE_RANGE))))
+    min_fill = min(cell_count, max(len(used_colors), min_fill))
+    fill_count = random.randint(min_fill, cell_count)
+
+    chosen_positions = random.sample(anchors, fill_count)
+    assignments = used_colors * 2
+    while len(assignments) < fill_count:
+        assignments.append(random.choice(used_colors))
+    assignments = assignments[:fill_count]
+    random.shuffle(assignments)
+    return [(r, c, color) for (r, c), color in zip(chosen_positions, assignments, strict=True)]
+
+
+def _try_place_legend(
+    grid: np.ndarray,
+    marker_color: int,
+) -> bool:
+    glyph_color, size, mask = GLYPHS[marker_color]
+    candidates = _all_top_left_positions(grid.shape[0], grid.shape[1], size)
+    random.shuffle(candidates)
+    for r0, c0 in candidates:
+        label = (r0 + size, c0 + size)
+        if label[0] >= grid.shape[0] or label[1] >= grid.shape[1]:
+            continue
+        patch = grid[r0 : r0 + size, c0 : c0 + size]
+        if np.any(patch != 0) or grid[label] != 0:
+            continue
+        patch[mask] = glyph_color
+        grid[label] = marker_color
+        return True
+    return False
+
+
+def _build_expected(height: int, width: int, markers: list[tuple[int, int, int]]) -> np.ndarray:
+    out = np.zeros((height, width), dtype=int)
+    for r, c, marker_color in markers:
+        glyph_color, _size, mask = GLYPHS[marker_color]
+        _paint_clipped(out, r, c, glyph_color, mask)
+    return out
+
+
+def generate_input() -> np.ndarray:
+    """
+    Construct a regular marker lattice plus 1-2 legend entries for the variable-size glyph rule.
+    """
+    for _ in range(GEN_RETRIES):
+        height = width = random.choice(GRID_SIZE_OPTIONS)
+        row_count = random.randint(*ROWCOL_COUNT_RANGE)
+        col_count = random.randint(*ROWCOL_COUNT_RANGE)
+        row_spacing = random.choice(SPACING_OPTIONS)
+        col_spacing = random.choice(SPACING_OPTIONS)
+        max_row_start = height - 1 - (row_count - 1) * row_spacing
+        max_col_start = width - 1 - (col_count - 1) * col_spacing
+        if max_row_start < 0 or max_col_start < 0:
+            continue
+
+        row0 = random.randint(0, max_row_start)
+        col0 = random.randint(0, max_col_start)
+        anchors = [(row0 + rr * row_spacing, col0 + cc * col_spacing) for rr in range(row_count) for cc in range(col_count)]
+
+        used_count = random.randint(2, 4)
+        used_colors = random.sample(list(GLYPHS), used_count)
+        real_markers = _choose_real_markers(anchors, used_colors)
+
+        grid = np.zeros((height, width), dtype=int)
+        for r, c, marker_color in real_markers:
+            grid[r, c] = marker_color
+
+        legend_colors = random.sample(used_colors, 1 + int(len(used_colors) > 1 and random.random() < 0.35))
+        placed_legends = 0
+        for marker_color in legend_colors:
+            placed_legends += int(_try_place_legend(grid, marker_color))
+        if placed_legends == 0:
+            continue
+
+        expected = _build_expected(height, width, real_markers)
+        actual = main(grid)
+        if not np.array_equal(actual, expected):
+            continue
+        return grid
+
+    raise RuntimeError("failed to generate a valid variable-size dfadab01 instance")
+
+            ```
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/24/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/24/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of dfadab01 (index 24)
+    # combo_spec: D3/0+D5/2
+    # Name: 2x2色块标记+可变尺寸字形
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/24` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/6ffbe589.py` — 参考任务 6ffbe589 的 solver（D5/2 的灵感来源）
+codex
+先读取原始 solver、单变体参考和目标目录状态，确认原题约束与可复用实现，再据此写融合版的设计分析和代码。
+exec
+/bin/bash -lc 'ls -la /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/24' in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '1,360p' /home/lixinyu/snap/new/ceshi/code/dfadab01/D5/2/code.py" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+from pathlib import Path
+p=Path('/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json')
+obj=json.loads(p.read_text())
+print('train', len(obj.get('train', [])), 'test', len(obj.get('test', [])))
+for split in ('train','test'):
+    for i,ex in enumerate(obj.get(split, [])):
+        inp=ex['input']; out=ex['output']
+        print(split, i, len(inp), len(inp[0]), '->', len(out), len(out[0]))
+PY" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/dfadab01.py" in /home/lixinyu/snap/new
+ succeeded in 124ms:
+# Variant of dfadab01
+# Dimension: D5 — 字形的固定几何形状 (meta)
+# Change: 四种固定4x4字形图案：空心方块（边框填充）、菱形（对角连接环）、对角块（2x2块对角排列）、X形（角和中心交叉）... → 字形大小可变
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+
+"""
+design_analysis:
+  a_concretization_and_trace:
+    original_scene:
+      - 输入里的真实对象只有单像素标记；输出把每个标记扩成固定 4x4 字形。
+      - 若输入额外出现一个样本字形，则它只是图例；其右下角的同色标记是标签，不参与输出。
+    variant_scene:
+      - 保留四种标记色 -> 四种输出色/图案家族的对应关系，但把字形边界框尺寸改成依颜色而定：
+        2 -> 3x3 空心方块, 3 -> 4x4 菱形环, 5 -> 5x5 对角块, 8 -> 6x6 X。
+      - 图例标签不再固定在 (+4,+4)，而是位于该颜色样本字形的右下外侧一格，即 (+size,+size)。
+      - 输出仍以标记像素为字形左上角，仍允许超出网格时裁剪。
+    concrete_trace:
+      - 原逻辑中，若输入在 (7, 8) 放一个颜色 5 标记，就总是在输出的 [7:11, 8:12] 里画固定 4x4 的两块对角 2x2。
+      - 变体中，同样位置的颜色 5 标记要在 [7:12, 8:13] 里画 5x5 字形；颜色 2 则只画 3x3。
+      - 因此差异不只是 mask 内容，还包括 label 偏移、边界裁剪范围、以及“不会重叠”的最小间距。
+  b_complexity_calibration:
+    - 只让尺寸在四个离散档位 {3,4,5,6} 中变化，避免自由度过多。
+    - 同一输入至少使用两种标记色，并尽量让每种已使用颜色出现至少两次，保证人类能看到重复支撑。
+    - 保留原题图例机制，用可见样本把“颜色 -> 图案/尺寸”联立提示出来，而不是引入不可见编码。
+  c_implicit_assumption_review_of_main:
+    - 原 _has_source_glyph() 假设 bbox 恒为 4x4；变体里必须改成使用 mask.shape。
+    - 原 _paint_clipped() 固定循环 4 次；变体里必须按实际 size 循环，否则会漏画或越界。
+    - 原 main() 用 (r-4, c-4) 检查图例标签；变体里必须改成 (r-size, c-size)。
+    - 原“不重叠”只需要 spacing >= 4；变体里若仍用 4，会导致 5x5/6x6 字形互相覆盖，所以 generator 必须升级 spacing 下界。
+    - 原 assert 的允许颜色集合不变，因为仍然只有背景、四种标记色、四种输出色。
+  d_placement_legality:
+    - 真实标记放在规则网格上，行列间距只从 {6,7} 选取，确保最大 6x6 字形也不会与相邻字形重叠。
+    - 图例样本要求完整落在网格内，且其整块 bbox 与标签像素都落在当前空白区域，避免与真实标记或其他图例纠缠。
+    - 真实标记允许靠近下边/右边，以保留“裁剪”这一原题行为。
+  e_visual_observability:
+    - 尺寸变化是直接可见的几何差异，不依赖颜色 id 的排序或数值运算。
+    - 采用固定四档尺寸并复用原图案家族，解题者能从少量样例观察到：相同标记色总是扩成同一种颜色、同一种图案、同一种大小。
+  f_visual_tidiness:
+    - 图例不与真实标记混叠，真实输出字形之间也不重叠，因此每个对象的来源都清楚。
+    - 小尺寸只分配给视觉上仍然清晰的图案：3x3 给边框方块，4x4 给菱形环，5x5 给对角块，6x6 给 X。
+  g_color_change_inferability:
+    - 颜色映射仍保持原题的一一对应，没有增加额外颜色机制。
+    - 变体的新增信息完全由可见几何尺寸承载，所以不会出现“颜色变了但无结构线索”的问题。
+  generator_guarantees_for_new_main:
+    - 每个输入至少有一个真实标记，因此 main() 的 seen_marker 断言可满足。
+    - 每个输入至少包含两种真实标记色，因此新维度 D5 在绝大多数样本里都可观察。
+    - 所有图例标签都严格位于对应样本字形的 (+size,+size)，因此 main() 的 skip 条件有构造性保证。
+"""
+
+
+def _frame_mask(size: int) -> np.ndarray:
+    rr, cc = np.indices((size, size))
+    return (rr == 0) | (rr == size - 1) | (cc == 0) | (cc == size - 1)
+
+
+def _diamond_ring_mask(size: int) -> np.ndarray:
+    center = (size - 1) / 2.0
+    radius = (size - 1) / 2.0
+    rr, cc = np.indices((size, size))
+    dist = np.abs(rr - center) + np.abs(cc - center)
+    return (dist >= radius - 0.5) & (dist <= radius + 0.5)
+
+
+def _diag_blocks_mask(size: int) -> np.ndarray:
+    block = max(1, size // 2)
+    mask = np.zeros((size, size), dtype=bool)
+    mask[:block, :block] = True
+    mask[size - block :, size - block :] = True
+    return mask
+
+
+def _x_mask(size: int) -> np.ndarray:
+    rr, cc = np.indices((size, size))
+    return (rr == cc) | (rr + cc == size - 1)
+
+
+GLYPHS: dict[int, tuple[int, int, np.ndarray]] = {
+    2: (4, 3, _frame_mask(3)),
+    3: (1, 4, _diamond_ring_mask(4)),
+    5: (6, 5, _diag_blocks_mask(5)),
+    8: (7, 6, _x_mask(6)),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    gh, gw = mask.shape
+    if r0 < 0 or c0 < 0 or r0 + gh > h or c0 + gw > w:
+        return False
+    patch = g[r0 : r0 + gh, c0 : c0 + gw]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    gh, gw = mask.shape
+    for dr in range(gh):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(gw):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding size-coded glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show legend samples: a glyph already drawn in its output color, plus a same-type marker one cell below-right of that sample's own bounding box.
+
+    Rule:
+    - Replace each real marker by the glyph tied to its color, using both that color's output hue and that color's dedicated size: 2->3x3 frame, 3->4x4 diamond ring, 5->5x5 diagonal blocks, 8->6x6 X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping anything that extends past the grid edge.
+    - Remove legend samples and skip the label markers that sit at (+size, +size) from their matching sample glyphs.
+
+    Key insight:
+    - Marker color now encodes two visible parameters at once: which glyph family to draw and how large its bounding box should be; the legend offset changes with that size instead of staying fixed at 4.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, size, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            if _has_source_glyph(g, int(r) - size, int(c) - size, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+
+GRID_SIZE_OPTIONS = (20, 24)
+ROWCOL_COUNT_RANGE = (2, 4)
+SPACING_OPTIONS = (6, 7)
+FILL_RATE_RANGE = (0.65, 1.0)
+GEN_RETRIES = 400
+
+
+def _all_top_left_positions(height: int, width: int, size: int) -> list[tuple[int, int]]:
+    return [(r, c) for r in range(height - size) for c in range(width - size)]
+
+
+def _choose_real_markers(
+    anchors: list[tuple[int, int]],
+    used_colors: list[int],
+) -> list[tuple[int, int, int]]:
+    cell_count = len(anchors)
+    min_fill = max(len(used_colors) * 2, int(np.ceil(cell_count * random.uniform(*FILL_RATE_RANGE))))
+    min_fill = min(cell_count, max(len(used_colors), min_fill))
+    fill_count = random.randint(min_fill, cell_count)
+
+    chosen_positions = random.sample(anchors, fill_count)
+    assignments = used_colors * 2
+    while len(assignments) < fill_count:
+        assignments.append(random.choice(used_colors))
+    assignments = assignments[:fill_count]
+    random.shuffle(assignments)
+    return [(r, c, color) for (r, c), color in zip(chosen_positions, assignments, strict=True)]
+
+
+def _try_place_legend(
+    grid: np.ndarray,
+    marker_color: int,
+) -> bool:
+    glyph_color, size, mask = GLYPHS[marker_color]
+    candidates = _all_top_left_positions(grid.shape[0], grid.shape[1], size)
+    random.shuffle(candidates)
+    for r0, c0 in candidates:
+        label = (r0 + size, c0 + size)
+        if label[0] >= grid.shape[0] or label[1] >= grid.shape[1]:
+            continue
+        patch = grid[r0 : r0 + size, c0 : c0 + size]
+        if np.any(patch != 0) or grid[label] != 0:
+            continue
+        patch[mask] = glyph_color
+        grid[label] = marker_color
+        return True
+    return False
+
+
+def _build_expected(height: int, width: int, markers: list[tuple[int, int, int]]) -> np.ndarray:
+    out = np.zeros((height, width), dtype=int)
+    for r, c, marker_color in markers:
+        glyph_color, _size, mask = GLYPHS[marker_color]
+        _paint_clipped(out, r, c, glyph_color, mask)
+    return out
+
+
+def generate_input() -> np.ndarray:
+    """
+    Construct a regular marker lattice plus 1-2 legend entries for the variable-size glyph rule.
+    """
+    for _ in range(GEN_RETRIES):
+        height = width = random.choice(GRID_SIZE_OPTIONS)
+        row_count = random.randint(*ROWCOL_COUNT_RANGE)
+        col_count = random.randint(*ROWCOL_COUNT_RANGE)
+        row_spacing = random.choice(SPACING_OPTIONS)
+        col_spacing = random.choice(SPACING_OPTIONS)
+        max_row_start = height - 1 - (row_count - 1) * row_spacing
+        max_col_start = width - 1 - (col_count - 1) * col_spacing
+        if max_row_start < 0 or max_col_start < 0:
+            continue
+
+        row0 = random.randint(0, max_row_start)
+        col0 = random.randint(0, max_col_start)
+        anchors = [(row0 + rr * row_spacing, col0 + cc * col_spacing) for rr in range(row_count) for cc in range(col_count)]
+
+        used_count = random.randint(2, 4)
+        used_colors = random.sample(list(GLYPHS), used_count)
+        real_markers = _choose_real_markers(anchors, used_colors)
+
+        grid = np.zeros((height, width), dtype=int)
+        for r, c, marker_color in real_markers:
+            grid[r, c] = marker_color
+
+        legend_colors = random.sample(used_colors, 1 + int(len(used_colors) > 1 and random.random() < 0.35))
+        placed_legends = 0
+        for marker_color in legend_colors:
+            placed_legends += int(_try_place_legend(grid, marker_color))
+        if placed_legends == 0:
+            continue
+
+        expected = _build_expected(height, width, real_markers)
+        actual = main(grid)
+        if not np.array_equal(actual, expected):
+            continue
+        return grid
+
+    raise RuntimeError("failed to generate a valid variable-size dfadab01 instance")
+
+ succeeded in 138ms:
+from __future__ import annotations
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding fixed 4x4 glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show a sample 4x4 glyph in the output color, with a same-rule marker just below-right of the sample.
+
+    Rule:
+    - Replace each marker color by its learned 4x4 glyph: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping at the grid boundary.
+    - Remove the sample glyphs and skip their below-right label markers.
+
+    Key insight:
+    - The colored pixels are control pixels for a fixed glyph alphabet; non-control sample glyphs are only legend entries, not preserved scene objects.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            # Legend labels appear one cell below-right of the sample glyph bbox.
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+ exited 2 in 150ms:
+ls: cannot access '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/24': No such file or directory
+
+ succeeded in 169ms:
+train 4 test 1
+train 0 20 20 -> 20 20
+train 1 10 10 -> 10 10
+train 2 10 10 -> 10 10
+train 3 20 20 -> 20 20
+test 0 20 20 -> 20 20
+
+codex
+已经确认原题和 D5 单变体的关键差异点。接下来把 D3 的 2x2 标记机制和 D5 的尺寸编码规则一起落到同一套几何假设里，再直接写融合版并自测。
+Implementing the fused D3/0 + D5/2 variant requires coordinated solver and generator changes plus validation that the new behavior is actually present in generated samples.
+  → Design fused geometry and generator constraints for 2x2 marker blocks plus variable glyph sizes
+  • Write combo variant code with design analysis, solver, and generator at ceshi/code_combo/dfadab01/24/code.py
+  • Run reliability and non-degeneracy checks, then refine until passing
+codex
+要开始落文件了。实现上会把“标记”统一定义为孤立的 2x2 同色色块，solver 只读取这些色块的左上角；generator 则通过更大的间距和图例空区约束，保证 2x2 标记与 3x3~6x6 字形在同一网格里可稳定共存。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/24' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/24/code.py
+diff --git a/ceshi/code_combo/dfadab01/24/code.py b/ceshi/code_combo/dfadab01/24/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e88d9f75319d914afa03ffb50751f0e10c2913f6
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/24/code.py
+@@ -0,0 +1,296 @@
++# Combo variant of dfadab01 (index 24)
++# combo_spec: D3/0+D5/2
++# Name: 2x2色块标记+可变尺寸字形
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++"""
++design_analysis:
++  a_concretization_and_trace:
++    original_scene:
++      - 原题把颜色 2/3/5/8 的单像素当作控制标记；输出时每个像素都扩成固定 4x4 字形。
++      - 若输入里还出现一个已画好的样本字形，则它只是图例；其右下角的同色单像素标签不参与输出。
++    fused_scene:
++      - 真实标记与图例标签都改成 2x2 同色色块，字形锚点取该色块左上角。
++      - 颜色仍决定图案家族与输出颜色，但现在还决定 bbox 尺寸：2->3x3，3->4x4，5->5x5，8->6x6。
++      - 图例标签也随尺寸变化，位于样本字形左上角的 (+size, +size)，且自身占 2x2。
++    concrete_trace:
++      - 例如输入在左上角 (8, 11) 放一个颜色 5 的 2x2 色块，原题若把四个像素都当单标记，会错误地产生四个互相平移的 4x4 字形。
++      - 融合后 solver 必须先把这四个像素识别为“一个 2x2 标记块”，再只用其左上角 (8, 11) 画一个 5x5 的对角双块字形。
++      - 若另有颜色 3 的图例样本放在 (2, 14)，则其 4x4 蓝色菱形环只是提示；位于 (6, 18) 的绿色 2x2 标签块要被识别并跳过，而不是扩写。
++      - 因此和原题相比，变化同时发生在“标记粒度”“图例标签几何”“字形尺寸”“裁剪范围”四个环节上。
++  b_complexity_calibration:
++    - 尺寸只用四个离散档位 {3,4,5,6}，与四种颜色一一对应，避免自由度过高。
++    - 每个样例至少使用两种真实标记色，并给每种已用颜色至少两个真实标记，保证人类能看到重复支撑。
++    - 图例仍保留 1-2 个，提供“颜色 -> 输出颜色/图案/尺寸”的直接可见线索，而不是依赖颜色数值。
++  c_implicit_assumption_review_of_main:
++    - 原 main() 直接对 `np.argwhere(g == marker_color)` 的每个像素扩写；融合后这会把一个 2x2 标记误当成四个标记，因此必须改成先检测孤立 2x2 色块。
++    - 原 `_has_source_glyph()` 与 `_paint_clipped()` 默认 4x4；融合后都必须改成读取 `mask.shape`。
++    - 原图例跳过条件使用固定偏移 `(r-4, c-4)`；融合后必须按当前颜色对应的 `size` 回推 `(r-size, c-size)`。
++    - 原 seen_marker 只需见到任一控制像素；融合后应统计检测到的 2x2 标记块，否则单个噪声像素会错误满足断言。
++    - 新增的 `_is_marker_block()` 依赖“标记块是孤立精确 2x2，同色邻接不会继续延展”的前提，因此 generator 需要显式保证该结构。
++  d_placement_legality:
++    - 真实 2x2 标记块放在规则锚点格上，行列间距从 {6,7} 取值，确保最大 6x6 输出字形也不会与邻居重叠。
++    - 锚点只要求 2x2 标记本身完全落在网格内，因此靠近下边或右边时仍可触发输出裁剪。
++    - 图例样本要求整个 glyph bbox、右下 2x2 标签块、以及其外侧一圈缓冲区都落在空白区域内，避免与真实标记或其他图例缠在一起。
++  e_visual_observability:
++    - 输入里 2x2 标记块与输出里的 3x3~6x6 字形形成明显的尺度层级，人眼可直接区分“控制标记”和“被展开的图形”。
++    - 不同颜色反复出现时，解题者能同时观察到三条稳定关系：同色 2x2 块总是映射到同一种输出颜色、同一种图案、同一种尺寸。
++    - 图例标签本身也是 2x2 块，进一步提示“真正需要读取的是一个小色块，而不是色块中的四个独立像素”。
++  f_visual_tidiness:
++    - 真实输出字形之间不重叠，图例区域与真实标记网格分离，因此网格不会出现难以拆分来源的覆盖。
++    - 2x2 标记块比单像素更显眼，但仍远小于 3x3~6x6 字形，不会喧宾夺主。
++    - 图例标签与样本字形对角相邻，关系清晰且不与样本本体融合成更大块。
++  g_color_change_inferability:
++    - 颜色映射仍沿用原题的四组固定对应，没有额外引入新的颜色机制。
++    - 新增难点完全来自几何层面：解题者需要从颜色稳定地推断尺寸，而不是从不可见的颜色 id 数值做排序或计算。
++  generator_guarantees_for_new_main:
++    - 每个输入至少有一个真实 2x2 标记块，且至少两种真实颜色，因此 D3 与 D5 都会实际参与。
++    - 所有真实标记块和图例标签块都满足“孤立精确 2x2”的检测条件，因此 solver 的块识别不会退化为逐像素处理。
++    - 所有图例标签都严格放在对应样本的 (+size, +size) 位置，保证 `main()` 的 skip 分支有构造性支撑。
++    - 在这些样本上，原始单像素/固定 4x4 solver 会把每个 2x2 块扩成多个 4x4 图形，故其输出与融合 solver 明显不同，可用于反退化检查。
++"""
++
++
++MARKER_BLOCK_SIZE = 2
++
++
++def _frame_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == 0) | (rr == size - 1) | (cc == 0) | (cc == size - 1)
++
++
++def _diamond_ring_mask(size: int) -> np.ndarray:
++    center = (size - 1) / 2.0
++    radius = (size - 1) / 2.0
++    rr, cc = np.indices((size, size))
++    dist = np.abs(rr - center) + np.abs(cc - center)
++    return (dist >= radius - 0.5) & (dist <= radius + 0.5)
++
++
++def _diag_blocks_mask(size: int) -> np.ndarray:
++    block = max(1, size // 2)
++    mask = np.zeros((size, size), dtype=bool)
++    mask[:block, :block] = True
++    mask[size - block :, size - block :] = True
++    return mask
++
++
++def _x_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == cc) | (rr + cc == size - 1)
++
++
++GLYPHS: dict[int, tuple[int, int, np.ndarray]] = {
++    2: (4, 3, _frame_mask(3)),
++    3: (1, 4, _diamond_ring_mask(4)),
++    5: (6, 5, _diag_blocks_mask(5)),
++    8: (7, 6, _x_mask(6)),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    gh, gw = mask.shape
++    if r0 < 0 or c0 < 0 or r0 + gh > h or c0 + gw > w:
++        return False
++    patch = g[r0 : r0 + gh, c0 : c0 + gw]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    gh, gw = mask.shape
++    for dr in range(gh):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(gw):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _is_marker_block(g: np.ndarray, r0: int, c0: int, color: int) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + MARKER_BLOCK_SIZE > h or c0 + MARKER_BLOCK_SIZE > w:
++        return False
++    if not np.all(g[r0 : r0 + MARKER_BLOCK_SIZE, c0 : c0 + MARKER_BLOCK_SIZE] == color):
++        return False
++
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + MARKER_BLOCK_SIZE + 1)
++    neighborhood = g[rs:re, cs:ce]
++    same_color = neighborhood == color
++    allowed = np.zeros_like(same_color, dtype=bool)
++    allowed[r0 - rs : r0 - rs + MARKER_BLOCK_SIZE, c0 - cs : c0 - cs + MARKER_BLOCK_SIZE] = True
++    return not np.any(same_color & ~allowed)
++
++
++def _find_marker_blocks(g: np.ndarray, color: int) -> list[tuple[int, int]]:
++    h, w = g.shape
++    return [
++        (r, c)
++        for r in range(max(0, h - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, w - MARKER_BLOCK_SIZE + 1))
++        if _is_marker_block(g, r, c, color)
++    ]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each 2x2 control block into the variable-size glyph assigned to its color.
++
++    Input structure:
++    - Black background with isolated 2x2 marker blocks in colors 2, 3, 5, and/or 8; each block's top-left cell is the placement anchor.
++    - Some inputs also include 1-2 legend samples: a glyph already drawn in its output color, plus a matching 2x2 label block placed one glyph-size down and right from that sample.
++
++    Rule:
++    - Replace every real 2x2 marker block by its color's output glyph, using both the mapped output color and the mapped size: 2->3x3 frame, 3->4x4 diamond ring, 5->5x5 diagonal blocks, 8->6x6 X.
++    - Paint each glyph with its top-left corner aligned to the marker block's top-left cell, clipping any part that extends beyond the grid.
++    - Remove legend samples and skip the 2x2 label blocks that sit at (+size, +size) from a matching sample glyph.
++
++    Key insight:
++    - The control object is no longer a single pixel but an entire 2x2 same-color block, and that block's color now determines both which glyph family to draw and how large the glyph should be.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    marker_block_count = 0
++    for marker_color, (glyph_color, size, mask) in GLYPHS.items():
++        blocks = _find_marker_blocks(g, marker_color)
++        marker_block_count += len(blocks)
++        for r, c in blocks:
++            if _has_source_glyph(g, r - size, c - size, glyph_color, mask):
++                continue
++            _paint_clipped(out, r, c, glyph_color, mask)
++
++    assert marker_block_count > 0
++    return out
++
++
++GRID_SIZE_OPTIONS = (20, 24)
++ROWCOL_COUNT_RANGE = (2, 4)
++SPACING_OPTIONS = (6, 7)
++FILL_RATE_RANGE = (0.65, 1.0)
++GEN_RETRIES = 500
++
++
++def _choose_real_markers(
++    anchors: list[tuple[int, int]],
++    used_colors: list[int],
++) -> list[tuple[int, int, int]]:
++    cell_count = len(anchors)
++    min_fill = max(
++        len(used_colors) * 2,
++        int(np.ceil(cell_count * random.uniform(*FILL_RATE_RANGE))),
++    )
++    min_fill = min(cell_count, max(len(used_colors), min_fill))
++    fill_count = random.randint(min_fill, cell_count)
++
++    chosen_positions = random.sample(anchors, fill_count)
++    assignments = used_colors * 2
++    while len(assignments) < fill_count:
++        assignments.append(random.choice(used_colors))
++    assignments = assignments[:fill_count]
++    random.shuffle(assignments)
++    return [(r, c, color) for (r, c), color in zip(chosen_positions, assignments, strict=True)]
++
++
++def _can_place_legend(grid: np.ndarray, r0: int, c0: int, size: int) -> bool:
++    h, w = grid.shape
++    if r0 < 0 or c0 < 0 or r0 + size + MARKER_BLOCK_SIZE > h or c0 + size + MARKER_BLOCK_SIZE > w:
++        return False
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + size + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + size + MARKER_BLOCK_SIZE + 1)
++    return not np.any(grid[rs:re, cs:ce] != 0)
++
++
++def _try_place_legend(grid: np.ndarray, marker_color: int) -> bool:
++    glyph_color, size, mask = GLYPHS[marker_color]
++    candidates = [
++        (r, c)
++        for r in range(max(0, grid.shape[0] - size - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, grid.shape[1] - size - MARKER_BLOCK_SIZE + 1))
++    ]
++    random.shuffle(candidates)
++    for r0, c0 in candidates:
++        if not _can_place_legend(grid, r0, c0, size):
++            continue
++        grid[r0 : r0 + size, c0 : c0 + size][mask] = glyph_color
++        grid[
++            r0 + size : r0 + size + MARKER_BLOCK_SIZE,
++            c0 + size : c0 + size + MARKER_BLOCK_SIZE,
++        ] = marker_color
++        return True
++    return False
++
++
++def _build_expected(height: int, width: int, markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((height, width), dtype=int)
++    for r, c, marker_color in markers:
++        glyph_color, _size, mask = GLYPHS[marker_color]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    """
++    Construct a sparse lattice of 2x2 marker blocks plus 1-2 legends for the fused rule.
++    """
++    for _ in range(GEN_RETRIES):
++        height = width = random.choice(GRID_SIZE_OPTIONS)
++        row_count = random.randint(*ROWCOL_COUNT_RANGE)
++        col_count = random.randint(*ROWCOL_COUNT_RANGE)
++        row_spacing = random.choice(SPACING_OPTIONS)
++        col_spacing = random.choice(SPACING_OPTIONS)
++        max_row_start = height - MARKER_BLOCK_SIZE - (row_count - 1) * row_spacing
++        max_col_start = width - MARKER_BLOCK_SIZE - (col_count - 1) * col_spacing
++        if max_row_start < 0 or max_col_start < 0:
++            continue
++
++        row0 = random.randint(0, max_row_start)
++        col0 = random.randint(0, max_col_start)
++        anchors = [
++            (row0 + rr * row_spacing, col0 + cc * col_spacing)
++            for rr in range(row_count)
++            for cc in range(col_count)
++        ]
++
++        max_used = min(4, len(anchors) // 2)
++        if max_used < 2:
++            continue
++        used_count = random.randint(2, max_used)
++        used_colors = random.sample(list(GLYPHS), used_count)
++        real_markers = _choose_real_markers(anchors, used_colors)
++
++        grid = np.zeros((height, width), dtype=int)
++        for r, c, marker_color in real_markers:
++            grid[r : r + MARKER_BLOCK_SIZE, c : c + MARKER_BLOCK_SIZE] = marker_color
++
++        legend_target_count = 1 + int(len(used_colors) > 2 and random.random() < 0.4)
++        legend_colors = random.sample(used_colors, legend_target_count)
++        placed_legends = 0
++        for marker_color in legend_colors:
++            placed_legends += int(_try_place_legend(grid, marker_color))
++        if placed_legends == 0:
++            continue
++
++        expected = _build_expected(height, width, real_markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid fused dfadab01 instance")
+
+diff --git a/ceshi/code_combo/dfadab01/24/code.py b/ceshi/code_combo/dfadab01/24/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e88d9f75319d914afa03ffb50751f0e10c2913f6
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/24/code.py
+@@ -0,0 +1,296 @@
++# Combo variant of dfadab01 (index 24)
++# combo_spec: D3/0+D5/2
++# Name: 2x2色块标记+可变尺寸字形
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++"""
++design_analysis:
++  a_concretization_and_trace:
++    original_scene:
++      - 原题把颜色 2/3/5/8 的单像素当作控制标记；输出时每个像素都扩成固定 4x4 字形。
++      - 若输入里还出现一个已画好的样本字形，则它只是图例；其右下角的同色单像素标签不参与输出。
++    fused_scene:
++      - 真实标记与图例标签都改成 2x2 同色色块，字形锚点取该色块左上角。
++      - 颜色仍决定图案家族与输出颜色，但现在还决定 bbox 尺寸：2->3x3，3->4x4，5->5x5，8->6x6。
++      - 图例标签也随尺寸变化，位于样本字形左上角的 (+size, +size)，且自身占 2x2。
++    concrete_trace:
++      - 例如输入在左上角 (8, 11) 放一个颜色 5 的 2x2 色块，原题若把四个像素都当单标记，会错误地产生四个互相平移的 4x4 字形。
++      - 融合后 solver 必须先把这四个像素识别为“一个 2x2 标记块”，再只用其左上角 (8, 11) 画一个 5x5 的对角双块字形。
++      - 若另有颜色 3 的图例样本放在 (2, 14)，则其 4x4 蓝色菱形环只是提示；位于 (6, 18) 的绿色 2x2 标签块要被识别并跳过，而不是扩写。
++      - 因此和原题相比，变化同时发生在“标记粒度”“图例标签几何”“字形尺寸”“裁剪范围”四个环节上。
++  b_complexity_calibration:
++    - 尺寸只用四个离散档位 {3,4,5,6}，与四种颜色一一对应，避免自由度过高。
++    - 每个样例至少使用两种真实标记色，并给每种已用颜色至少两个真实标记，保证人类能看到重复支撑。
++    - 图例仍保留 1-2 个，提供“颜色 -> 输出颜色/图案/尺寸”的直接可见线索，而不是依赖颜色数值。
++  c_implicit_assumption_review_of_main:
++    - 原 main() 直接对 `np.argwhere(g == marker_color)` 的每个像素扩写；融合后这会把一个 2x2 标记误当成四个标记，因此必须改成先检测孤立 2x2 色块。
++    - 原 `_has_source_glyph()` 与 `_paint_clipped()` 默认 4x4；融合后都必须改成读取 `mask.shape`。
++    - 原图例跳过条件使用固定偏移 `(r-4, c-4)`；融合后必须按当前颜色对应的 `size` 回推 `(r-size, c-size)`。
++    - 原 seen_marker 只需见到任一控制像素；融合后应统计检测到的 2x2 标记块，否则单个噪声像素会错误满足断言。
++    - 新增的 `_is_marker_block()` 依赖“标记块是孤立精确 2x2，同色邻接不会继续延展”的前提，因此 generator 需要显式保证该结构。
++  d_placement_legality:
++    - 真实 2x2 标记块放在规则锚点格上，行列间距从 {6,7} 取值，确保最大 6x6 输出字形也不会与邻居重叠。
++    - 锚点只要求 2x2 标记本身完全落在网格内，因此靠近下边或右边时仍可触发输出裁剪。
++    - 图例样本要求整个 glyph bbox、右下 2x2 标签块、以及其外侧一圈缓冲区都落在空白区域内，避免与真实标记或其他图例缠在一起。
++  e_visual_observability:
++    - 输入里 2x2 标记块与输出里的 3x3~6x6 字形形成明显的尺度层级，人眼可直接区分“控制标记”和“被展开的图形”。
++    - 不同颜色反复出现时，解题者能同时观察到三条稳定关系：同色 2x2 块总是映射到同一种输出颜色、同一种图案、同一种尺寸。
++    - 图例标签本身也是 2x2 块，进一步提示“真正需要读取的是一个小色块，而不是色块中的四个独立像素”。
++  f_visual_tidiness:
++    - 真实输出字形之间不重叠，图例区域与真实标记网格分离，因此网格不会出现难以拆分来源的覆盖。
++    - 2x2 标记块比单像素更显眼，但仍远小于 3x3~6x6 字形，不会喧宾夺主。
++    - 图例标签与样本字形对角相邻，关系清晰且不与样本本体融合成更大块。
++  g_color_change_inferability:
++    - 颜色映射仍沿用原题的四组固定对应，没有额外引入新的颜色机制。
++    - 新增难点完全来自几何层面：解题者需要从颜色稳定地推断尺寸，而不是从不可见的颜色 id 数值做排序或计算。
++  generator_guarantees_for_new_main:
++    - 每个输入至少有一个真实 2x2 标记块，且至少两种真实颜色，因此 D3 与 D5 都会实际参与。
++    - 所有真实标记块和图例标签块都满足“孤立精确 2x2”的检测条件，因此 solver 的块识别不会退化为逐像素处理。
++    - 所有图例标签都严格放在对应样本的 (+size, +size) 位置，保证 `main()` 的 skip 分支有构造性支撑。
++    - 在这些样本上，原始单像素/固定 4x4 solver 会把每个 2x2 块扩成多个 4x4 图形，故其输出与融合 solver 明显不同，可用于反退化检查。
++"""
++
++
++MARKER_BLOCK_SIZE = 2
++
++
++def _frame_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == 0) | (rr == size - 1) | (cc == 0) | (cc == size - 1)
++
++
++def _diamond_ring_mask(size: int) -> np.ndarray:
++    center = (size - 1) / 2.0
++    radius = (size - 1) / 2.0
++    rr, cc = np.indices((size, size))
++    dist = np.abs(rr - center) + np.abs(cc - center)
++    return (dist >= radius - 0.5) & (dist <= radius + 0.5)
++
++
++def _diag_blocks_mask(size: int) -> np.ndarray:
++    block = max(1, size // 2)
++    mask = np.zeros((size, size), dtype=bool)
++    mask[:block, :block] = True
++    mask[size - block :, size - block :] = True
++    return mask
++
++
++def _x_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == cc) | (rr + cc == size - 1)
++
++
++GLYPHS: dict[int, tuple[int, int, np.ndarray]] = {
++    2: (4, 3, _frame_mask(3)),
++    3: (1, 4, _diamond_ring_mask(4)),
++    5: (6, 5, _diag_blocks_mask(5)),
++    8: (7, 6, _x_mask(6)),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    gh, gw = mask.shape
++    if r0 < 0 or c0 < 0 or r0 + gh > h or c0 + gw > w:
++        return False
++    patch = g[r0 : r0 + gh, c0 : c0 + gw]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    gh, gw = mask.shape
++    for dr in range(gh):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(gw):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _is_marker_block(g: np.ndarray, r0: int, c0: int, color: int) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + MARKER_BLOCK_SIZE > h or c0 + MARKER_BLOCK_SIZE > w:
++        return False
++    if not np.all(g[r0 : r0 + MARKER_BLOCK_SIZE, c0 : c0 + MARKER_BLOCK_SIZE] == color):
++        return False
++
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + MARKER_BLOCK_SIZE + 1)
++    neighborhood = g[rs:re, cs:ce]
++    same_color = neighborhood == color
++    allowed = np.zeros_like(same_color, dtype=bool)
++    allowed[r0 - rs : r0 - rs + MARKER_BLOCK_SIZE, c0 - cs : c0 - cs + MARKER_BLOCK_SIZE] = True
++    return not np.any(same_color & ~allowed)
++
++
++def _find_marker_blocks(g: np.ndarray, color: int) -> list[tuple[int, int]]:
++    h, w = g.shape
++    return [
++        (r, c)
++        for r in range(max(0, h - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, w - MARKER_BLOCK_SIZE + 1))
++        if _is_marker_block(g, r, c, color)
++    ]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each 2x2 control block into the variable-size glyph assigned to its color.
++
++    Input structure:
++    - Black background with isolated 2x2 marker blocks in colors 2, 3, 5, and/or 8; each block's top-left cell is the placement anchor.
++    - Some inputs also include 1-2 legend samples: a glyph already drawn in its output color, plus a matching 2x2 label block placed one glyph-size down and right from that sample.
++
++    Rule:
++    - Replace every real 2x2 marker block by its color's output glyph, using both the mapped output color and the mapped size: 2->3x3 frame, 3->4x4 diamond ring, 5->5x5 diagonal blocks, 8->6x6 X.
++    - Paint each glyph with its top-left corner aligned to the marker block's top-left cell, clipping any part that extends beyond the grid.
++    - Remove legend samples and skip the 2x2 label blocks that sit at (+size, +size) from a matching sample glyph.
++
++    Key insight:
++    - The control object is no longer a single pixel but an entire 2x2 same-color block, and that block's color now determines both which glyph family to draw and how large the glyph should be.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    marker_block_count = 0
++    for marker_color, (glyph_color, size, mask) in GLYPHS.items():
++        blocks = _find_marker_blocks(g, marker_color)
++        marker_block_count += len(blocks)
++        for r, c in blocks:
++            if _has_source_glyph(g, r - size, c - size, glyph_color, mask):
++                continue
++            _paint_clipped(out, r, c, glyph_color, mask)
++
++    assert marker_block_count > 0
++    return out
++
++
++GRID_SIZE_OPTIONS = (20, 24)
++ROWCOL_COUNT_RANGE = (2, 4)
++SPACING_OPTIONS = (6, 7)
++FILL_RATE_RANGE = (0.65, 1.0)
++GEN_RETRIES = 500
++
++
++def _choose_real_markers(
++    anchors: list[tuple[int, int]],
++    used_colors: list[int],
++) -> list[tuple[int, int, int]]:
++    cell_count = len(anchors)
++    min_fill = max(
++        len(used_colors) * 2,
++        int(np.ceil(cell_count * random.uniform(*FILL_RATE_RANGE))),
++    )
++    min_fill = min(cell_count, max(len(used_colors), min_fill))
++    fill_count = random.randint(min_fill, cell_count)
++
++    chosen_positions = random.sample(anchors, fill_count)
++    assignments = used_colors * 2
++    while len(assignments) < fill_count:
++        assignments.append(random.choice(used_colors))
++    assignments = assignments[:fill_count]
++    random.shuffle(assignments)
++    return [(r, c, color) for (r, c), color in zip(chosen_positions, assignments, strict=True)]
++
++
++def _can_place_legend(grid: np.ndarray, r0: int, c0: int, size: int) -> bool:
++    h, w = grid.shape
++    if r0 < 0 or c0 < 0 or r0 + size + MARKER_BLOCK_SIZE > h or c0 + size + MARKER_BLOCK_SIZE > w:
++        return False
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + size + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + size + MARKER_BLOCK_SIZE + 1)
++    return not np.any(grid[rs:re, cs:ce] != 0)
++
++
++def _try_place_legend(grid: np.ndarray, marker_color: int) -> bool:
++    glyph_color, size, mask = GLYPHS[marker_color]
++    candidates = [
++        (r, c)
++        for r in range(max(0, grid.shape[0] - size - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, grid.shape[1] - size - MARKER_BLOCK_SIZE + 1))
++    ]
++    random.shuffle(candidates)
++    for r0, c0 in candidates:
++        if not _can_place_legend(grid, r0, c0, size):
++            continue
++        grid[r0 : r0 + size, c0 : c0 + size][mask] = glyph_color
++        grid[
++            r0 + size : r0 + size + MARKER_BLOCK_SIZE,
++            c0 + size : c0 + size + MARKER_BLOCK_SIZE,
++        ] = marker_color
++        return True
++    return False
++
++
++def _build_expected(height: int, width: int, markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((height, width), dtype=int)
++    for r, c, marker_color in markers:
++        glyph_color, _size, mask = GLYPHS[marker_color]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    """
++    Construct a sparse lattice of 2x2 marker blocks plus 1-2 legends for the fused rule.
++    """
++    for _ in range(GEN_RETRIES):
++        height = width = random.choice(GRID_SIZE_OPTIONS)
++        row_count = random.randint(*ROWCOL_COUNT_RANGE)
++        col_count = random.randint(*ROWCOL_COUNT_RANGE)
++        row_spacing = random.choice(SPACING_OPTIONS)
++        col_spacing = random.choice(SPACING_OPTIONS)
++        max_row_start = height - MARKER_BLOCK_SIZE - (row_count - 1) * row_spacing
++        max_col_start = width - MARKER_BLOCK_SIZE - (col_count - 1) * col_spacing
++        if max_row_start < 0 or max_col_start < 0:
++            continue
++
++        row0 = random.randint(0, max_row_start)
++        col0 = random.randint(0, max_col_start)
++        anchors = [
++            (row0 + rr * row_spacing, col0 + cc * col_spacing)
++            for rr in range(row_count)
++            for cc in range(col_count)
++        ]
++
++        max_used = min(4, len(anchors) // 2)
++        if max_used < 2:
++            continue
++        used_count = random.randint(2, max_used)
++        used_colors = random.sample(list(GLYPHS), used_count)
++        real_markers = _choose_real_markers(anchors, used_colors)
++
++        grid = np.zeros((height, width), dtype=int)
++        for r, c, marker_color in real_markers:
++            grid[r : r + MARKER_BLOCK_SIZE, c : c + MARKER_BLOCK_SIZE] = marker_color
++
++        legend_target_count = 1 + int(len(used_colors) > 2 and random.random() < 0.4)
++        legend_colors = random.sample(used_colors, legend_target_count)
++        placed_legends = 0
++        for marker_color in legend_colors:
++            placed_legends += int(_try_place_legend(grid, marker_color))
++        if placed_legends == 0:
++            continue
++
++        expected = _build_expected(height, width, real_markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid fused dfadab01 instance")
+
+codex
+代码已写入。现在先跑用户给的 50 次稳定性测试；如果有失败，再针对具体崩点修改 solver 或 generator。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/24/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/24/code.py b/ceshi/code_combo/dfadab01/24/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e88d9f75319d914afa03ffb50751f0e10c2913f6
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/24/code.py
+@@ -0,0 +1,296 @@
++# Combo variant of dfadab01 (index 24)
++# combo_spec: D3/0+D5/2
++# Name: 2x2色块标记+可变尺寸字形
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++"""
++design_analysis:
++  a_concretization_and_trace:
++    original_scene:
++      - 原题把颜色 2/3/5/8 的单像素当作控制标记；输出时每个像素都扩成固定 4x4 字形。
++      - 若输入里还出现一个已画好的样本字形，则它只是图例；其右下角的同色单像素标签不参与输出。
++    fused_scene:
++      - 真实标记与图例标签都改成 2x2 同色色块，字形锚点取该色块左上角。
++      - 颜色仍决定图案家族与输出颜色，但现在还决定 bbox 尺寸：2->3x3，3->4x4，5->5x5，8->6x6。
++      - 图例标签也随尺寸变化，位于样本字形左上角的 (+size, +size)，且自身占 2x2。
++    concrete_trace:
++      - 例如输入在左上角 (8, 11) 放一个颜色 5 的 2x2 色块，原题若把四个像素都当单标记，会错误地产生四个互相平移的 4x4 字形。
++      - 融合后 solver 必须先把这四个像素识别为“一个 2x2 标记块”，再只用其左上角 (8, 11) 画一个 5x5 的对角双块字形。
++      - 若另有颜色 3 的图例样本放在 (2, 14)，则其 4x4 蓝色菱形环只是提示；位于 (6, 18) 的绿色 2x2 标签块要被识别并跳过，而不是扩写。
++      - 因此和原题相比，变化同时发生在“标记粒度”“图例标签几何”“字形尺寸”“裁剪范围”四个环节上。
++  b_complexity_calibration:
++    - 尺寸只用四个离散档位 {3,4,5,6}，与四种颜色一一对应，避免自由度过高。
++    - 每个样例至少使用两种真实标记色，并给每种已用颜色至少两个真实标记，保证人类能看到重复支撑。
++    - 图例仍保留 1-2 个，提供“颜色 -> 输出颜色/图案/尺寸”的直接可见线索，而不是依赖颜色数值。
++  c_implicit_assumption_review_of_main:
++    - 原 main() 直接对 `np.argwhere(g == marker_color)` 的每个像素扩写；融合后这会把一个 2x2 标记误当成四个标记，因此必须改成先检测孤立 2x2 色块。
++    - 原 `_has_source_glyph()` 与 `_paint_clipped()` 默认 4x4；融合后都必须改成读取 `mask.shape`。
++    - 原图例跳过条件使用固定偏移 `(r-4, c-4)`；融合后必须按当前颜色对应的 `size` 回推 `(r-size, c-size)`。
++    - 原 seen_marker 只需见到任一控制像素；融合后应统计检测到的 2x2 标记块，否则单个噪声像素会错误满足断言。
++    - 新增的 `_is_marker_block()` 依赖“标记块是孤立精确 2x2，同色邻接不会继续延展”的前提，因此 generator 需要显式保证该结构。
++  d_placement_legality:
++    - 真实 2x2 标记块放在规则锚点格上，行列间距从 {6,7} 取值，确保最大 6x6 输出字形也不会与邻居重叠。
++    - 锚点只要求 2x2 标记本身完全落在网格内，因此靠近下边或右边时仍可触发输出裁剪。
++    - 图例样本要求整个 glyph bbox、右下 2x2 标签块、以及其外侧一圈缓冲区都落在空白区域内，避免与真实标记或其他图例缠在一起。
++  e_visual_observability:
++    - 输入里 2x2 标记块与输出里的 3x3~6x6 字形形成明显的尺度层级，人眼可直接区分“控制标记”和“被展开的图形”。
++    - 不同颜色反复出现时，解题者能同时观察到三条稳定关系：同色 2x2 块总是映射到同一种输出颜色、同一种图案、同一种尺寸。
++    - 图例标签本身也是 2x2 块，进一步提示“真正需要读取的是一个小色块，而不是色块中的四个独立像素”。
++  f_visual_tidiness:
++    - 真实输出字形之间不重叠，图例区域与真实标记网格分离，因此网格不会出现难以拆分来源的覆盖。
++    - 2x2 标记块比单像素更显眼，但仍远小于 3x3~6x6 字形，不会喧宾夺主。
++    - 图例标签与样本字形对角相邻，关系清晰且不与样本本体融合成更大块。
++  g_color_change_inferability:
++    - 颜色映射仍沿用原题的四组固定对应，没有额外引入新的颜色机制。
++    - 新增难点完全来自几何层面：解题者需要从颜色稳定地推断尺寸，而不是从不可见的颜色 id 数值做排序或计算。
++  generator_guarantees_for_new_main:
++    - 每个输入至少有一个真实 2x2 标记块，且至少两种真实颜色，因此 D3 与 D5 都会实际参与。
++    - 所有真实标记块和图例标签块都满足“孤立精确 2x2”的检测条件，因此 solver 的块识别不会退化为逐像素处理。
++    - 所有图例标签都严格放在对应样本的 (+size, +size) 位置，保证 `main()` 的 skip 分支有构造性支撑。
++    - 在这些样本上，原始单像素/固定 4x4 solver 会把每个 2x2 块扩成多个 4x4 图形，故其输出与融合 solver 明显不同，可用于反退化检查。
++"""
++
++
++MARKER_BLOCK_SIZE = 2
++
++
++def _frame_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == 0) | (rr == size - 1) | (cc == 0) | (cc == size - 1)
++
++
++def _diamond_ring_mask(size: int) -> np.ndarray:
++    center = (size - 1) / 2.0
++    radius = (size - 1) / 2.0
++    rr, cc = np.indices((size, size))
++    dist = np.abs(rr - center) + np.abs(cc - center)
++    return (dist >= radius - 0.5) & (dist <= radius + 0.5)
++
++
++def _diag_blocks_mask(size: int) -> np.ndarray:
++    block = max(1, size // 2)
++    mask = np.zeros((size, size), dtype=bool)
++    mask[:block, :block] = True
++    mask[size - block :, size - block :] = True
++    return mask
++
++
++def _x_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == cc) | (rr + cc == size - 1)
++
++
++GLYPHS: dict[int, tuple[int, int, np.ndarray]] = {
++    2: (4, 3, _frame_mask(3)),
++    3: (1, 4, _diamond_ring_mask(4)),
++    5: (6, 5, _diag_blocks_mask(5)),
++    8: (7, 6, _x_mask(6)),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    gh, gw = mask.shape
++    if r0 < 0 or c0 < 0 or r0 + gh > h or c0 + gw > w:
++        return False
++    patch = g[r0 : r0 + gh, c0 : c0 + gw]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    gh, gw = mask.shape
++    for dr in range(gh):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(gw):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _is_marker_block(g: np.ndarray, r0: int, c0: int, color: int) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + MARKER_BLOCK_SIZE > h or c0 + MARKER_BLOCK_SIZE > w:
++        return False
++    if not np.all(g[r0 : r0 + MARKER_BLOCK_SIZE, c0 : c0 + MARKER_BLOCK_SIZE] == color):
++        return False
++
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + MARKER_BLOCK_SIZE + 1)
++    neighborhood = g[rs:re, cs:ce]
++    same_color = neighborhood == color
++    allowed = np.zeros_like(same_color, dtype=bool)
++    allowed[r0 - rs : r0 - rs + MARKER_BLOCK_SIZE, c0 - cs : c0 - cs + MARKER_BLOCK_SIZE] = True
++    return not np.any(same_color & ~allowed)
++
++
++def _find_marker_blocks(g: np.ndarray, color: int) -> list[tuple[int, int]]:
++    h, w = g.shape
++    return [
++        (r, c)
++        for r in range(max(0, h - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, w - MARKER_BLOCK_SIZE + 1))
++        if _is_marker_block(g, r, c, color)
++    ]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each 2x2 control block into the variable-size glyph assigned to its color.
++
++    Input structure:
++    - Black background with isolated 2x2 marker blocks in colors 2, 3, 5, and/or 8; each block's top-left cell is the placement anchor.
++    - Some inputs also include 1-2 legend samples: a glyph already drawn in its output color, plus a matching 2x2 label block placed one glyph-size down and right from that sample.
++
++    Rule:
++    - Replace every real 2x2 marker block by its color's output glyph, using both the mapped output color and the mapped size: 2->3x3 frame, 3->4x4 diamond ring, 5->5x5 diagonal blocks, 8->6x6 X.
++    - Paint each glyph with its top-left corner aligned to the marker block's top-left cell, clipping any part that extends beyond the grid.
++    - Remove legend samples and skip the 2x2 label blocks that sit at (+size, +size) from a matching sample glyph.
++
++    Key insight:
++    - The control object is no longer a single pixel but an entire 2x2 same-color block, and that block's color now determines both which glyph family to draw and how large the glyph should be.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    marker_block_count = 0
++    for marker_color, (glyph_color, size, mask) in GLYPHS.items():
++        blocks = _find_marker_blocks(g, marker_color)
++        marker_block_count += len(blocks)
++        for r, c in blocks:
++            if _has_source_glyph(g, r - size, c - size, glyph_color, mask):
++                continue
++            _paint_clipped(out, r, c, glyph_color, mask)
++
++    assert marker_block_count > 0
++    return out
++
++
++GRID_SIZE_OPTIONS = (20, 24)
++ROWCOL_COUNT_RANGE = (2, 4)
++SPACING_OPTIONS = (6, 7)
++FILL_RATE_RANGE = (0.65, 1.0)
++GEN_RETRIES = 500
++
++
++def _choose_real_markers(
++    anchors: list[tuple[int, int]],
++    used_colors: list[int],
++) -> list[tuple[int, int, int]]:
++    cell_count = len(anchors)
++    min_fill = max(
++        len(used_colors) * 2,
++        int(np.ceil(cell_count * random.uniform(*FILL_RATE_RANGE))),
++    )
++    min_fill = min(cell_count, max(len(used_colors), min_fill))
++    fill_count = random.randint(min_fill, cell_count)
++
++    chosen_positions = random.sample(anchors, fill_count)
++    assignments = used_colors * 2
++    while len(assignments) < fill_count:
++        assignments.append(random.choice(used_colors))
++    assignments = assignments[:fill_count]
++    random.shuffle(assignments)
++    return [(r, c, color) for (r, c), color in zip(chosen_positions, assignments, strict=True)]
++
++
++def _can_place_legend(grid: np.ndarray, r0: int, c0: int, size: int) -> bool:
++    h, w = grid.shape
++    if r0 < 0 or c0 < 0 or r0 + size + MARKER_BLOCK_SIZE > h or c0 + size + MARKER_BLOCK_SIZE > w:
++        return False
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + size + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + size + MARKER_BLOCK_SIZE + 1)
++    return not np.any(grid[rs:re, cs:ce] != 0)
++
++
++def _try_place_legend(grid: np.ndarray, marker_color: int) -> bool:
++    glyph_color, size, mask = GLYPHS[marker_color]
++    candidates = [
++        (r, c)
++        for r in range(max(0, grid.shape[0] - size - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, grid.shape[1] - size - MARKER_BLOCK_SIZE + 1))
++    ]
++    random.shuffle(candidates)
++    for r0, c0 in candidates:
++        if not _can_place_legend(grid, r0, c0, size):
++            continue
++        grid[r0 : r0 + size, c0 : c0 + size][mask] = glyph_color
++        grid[
++            r0 + size : r0 + size + MARKER_BLOCK_SIZE,
++            c0 + size : c0 + size + MARKER_BLOCK_SIZE,
++        ] = marker_color
++        return True
++    return False
++
++
++def _build_expected(height: int, width: int, markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((height, width), dtype=int)
++    for r, c, marker_color in markers:
++        glyph_color, _size, mask = GLYPHS[marker_color]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    """
++    Construct a sparse lattice of 2x2 marker blocks plus 1-2 legends for the fused rule.
++    """
++    for _ in range(GEN_RETRIES):
++        height = width = random.choice(GRID_SIZE_OPTIONS)
++        row_count = random.randint(*ROWCOL_COUNT_RANGE)
++        col_count = random.randint(*ROWCOL_COUNT_RANGE)
++        row_spacing = random.choice(SPACING_OPTIONS)
++        col_spacing = random.choice(SPACING_OPTIONS)
++        max_row_start = height - MARKER_BLOCK_SIZE - (row_count - 1) * row_spacing
++        max_col_start = width - MARKER_BLOCK_SIZE - (col_count - 1) * col_spacing
++        if max_row_start < 0 or max_col_start < 0:
++            continue
++
++        row0 = random.randint(0, max_row_start)
++        col0 = random.randint(0, max_col_start)
++        anchors = [
++            (row0 + rr * row_spacing, col0 + cc * col_spacing)
++            for rr in range(row_count)
++            for cc in range(col_count)
++        ]
++
++        max_used = min(4, len(anchors) // 2)
++        if max_used < 2:
++            continue
++        used_count = random.randint(2, max_used)
++        used_colors = random.sample(list(GLYPHS), used_count)
++        real_markers = _choose_real_markers(anchors, used_colors)
++
++        grid = np.zeros((height, width), dtype=int)
++        for r, c, marker_color in real_markers:
++            grid[r : r + MARKER_BLOCK_SIZE, c : c + MARKER_BLOCK_SIZE] = marker_color
++
++        legend_target_count = 1 + int(len(used_colors) > 2 and random.random() < 0.4)
++        legend_colors = random.sample(used_colors, legend_target_count)
++        placed_legends = 0
++        for marker_color in legend_colors:
++            placed_legends += int(_try_place_legend(grid, marker_color))
++        if placed_legends == 0:
++            continue
++
++        expected = _build_expected(height, width, real_markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid fused dfadab01 instance")
+
+ succeeded in 1626ms:
+Success: 50/50, Time: 1.4s (28ms/call)
+
+codex
+测试还在跑。我同时准备一轮反退化检查：不仅要看 `main(generate_input())` 是否成功，还要看这些输入是否真的迫使 solver 识别 2x2 标记并使用不同尺寸。
+diff --git a/ceshi/code_combo/dfadab01/24/code.py b/ceshi/code_combo/dfadab01/24/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e88d9f75319d914afa03ffb50751f0e10c2913f6
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/24/code.py
+@@ -0,0 +1,296 @@
++# Combo variant of dfadab01 (index 24)
++# combo_spec: D3/0+D5/2
++# Name: 2x2色块标记+可变尺寸字形
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++"""
++design_analysis:
++  a_concretization_and_trace:
++    original_scene:
++      - 原题把颜色 2/3/5/8 的单像素当作控制标记；输出时每个像素都扩成固定 4x4 字形。
++      - 若输入里还出现一个已画好的样本字形，则它只是图例；其右下角的同色单像素标签不参与输出。
++    fused_scene:
++      - 真实标记与图例标签都改成 2x2 同色色块，字形锚点取该色块左上角。
++      - 颜色仍决定图案家族与输出颜色，但现在还决定 bbox 尺寸：2->3x3，3->4x4，5->5x5，8->6x6。
++      - 图例标签也随尺寸变化，位于样本字形左上角的 (+size, +size)，且自身占 2x2。
++    concrete_trace:
++      - 例如输入在左上角 (8, 11) 放一个颜色 5 的 2x2 色块，原题若把四个像素都当单标记，会错误地产生四个互相平移的 4x4 字形。
++      - 融合后 solver 必须先把这四个像素识别为“一个 2x2 标记块”，再只用其左上角 (8, 11) 画一个 5x5 的对角双块字形。
++      - 若另有颜色 3 的图例样本放在 (2, 14)，则其 4x4 蓝色菱形环只是提示；位于 (6, 18) 的绿色 2x2 标签块要被识别并跳过，而不是扩写。
++      - 因此和原题相比，变化同时发生在“标记粒度”“图例标签几何”“字形尺寸”“裁剪范围”四个环节上。
++  b_complexity_calibration:
++    - 尺寸只用四个离散档位 {3,4,5,6}，与四种颜色一一对应，避免自由度过高。
++    - 每个样例至少使用两种真实标记色，并给每种已用颜色至少两个真实标记，保证人类能看到重复支撑。
++    - 图例仍保留 1-2 个，提供“颜色 -> 输出颜色/图案/尺寸”的直接可见线索，而不是依赖颜色数值。
++  c_implicit_assumption_review_of_main:
++    - 原 main() 直接对 `np.argwhere(g == marker_color)` 的每个像素扩写；融合后这会把一个 2x2 标记误当成四个标记，因此必须改成先检测孤立 2x2 色块。
++    - 原 `_has_source_glyph()` 与 `_paint_clipped()` 默认 4x4；融合后都必须改成读取 `mask.shape`。
++    - 原图例跳过条件使用固定偏移 `(r-4, c-4)`；融合后必须按当前颜色对应的 `size` 回推 `(r-size, c-size)`。
++    - 原 seen_marker 只需见到任一控制像素；融合后应统计检测到的 2x2 标记块，否则单个噪声像素会错误满足断言。
++    - 新增的 `_is_marker_block()` 依赖“标记块是孤立精确 2x2，同色邻接不会继续延展”的前提，因此 generator 需要显式保证该结构。
++  d_placement_legality:
++    - 真实 2x2 标记块放在规则锚点格上，行列间距从 {6,7} 取值，确保最大 6x6 输出字形也不会与邻居重叠。
++    - 锚点只要求 2x2 标记本身完全落在网格内，因此靠近下边或右边时仍可触发输出裁剪。
++    - 图例样本要求整个 glyph bbox、右下 2x2 标签块、以及其外侧一圈缓冲区都落在空白区域内，避免与真实标记或其他图例缠在一起。
++  e_visual_observability:
++    - 输入里 2x2 标记块与输出里的 3x3~6x6 字形形成明显的尺度层级，人眼可直接区分“控制标记”和“被展开的图形”。
++    - 不同颜色反复出现时，解题者能同时观察到三条稳定关系：同色 2x2 块总是映射到同一种输出颜色、同一种图案、同一种尺寸。
++    - 图例标签本身也是 2x2 块，进一步提示“真正需要读取的是一个小色块，而不是色块中的四个独立像素”。
++  f_visual_tidiness:
++    - 真实输出字形之间不重叠，图例区域与真实标记网格分离，因此网格不会出现难以拆分来源的覆盖。
++    - 2x2 标记块比单像素更显眼，但仍远小于 3x3~6x6 字形，不会喧宾夺主。
++    - 图例标签与样本字形对角相邻，关系清晰且不与样本本体融合成更大块。
++  g_color_change_inferability:
++    - 颜色映射仍沿用原题的四组固定对应，没有额外引入新的颜色机制。
++    - 新增难点完全来自几何层面：解题者需要从颜色稳定地推断尺寸，而不是从不可见的颜色 id 数值做排序或计算。
++  generator_guarantees_for_new_main:
++    - 每个输入至少有一个真实 2x2 标记块，且至少两种真实颜色，因此 D3 与 D5 都会实际参与。
++    - 所有真实标记块和图例标签块都满足“孤立精确 2x2”的检测条件，因此 solver 的块识别不会退化为逐像素处理。
++    - 所有图例标签都严格放在对应样本的 (+size, +size) 位置，保证 `main()` 的 skip 分支有构造性支撑。
++    - 在这些样本上，原始单像素/固定 4x4 solver 会把每个 2x2 块扩成多个 4x4 图形，故其输出与融合 solver 明显不同，可用于反退化检查。
++"""
++
++
++MARKER_BLOCK_SIZE = 2
++
++
++def _frame_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == 0) | (rr == size - 1) | (cc == 0) | (cc == size - 1)
++
++
++def _diamond_ring_mask(size: int) -> np.ndarray:
++    center = (size - 1) / 2.0
++    radius = (size - 1) / 2.0
++    rr, cc = np.indices((size, size))
++    dist = np.abs(rr - center) + np.abs(cc - center)
++    return (dist >= radius - 0.5) & (dist <= radius + 0.5)
++
++
++def _diag_blocks_mask(size: int) -> np.ndarray:
++    block = max(1, size // 2)
++    mask = np.zeros((size, size), dtype=bool)
++    mask[:block, :block] = True
++    mask[size - block :, size - block :] = True
++    return mask
++
++
++def _x_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == cc) | (rr + cc == size - 1)
++
++
++GLYPHS: dict[int, tuple[int, int, np.ndarray]] = {
++    2: (4, 3, _frame_mask(3)),
++    3: (1, 4, _diamond_ring_mask(4)),
++    5: (6, 5, _diag_blocks_mask(5)),
++    8: (7, 6, _x_mask(6)),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    gh, gw = mask.shape
++    if r0 < 0 or c0 < 0 or r0 + gh > h or c0 + gw > w:
++        return False
++    patch = g[r0 : r0 + gh, c0 : c0 + gw]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    gh, gw = mask.shape
++    for dr in range(gh):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(gw):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _is_marker_block(g: np.ndarray, r0: int, c0: int, color: int) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + MARKER_BLOCK_SIZE > h or c0 + MARKER_BLOCK_SIZE > w:
++        return False
++    if not np.all(g[r0 : r0 + MARKER_BLOCK_SIZE, c0 : c0 + MARKER_BLOCK_SIZE] == color):
++        return False
++
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + MARKER_BLOCK_SIZE + 1)
++    neighborhood = g[rs:re, cs:ce]
++    same_color = neighborhood == color
++    allowed = np.zeros_like(same_color, dtype=bool)
++    allowed[r0 - rs : r0 - rs + MARKER_BLOCK_SIZE, c0 - cs : c0 - cs + MARKER_BLOCK_SIZE] = True
++    return not np.any(same_color & ~allowed)
++
++
++def _find_marker_blocks(g: np.ndarray, color: int) -> list[tuple[int, int]]:
++    h, w = g.shape
++    return [
++        (r, c)
++        for r in range(max(0, h - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, w - MARKER_BLOCK_SIZE + 1))
++        if _is_marker_block(g, r, c, color)
++    ]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each 2x2 control block into the variable-size glyph assigned to its color.
++
++    Input structure:
++    - Black background with isolated 2x2 marker blocks in colors 2, 3, 5, and/or 8; each block's top-left cell is the placement anchor.
++    - Some inputs also include 1-2 legend samples: a glyph already drawn in its output color, plus a matching 2x2 label block placed one glyph-size down and right from that sample.
++
++    Rule:
++    - Replace every real 2x2 marker block by its color's output glyph, using both the mapped output color and the mapped size: 2->3x3 frame, 3->4x4 diamond ring, 5->5x5 diagonal blocks, 8->6x6 X.
++    - Paint each glyph with its top-left corner aligned to the marker block's top-left cell, clipping any part that extends beyond the grid.
++    - Remove legend samples and skip the 2x2 label blocks that sit at (+size, +size) from a matching sample glyph.
++
++    Key insight:
++    - The control object is no longer a single pixel but an entire 2x2 same-color block, and that block's color now determines both which glyph family to draw and how large the glyph should be.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    marker_block_count = 0
++    for marker_color, (glyph_color, size, mask) in GLYPHS.items():
++        blocks = _find_marker_blocks(g, marker_color)
++        marker_block_count += len(blocks)
++        for r, c in blocks:
++            if _has_source_glyph(g, r - size, c - size, glyph_color, mask):
++                continue
++            _paint_clipped(out, r, c, glyph_color, mask)
++
++    assert marker_block_count > 0
++    return out
++
++
++GRID_SIZE_OPTIONS = (20, 24)
++ROWCOL_COUNT_RANGE = (2, 4)
++SPACING_OPTIONS = (6, 7)
++FILL_RATE_RANGE = (0.65, 1.0)
++GEN_RETRIES = 500
++
++
++def _choose_real_markers(
++    anchors: list[tuple[int, int]],
++    used_colors: list[int],
++) -> list[tuple[int, int, int]]:
++    cell_count = len(anchors)
++    min_fill = max(
++        len(used_colors) * 2,
++        int(np.ceil(cell_count * random.uniform(*FILL_RATE_RANGE))),
++    )
++    min_fill = min(cell_count, max(len(used_colors), min_fill))
++    fill_count = random.randint(min_fill, cell_count)
++
++    chosen_positions = random.sample(anchors, fill_count)
++    assignments = used_colors * 2
++    while len(assignments) < fill_count:
++        assignments.append(random.choice(used_colors))
++    assignments = assignments[:fill_count]
++    random.shuffle(assignments)
++    return [(r, c, color) for (r, c), color in zip(chosen_positions, assignments, strict=True)]
++
++
++def _can_place_legend(grid: np.ndarray, r0: int, c0: int, size: int) -> bool:
++    h, w = grid.shape
++    if r0 < 0 or c0 < 0 or r0 + size + MARKER_BLOCK_SIZE > h or c0 + size + MARKER_BLOCK_SIZE > w:
++        return False
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + size + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + size + MARKER_BLOCK_SIZE + 1)
++    return not np.any(grid[rs:re, cs:ce] != 0)
++
++
++def _try_place_legend(grid: np.ndarray, marker_color: int) -> bool:
++    glyph_color, size, mask = GLYPHS[marker_color]
++    candidates = [
++        (r, c)
++        for r in range(max(0, grid.shape[0] - size - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, grid.shape[1] - size - MARKER_BLOCK_SIZE + 1))
++    ]
++    random.shuffle(candidates)
++    for r0, c0 in candidates:
++        if not _can_place_legend(grid, r0, c0, size):
++            continue
++        grid[r0 : r0 + size, c0 : c0 + size][mask] = glyph_color
++        grid[
++            r0 + size : r0 + size + MARKER_BLOCK_SIZE,
++            c0 + size : c0 + size + MARKER_BLOCK_SIZE,
++        ] = marker_color
++        return True
++    return False
++
++
++def _build_expected(height: int, width: int, markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((height, width), dtype=int)
++    for r, c, marker_color in markers:
++        glyph_color, _size, mask = GLYPHS[marker_color]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    """
++    Construct a sparse lattice of 2x2 marker blocks plus 1-2 legends for the fused rule.
++    """
++    for _ in range(GEN_RETRIES):
++        height = width = random.choice(GRID_SIZE_OPTIONS)
++        row_count = random.randint(*ROWCOL_COUNT_RANGE)
++        col_count = random.randint(*ROWCOL_COUNT_RANGE)
++        row_spacing = random.choice(SPACING_OPTIONS)
++        col_spacing = random.choice(SPACING_OPTIONS)
++        max_row_start = height - MARKER_BLOCK_SIZE - (row_count - 1) * row_spacing
++        max_col_start = width - MARKER_BLOCK_SIZE - (col_count - 1) * col_spacing
++        if max_row_start < 0 or max_col_start < 0:
++            continue
++
++        row0 = random.randint(0, max_row_start)
++        col0 = random.randint(0, max_col_start)
++        anchors = [
++            (row0 + rr * row_spacing, col0 + cc * col_spacing)
++            for rr in range(row_count)
++            for cc in range(col_count)
++        ]
++
++        max_used = min(4, len(anchors) // 2)
++        if max_used < 2:
++            continue
++        used_count = random.randint(2, max_used)
++        used_colors = random.sample(list(GLYPHS), used_count)
++        real_markers = _choose_real_markers(anchors, used_colors)
++
++        grid = np.zeros((height, width), dtype=int)
++        for r, c, marker_color in real_markers:
++            grid[r : r + MARKER_BLOCK_SIZE, c : c + MARKER_BLOCK_SIZE] = marker_color
++
++        legend_target_count = 1 + int(len(used_colors) > 2 and random.random() < 0.4)
++        legend_colors = random.sample(used_colors, legend_target_count)
++        placed_legends = 0
++        for marker_color in legend_colors:
++            placed_legends += int(_try_place_legend(grid, marker_color))
++        if placed_legends == 0:
++            continue
++
++        expected = _build_expected(height, width, real_markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid fused dfadab01 instance")
+
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util
+import numpy as np
+from collections import Counter
+
+combo_spec = importlib.util.spec_from_file_location('combo', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/24/code.py')
+combo = importlib.util.module_from_spec(combo_spec)
+combo_spec.loader.exec_module(combo)
+orig_spec = importlib.util.spec_from_file_location('orig', '/home/lixinyu/snap/new/arc2_solver_select/dfadab01.py')
+orig = importlib.util.module_from_spec(orig_spec)
+orig_spec.loader.exec_module(orig)
+
+N = 200
+size_dist = Counter()
+block_count_dist = Counter()
+legend_count_dist = Counter()
+orig_equal = 0
+pixel_diffs = []
+clipped_real_samples = 0
+
+for _ in range(N):
+    inp = combo.generate_input()
+    combo_out = combo.main(inp)
+    orig_out = orig.main(inp)
+    if np.array_equal(combo_out, orig_out):
+        orig_equal += 1
+    pixel_diffs.append(int(np.count_nonzero(combo_out "'!= orig_out)))
+
+    real_sizes = []
+    legend_count = 0
+    has_clipped = False
+    h, w = inp.shape
+    for marker_color, (glyph_color, size, mask) in combo.GLYPHS.items():
+        blocks = combo._find_marker_blocks(inp, marker_color)
+        for r, c in blocks:
+            if combo._has_source_glyph(inp, r - size, c - size, glyph_color, mask):
+                legend_count += 1
+                continue
+            real_sizes.append(size)
+            if r + size > h or c + size > w:
+                has_clipped = True
+    size_dist[len(set(real_sizes))] += 1
+    block_count_dist[len(real_sizes)] += 1
+    legend_count_dist[legend_count] += 1
+    clipped_real_samples += int(has_clipped)
+
+print('"'distinct_real_sizes distribution:', dict(sorted(size_dist.items())))
+print('real_block_count distribution:', dict(sorted(block_count_dist.items())))
+print('legend_count distribution:', dict(sorted(legend_count_dist.items())))
+print('samples with >=1 clipped real glyph:', clipped_real_samples, '/', N)
+print('orig_equal:', orig_equal, '/', N)
+print('pixel_diff min/avg/max:', min(pixel_diffs), round(sum(pixel_diffs)/N, 2), max(pixel_diffs))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/24/code.py b/ceshi/code_combo/dfadab01/24/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e88d9f75319d914afa03ffb50751f0e10c2913f6
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/24/code.py
+@@ -0,0 +1,296 @@
++# Combo variant of dfadab01 (index 24)
++# combo_spec: D3/0+D5/2
++# Name: 2x2色块标记+可变尺寸字形
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++"""
++design_analysis:
++  a_concretization_and_trace:
++    original_scene:
++      - 原题把颜色 2/3/5/8 的单像素当作控制标记；输出时每个像素都扩成固定 4x4 字形。
++      - 若输入里还出现一个已画好的样本字形，则它只是图例；其右下角的同色单像素标签不参与输出。
++    fused_scene:
++      - 真实标记与图例标签都改成 2x2 同色色块，字形锚点取该色块左上角。
++      - 颜色仍决定图案家族与输出颜色，但现在还决定 bbox 尺寸：2->3x3，3->4x4，5->5x5，8->6x6。
++      - 图例标签也随尺寸变化，位于样本字形左上角的 (+size, +size)，且自身占 2x2。
++    concrete_trace:
++      - 例如输入在左上角 (8, 11) 放一个颜色 5 的 2x2 色块，原题若把四个像素都当单标记，会错误地产生四个互相平移的 4x4 字形。
++      - 融合后 solver 必须先把这四个像素识别为“一个 2x2 标记块”，再只用其左上角 (8, 11) 画一个 5x5 的对角双块字形。
++      - 若另有颜色 3 的图例样本放在 (2, 14)，则其 4x4 蓝色菱形环只是提示；位于 (6, 18) 的绿色 2x2 标签块要被识别并跳过，而不是扩写。
++      - 因此和原题相比，变化同时发生在“标记粒度”“图例标签几何”“字形尺寸”“裁剪范围”四个环节上。
++  b_complexity_calibration:
++    - 尺寸只用四个离散档位 {3,4,5,6}，与四种颜色一一对应，避免自由度过高。
++    - 每个样例至少使用两种真实标记色，并给每种已用颜色至少两个真实标记，保证人类能看到重复支撑。
++    - 图例仍保留 1-2 个，提供“颜色 -> 输出颜色/图案/尺寸”的直接可见线索，而不是依赖颜色数值。
++  c_implicit_assumption_review_of_main:
++    - 原 main() 直接对 `np.argwhere(g == marker_color)` 的每个像素扩写；融合后这会把一个 2x2 标记误当成四个标记，因此必须改成先检测孤立 2x2 色块。
++    - 原 `_has_source_glyph()` 与 `_paint_clipped()` 默认 4x4；融合后都必须改成读取 `mask.shape`。
++    - 原图例跳过条件使用固定偏移 `(r-4, c-4)`；融合后必须按当前颜色对应的 `size` 回推 `(r-size, c-size)`。
++    - 原 seen_marker 只需见到任一控制像素；融合后应统计检测到的 2x2 标记块，否则单个噪声像素会错误满足断言。
++    - 新增的 `_is_marker_block()` 依赖“标记块是孤立精确 2x2，同色邻接不会继续延展”的前提，因此 generator 需要显式保证该结构。
++  d_placement_legality:
++    - 真实 2x2 标记块放在规则锚点格上，行列间距从 {6,7} 取值，确保最大 6x6 输出字形也不会与邻居重叠。
++    - 锚点只要求 2x2 标记本身完全落在网格内，因此靠近下边或右边时仍可触发输出裁剪。
++    - 图例样本要求整个 glyph bbox、右下 2x2 标签块、以及其外侧一圈缓冲区都落在空白区域内，避免与真实标记或其他图例缠在一起。
++  e_visual_observability:
++    - 输入里 2x2 标记块与输出里的 3x3~6x6 字形形成明显的尺度层级，人眼可直接区分“控制标记”和“被展开的图形”。
++    - 不同颜色反复出现时，解题者能同时观察到三条稳定关系：同色 2x2 块总是映射到同一种输出颜色、同一种图案、同一种尺寸。
++    - 图例标签本身也是 2x2 块，进一步提示“真正需要读取的是一个小色块，而不是色块中的四个独立像素”。
++  f_visual_tidiness:
++    - 真实输出字形之间不重叠，图例区域与真实标记网格分离，因此网格不会出现难以拆分来源的覆盖。
++    - 2x2 标记块比单像素更显眼，但仍远小于 3x3~6x6 字形，不会喧宾夺主。
++    - 图例标签与样本字形对角相邻，关系清晰且不与样本本体融合成更大块。
++  g_color_change_inferability:
++    - 颜色映射仍沿用原题的四组固定对应，没有额外引入新的颜色机制。
++    - 新增难点完全来自几何层面：解题者需要从颜色稳定地推断尺寸，而不是从不可见的颜色 id 数值做排序或计算。
++  generator_guarantees_for_new_main:
++    - 每个输入至少有一个真实 2x2 标记块，且至少两种真实颜色，因此 D3 与 D5 都会实际参与。
++    - 所有真实标记块和图例标签块都满足“孤立精确 2x2”的检测条件，因此 solver 的块识别不会退化为逐像素处理。
++    - 所有图例标签都严格放在对应样本的 (+size, +size) 位置，保证 `main()` 的 skip 分支有构造性支撑。
++    - 在这些样本上，原始单像素/固定 4x4 solver 会把每个 2x2 块扩成多个 4x4 图形，故其输出与融合 solver 明显不同，可用于反退化检查。
++"""
++
++
++MARKER_BLOCK_SIZE = 2
++
++
++def _frame_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == 0) | (rr == size - 1) | (cc == 0) | (cc == size - 1)
++
++
++def _diamond_ring_mask(size: int) -> np.ndarray:
++    center = (size - 1) / 2.0
++    radius = (size - 1) / 2.0
++    rr, cc = np.indices((size, size))
++    dist = np.abs(rr - center) + np.abs(cc - center)
++    return (dist >= radius - 0.5) & (dist <= radius + 0.5)
++
++
++def _diag_blocks_mask(size: int) -> np.ndarray:
++    block = max(1, size // 2)
++    mask = np.zeros((size, size), dtype=bool)
++    mask[:block, :block] = True
++    mask[size - block :, size - block :] = True
++    return mask
++
++
++def _x_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == cc) | (rr + cc == size - 1)
++
++
++GLYPHS: dict[int, tuple[int, int, np.ndarray]] = {
++    2: (4, 3, _frame_mask(3)),
++    3: (1, 4, _diamond_ring_mask(4)),
++    5: (6, 5, _diag_blocks_mask(5)),
++    8: (7, 6, _x_mask(6)),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    gh, gw = mask.shape
++    if r0 < 0 or c0 < 0 or r0 + gh > h or c0 + gw > w:
++        return False
++    patch = g[r0 : r0 + gh, c0 : c0 + gw]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    gh, gw = mask.shape
++    for dr in range(gh):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(gw):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _is_marker_block(g: np.ndarray, r0: int, c0: int, color: int) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + MARKER_BLOCK_SIZE > h or c0 + MARKER_BLOCK_SIZE > w:
++        return False
++    if not np.all(g[r0 : r0 + MARKER_BLOCK_SIZE, c0 : c0 + MARKER_BLOCK_SIZE] == color):
++        return False
++
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + MARKER_BLOCK_SIZE + 1)
++    neighborhood = g[rs:re, cs:ce]
++    same_color = neighborhood == color
++    allowed = np.zeros_like(same_color, dtype=bool)
++    allowed[r0 - rs : r0 - rs + MARKER_BLOCK_SIZE, c0 - cs : c0 - cs + MARKER_BLOCK_SIZE] = True
++    return not np.any(same_color & ~allowed)
++
++
++def _find_marker_blocks(g: np.ndarray, color: int) -> list[tuple[int, int]]:
++    h, w = g.shape
++    return [
++        (r, c)
++        for r in range(max(0, h - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, w - MARKER_BLOCK_SIZE + 1))
++        if _is_marker_block(g, r, c, color)
++    ]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each 2x2 control block into the variable-size glyph assigned to its color.
++
++    Input structure:
++    - Black background with isolated 2x2 marker blocks in colors 2, 3, 5, and/or 8; each block's top-left cell is the placement anchor.
++    - Some inputs also include 1-2 legend samples: a glyph already drawn in its output color, plus a matching 2x2 label block placed one glyph-size down and right from that sample.
++
++    Rule:
++    - Replace every real 2x2 marker block by its color's output glyph, using both the mapped output color and the mapped size: 2->3x3 frame, 3->4x4 diamond ring, 5->5x5 diagonal blocks, 8->6x6 X.
++    - Paint each glyph with its top-left corner aligned to the marker block's top-left cell, clipping any part that extends beyond the grid.
++    - Remove legend samples and skip the 2x2 label blocks that sit at (+size, +size) from a matching sample glyph.
++
++    Key insight:
++    - The control object is no longer a single pixel but an entire 2x2 same-color block, and that block's color now determines both which glyph family to draw and how large the glyph should be.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    marker_block_count = 0
++    for marker_color, (glyph_color, size, mask) in GLYPHS.items():
++        blocks = _find_marker_blocks(g, marker_color)
++        marker_block_count += len(blocks)
++        for r, c in blocks:
++            if _has_source_glyph(g, r - size, c - size, glyph_color, mask):
++                continue
++            _paint_clipped(out, r, c, glyph_color, mask)
++
++    assert marker_block_count > 0
++    return out
++
++
++GRID_SIZE_OPTIONS = (20, 24)
++ROWCOL_COUNT_RANGE = (2, 4)
++SPACING_OPTIONS = (6, 7)
++FILL_RATE_RANGE = (0.65, 1.0)
++GEN_RETRIES = 500
++
++
++def _choose_real_markers(
++    anchors: list[tuple[int, int]],
++    used_colors: list[int],
++) -> list[tuple[int, int, int]]:
++    cell_count = len(anchors)
++    min_fill = max(
++        len(used_colors) * 2,
++        int(np.ceil(cell_count * random.uniform(*FILL_RATE_RANGE))),
++    )
++    min_fill = min(cell_count, max(len(used_colors), min_fill))
++    fill_count = random.randint(min_fill, cell_count)
++
++    chosen_positions = random.sample(anchors, fill_count)
++    assignments = used_colors * 2
++    while len(assignments) < fill_count:
++        assignments.append(random.choice(used_colors))
++    assignments = assignments[:fill_count]
++    random.shuffle(assignments)
++    return [(r, c, color) for (r, c), color in zip(chosen_positions, assignments, strict=True)]
++
++
++def _can_place_legend(grid: np.ndarray, r0: int, c0: int, size: int) -> bool:
++    h, w = grid.shape
++    if r0 < 0 or c0 < 0 or r0 + size + MARKER_BLOCK_SIZE > h or c0 + size + MARKER_BLOCK_SIZE > w:
++        return False
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + size + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + size + MARKER_BLOCK_SIZE + 1)
++    return not np.any(grid[rs:re, cs:ce] != 0)
++
++
++def _try_place_legend(grid: np.ndarray, marker_color: int) -> bool:
++    glyph_color, size, mask = GLYPHS[marker_color]
++    candidates = [
++        (r, c)
++        for r in range(max(0, grid.shape[0] - size - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, grid.shape[1] - size - MARKER_BLOCK_SIZE + 1))
++    ]
++    random.shuffle(candidates)
++    for r0, c0 in candidates:
++        if not _can_place_legend(grid, r0, c0, size):
++            continue
++        grid[r0 : r0 + size, c0 : c0 + size][mask] = glyph_color
++        grid[
++            r0 + size : r0 + size + MARKER_BLOCK_SIZE,
++            c0 + size : c0 + size + MARKER_BLOCK_SIZE,
++        ] = marker_color
++        return True
++    return False
++
++
++def _build_expected(height: int, width: int, markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((height, width), dtype=int)
++    for r, c, marker_color in markers:
++        glyph_color, _size, mask = GLYPHS[marker_color]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    """
++    Construct a sparse lattice of 2x2 marker blocks plus 1-2 legends for the fused rule.
++    """
++    for _ in range(GEN_RETRIES):
++        height = width = random.choice(GRID_SIZE_OPTIONS)
++        row_count = random.randint(*ROWCOL_COUNT_RANGE)
++        col_count = random.randint(*ROWCOL_COUNT_RANGE)
++        row_spacing = random.choice(SPACING_OPTIONS)
++        col_spacing = random.choice(SPACING_OPTIONS)
++        max_row_start = height - MARKER_BLOCK_SIZE - (row_count - 1) * row_spacing
++        max_col_start = width - MARKER_BLOCK_SIZE - (col_count - 1) * col_spacing
++        if max_row_start < 0 or max_col_start < 0:
++            continue
++
++        row0 = random.randint(0, max_row_start)
++        col0 = random.randint(0, max_col_start)
++        anchors = [
++            (row0 + rr * row_spacing, col0 + cc * col_spacing)
++            for rr in range(row_count)
++            for cc in range(col_count)
++        ]
++
++        max_used = min(4, len(anchors) // 2)
++        if max_used < 2:
++            continue
++        used_count = random.randint(2, max_used)
++        used_colors = random.sample(list(GLYPHS), used_count)
++        real_markers = _choose_real_markers(anchors, used_colors)
++
++        grid = np.zeros((height, width), dtype=int)
++        for r, c, marker_color in real_markers:
++            grid[r : r + MARKER_BLOCK_SIZE, c : c + MARKER_BLOCK_SIZE] = marker_color
++
++        legend_target_count = 1 + int(len(used_colors) > 2 and random.random() < 0.4)
++        legend_colors = random.sample(used_colors, legend_target_count)
++        placed_legends = 0
++        for marker_color in legend_colors:
++            placed_legends += int(_try_place_legend(grid, marker_color))
++        if placed_legends == 0:
++            continue
++
++        expected = _build_expected(height, width, real_markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid fused dfadab01 instance")
+
+diff --git a/ceshi/code_combo/dfadab01/24/code.py b/ceshi/code_combo/dfadab01/24/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e88d9f75319d914afa03ffb50751f0e10c2913f6
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/24/code.py
+@@ -0,0 +1,296 @@
++# Combo variant of dfadab01 (index 24)
++# combo_spec: D3/0+D5/2
++# Name: 2x2色块标记+可变尺寸字形
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++"""
++design_analysis:
++  a_concretization_and_trace:
++    original_scene:
++      - 原题把颜色 2/3/5/8 的单像素当作控制标记；输出时每个像素都扩成固定 4x4 字形。
++      - 若输入里还出现一个已画好的样本字形，则它只是图例；其右下角的同色单像素标签不参与输出。
++    fused_scene:
++      - 真实标记与图例标签都改成 2x2 同色色块，字形锚点取该色块左上角。
++      - 颜色仍决定图案家族与输出颜色，但现在还决定 bbox 尺寸：2->3x3，3->4x4，5->5x5，8->6x6。
++      - 图例标签也随尺寸变化，位于样本字形左上角的 (+size, +size)，且自身占 2x2。
++    concrete_trace:
++      - 例如输入在左上角 (8, 11) 放一个颜色 5 的 2x2 色块，原题若把四个像素都当单标记，会错误地产生四个互相平移的 4x4 字形。
++      - 融合后 solver 必须先把这四个像素识别为“一个 2x2 标记块”，再只用其左上角 (8, 11) 画一个 5x5 的对角双块字形。
++      - 若另有颜色 3 的图例样本放在 (2, 14)，则其 4x4 蓝色菱形环只是提示；位于 (6, 18) 的绿色 2x2 标签块要被识别并跳过，而不是扩写。
++      - 因此和原题相比，变化同时发生在“标记粒度”“图例标签几何”“字形尺寸”“裁剪范围”四个环节上。
++  b_complexity_calibration:
++    - 尺寸只用四个离散档位 {3,4,5,6}，与四种颜色一一对应，避免自由度过高。
++    - 每个样例至少使用两种真实标记色，并给每种已用颜色至少两个真实标记，保证人类能看到重复支撑。
++    - 图例仍保留 1-2 个，提供“颜色 -> 输出颜色/图案/尺寸”的直接可见线索，而不是依赖颜色数值。
++  c_implicit_assumption_review_of_main:
++    - 原 main() 直接对 `np.argwhere(g == marker_color)` 的每个像素扩写；融合后这会把一个 2x2 标记误当成四个标记，因此必须改成先检测孤立 2x2 色块。
++    - 原 `_has_source_glyph()` 与 `_paint_clipped()` 默认 4x4；融合后都必须改成读取 `mask.shape`。
++    - 原图例跳过条件使用固定偏移 `(r-4, c-4)`；融合后必须按当前颜色对应的 `size` 回推 `(r-size, c-size)`。
++    - 原 seen_marker 只需见到任一控制像素；融合后应统计检测到的 2x2 标记块，否则单个噪声像素会错误满足断言。
++    - 新增的 `_is_marker_block()` 依赖“标记块是孤立精确 2x2，同色邻接不会继续延展”的前提，因此 generator 需要显式保证该结构。
++  d_placement_legality:
++    - 真实 2x2 标记块放在规则锚点格上，行列间距从 {6,7} 取值，确保最大 6x6 输出字形也不会与邻居重叠。
++    - 锚点只要求 2x2 标记本身完全落在网格内，因此靠近下边或右边时仍可触发输出裁剪。
++    - 图例样本要求整个 glyph bbox、右下 2x2 标签块、以及其外侧一圈缓冲区都落在空白区域内，避免与真实标记或其他图例缠在一起。
++  e_visual_observability:
++    - 输入里 2x2 标记块与输出里的 3x3~6x6 字形形成明显的尺度层级，人眼可直接区分“控制标记”和“被展开的图形”。
++    - 不同颜色反复出现时，解题者能同时观察到三条稳定关系：同色 2x2 块总是映射到同一种输出颜色、同一种图案、同一种尺寸。
++    - 图例标签本身也是 2x2 块，进一步提示“真正需要读取的是一个小色块，而不是色块中的四个独立像素”。
++  f_visual_tidiness:
++    - 真实输出字形之间不重叠，图例区域与真实标记网格分离，因此网格不会出现难以拆分来源的覆盖。
++    - 2x2 标记块比单像素更显眼，但仍远小于 3x3~6x6 字形，不会喧宾夺主。
++    - 图例标签与样本字形对角相邻，关系清晰且不与样本本体融合成更大块。
++  g_color_change_inferability:
++    - 颜色映射仍沿用原题的四组固定对应，没有额外引入新的颜色机制。
++    - 新增难点完全来自几何层面：解题者需要从颜色稳定地推断尺寸，而不是从不可见的颜色 id 数值做排序或计算。
++  generator_guarantees_for_new_main:
++    - 每个输入至少有一个真实 2x2 标记块，且至少两种真实颜色，因此 D3 与 D5 都会实际参与。
++    - 所有真实标记块和图例标签块都满足“孤立精确 2x2”的检测条件，因此 solver 的块识别不会退化为逐像素处理。
++    - 所有图例标签都严格放在对应样本的 (+size, +size) 位置，保证 `main()` 的 skip 分支有构造性支撑。
++    - 在这些样本上，原始单像素/固定 4x4 solver 会把每个 2x2 块扩成多个 4x4 图形，故其输出与融合 solver 明显不同，可用于反退化检查。
++"""
++
++
++MARKER_BLOCK_SIZE = 2
++
++
++def _frame_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == 0) | (rr == size - 1) | (cc == 0) | (cc == size - 1)
++
++
++def _diamond_ring_mask(size: int) -> np.ndarray:
++    center = (size - 1) / 2.0
++    radius = (size - 1) / 2.0
++    rr, cc = np.indices((size, size))
++    dist = np.abs(rr - center) + np.abs(cc - center)
++    return (dist >= radius - 0.5) & (dist <= radius + 0.5)
++
++
++def _diag_blocks_mask(size: int) -> np.ndarray:
++    block = max(1, size // 2)
++    mask = np.zeros((size, size), dtype=bool)
++    mask[:block, :block] = True
++    mask[size - block :, size - block :] = True
++    return mask
++
++
++def _x_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == cc) | (rr + cc == size - 1)
++
++
++GLYPHS: dict[int, tuple[int, int, np.ndarray]] = {
++    2: (4, 3, _frame_mask(3)),
++    3: (1, 4, _diamond_ring_mask(4)),
++    5: (6, 5, _diag_blocks_mask(5)),
++    8: (7, 6, _x_mask(6)),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    gh, gw = mask.shape
++    if r0 < 0 or c0 < 0 or r0 + gh > h or c0 + gw > w:
++        return False
++    patch = g[r0 : r0 + gh, c0 : c0 + gw]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    gh, gw = mask.shape
++    for dr in range(gh):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(gw):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _is_marker_block(g: np.ndarray, r0: int, c0: int, color: int) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + MARKER_BLOCK_SIZE > h or c0 + MARKER_BLOCK_SIZE > w:
++        return False
++    if not np.all(g[r0 : r0 + MARKER_BLOCK_SIZE, c0 : c0 + MARKER_BLOCK_SIZE] == color):
++        return False
++
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + MARKER_BLOCK_SIZE + 1)
++    neighborhood = g[rs:re, cs:ce]
++    same_color = neighborhood == color
++    allowed = np.zeros_like(same_color, dtype=bool)
++    allowed[r0 - rs : r0 - rs + MARKER_BLOCK_SIZE, c0 - cs : c0 - cs + MARKER_BLOCK_SIZE] = True
++    return not np.any(same_color & ~allowed)
++
++
++def _find_marker_blocks(g: np.ndarray, color: int) -> list[tuple[int, int]]:
++    h, w = g.shape
++    return [
++        (r, c)
++        for r in range(max(0, h - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, w - MARKER_BLOCK_SIZE + 1))
++        if _is_marker_block(g, r, c, color)
++    ]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each 2x2 control block into the variable-size glyph assigned to its color.
++
++    Input structure:
++    - Black background with isolated 2x2 marker blocks in colors 2, 3, 5, and/or 8; each block's top-left cell is the placement anchor.
++    - Some inputs also include 1-2 legend samples: a glyph already drawn in its output color, plus a matching 2x2 label block placed one glyph-size down and right from that sample.
++
++    Rule:
++    - Replace every real 2x2 marker block by its color's output glyph, using both the mapped output color and the mapped size: 2->3x3 frame, 3->4x4 diamond ring, 5->5x5 diagonal blocks, 8->6x6 X.
++    - Paint each glyph with its top-left corner aligned to the marker block's top-left cell, clipping any part that extends beyond the grid.
++    - Remove legend samples and skip the 2x2 label blocks that sit at (+size, +size) from a matching sample glyph.
++
++    Key insight:
++    - The control object is no longer a single pixel but an entire 2x2 same-color block, and that block's color now determines both which glyph family to draw and how large the glyph should be.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    marker_block_count = 0
++    for marker_color, (glyph_color, size, mask) in GLYPHS.items():
++        blocks = _find_marker_blocks(g, marker_color)
++        marker_block_count += len(blocks)
++        for r, c in blocks:
++            if _has_source_glyph(g, r - size, c - size, glyph_color, mask):
++                continue
++            _paint_clipped(out, r, c, glyph_color, mask)
++
++    assert marker_block_count > 0
++    return out
++
++
++GRID_SIZE_OPTIONS = (20, 24)
++ROWCOL_COUNT_RANGE = (2, 4)
++SPACING_OPTIONS = (6, 7)
++FILL_RATE_RANGE = (0.65, 1.0)
++GEN_RETRIES = 500
++
++
++def _choose_real_markers(
++    anchors: list[tuple[int, int]],
++    used_colors: list[int],
++) -> list[tuple[int, int, int]]:
++    cell_count = len(anchors)
++    min_fill = max(
++        len(used_colors) * 2,
++        int(np.ceil(cell_count * random.uniform(*FILL_RATE_RANGE))),
++    )
++    min_fill = min(cell_count, max(len(used_colors), min_fill))
++    fill_count = random.randint(min_fill, cell_count)
++
++    chosen_positions = random.sample(anchors, fill_count)
++    assignments = used_colors * 2
++    while len(assignments) < fill_count:
++        assignments.append(random.choice(used_colors))
++    assignments = assignments[:fill_count]
++    random.shuffle(assignments)
++    return [(r, c, color) for (r, c), color in zip(chosen_positions, assignments, strict=True)]
++
++
++def _can_place_legend(grid: np.ndarray, r0: int, c0: int, size: int) -> bool:
++    h, w = grid.shape
++    if r0 < 0 or c0 < 0 or r0 + size + MARKER_BLOCK_SIZE > h or c0 + size + MARKER_BLOCK_SIZE > w:
++        return False
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + size + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + size + MARKER_BLOCK_SIZE + 1)
++    return not np.any(grid[rs:re, cs:ce] != 0)
++
++
++def _try_place_legend(grid: np.ndarray, marker_color: int) -> bool:
++    glyph_color, size, mask = GLYPHS[marker_color]
++    candidates = [
++        (r, c)
++        for r in range(max(0, grid.shape[0] - size - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, grid.shape[1] - size - MARKER_BLOCK_SIZE + 1))
++    ]
++    random.shuffle(candidates)
++    for r0, c0 in candidates:
++        if not _can_place_legend(grid, r0, c0, size):
++            continue
++        grid[r0 : r0 + size, c0 : c0 + size][mask] = glyph_color
++        grid[
++            r0 + size : r0 + size + MARKER_BLOCK_SIZE,
++            c0 + size : c0 + size + MARKER_BLOCK_SIZE,
++        ] = marker_color
++        return True
++    return False
++
++
++def _build_expected(height: int, width: int, markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((height, width), dtype=int)
++    for r, c, marker_color in markers:
++        glyph_color, _size, mask = GLYPHS[marker_color]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    """
++    Construct a sparse lattice of 2x2 marker blocks plus 1-2 legends for the fused rule.
++    """
++    for _ in range(GEN_RETRIES):
++        height = width = random.choice(GRID_SIZE_OPTIONS)
++        row_count = random.randint(*ROWCOL_COUNT_RANGE)
++        col_count = random.randint(*ROWCOL_COUNT_RANGE)
++        row_spacing = random.choice(SPACING_OPTIONS)
++        col_spacing = random.choice(SPACING_OPTIONS)
++        max_row_start = height - MARKER_BLOCK_SIZE - (row_count - 1) * row_spacing
++        max_col_start = width - MARKER_BLOCK_SIZE - (col_count - 1) * col_spacing
++        if max_row_start < 0 or max_col_start < 0:
++            continue
++
++        row0 = random.randint(0, max_row_start)
++        col0 = random.randint(0, max_col_start)
++        anchors = [
++            (row0 + rr * row_spacing, col0 + cc * col_spacing)
++            for rr in range(row_count)
++            for cc in range(col_count)
++        ]
++
++        max_used = min(4, len(anchors) // 2)
++        if max_used < 2:
++            continue
++        used_count = random.randint(2, max_used)
++        used_colors = random.sample(list(GLYPHS), used_count)
++        real_markers = _choose_real_markers(anchors, used_colors)
++
++        grid = np.zeros((height, width), dtype=int)
++        for r, c, marker_color in real_markers:
++            grid[r : r + MARKER_BLOCK_SIZE, c : c + MARKER_BLOCK_SIZE] = marker_color
++
++        legend_target_count = 1 + int(len(used_colors) > 2 and random.random() < 0.4)
++        legend_colors = random.sample(used_colors, legend_target_count)
++        placed_legends = 0
++        for marker_color in legend_colors:
++            placed_legends += int(_try_place_legend(grid, marker_color))
++        if placed_legends == 0:
++            continue
++
++        expected = _build_expected(height, width, real_markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid fused dfadab01 instance")
+
+ succeeded in 6589ms:
+distinct_real_sizes distribution: {2: 101, 3: 72, 4: 27}
+real_block_count distribution: {4: 32, 5: 10, 6: 54, 7: 13, 8: 40, 9: 11, 10: 7, 11: 10, 12: 14, 13: 1, 14: 4, 15: 4}
+legend_count distribution: {1: 174, 2: 26}
+samples with >=1 clipped real glyph: 133 / 200
+orig_equal: 0 / 200
+pixel_diff min/avg/max: 36 99.62 202
+
+codex
+稳定性已经过了。现在补最后一层审查：检查生成样本是否真的触发了融合行为，而不是碰巧用原题 solver 也能得到同样结果。
+The fused variant is implemented and passes the reliability test. I also ran a non-degeneracy check against the original solver to confirm the generated inputs actually exercise the new 2x2-marker and variable-size behavior.
+  ✓ Design fused geometry and generator constraints for 2x2 marker blocks plus variable glyph sizes
+  ✓ Write combo variant code with design analysis, solver, and generator at ceshi/code_combo/dfadab01/24/code.py
+  ✓ Run reliability and non-degeneracy checks, then refine until passing
+diff --git a/ceshi/code_combo/dfadab01/24/code.py b/ceshi/code_combo/dfadab01/24/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e88d9f75319d914afa03ffb50751f0e10c2913f6
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/24/code.py
+@@ -0,0 +1,296 @@
++# Combo variant of dfadab01 (index 24)
++# combo_spec: D3/0+D5/2
++# Name: 2x2色块标记+可变尺寸字形
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++"""
++design_analysis:
++  a_concretization_and_trace:
++    original_scene:
++      - 原题把颜色 2/3/5/8 的单像素当作控制标记；输出时每个像素都扩成固定 4x4 字形。
++      - 若输入里还出现一个已画好的样本字形，则它只是图例；其右下角的同色单像素标签不参与输出。
++    fused_scene:
++      - 真实标记与图例标签都改成 2x2 同色色块，字形锚点取该色块左上角。
++      - 颜色仍决定图案家族与输出颜色，但现在还决定 bbox 尺寸：2->3x3，3->4x4，5->5x5，8->6x6。
++      - 图例标签也随尺寸变化，位于样本字形左上角的 (+size, +size)，且自身占 2x2。
++    concrete_trace:
++      - 例如输入在左上角 (8, 11) 放一个颜色 5 的 2x2 色块，原题若把四个像素都当单标记，会错误地产生四个互相平移的 4x4 字形。
++      - 融合后 solver 必须先把这四个像素识别为“一个 2x2 标记块”，再只用其左上角 (8, 11) 画一个 5x5 的对角双块字形。
++      - 若另有颜色 3 的图例样本放在 (2, 14)，则其 4x4 蓝色菱形环只是提示；位于 (6, 18) 的绿色 2x2 标签块要被识别并跳过，而不是扩写。
++      - 因此和原题相比，变化同时发生在“标记粒度”“图例标签几何”“字形尺寸”“裁剪范围”四个环节上。
++  b_complexity_calibration:
++    - 尺寸只用四个离散档位 {3,4,5,6}，与四种颜色一一对应，避免自由度过高。
++    - 每个样例至少使用两种真实标记色，并给每种已用颜色至少两个真实标记，保证人类能看到重复支撑。
++    - 图例仍保留 1-2 个，提供“颜色 -> 输出颜色/图案/尺寸”的直接可见线索，而不是依赖颜色数值。
++  c_implicit_assumption_review_of_main:
++    - 原 main() 直接对 `np.argwhere(g == marker_color)` 的每个像素扩写；融合后这会把一个 2x2 标记误当成四个标记，因此必须改成先检测孤立 2x2 色块。
++    - 原 `_has_source_glyph()` 与 `_paint_clipped()` 默认 4x4；融合后都必须改成读取 `mask.shape`。
++    - 原图例跳过条件使用固定偏移 `(r-4, c-4)`；融合后必须按当前颜色对应的 `size` 回推 `(r-size, c-size)`。
++    - 原 seen_marker 只需见到任一控制像素；融合后应统计检测到的 2x2 标记块，否则单个噪声像素会错误满足断言。
++    - 新增的 `_is_marker_block()` 依赖“标记块是孤立精确 2x2，同色邻接不会继续延展”的前提，因此 generator 需要显式保证该结构。
++  d_placement_legality:
++    - 真实 2x2 标记块放在规则锚点格上，行列间距从 {6,7} 取值，确保最大 6x6 输出字形也不会与邻居重叠。
++    - 锚点只要求 2x2 标记本身完全落在网格内，因此靠近下边或右边时仍可触发输出裁剪。
++    - 图例样本要求整个 glyph bbox、右下 2x2 标签块、以及其外侧一圈缓冲区都落在空白区域内，避免与真实标记或其他图例缠在一起。
++  e_visual_observability:
++    - 输入里 2x2 标记块与输出里的 3x3~6x6 字形形成明显的尺度层级，人眼可直接区分“控制标记”和“被展开的图形”。
++    - 不同颜色反复出现时，解题者能同时观察到三条稳定关系：同色 2x2 块总是映射到同一种输出颜色、同一种图案、同一种尺寸。
++    - 图例标签本身也是 2x2 块，进一步提示“真正需要读取的是一个小色块，而不是色块中的四个独立像素”。
++  f_visual_tidiness:
++    - 真实输出字形之间不重叠，图例区域与真实标记网格分离，因此网格不会出现难以拆分来源的覆盖。
++    - 2x2 标记块比单像素更显眼，但仍远小于 3x3~6x6 字形，不会喧宾夺主。
++    - 图例标签与样本字形对角相邻，关系清晰且不与样本本体融合成更大块。
++  g_color_change_inferability:
++    - 颜色映射仍沿用原题的四组固定对应，没有额外引入新的颜色机制。
++    - 新增难点完全来自几何层面：解题者需要从颜色稳定地推断尺寸，而不是从不可见的颜色 id 数值做排序或计算。
++  generator_guarantees_for_new_main:
++    - 每个输入至少有一个真实 2x2 标记块，且至少两种真实颜色，因此 D3 与 D5 都会实际参与。
++    - 所有真实标记块和图例标签块都满足“孤立精确 2x2”的检测条件，因此 solver 的块识别不会退化为逐像素处理。
++    - 所有图例标签都严格放在对应样本的 (+size, +size) 位置，保证 `main()` 的 skip 分支有构造性支撑。
++    - 在这些样本上，原始单像素/固定 4x4 solver 会把每个 2x2 块扩成多个 4x4 图形，故其输出与融合 solver 明显不同，可用于反退化检查。
++"""
++
++
++MARKER_BLOCK_SIZE = 2
++
++
++def _frame_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == 0) | (rr == size - 1) | (cc == 0) | (cc == size - 1)
++
++
++def _diamond_ring_mask(size: int) -> np.ndarray:
++    center = (size - 1) / 2.0
++    radius = (size - 1) / 2.0
++    rr, cc = np.indices((size, size))
++    dist = np.abs(rr - center) + np.abs(cc - center)
++    return (dist >= radius - 0.5) & (dist <= radius + 0.5)
++
++
++def _diag_blocks_mask(size: int) -> np.ndarray:
++    block = max(1, size // 2)
++    mask = np.zeros((size, size), dtype=bool)
++    mask[:block, :block] = True
++    mask[size - block :, size - block :] = True
++    return mask
++
++
++def _x_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == cc) | (rr + cc == size - 1)
++
++
++GLYPHS: dict[int, tuple[int, int, np.ndarray]] = {
++    2: (4, 3, _frame_mask(3)),
++    3: (1, 4, _diamond_ring_mask(4)),
++    5: (6, 5, _diag_blocks_mask(5)),
++    8: (7, 6, _x_mask(6)),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    gh, gw = mask.shape
++    if r0 < 0 or c0 < 0 or r0 + gh > h or c0 + gw > w:
++        return False
++    patch = g[r0 : r0 + gh, c0 : c0 + gw]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    gh, gw = mask.shape
++    for dr in range(gh):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(gw):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _is_marker_block(g: np.ndarray, r0: int, c0: int, color: int) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + MARKER_BLOCK_SIZE > h or c0 + MARKER_BLOCK_SIZE > w:
++        return False
++    if not np.all(g[r0 : r0 + MARKER_BLOCK_SIZE, c0 : c0 + MARKER_BLOCK_SIZE] == color):
++        return False
++
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + MARKER_BLOCK_SIZE + 1)
++    neighborhood = g[rs:re, cs:ce]
++    same_color = neighborhood == color
++    allowed = np.zeros_like(same_color, dtype=bool)
++    allowed[r0 - rs : r0 - rs + MARKER_BLOCK_SIZE, c0 - cs : c0 - cs + MARKER_BLOCK_SIZE] = True
++    return not np.any(same_color & ~allowed)
++
++
++def _find_marker_blocks(g: np.ndarray, color: int) -> list[tuple[int, int]]:
++    h, w = g.shape
++    return [
++        (r, c)
++        for r in range(max(0, h - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, w - MARKER_BLOCK_SIZE + 1))
++        if _is_marker_block(g, r, c, color)
++    ]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each 2x2 control block into the variable-size glyph assigned to its color.
++
++    Input structure:
++    - Black background with isolated 2x2 marker blocks in colors 2, 3, 5, and/or 8; each block's top-left cell is the placement anchor.
++    - Some inputs also include 1-2 legend samples: a glyph already drawn in its output color, plus a matching 2x2 label block placed one glyph-size down and right from that sample.
++
++    Rule:
++    - Replace every real 2x2 marker block by its color's output glyph, using both the mapped output color and the mapped size: 2->3x3 frame, 3->4x4 diamond ring, 5->5x5 diagonal blocks, 8->6x6 X.
++    - Paint each glyph with its top-left corner aligned to the marker block's top-left cell, clipping any part that extends beyond the grid.
++    - Remove legend samples and skip the 2x2 label blocks that sit at (+size, +size) from a matching sample glyph.
++
++    Key insight:
++    - The control object is no longer a single pixel but an entire 2x2 same-color block, and that block's color now determines both which glyph family to draw and how large the glyph should be.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    marker_block_count = 0
++    for marker_color, (glyph_color, size, mask) in GLYPHS.items():
++        blocks = _find_marker_blocks(g, marker_color)
++        marker_block_count += len(blocks)
++        for r, c in blocks:
++            if _has_source_glyph(g, r - size, c - size, glyph_color, mask):
++                continue
++            _paint_clipped(out, r, c, glyph_color, mask)
++
++    assert marker_block_count > 0
++    return out
++
++
++GRID_SIZE_OPTIONS = (20, 24)
++ROWCOL_COUNT_RANGE = (2, 4)
++SPACING_OPTIONS = (6, 7)
++FILL_RATE_RANGE = (0.65, 1.0)
++GEN_RETRIES = 500
++
++
++def _choose_real_markers(
++    anchors: list[tuple[int, int]],
++    used_colors: list[int],
++) -> list[tuple[int, int, int]]:
++    cell_count = len(anchors)
++    min_fill = max(
++        len(used_colors) * 2,
++        int(np.ceil(cell_count * random.uniform(*FILL_RATE_RANGE))),
++    )
++    min_fill = min(cell_count, max(len(used_colors), min_fill))
++    fill_count = random.randint(min_fill, cell_count)
++
++    chosen_positions = random.sample(anchors, fill_count)
++    assignments = used_colors * 2
++    while len(assignments) < fill_count:
++        assignments.append(random.choice(used_colors))
++    assignments = assignments[:fill_count]
++    random.shuffle(assignments)
++    return [(r, c, color) for (r, c), color in zip(chosen_positions, assignments, strict=True)]
++
++
++def _can_place_legend(grid: np.ndarray, r0: int, c0: int, size: int) -> bool:
++    h, w = grid.shape
++    if r0 < 0 or c0 < 0 or r0 + size + MARKER_BLOCK_SIZE > h or c0 + size + MARKER_BLOCK_SIZE > w:
++        return False
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + size + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + size + MARKER_BLOCK_SIZE + 1)
++    return not np.any(grid[rs:re, cs:ce] != 0)
++
++
++def _try_place_legend(grid: np.ndarray, marker_color: int) -> bool:
++    glyph_color, size, mask = GLYPHS[marker_color]
++    candidates = [
++        (r, c)
++        for r in range(max(0, grid.shape[0] - size - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, grid.shape[1] - size - MARKER_BLOCK_SIZE + 1))
++    ]
++    random.shuffle(candidates)
++    for r0, c0 in candidates:
++        if not _can_place_legend(grid, r0, c0, size):
++            continue
++        grid[r0 : r0 + size, c0 : c0 + size][mask] = glyph_color
++        grid[
++            r0 + size : r0 + size + MARKER_BLOCK_SIZE,
++            c0 + size : c0 + size + MARKER_BLOCK_SIZE,
++        ] = marker_color
++        return True
++    return False
++
++
++def _build_expected(height: int, width: int, markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((height, width), dtype=int)
++    for r, c, marker_color in markers:
++        glyph_color, _size, mask = GLYPHS[marker_color]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    """
++    Construct a sparse lattice of 2x2 marker blocks plus 1-2 legends for the fused rule.
++    """
++    for _ in range(GEN_RETRIES):
++        height = width = random.choice(GRID_SIZE_OPTIONS)
++        row_count = random.randint(*ROWCOL_COUNT_RANGE)
++        col_count = random.randint(*ROWCOL_COUNT_RANGE)
++        row_spacing = random.choice(SPACING_OPTIONS)
++        col_spacing = random.choice(SPACING_OPTIONS)
++        max_row_start = height - MARKER_BLOCK_SIZE - (row_count - 1) * row_spacing
++        max_col_start = width - MARKER_BLOCK_SIZE - (col_count - 1) * col_spacing
++        if max_row_start < 0 or max_col_start < 0:
++            continue
++
++        row0 = random.randint(0, max_row_start)
++        col0 = random.randint(0, max_col_start)
++        anchors = [
++            (row0 + rr * row_spacing, col0 + cc * col_spacing)
++            for rr in range(row_count)
++            for cc in range(col_count)
++        ]
++
++        max_used = min(4, len(anchors) // 2)
++        if max_used < 2:
++            continue
++        used_count = random.randint(2, max_used)
++        used_colors = random.sample(list(GLYPHS), used_count)
++        real_markers = _choose_real_markers(anchors, used_colors)
++
++        grid = np.zeros((height, width), dtype=int)
++        for r, c, marker_color in real_markers:
++            grid[r : r + MARKER_BLOCK_SIZE, c : c + MARKER_BLOCK_SIZE] = marker_color
++
++        legend_target_count = 1 + int(len(used_colors) > 2 and random.random() < 0.4)
++        legend_colors = random.sample(used_colors, legend_target_count)
++        placed_legends = 0
++        for marker_color in legend_colors:
++            placed_legends += int(_try_place_legend(grid, marker_color))
++        if placed_legends == 0:
++            continue
++
++        expected = _build_expected(height, width, real_markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid fused dfadab01 instance")
+
+codex
+融合变体已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/24/code.py)。
+
+这版 `main()` 改为识别孤立的 `2x2` 同色色块，并以色块左上角作为锚点展开字形；颜色同时决定输出颜色、图案家族和尺寸 `3x3/4x4/5x5/6x6`。`generate_input()` 则保证真实标记块、图例样本和 `(+size,+size)` 的 `2x2` 标签块彼此合法分离，且保留边界裁剪现象。文件里也补上了完整的设计分析注释，以及按要求重写的四段式 `main()` 说明。
+
+验证结果：
+- 提供的稳定性测试通过：`Success: 50/50, Time: 1.4s (28ms/call)`
+- 反退化检查 `200` 个样本中，真实标记的尺寸种类分布为 `{2: 101, 3: 72, 4: 27}`，没有退化成单一尺寸
+- 与原始 `dfadab01` solver 的输出相同次数为 `0/200`，像素差异 `min/avg/max = 36 / 99.62 / 202`
+- 含至少一个被裁剪真实字形的样本为 `133/200`，说明裁剪行为也仍然活跃
+diff --git a/ceshi/code_combo/dfadab01/24/code.py b/ceshi/code_combo/dfadab01/24/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e88d9f75319d914afa03ffb50751f0e10c2913f6
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/24/code.py
+@@ -0,0 +1,296 @@
++# Combo variant of dfadab01 (index 24)
++# combo_spec: D3/0+D5/2
++# Name: 2x2色块标记+可变尺寸字形
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++"""
++design_analysis:
++  a_concretization_and_trace:
++    original_scene:
++      - 原题把颜色 2/3/5/8 的单像素当作控制标记；输出时每个像素都扩成固定 4x4 字形。
++      - 若输入里还出现一个已画好的样本字形，则它只是图例；其右下角的同色单像素标签不参与输出。
++    fused_scene:
++      - 真实标记与图例标签都改成 2x2 同色色块，字形锚点取该色块左上角。
++      - 颜色仍决定图案家族与输出颜色，但现在还决定 bbox 尺寸：2->3x3，3->4x4，5->5x5，8->6x6。
++      - 图例标签也随尺寸变化，位于样本字形左上角的 (+size, +size)，且自身占 2x2。
++    concrete_trace:
++      - 例如输入在左上角 (8, 11) 放一个颜色 5 的 2x2 色块，原题若把四个像素都当单标记，会错误地产生四个互相平移的 4x4 字形。
++      - 融合后 solver 必须先把这四个像素识别为“一个 2x2 标记块”，再只用其左上角 (8, 11) 画一个 5x5 的对角双块字形。
++      - 若另有颜色 3 的图例样本放在 (2, 14)，则其 4x4 蓝色菱形环只是提示；位于 (6, 18) 的绿色 2x2 标签块要被识别并跳过，而不是扩写。
++      - 因此和原题相比，变化同时发生在“标记粒度”“图例标签几何”“字形尺寸”“裁剪范围”四个环节上。
++  b_complexity_calibration:
++    - 尺寸只用四个离散档位 {3,4,5,6}，与四种颜色一一对应，避免自由度过高。
++    - 每个样例至少使用两种真实标记色，并给每种已用颜色至少两个真实标记，保证人类能看到重复支撑。
++    - 图例仍保留 1-2 个，提供“颜色 -> 输出颜色/图案/尺寸”的直接可见线索，而不是依赖颜色数值。
++  c_implicit_assumption_review_of_main:
++    - 原 main() 直接对 `np.argwhere(g == marker_color)` 的每个像素扩写；融合后这会把一个 2x2 标记误当成四个标记，因此必须改成先检测孤立 2x2 色块。
++    - 原 `_has_source_glyph()` 与 `_paint_clipped()` 默认 4x4；融合后都必须改成读取 `mask.shape`。
++    - 原图例跳过条件使用固定偏移 `(r-4, c-4)`；融合后必须按当前颜色对应的 `size` 回推 `(r-size, c-size)`。
++    - 原 seen_marker 只需见到任一控制像素；融合后应统计检测到的 2x2 标记块，否则单个噪声像素会错误满足断言。
++    - 新增的 `_is_marker_block()` 依赖“标记块是孤立精确 2x2，同色邻接不会继续延展”的前提，因此 generator 需要显式保证该结构。
++  d_placement_legality:
++    - 真实 2x2 标记块放在规则锚点格上，行列间距从 {6,7} 取值，确保最大 6x6 输出字形也不会与邻居重叠。
++    - 锚点只要求 2x2 标记本身完全落在网格内，因此靠近下边或右边时仍可触发输出裁剪。
++    - 图例样本要求整个 glyph bbox、右下 2x2 标签块、以及其外侧一圈缓冲区都落在空白区域内，避免与真实标记或其他图例缠在一起。
++  e_visual_observability:
++    - 输入里 2x2 标记块与输出里的 3x3~6x6 字形形成明显的尺度层级，人眼可直接区分“控制标记”和“被展开的图形”。
++    - 不同颜色反复出现时，解题者能同时观察到三条稳定关系：同色 2x2 块总是映射到同一种输出颜色、同一种图案、同一种尺寸。
++    - 图例标签本身也是 2x2 块，进一步提示“真正需要读取的是一个小色块，而不是色块中的四个独立像素”。
++  f_visual_tidiness:
++    - 真实输出字形之间不重叠，图例区域与真实标记网格分离，因此网格不会出现难以拆分来源的覆盖。
++    - 2x2 标记块比单像素更显眼，但仍远小于 3x3~6x6 字形，不会喧宾夺主。
++    - 图例标签与样本字形对角相邻，关系清晰且不与样本本体融合成更大块。
++  g_color_change_inferability:
++    - 颜色映射仍沿用原题的四组固定对应，没有额外引入新的颜色机制。
++    - 新增难点完全来自几何层面：解题者需要从颜色稳定地推断尺寸，而不是从不可见的颜色 id 数值做排序或计算。
++  generator_guarantees_for_new_main:
++    - 每个输入至少有一个真实 2x2 标记块，且至少两种真实颜色，因此 D3 与 D5 都会实际参与。
++    - 所有真实标记块和图例标签块都满足“孤立精确 2x2”的检测条件，因此 solver 的块识别不会退化为逐像素处理。
++    - 所有图例标签都严格放在对应样本的 (+size, +size) 位置，保证 `main()` 的 skip 分支有构造性支撑。
++    - 在这些样本上，原始单像素/固定 4x4 solver 会把每个 2x2 块扩成多个 4x4 图形，故其输出与融合 solver 明显不同，可用于反退化检查。
++"""
++
++
++MARKER_BLOCK_SIZE = 2
++
++
++def _frame_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == 0) | (rr == size - 1) | (cc == 0) | (cc == size - 1)
++
++
++def _diamond_ring_mask(size: int) -> np.ndarray:
++    center = (size - 1) / 2.0
++    radius = (size - 1) / 2.0
++    rr, cc = np.indices((size, size))
++    dist = np.abs(rr - center) + np.abs(cc - center)
++    return (dist >= radius - 0.5) & (dist <= radius + 0.5)
++
++
++def _diag_blocks_mask(size: int) -> np.ndarray:
++    block = max(1, size // 2)
++    mask = np.zeros((size, size), dtype=bool)
++    mask[:block, :block] = True
++    mask[size - block :, size - block :] = True
++    return mask
++
++
++def _x_mask(size: int) -> np.ndarray:
++    rr, cc = np.indices((size, size))
++    return (rr == cc) | (rr + cc == size - 1)
++
++
++GLYPHS: dict[int, tuple[int, int, np.ndarray]] = {
++    2: (4, 3, _frame_mask(3)),
++    3: (1, 4, _diamond_ring_mask(4)),
++    5: (6, 5, _diag_blocks_mask(5)),
++    8: (7, 6, _x_mask(6)),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    gh, gw = mask.shape
++    if r0 < 0 or c0 < 0 or r0 + gh > h or c0 + gw > w:
++        return False
++    patch = g[r0 : r0 + gh, c0 : c0 + gw]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    gh, gw = mask.shape
++    for dr in range(gh):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(gw):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _is_marker_block(g: np.ndarray, r0: int, c0: int, color: int) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + MARKER_BLOCK_SIZE > h or c0 + MARKER_BLOCK_SIZE > w:
++        return False
++    if not np.all(g[r0 : r0 + MARKER_BLOCK_SIZE, c0 : c0 + MARKER_BLOCK_SIZE] == color):
++        return False
++
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + MARKER_BLOCK_SIZE + 1)
++    neighborhood = g[rs:re, cs:ce]
++    same_color = neighborhood == color
++    allowed = np.zeros_like(same_color, dtype=bool)
++    allowed[r0 - rs : r0 - rs + MARKER_BLOCK_SIZE, c0 - cs : c0 - cs + MARKER_BLOCK_SIZE] = True
++    return not np.any(same_color & ~allowed)
++
++
++def _find_marker_blocks(g: np.ndarray, color: int) -> list[tuple[int, int]]:
++    h, w = g.shape
++    return [
++        (r, c)
++        for r in range(max(0, h - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, w - MARKER_BLOCK_SIZE + 1))
++        if _is_marker_block(g, r, c, color)
++    ]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each 2x2 control block into the variable-size glyph assigned to its color.
++
++    Input structure:
++    - Black background with isolated 2x2 marker blocks in colors 2, 3, 5, and/or 8; each block's top-left cell is the placement anchor.
++    - Some inputs also include 1-2 legend samples: a glyph already drawn in its output color, plus a matching 2x2 label block placed one glyph-size down and right from that sample.
++
++    Rule:
++    - Replace every real 2x2 marker block by its color's output glyph, using both the mapped output color and the mapped size: 2->3x3 frame, 3->4x4 diamond ring, 5->5x5 diagonal blocks, 8->6x6 X.
++    - Paint each glyph with its top-left corner aligned to the marker block's top-left cell, clipping any part that extends beyond the grid.
++    - Remove legend samples and skip the 2x2 label blocks that sit at (+size, +size) from a matching sample glyph.
++
++    Key insight:
++    - The control object is no longer a single pixel but an entire 2x2 same-color block, and that block's color now determines both which glyph family to draw and how large the glyph should be.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
++
++    out = np.zeros_like(g)
++    marker_block_count = 0
++    for marker_color, (glyph_color, size, mask) in GLYPHS.items():
++        blocks = _find_marker_blocks(g, marker_color)
++        marker_block_count += len(blocks)
++        for r, c in blocks:
++            if _has_source_glyph(g, r - size, c - size, glyph_color, mask):
++                continue
++            _paint_clipped(out, r, c, glyph_color, mask)
++
++    assert marker_block_count > 0
++    return out
++
++
++GRID_SIZE_OPTIONS = (20, 24)
++ROWCOL_COUNT_RANGE = (2, 4)
++SPACING_OPTIONS = (6, 7)
++FILL_RATE_RANGE = (0.65, 1.0)
++GEN_RETRIES = 500
++
++
++def _choose_real_markers(
++    anchors: list[tuple[int, int]],
++    used_colors: list[int],
++) -> list[tuple[int, int, int]]:
++    cell_count = len(anchors)
++    min_fill = max(
++        len(used_colors) * 2,
++        int(np.ceil(cell_count * random.uniform(*FILL_RATE_RANGE))),
++    )
++    min_fill = min(cell_count, max(len(used_colors), min_fill))
++    fill_count = random.randint(min_fill, cell_count)
++
++    chosen_positions = random.sample(anchors, fill_count)
++    assignments = used_colors * 2
++    while len(assignments) < fill_count:
++        assignments.append(random.choice(used_colors))
++    assignments = assignments[:fill_count]
++    random.shuffle(assignments)
++    return [(r, c, color) for (r, c), color in zip(chosen_positions, assignments, strict=True)]
++
++
++def _can_place_legend(grid: np.ndarray, r0: int, c0: int, size: int) -> bool:
++    h, w = grid.shape
++    if r0 < 0 or c0 < 0 or r0 + size + MARKER_BLOCK_SIZE > h or c0 + size + MARKER_BLOCK_SIZE > w:
++        return False
++    rs = max(0, r0 - 1)
++    re = min(h, r0 + size + MARKER_BLOCK_SIZE + 1)
++    cs = max(0, c0 - 1)
++    ce = min(w, c0 + size + MARKER_BLOCK_SIZE + 1)
++    return not np.any(grid[rs:re, cs:ce] != 0)
++
++
++def _try_place_legend(grid: np.ndarray, marker_color: int) -> bool:
++    glyph_color, size, mask = GLYPHS[marker_color]
++    candidates = [
++        (r, c)
++        for r in range(max(0, grid.shape[0] - size - MARKER_BLOCK_SIZE + 1))
++        for c in range(max(0, grid.shape[1] - size - MARKER_BLOCK_SIZE + 1))
++    ]
++    random.shuffle(candidates)
++    for r0, c0 in candidates:
++        if not _can_place_legend(grid, r0, c0, size):
++            continue
++        grid[r0 : r0 + size, c0 : c0 + size][mask] = glyph_color
++        grid[
++            r0 + size : r0 + size + MARKER_BLOCK_SIZE,
++            c0 + size : c0 + size + MARKER_BLOCK_SIZE,
++        ] = marker_color
++        return True
++    return False
++
++
++def _build_expected(height: int, width: int, markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((height, width), dtype=int)
++    for r, c, marker_color in markers:
++        glyph_color, _size, mask = GLYPHS[marker_color]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def generate_input() -> np.ndarray:
++    """
++    Construct a sparse lattice of 2x2 marker blocks plus 1-2 legends for the fused rule.
++    """
++    for _ in range(GEN_RETRIES):
++        height = width = random.choice(GRID_SIZE_OPTIONS)
++        row_count = random.randint(*ROWCOL_COUNT_RANGE)
++        col_count = random.randint(*ROWCOL_COUNT_RANGE)
++        row_spacing = random.choice(SPACING_OPTIONS)
++        col_spacing = random.choice(SPACING_OPTIONS)
++        max_row_start = height - MARKER_BLOCK_SIZE - (row_count - 1) * row_spacing
++        max_col_start = width - MARKER_BLOCK_SIZE - (col_count - 1) * col_spacing
++        if max_row_start < 0 or max_col_start < 0:
++            continue
++
++        row0 = random.randint(0, max_row_start)
++        col0 = random.randint(0, max_col_start)
++        anchors = [
++            (row0 + rr * row_spacing, col0 + cc * col_spacing)
++            for rr in range(row_count)
++            for cc in range(col_count)
++        ]
++
++        max_used = min(4, len(anchors) // 2)
++        if max_used < 2:
++            continue
++        used_count = random.randint(2, max_used)
++        used_colors = random.sample(list(GLYPHS), used_count)
++        real_markers = _choose_real_markers(anchors, used_colors)
++
++        grid = np.zeros((height, width), dtype=int)
++        for r, c, marker_color in real_markers:
++            grid[r : r + MARKER_BLOCK_SIZE, c : c + MARKER_BLOCK_SIZE] = marker_color
++
++        legend_target_count = 1 + int(len(used_colors) > 2 and random.random() < 0.4)
++        legend_colors = random.sample(used_colors, legend_target_count)
++        placed_legends = 0
++        for marker_color in legend_colors:
++            placed_legends += int(_try_place_legend(grid, marker_color))
++        if placed_legends == 0:
++            continue
++
++        expected = _build_expected(height, width, real_markers)
++        actual = main(grid)
++        if not np.array_equal(actual, expected):
++            continue
++        return grid
++
++    raise RuntimeError("failed to generate a valid fused dfadab01 instance")
+
+tokens used
+51,930
+融合变体已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/24/code.py)。
+
+这版 `main()` 改为识别孤立的 `2x2` 同色色块，并以色块左上角作为锚点展开字形；颜色同时决定输出颜色、图案家族和尺寸 `3x3/4x4/5x5/6x6`。`generate_input()` 则保证真实标记块、图例样本和 `(+size,+size)` 的 `2x2` 标签块彼此合法分离，且保留边界裁剪现象。文件里也补上了完整的设计分析注释，以及按要求重写的四段式 `main()` 说明。
+
+验证结果：
+- 提供的稳定性测试通过：`Success: 50/50, Time: 1.4s (28ms/call)`
+- 反退化检查 `200` 个样本中，真实标记的尺寸种类分布为 `{2: 101, 3: 72, 4: 27}`，没有退化成单一尺寸
+- 与原始 `dfadab01` solver 的输出相同次数为 `0/200`，像素差异 `min/avg/max = 36 / 99.62 / 202`
+- 含至少一个被裁剪真实字形的样本为 `133/200`，说明裁剪行为也仍然活跃
