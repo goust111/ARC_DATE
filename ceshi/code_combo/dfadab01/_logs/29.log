@@ -1,0 +1,3414 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e2bb0-029e-72f2-b3c5-f9a697778a4b
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: dfadab01
+    **摘要**: 输入中的单像素标记按固定字形字典被替换为对应的4x4图案（标记色->图案色），样本字形及其右下标签在输出中消失，超出网格边缘的部分被裁剪
+
+    ## 要实现的融合组合
+    - **组合名称**: 禁止裁剪+随机散布
+    - **combo_spec**: D6/3+D7/0
+
+    ### 融合描述（实现规格）
+
+    标记在网格中不规则散布。字形超出边界的标记直接忽略不处理。 随机散布使得边缘附近的标记密度不可预测，哪些标记被跳过取决于随机位置。 解题者需要逐个判断每个标记的字形是否完全在网格内，引入了基于位置的条件过滤。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D6/3** — 网格边缘裁剪规则 (`grid_shape`)
+  - 当前值: 字形放置时如果超出网格边界，超出部分被裁剪（只显示网格内的部分）
+  - 改为: 禁止裁剪——仅处理完全在网格内的标记 — 反转裁剪规则：字形超出边界的标记直接忽略不处理（等同于该标记不存在）。解题者需要判断哪些标记会被跳过，引入了基于位置的条件过滤。
+  - 来源: conditional_deletion（参考任务: 8b9c3697）
+- **D7/0** — 标记的空间排列模式 (`meta`)
+  - 当前值: 标记在网格中呈规则的等间距排列（如每隔4或5个单元格），形成网格状分布
+  - 改为: 标记随机散布 — 标记不再等间距排列，而是在网格中不规则散布（但保证字形之间有足够间距不重叠）。解题者不能依赖规则间距模式来推断标记位置，必须逐个定位。
+  - 来源: creative（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/dfadab01.py`
+
+    ```python
+    from __future__ import annotations
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding fixed 4x4 glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show a sample 4x4 glyph in the output color, with a same-rule marker just below-right of the sample.
+
+    Rule:
+    - Replace each marker color by its learned 4x4 glyph: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping at the grid boundary.
+    - Remove the sample glyphs and skip their below-right label markers.
+
+    Key insight:
+    - The colored pixels are control pixels for a fixed glyph alphabet; non-control sample glyphs are only legend entries, not preserved scene objects.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            # Legend labels appear one cell below-right of the sample glyph bbox.
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 10x10 or 20x20 [observed]; must accommodate marker_grid_rows * row_spacing + glyph_size(4)
+  glyph_alphabet:
+    fixed 4x4 patterns, each 8 filled pixels out of 16:
+      marker 2 (red) -> color 4 (yellow) solid frame
+      marker 3 (green) -> color 1 (blue) open ring
+      marker 5 (gray) -> color 6 (magenta) diagonal blocks
+      marker 8 (azure) -> color 7 (orange) X-shape
+  marker_grid:
+    markers placed on a regular grid of positions (rows x cols)
+    shape: 2x2 to 5x5; rows and cols chosen independently
+    row_spacing: 4-6, uniform within example [observed]
+    col_spacing: 4-6, may be non-uniform across columns
+    fill_rate: 60-100% of grid cells contain a marker; unfilled cells are empty (black)
+    marker_types_used: 1-4 distinct types from {2,3,5,8}; each cell assigned one type
+  legend:
+    0 or 1 legend entry per input [observed]; shows one glyph type's mapping
+    structure: the 4x4 glyph drawn in output color + a label marker of matching type at (glyph_row+4, glyph_col+4)
+    legend glyph may overlap a grid cell position (the marker pixel sits where glyph mask has 0)
+    label marker is skipped in output (not expanded)
+  output:
+    black background; each real marker replaced by its 4x4 glyph in the mapped output color
+    glyph top-left at marker position; clipped at grid boundary
+    legend glyph and label removed; no glyph painted for label markers
+    glyphs never overlap (guaranteed by spacing >= 4)
+
+generation_strategy:
+  approach: direct construction (constraints are easy to satisfy constructively)
+  steps:
+    1. Pick grid dimensions ensuring rows * row_spacing and cols * col_spacing fit (with room for 4-cell glyph); e.g. for 5x5 grid with spacing 4, need >= 20.
+    2. Choose 1-4 marker types from {2,3,5,8}. Choose grid shape (R x C, each 2-5). Choose row_spacing and col_spacing (4-6 each).
+    3. Compute marker row/col positions; first row/col >= 0, last row + 3 <= H, last col + 3 <= W (or allow clipping for edge markers).
+    4. Fill grid cells: assign a random marker type to each cell; optionally leave some cells empty (fill_rate >= 60%).
+    5. Optionally add one legend entry: pick a used marker type, find a location where the 4x4 glyph + label at (+4,+4) fits without conflicting with real markers. Draw glyph in output color; place label marker pixel.
+    6. Build input grid: black background + single marker pixels at filled grid cells + legend if present.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+## 已有单变体参考代码
+
+以下组成项已有单变体实现，可作为融合时的参考：
+
+            ### 参考代码: D6/3
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/dfadab01/D6/3/code.py`
+
+            ```python
+            # Variant of dfadab01
+# Dimension: D6 — 网格边缘裁剪规则 (grid_shape)
+# Change: 字形放置时如果超出网格边界，超出部分被裁剪（只显示网格内的部分）... → 禁止裁剪——仅处理完全在网格内的标记
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+
+# Design analysis for the D6 variant
+# a) Concretization and behavior trace
+#    - The scene still contains single-cell markers in colors {2, 3, 5, 8} and an
+#      optional legend made of a 4x4 sample glyph plus a label marker at (+4, +4).
+#    - Each real marker still points to the same fixed 4x4 glyph/color pair.
+#    - The changed behavior is positional: a marker is active only when its full 4x4
+#      glyph box lies inside the grid. Markers in the last three rows and/or last
+#      three columns are now ignored instead of being partially drawn.
+#    - Example on a 10x10 grid: marker 2 at (7, 1).
+#      Old rule: paint rows 7..9 of the yellow frame and clip row 10 away.
+#      New rule: 7 + 4 > 10, so the marker is discarded and contributes nothing.
+# b) Complexity calibration
+#    - The glyph dictionary, colors, legend mechanics, and marker lattice stay fixed.
+#      Only the boundary policy changes, so the task remains close to the source.
+#    - To make the new branch visible, generated inputs always contain both:
+#      at least one fully fitting marker and at least one overflowing marker whose
+#      clipped rendering would have produced visible pixels under the old rule.
+# c) Implicit-assumption audit for main()
+#    - Original _paint_clipped() assumed every marker should be rendered somehow.
+#      That assumption is no longer valid; rendering must now be gated by a fit test.
+#    - Legend skipping via _has_source_glyph() still works because legend glyphs are
+#      always fully inside the grid; otherwise a label marker could be misread.
+#    - The output is still built on a blank canvas, so ignoring a marker is safe:
+#      there is no need to erase anything because no partial glyph is ever written.
+# d) Placement legality
+#    - Real markers are placed on a regular grid with spacing 4..6, so fully fitting
+#      glyphs never overlap each other.
+#    - The generator chooses row/column sequences so that some coordinates cross the
+#      fit threshold H-4 or W-4 while remaining valid input cells inside the grid.
+#    - The optional legend is placed in a marker-free 5x5 box, guaranteeing that the
+#      sample glyph is recognizable and its label marker is skipped correctly.
+# e) Visual observability
+#    - Each sample contains surviving markers and skipped edge markers together.
+#      A human can compare similar marker placements and notice that edge-near ones
+#      disappear completely instead of leaving cropped fragments.
+#    - The generator rejects cases where old clipped output and new output coincide.
+# f) Visual cleanliness
+#    - Marker spacing is at least 4, so surviving 4x4 glyphs do not overlap.
+#    - The legend is isolated from the marker lattice, avoiding ambiguous overlays.
+# g) Color inference
+#    - Color mapping is unchanged from the original task. No new color-dependent rule
+#      is introduced, so the only extra inference burden is the in-bounds test.
+
+GLYPH_SIZE = 4
+MARKER_COLORS = (2, 3, 5, 8)
+GLYPH_COLORS = (1, 4, 6, 7)
+ALLOWED_COLORS = {0, *MARKER_COLORS, *GLYPH_COLORS}
+MAX_RETRIES = 400
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + GLYPH_SIZE > h or c0 + GLYPH_SIZE > w:
+        return False
+    patch = g[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _fits_glyph(shape: tuple[int, int], r0: int, c0: int) -> bool:
+    h, w = shape
+    return 0 <= r0 and 0 <= c0 and r0 + GLYPH_SIZE <= h and c0 + GLYPH_SIZE <= w
+
+
+def _paint_full(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    out[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE][mask] = color
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(GLYPH_SIZE):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(GLYPH_SIZE):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def _render(grid: np.ndarray, *, allow_clipping: bool) -> np.ndarray:
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(map(int, np.unique(g))).issubset(ALLOWED_COLORS)
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            rr = int(r)
+            cc = int(c)
+            if _has_source_glyph(g, rr - GLYPH_SIZE, cc - GLYPH_SIZE, glyph_color, mask):
+                continue
+            if allow_clipping:
+                _paint_clipped(out, rr, cc, glyph_color, mask)
+            elif _fits_glyph(g.shape, rr, cc):
+                _paint_full(out, rr, cc, glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each eligible control pixel into its fixed 4x4 glyph, but only when the full glyph fits.
+
+    Input structure:
+    - Black background with single-cell markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also include one legend entry: a 4x4 sample glyph in the output color plus a same-type label marker placed one row-block down-right.
+
+    Rule:
+    - Map each marker color to the same fixed glyph alphabet as the original puzzle.
+    - Ignore legend label markers, and erase the legend sample itself from the output.
+    - For real markers, draw the glyph only if its entire 4x4 footprint stays inside the grid; edge-overflowing markers are skipped completely.
+
+    Key insight:
+    - Marker color still selects the glyph, but position now matters too: a boundary-near marker is inactive if its glyph would need clipping.
+    """
+    return _render(grid, allow_clipping=False)
+
+
+def _choose_axis_positions(size: int, rng: random.Random, require_overflow: bool) -> list[int]:
+    fit_limit = size - GLYPH_SIZE
+    for _ in range(200):
+        count = rng.randint(2, 5)
+        spacing = rng.randint(4, 6)
+        max_start = size - 1 - spacing * (count - 1)
+        if max_start < 0:
+            continue
+
+        if require_overflow:
+            low = max(0, fit_limit - spacing * (count - 1) + 1)
+            high = min(max_start, fit_limit)
+            if low > high:
+                continue
+            start = rng.randint(low, high)
+        else:
+            high = min(max_start, fit_limit - spacing * (count - 1))
+            if high < 0:
+                continue
+            start = rng.randint(0, high)
+
+        positions = [start + spacing * i for i in range(count)]
+        has_fit = any(p <= fit_limit for p in positions)
+        has_overflow = any(p > fit_limit for p in positions)
+        if require_overflow:
+            if has_fit and has_overflow:
+                return positions
+        elif has_fit and not has_overflow:
+            return positions
+
+    raise ValueError("could not choose axis positions")
+
+
+def _place_legend(
+    grid: np.ndarray,
+    marker_positions: set[tuple[int, int]],
+    used_colors: tuple[int, ...],
+    rng: random.Random,
+) -> bool:
+    h, w = grid.shape
+    candidates: list[tuple[int, int, int]] = []
+    for marker_color in used_colors:
+        for r0 in range(h - GLYPH_SIZE):
+            for c0 in range(w - GLYPH_SIZE):
+                blocked = False
+                for rr in range(r0, r0 + GLYPH_SIZE + 1):
+                    for cc in range(c0, c0 + GLYPH_SIZE + 1):
+                        if (rr, cc) in marker_positions:
+                            blocked = True
+                            break
+                    if blocked:
+                        break
+                if blocked:
+                    continue
+                if np.any(grid[r0 : r0 + GLYPH_SIZE + 1, c0 : c0 + GLYPH_SIZE + 1] != 0):
+                    continue
+                candidates.append((marker_color, r0, c0))
+
+    if not candidates:
+        return False
+
+    marker_color, r0, c0 = rng.choice(candidates)
+    glyph_color, mask = GLYPHS[marker_color]
+    patch = grid[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
+    patch[mask] = glyph_color
+    grid[r0 + GLYPH_SIZE, c0 + GLYPH_SIZE] = marker_color
+    return True
+
+
+def generate_input() -> np.ndarray:
+    rng = random.Random()
+
+    for _ in range(MAX_RETRIES):
+        h = rng.choice((10, 20))
+        w = rng.choice((10, 20))
+
+        overflow_rows = rng.choice((True, False))
+        overflow_cols = True if not overflow_rows else rng.choice((True, False))
+
+        try:
+            row_positions = _choose_axis_positions(h, rng, overflow_rows)
+            col_positions = _choose_axis_positions(w, rng, overflow_cols)
+        except ValueError:
+            continue
+
+        cells = [(r, c) for r in row_positions for c in col_positions]
+        fit_cells = [(r, c) for r, c in cells if _fits_glyph((h, w), r, c)]
+        overflow_cells = [(r, c) for r, c in cells if not _fits_glyph((h, w), r, c)]
+        if not fit_cells or not overflow_cells:
+            continue
+
+        fill_min = max(2, (3 * len(cells) + 4) // 5)
+        fill_count = rng.randint(fill_min, len(cells))
+
+        chosen = {
+            rng.choice(fit_cells),
+            rng.choice(overflow_cells),
+        }
+        remaining = [cell for cell in cells if cell not in chosen]
+        rng.shuffle(remaining)
+        for cell in remaining[: fill_count - len(chosen)]:
+            chosen.add(cell)
+
+        used_count = rng.randint(1, len(MARKER_COLORS))
+        used_colors = tuple(sorted(rng.sample(MARKER_COLORS, used_count)))
+
+        grid = np.zeros((h, w), dtype=int)
+        marker_positions: set[tuple[int, int]] = set()
+        for r, c in chosen:
+            marker_positions.add((r, c))
+            grid[r, c] = rng.choice(used_colors)
+
+        if rng.random() < 0.6:
+            _place_legend(grid, marker_positions, used_colors, rng)
+
+        new_out = main(grid)
+        old_out = _render(grid, allow_clipping=True)
+        if np.array_equal(new_out, old_out):
+            continue
+        if not np.any(new_out != 0):
+            continue
+
+        assert np.array_equal(new_out, _render(grid, allow_clipping=False))
+        return grid
+
+    raise RuntimeError("failed to generate a non-degenerate D6 sample")
+
+            ```
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/29/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/29/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of dfadab01 (index 29)
+    # combo_spec: D6/3+D7/0
+    # Name: 禁止裁剪+随机散布
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/29` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/8b9c3697.py` — 参考任务 8b9c3697 的 solver（D6/3 的灵感来源）
+codex
+我先检查原题代码、参考单变体代码和目标目录状态，确认 solver/generator 的现有约束，再据此落地融合规则。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/dfadab01.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding fixed 4x4 glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show a sample 4x4 glyph in the output color, with a same-rule marker just below-right of the sample.
+
+    Rule:
+    - Replace each marker color by its learned 4x4 glyph: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping at the grid boundary.
+    - Remove the sample glyphs and skip their below-right label markers.
+
+    Key insight:
+    - The colored pixels are control pixels for a fixed glyph alphabet; non-control sample glyphs are only legend entries, not preserved scene objects.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            # Legend labels appear one cell below-right of the sample glyph bbox.
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+exec
+/bin/bash -lc 'ls -la /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/29' in /home/lixinyu/snap/new
+ exited 2 in 0ms:
+ls: cannot access '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/29': No such file or directory
+
+exec
+/bin/bash -lc "sed -n '1,360p' /home/lixinyu/snap/new/ceshi/code/dfadab01/D6/3/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Variant of dfadab01
+# Dimension: D6 — 网格边缘裁剪规则 (grid_shape)
+# Change: 字形放置时如果超出网格边界，超出部分被裁剪（只显示网格内的部分）... → 禁止裁剪——仅处理完全在网格内的标记
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+
+# Design analysis for the D6 variant
+# a) Concretization and behavior trace
+#    - The scene still contains single-cell markers in colors {2, 3, 5, 8} and an
+#      optional legend made of a 4x4 sample glyph plus a label marker at (+4, +4).
+#    - Each real marker still points to the same fixed 4x4 glyph/color pair.
+#    - The changed behavior is positional: a marker is active only when its full 4x4
+#      glyph box lies inside the grid. Markers in the last three rows and/or last
+#      three columns are now ignored instead of being partially drawn.
+#    - Example on a 10x10 grid: marker 2 at (7, 1).
+#      Old rule: paint rows 7..9 of the yellow frame and clip row 10 away.
+#      New rule: 7 + 4 > 10, so the marker is discarded and contributes nothing.
+# b) Complexity calibration
+#    - The glyph dictionary, colors, legend mechanics, and marker lattice stay fixed.
+#      Only the boundary policy changes, so the task remains close to the source.
+#    - To make the new branch visible, generated inputs always contain both:
+#      at least one fully fitting marker and at least one overflowing marker whose
+#      clipped rendering would have produced visible pixels under the old rule.
+# c) Implicit-assumption audit for main()
+#    - Original _paint_clipped() assumed every marker should be rendered somehow.
+#      That assumption is no longer valid; rendering must now be gated by a fit test.
+#    - Legend skipping via _has_source_glyph() still works because legend glyphs are
+#      always fully inside the grid; otherwise a label marker could be misread.
+#    - The output is still built on a blank canvas, so ignoring a marker is safe:
+#      there is no need to erase anything because no partial glyph is ever written.
+# d) Placement legality
+#    - Real markers are placed on a regular grid with spacing 4..6, so fully fitting
+#      glyphs never overlap each other.
+#    - The generator chooses row/column sequences so that some coordinates cross the
+#      fit threshold H-4 or W-4 while remaining valid input cells inside the grid.
+#    - The optional legend is placed in a marker-free 5x5 box, guaranteeing that the
+#      sample glyph is recognizable and its label marker is skipped correctly.
+# e) Visual observability
+#    - Each sample contains surviving markers and skipped edge markers together.
+#      A human can compare similar marker placements and notice that edge-near ones
+#      disappear completely instead of leaving cropped fragments.
+#    - The generator rejects cases where old clipped output and new output coincide.
+# f) Visual cleanliness
+#    - Marker spacing is at least 4, so surviving 4x4 glyphs do not overlap.
+#    - The legend is isolated from the marker lattice, avoiding ambiguous overlays.
+# g) Color inference
+#    - Color mapping is unchanged from the original task. No new color-dependent rule
+#      is introduced, so the only extra inference burden is the in-bounds test.
+
+GLYPH_SIZE = 4
+MARKER_COLORS = (2, 3, 5, 8)
+GLYPH_COLORS = (1, 4, 6, 7)
+ALLOWED_COLORS = {0, *MARKER_COLORS, *GLYPH_COLORS}
+MAX_RETRIES = 400
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + GLYPH_SIZE > h or c0 + GLYPH_SIZE > w:
+        return False
+    patch = g[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _fits_glyph(shape: tuple[int, int], r0: int, c0: int) -> bool:
+    h, w = shape
+    return 0 <= r0 and 0 <= c0 and r0 + GLYPH_SIZE <= h and c0 + GLYPH_SIZE <= w
+
+
+def _paint_full(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    out[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE][mask] = color
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(GLYPH_SIZE):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(GLYPH_SIZE):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def _render(grid: np.ndarray, *, allow_clipping: bool) -> np.ndarray:
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(map(int, np.unique(g))).issubset(ALLOWED_COLORS)
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            rr = int(r)
+            cc = int(c)
+            if _has_source_glyph(g, rr - GLYPH_SIZE, cc - GLYPH_SIZE, glyph_color, mask):
+                continue
+            if allow_clipping:
+                _paint_clipped(out, rr, cc, glyph_color, mask)
+            elif _fits_glyph(g.shape, rr, cc):
+                _paint_full(out, rr, cc, glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each eligible control pixel into its fixed 4x4 glyph, but only when the full glyph fits.
+
+    Input structure:
+    - Black background with single-cell markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also include one legend entry: a 4x4 sample glyph in the output color plus a same-type label marker placed one row-block down-right.
+
+    Rule:
+    - Map each marker color to the same fixed glyph alphabet as the original puzzle.
+    - Ignore legend label markers, and erase the legend sample itself from the output.
+    - For real markers, draw the glyph only if its entire 4x4 footprint stays inside the grid; edge-overflowing markers are skipped completely.
+
+    Key insight:
+    - Marker color still selects the glyph, but position now matters too: a boundary-near marker is inactive if its glyph would need clipping.
+    """
+    return _render(grid, allow_clipping=False)
+
+
+def _choose_axis_positions(size: int, rng: random.Random, require_overflow: bool) -> list[int]:
+    fit_limit = size - GLYPH_SIZE
+    for _ in range(200):
+        count = rng.randint(2, 5)
+        spacing = rng.randint(4, 6)
+        max_start = size - 1 - spacing * (count - 1)
+        if max_start < 0:
+            continue
+
+        if require_overflow:
+            low = max(0, fit_limit - spacing * (count - 1) + 1)
+            high = min(max_start, fit_limit)
+            if low > high:
+                continue
+            start = rng.randint(low, high)
+        else:
+            high = min(max_start, fit_limit - spacing * (count - 1))
+            if high < 0:
+                continue
+            start = rng.randint(0, high)
+
+        positions = [start + spacing * i for i in range(count)]
+        has_fit = any(p <= fit_limit for p in positions)
+        has_overflow = any(p > fit_limit for p in positions)
+        if require_overflow:
+            if has_fit and has_overflow:
+                return positions
+        elif has_fit and not has_overflow:
+            return positions
+
+    raise ValueError("could not choose axis positions")
+
+
+def _place_legend(
+    grid: np.ndarray,
+    marker_positions: set[tuple[int, int]],
+    used_colors: tuple[int, ...],
+    rng: random.Random,
+) -> bool:
+    h, w = grid.shape
+    candidates: list[tuple[int, int, int]] = []
+    for marker_color in used_colors:
+        for r0 in range(h - GLYPH_SIZE):
+            for c0 in range(w - GLYPH_SIZE):
+                blocked = False
+                for rr in range(r0, r0 + GLYPH_SIZE + 1):
+                    for cc in range(c0, c0 + GLYPH_SIZE + 1):
+                        if (rr, cc) in marker_positions:
+                            blocked = True
+                            break
+                    if blocked:
+                        break
+                if blocked:
+                    continue
+                if np.any(grid[r0 : r0 + GLYPH_SIZE + 1, c0 : c0 + GLYPH_SIZE + 1] != 0):
+                    continue
+                candidates.append((marker_color, r0, c0))
+
+    if not candidates:
+        return False
+
+    marker_color, r0, c0 = rng.choice(candidates)
+    glyph_color, mask = GLYPHS[marker_color]
+    patch = grid[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
+    patch[mask] = glyph_color
+    grid[r0 + GLYPH_SIZE, c0 + GLYPH_SIZE] = marker_color
+    return True
+
+
+def generate_input() -> np.ndarray:
+    rng = random.Random()
+
+    for _ in range(MAX_RETRIES):
+        h = rng.choice((10, 20))
+        w = rng.choice((10, 20))
+
+        overflow_rows = rng.choice((True, False))
+        overflow_cols = True if not overflow_rows else rng.choice((True, False))
+
+        try:
+            row_positions = _choose_axis_positions(h, rng, overflow_rows)
+            col_positions = _choose_axis_positions(w, rng, overflow_cols)
+        except ValueError:
+            continue
+
+        cells = [(r, c) for r in row_positions for c in col_positions]
+        fit_cells = [(r, c) for r, c in cells if _fits_glyph((h, w), r, c)]
+        overflow_cells = [(r, c) for r, c in cells if not _fits_glyph((h, w), r, c)]
+        if not fit_cells or not overflow_cells:
+            continue
+
+        fill_min = max(2, (3 * len(cells) + 4) // 5)
+        fill_count = rng.randint(fill_min, len(cells))
+
+        chosen = {
+            rng.choice(fit_cells),
+            rng.choice(overflow_cells),
+        }
+        remaining = [cell for cell in cells if cell not in chosen]
+        rng.shuffle(remaining)
+        for cell in remaining[: fill_count - len(chosen)]:
+            chosen.add(cell)
+
+        used_count = rng.randint(1, len(MARKER_COLORS))
+        used_colors = tuple(sorted(rng.sample(MARKER_COLORS, used_count)))
+
+        grid = np.zeros((h, w), dtype=int)
+        marker_positions: set[tuple[int, int]] = set()
+        for r, c in chosen:
+            marker_positions.add((r, c))
+            grid[r, c] = rng.choice(used_colors)
+
+        if rng.random() < 0.6:
+            _place_legend(grid, marker_positions, used_colors, rng)
+
+        new_out = main(grid)
+        old_out = _render(grid, allow_clipping=True)
+        if np.array_equal(new_out, old_out):
+            continue
+        if not np.any(new_out != 0):
+            continue
+
+        assert np.array_equal(new_out, _render(grid, allow_clipping=False))
+        return grid
+
+    raise RuntimeError("failed to generate a non-degenerate D6 sample")
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json'
+with open(p) as f:
+    data=json.load(f)
+print('train', len(data.get('train', [])), 'test', len(data.get('test', [])))
+for split in ('train','test'):
+    for i,ex in enumerate(data.get(split, [])):
+        inp=ex['input']
+        out=ex['output']
+        print(split, i, len(inp), len(inp[0]), '->', len(out), len(out[0]))
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+train 4 test 1
+train 0 20 20 -> 20 20
+train 1 10 10 -> 10 10
+train 2 10 10 -> 10 10
+train 3 20 20 -> 20 20
+test 0 20 20 -> 20 20
+
+codex
+原题核心很窄：固定 4x4 字形映射加可选图例。融合点主要影响两处：`main()` 里的边界判定要从“裁剪绘制”改成“整块可放置才绘制”，`generate_input()` 里的标记布局要从规则栅格改成不规则散布，同时仍保证字形不重叠、图例可识别、并且一定包含会被新规则过滤掉的边缘标记。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/8b9c3697.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+from collections import defaultdict
+import numpy as np
+from arc_utils import Color, bbox_coords, components_mask, get_bg
+import random
+from arc_utils import Color, bbox_coords, components_mask, paste, random_free_location
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Insert red components into interior sockets of large structures, leaving a black trail.
+
+    Input structure:
+    - bg = most common. Large non-bg, non-red structures with interior cavities.
+    - Red components outside structures.
+
+    Rule:
+    - Interior sockets: bg cells inside a structure's bbox, adjacent to structure pixels.
+    - For each structure, find the direction where rays from sockets hit a red component.
+    - Slide that component into the socket; paint traversed cells black.
+    - Unmatched reds vanish.
+
+    Key insight: Docking direction is inferred by ray-casting from interior sockets to the nearest red component.
+    """
+    g = np.array(grid, dtype=int)
+    bg = int(get_bg(g))
+    H, W = g.shape
+
+    RED = int(Color.RED)
+    BLACK = int(Color.BLACK)
+
+    assert not (int(RED) not in set(map(int, np.unique(g))))
+
+    # --- connected components: red blobs ---
+    red_comps = components_mask(g == int(RED), connectivity=4)
+    assert not (not red_comps)
+
+    red_coords: list[list[tuple[int, int]]] = []
+    red_bbox: list[tuple[int, int, int, int]] = []
+    red_at: dict[tuple[int, int], int] = {}
+
+    for rid, coords in enumerate(red_comps):
+        pts = [(int(r), int(c)) for r, c in coords]
+        red_coords.append(pts)
+        red_bbox.append(tuple(map(int, bbox_coords(coords))))
+        for rc in pts:
+            red_at[rc] = int(rid)
+
+    # --- connected components: structures (non-bg, non-red) ---
+    struct_mask = (g != int(bg)) & (g != int(RED))
+    struct_comps = components_mask(struct_mask, connectivity=4)
+    assert struct_comps, "expected at least one non-bg non-red structure to dock into"
+
+    struct_coords: list[set[tuple[int, int]]] = []
+    struct_bbox: list[tuple[int, int, int, int]] = []
+    for coords in struct_comps:
+        pts = {(int(r), int(c)) for r, c in coords}
+        struct_coords.append(pts)
+        struct_bbox.append(tuple(map(int, bbox_coords(coords))))
+
+    dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    # For each structure, find its best (red, dir, anchor) triple.
+    struct_best: list[tuple[tuple[int, int], int, tuple[int, int], tuple[int, int], int]] = []
+    # entries: ((hit_count, -min_dist), rid, dir, anchor, sid)
+
+    for sid, S in enumerate(struct_coords):
+        sr0, sc0, sr1, sc1 = map(int, struct_bbox[sid])
+        best = None  # (hit_count, -min_dist, rid, dir, anchor)
+
+        for dr, dc in dirs:
+            # rid -> [count, min_dist, best_anchor]
+            hits: dict[int, list] = defaultdict(lambda: [0, 10**9, None])
+            for (r, c) in S:
+                nr, nc = int(r + dr), int(c + dc)
+                if not (0 <= nr < H and 0 <= nc < W):
+                    continue
+                if int(g[nr, nc]) != int(bg):
+                    continue
+                # Socket must lie strictly inside the structure bbox.
+                if not (sr0 < nr < sr1 and sc0 < nc < sc1):
+                    continue
+
+                rr, cc = int(nr), int(nc)
+                while 0 <= rr < H and 0 <= cc < W and int(g[rr, cc]) == int(bg):
+                    rr += int(dr)
+                    cc += int(dc)
+
+                if 0 <= rr < H and 0 <= cc < W and int(g[rr, cc]) == int(RED):
+                    rid = int(red_at[(int(rr), int(cc))])
+                    rec = hits[rid]
+                    rec[0] += 1
+                    dist = abs(int(rr) - int(r)) + abs(int(cc) - int(c))
+                    if int(dist) < int(rec[1]):
+                        rec[1] = int(dist)
+                        rec[2] = (int(r), int(c))
+
+            if not hits:
+                continue
+
+            rid_best = max(hits.keys(), key=lambda k: (int(hits[k][0]), -int(hits[k][1])))
+            cnt, mind, anchor = hits[rid_best]
+            cand = (int(cnt), -int(mind), int(rid_best), (int(dr), int(dc)), anchor)
+            if best is None or cand > best:
+                best = cand
+
+        if best is not None:
+            cnt, neg_mind, rid, dirv, anchor = best
+            struct_best.append(((int(cnt), int(neg_mind)), int(rid), (int(dirv[0]), int(dirv[1])), anchor, int(sid)))
+
+    # Assign each red component to at most one structure (greedy best-first).
+    struct_best.sort(reverse=True, key=lambda t: t[0])
+    used_red: set[int] = set()
+    assignments: list[tuple[int, tuple[int, int], tuple[int, int]]] = []
+    for _score, rid, (dr, dc), anchor, _sid in struct_best:
+        if int(rid) in used_red or anchor is None:
+            continue
+        used_red.add(int(rid))
+        assignments.append((int(rid), (int(dr), int(dc)), (int(anchor[0]), int(anchor[1]))))
+
+    # --- build output ---
+    out = g.copy()
+    out[out == int(RED)] = int(bg)  # all reds vanish unless re-drawn by an assignment
+
+    for rid, (dr, dc), (ar, ac) in assignments:
+        coords = red_coords[int(rid)]
+        r0, c0, r1, c1 = map(int, red_bbox[int(rid)])
+        tr, tc = int(ar + dr), int(ac + dc)  # socket cell
+
+        # Shift so the component face nearest the structure lands on the socket.
+        if dr == 0 and dc == 1:  # east; align min col
+            shift_r, shift_c = 0, int(tc - c0)
+        elif dr == 0 and dc == -1:  # west; align max col
+            shift_r, shift_c = 0, int(tc - c1)
+        elif dr == 1 and dc == 0:  # south; align min row
+            shift_r, shift_c = int(tr - r0), 0
+        else:  # north; align max row
+            shift_r, shift_c = int(tr - r1), 0
+
+        steps = int(max(abs(int(shift_r)), abs(int(shift_c))))
+        step_dr = 0 if shift_r == 0 else (1 if shift_r > 0 else -1)
+        step_dc = 0 if shift_c == 0 else (1 if shift_c > 0 else -1)
+
+        # Paint trail black for intermediate placements (including the original),
+        # but excluding the final placement where the red ends up.
+        for step in range(0, steps):
+            off_r = int(step * step_dr)
+            off_c = int(step * step_dc)
+            for r, c in coords:
+                rr = int(r + off_r)
+                cc = int(c + off_c)
+                if 0 <= rr < H and 0 <= cc < W:
+                    out[rr, cc] = int(BLACK)
+
+        # Final placement of the red component.
+        for r, c in coords:
+            rr = int(r + shift_r)
+            cc = int(c + shift_c)
+            if 0 <= rr < H and 0 <= cc < W:
+                out[rr, cc] = int(RED)
+
+    return out
+
+# --------------- generator (codex-att2) ---------------
+
+# ── CFG: canvas & grid ──────────────────────────────────────────────
+GRID_H_RANGE = (19, 23)          # output grid height
+GRID_W_RANGE = (22, 27)          # output grid width
+BG_COLORS = (3, 4)               # candidate background colors
+STRUCT_COLORS = (1, 4, 8)        # candidate structure colors
+
+# ── CFG: structures ─────────────────────────────────────────────────
+STRUCT_WIDTH_TEETH = ((7, 1), (8, 2), (9, 1), (9, 3))  # (back_wall_width, teeth_count)
+STRUCT_COUNT_RANGE = (2, 3)      # number of comb/bracket structures
+UNMATCHED_PROB = 0.35            # probability of 1 unmatched structure
+SLIDE_RANGE = (4, 8)             # red slide distance into socket
+STRUCT_PADDING = 4               # min gap between placed structures
+
+# ── CFG: distractors ────────────────────────────────────────────────
+DISTRACTOR_SHAPES = ((1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2))
+TOTAL_RED_MIN = 5                # min total red components (matched + distractors)
+TOTAL_RED_MAX = 11               # max total red components
+DISTRACTOR_MIN = 2               # absolute min distractors
+DISTRACTOR_MAX = 8               # absolute max distractors
+
+# ── CFG: retry ──────────────────────────────────────────────────────
+MAX_RETRIES = 300                # outer retry loop for generate_input
+
+_DIRS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+
+def _dilate4(mask: np.ndarray) -> np.ndarray:
+    """4-connected dilation of a boolean mask."""
+    out = mask.copy()
+    out[1:, :] |= mask[:-1, :]
+    out[:-1, :] |= mask[1:, :]
+    out[:, 1:] |= mask[:, :-1]
+    out[:, :-1] |= mask[:, 1:]
+    return out
+
+
+def _structure_array(width: int, teeth: int, bg: int, sc: int) -> np.ndarray:
+    """Build a 4-row normalized comb structure (opening facing down)."""
+    g = np.full((4, width), bg, dtype=int)
+    start = (width - teeth) // 2
+    g[0, :] = sc                         # back wall
+    g[1, 1] = g[1, width - 2] = sc       # side walls row 1
+    g[2:4, 1] = g[2:4, width - 2] = sc   # side walls rows 2-3
+    g[1, start:start + teeth] = sc        # teeth
+    return g
+
+
+def _matched_patches(width: int, teeth: int, slide: int, rot_k: int,
+                     bg: int, sc: int) -> dict:
+    """Build input/output/structure patches for a matched structure+red pair."""
+    red, black = int(Color.RED), int(Color.BLACK)
+    red_h = min(teeth, 2)
+    base = _structure_array(width, teeth, bg, sc)
+    patch_h = 2 + slide + red_h
+
+    structure = np.full((patch_h, width), bg, dtype=int)
+    paste(structure, base, 0, 0, transparent=bg)
+    input_patch = structure.copy()
+    output_patch = structure.copy()
+
+    start = (width - teeth) // 2
+    for off in range(1, slide + 1):
+        output_patch[2 + off:2 + off + red_h, start:start + teeth] = black
+    output_patch[2:2 + red_h, start:start + teeth] = red
+    input_patch[2 + slide:2 + slide + red_h, start:start + teeth] = red
+
+    return {
+        "structure": np.rot90(structure, k=rot_k),
+        "input": np.rot90(input_patch, k=rot_k),
+        "output": np.rot90(output_patch, k=rot_k),
+    }
+
+
+def _unmatched_patches(width: int, teeth: int, rot_k: int,
+                       bg: int, sc: int) -> dict:
+    """Build patches for an unmatched structure (no red component)."""
+    structure = np.rot90(_structure_array(width, teeth, bg, sc), k=rot_k)
+    return {"structure": structure, "input": structure.copy(), "output": structure.copy()}
+
+
+def _structure_rays(struct_grid: np.ndarray, placed: list[dict], bg: int) -> np.ndarray:
+    """Return a boolean mask of cells on line-of-sight from any socket outward."""
+    h, w = struct_grid.shape
+    forbidden = np.zeros((h, w), dtype=bool)
+    for item in placed:
+        r0, c0, r1, c1 = item["bbox"]
+        for dr, dc in _DIRS:
+            for r, c in item["coords"]:
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < h and 0 <= nc < w):
+                    continue
+                if struct_grid[nr, nc] != bg:
+                    continue
+                if not (r0 < nr < r1 and c0 < nc < c1):
+                    continue
+                rr, cc = nr, nc
+
+exec
+/bin/bash -lc "find /home/lixinyu/snap/new/ceshi/code_combo/dfadab01 -maxdepth 2 -type f | sort | sed -n '1,40p'" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/1.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/10.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/11.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/12.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/13.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/14.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/15.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/16.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/17.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/18.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/19.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/2.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/20.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/21.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/22.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/23.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/24.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/25.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/26.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/27.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/28.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/29.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/3.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/30.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/31.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/32.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/33.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/34.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/35.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/4.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/5.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/6.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/7.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/8.log
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/_logs/9.log
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json, numpy as np
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json'
+with open(p) as f:
+    data=json.load(f)
+for i,ex in enumerate(data['train']):
+    a=np.array(ex['input'])
+    b=np.array(ex['output'])
+    print('train', i, 'in colors', sorted(np.unique(a).tolist()), 'out colors', sorted(np.unique(b).tolist()))
+PY" in /home/lixinyu/snap/new
+ succeeded in 230ms:
+train 0 in colors [0, 2, 3, 5, 6] out colors [0, 1, 4, 6]
+train 1 in colors [0, 1, 2, 3] out colors [0, 1, 4]
+train 2 in colors [0, 2, 4] out colors [0, 4]
+train 3 in colors [0, 2, 3, 5, 8] out colors [0, 1, 4, 6, 7]
+
+codex
+我已经确认目标目录还不存在，需要新建并写完整文件。接下来直接实现一个独立的融合版：保留原字形字典和图例识别，但把生成器改成“稀疏随机候选框采样”，用 4x4 占位框控制不重叠，并强制同时出现“可完整放置”和“会被越界丢弃”的标记。
+codex
+实现方案分三块：
+
+1. `main()`
+- 复用原字形字典和图例标签识别。
+- 新增 `_fits_glyph()` 和整块绘制函数，去掉主路径里的裁剪绘制。
+- 只有“不是图例标签”且“4x4 完全落在网格内”的标记才会被扩展。
+
+2. `generate_input()`
+- 不再构造规则行列栅格，改成在整张图上随机抽样单像素标记位置。
+- 用每个标记对应的 4x4 包围框做碰撞检测；完全在界内的标记彼此 4x4 不重叠，越界标记也不能与现有完整包围框或图例区域冲突。
+- 强制至少一个可绘制标记和至少一个会越界被忽略的标记，并用与旧裁剪版输出对比的退化检测兜底。
+
+3. 验证
+- 先跑 50 次成功率测试。
+- 再统计“被过滤的越界标记数”和“新旧输出差异像素数”，确认生成样本确实触发融合行为，而不是碰巧退化回原题。
+codex
+我要开始写文件了：先创建目标目录，再把融合版 solver/generator 一次性落进去，随后直接跑压力测试和行为指标统计。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/29' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/29/code.py
+diff --git a/ceshi/code_combo/dfadab01/29/code.py b/ceshi/code_combo/dfadab01/29/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc5a0e7b0b02a6ecb23159192bcecfa8fa3d9f62
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/29/code.py
+@@ -0,0 +1,373 @@
++# Combo variant of dfadab01 (index 29)
++# combo_spec: D6/3+D7/0
++# Name: 禁止裁剪+随机散布
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++# Design analysis for the combo variant
++# a) Concretization and behavior trace
++#    - The fixed alphabet is unchanged: marker colors {2, 3, 5, 8} still point to the
++#      same 4x4 output masks/colors, and an optional legend is still a painted sample
++#      glyph with its label marker at (+4, +4).
++#    - The two changes interact through position. Example on a 10x10 grid:
++#      markers at (1, 1), (2, 6), (6, 0), (8, 5), scattered without row/col spacing.
++#      Old task: every real marker expands, so (8, 5) contributes a cropped fragment.
++#      New combo: each marker is checked independently; (1, 1), (2, 6), (6, 0) survive
++#      only if their full 4x4 boxes fit, while (8, 5) is ignored because 8 + 4 > 10.
++#      Random scattering matters because edge-near markers can now appear anywhere,
++#      not only on the last row/column of a regular lattice.
++# b) Complexity calibration
++#    - The rule change stays single-branch: color chooses glyph, then position decides
++#      whether that glyph is active. There is no extra remapping or shape mutation.
++#    - The generator always includes both at least one fully fitting marker and at
++#      least one overflowing marker, so the "skip instead of crop" behavior is visible.
++#    - Scatter is constrained by 4x4 non-overlap boxes, keeping scenes readable while
++#      still breaking the original equal-spacing cue.
++# c) Implicit-assumption audit for main()
++#    - Original logic assumed every non-legend marker should paint something via
++#      clipping. That assumption is invalid now; painting must be gated by _fits_glyph().
++#    - Legend detection via _has_source_glyph() still works because the legend sample
++#      is always fully inside the grid and isolated from real markers by construction.
++#    - Iterating markers color-by-color remains safe because surviving glyphs never
++#      overlap, so paint order does not affect the output.
++# d) Placement legality
++#    - The generator treats every real marker as owning a 4x4 intended glyph box,
++#      even for overflowing markers. Those boxes are sampled without overlap, so the
++#      input is unambiguous and the clipped baseline would also stay non-overlapping.
++#    - The optional legend uses a disjoint 5x5 reservation box (4x4 sample + label),
++#      preventing collisions with marker pixels or intended glyph regions.
++# e) Visual observability
++#    - Each accepted sample has real scattered markers in several unrelated rows/cols,
++#      plus at least one edge-near marker that disappears entirely in the output.
++#    - The generator rejects any case where the new output matches the old clipped
++#      output, so the boundary-rule change is guaranteed to manifest.
++# f) Visual cleanliness
++#    - Non-overlapping 4x4 boxes keep glyphs separated even though marker pixels are
++#      irregularly placed. The legend is isolated, so it reads as a removable key.
++#    - Random scatter is limited to modest marker counts, avoiding dense clutter.
++# g) Color inference
++#    - Color semantics are unchanged from the source puzzle. The only new inference is
++#      that marker location relative to the bottom/right border can deactivate it.
++
++GLYPH_SIZE = 4
++LEGEND_SIZE = GLYPH_SIZE + 1
++MARKER_COLORS = (2, 3, 5, 8)
++GLYPH_COLORS = (1, 4, 6, 7)
++ALLOWED_COLORS = {0, *MARKER_COLORS, *GLYPH_COLORS}
++MAX_RETRIES = 500
++
++GLYPHS: dict[int, tuple[int, np.ndarray]] = {
++    2: (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    3: (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    5: (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    8: (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + GLYPH_SIZE > h or c0 + GLYPH_SIZE > w:
++        return False
++    patch = g[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _fits_glyph(shape: tuple[int, int], r0: int, c0: int) -> bool:
++    h, w = shape
++    return 0 <= r0 and 0 <= c0 and r0 + GLYPH_SIZE <= h and c0 + GLYPH_SIZE <= w
++
++
++def _paint_full(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    patch = out[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    patch[mask] = color
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(GLYPH_SIZE):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(GLYPH_SIZE):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _render(grid: np.ndarray, *, allow_clipping: bool) -> np.ndarray:
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(map(int, np.unique(g))).issubset(ALLOWED_COLORS)
++
++    out = np.zeros_like(g)
++    seen_marker = False
++    for marker_color, (glyph_color, mask) in GLYPHS.items():
++        coords = np.argwhere(g == marker_color)
++        if coords.size:
++            seen_marker = True
++        for r, c in coords:
++            rr = int(r)
++            cc = int(c)
++            if _has_source_glyph(g, rr - GLYPH_SIZE, cc - GLYPH_SIZE, glyph_color, mask):
++                continue
++            if allow_clipping:
++                _paint_clipped(out, rr, cc, glyph_color, mask)
++            elif _fits_glyph(g.shape, rr, cc):
++                _paint_full(out, rr, cc, glyph_color, mask)
++
++    assert seen_marker
++    return out
++
++
++def _iter_real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
++    real: list[tuple[int, int, int]] = []
++    for marker_color, (glyph_color, mask) in GLYPHS.items():
++        for r, c in np.argwhere(g == marker_color):
++            rr = int(r)
++            cc = int(c)
++            if _has_source_glyph(g, rr - GLYPH_SIZE, cc - GLYPH_SIZE, glyph_color, mask):
++                continue
++            real.append((rr, cc, marker_color))
++    return real
++
++
++def _box_for_marker(r0: int, c0: int) -> tuple[int, int, int, int]:
++    return (r0, c0, r0 + GLYPH_SIZE, c0 + GLYPH_SIZE)
++
++
++def _boxes_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
++    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
++
++
++def _axis_has_uniform_spacing(values: list[int]) -> bool:
++    if len(values) < 3:
++        return False
++    diffs = [b - a for a, b in zip(values, values[1:])]
++    return len(set(diffs)) == 1
++
++
++def _looks_regular_scatter(positions: list[tuple[int, int]]) -> bool:
++    rows = sorted({r for r, _ in positions})
++    cols = sorted({c for _, c in positions})
++    return _axis_has_uniform_spacing(rows) and _axis_has_uniform_spacing(cols)
++
++
++def _try_sample_positions(
++    shape: tuple[int, int],
++    fit_target: int,
++    overflow_target: int,
++    rng: random.Random,
++) -> list[tuple[int, int]] | None:
++    h, w = shape
++    fit_candidates = [(r, c) for r in range(h) for c in range(w) if _fits_glyph(shape, r, c)]
++    overflow_candidates = [(r, c) for r in range(h) for c in range(w) if not _fits_glyph(shape, r, c)]
++    rng.shuffle(fit_candidates)
++    rng.shuffle(overflow_candidates)
++
++    chosen: list[tuple[int, int]] = []
++    boxes: list[tuple[int, int, int, int]] = []
++
++    for pool, target in ((fit_candidates, fit_target), (overflow_candidates, overflow_target)):
++        added = 0
++        for r, c in pool:
++            box = _box_for_marker(r, c)
++            if any(_boxes_overlap(box, other) for other in boxes):
++                continue
++            chosen.append((r, c))
++            boxes.append(box)
++            added += 1
++            if added == target:
++                break
++        if added != target:
++            return None
++
++    return chosen
++
++
++def _choose_scattered_positions(shape: tuple[int, int], rng: random.Random) -> list[tuple[int, int]]:
++    h, w = shape
++    fit_range = (2, 3) if h == 10 and w == 10 else (4, 7)
++    overflow_range = (1, 2) if h == 10 and w == 10 else (2, 4)
++
++    for _ in range(200):
++        fit_target = rng.randint(*fit_range)
++        overflow_target = rng.randint(*overflow_range)
++        positions = _try_sample_positions(shape, fit_target, overflow_target, rng)
++        if positions is None:
++            continue
++        rows = {r for r, _ in positions}
++        cols = {c for _, c in positions}
++        if len(rows) < 3 or len(cols) < 3:
++            continue
++        if _looks_regular_scatter(positions):
++            continue
++        return positions
++
++    raise ValueError("could not choose irregular scattered marker positions")
++
++
++def _place_legend(
++    grid: np.ndarray,
++    marker_boxes: list[tuple[int, int, int, int]],
++    used_colors: tuple[int, ...],
++    rng: random.Random,
++) -> bool:
++    h, w = grid.shape
++    candidates: list[tuple[int, int, int]] = []
++    for marker_color in used_colors:
++        for r0 in range(h - GLYPH_SIZE):
++            for c0 in range(w - GLYPH_SIZE):
++                legend_box = (r0, c0, r0 + LEGEND_SIZE, c0 + LEGEND_SIZE)
++                if any(_boxes_overlap(legend_box, box) for box in marker_boxes):
++                    continue
++                if np.any(grid[r0 : r0 + LEGEND_SIZE, c0 : c0 + LEGEND_SIZE] != 0):
++                    continue
++                candidates.append((marker_color, r0, c0))
++
++    if not candidates:
++        return False
++
++    marker_color, r0, c0 = rng.choice(candidates)
++    glyph_color, mask = GLYPHS[marker_color]
++    patch = grid[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    patch[mask] = glyph_color
++    grid[r0 + GLYPH_SIZE, c0 + GLYPH_SIZE] = marker_color
++    return True
++
++
++def _sample_metrics(grid: np.ndarray) -> dict[str, int | bool]:
++    g = np.asarray(grid, dtype=int)
++    real_markers = _iter_real_markers(g)
++    skipped = sum(1 for r, c, _ in real_markers if not _fits_glyph(g.shape, r, c))
++    old_out = _render(g, allow_clipping=True)
++    new_out = _render(g, allow_clipping=False)
++    return {
++        "real_marker_count": len(real_markers),
++        "skipped_marker_count": skipped,
++        "diff_pixels": int(np.count_nonzero(old_out != new_out)),
++        "regular_scatter": _looks_regular_scatter([(r, c) for r, c, _ in real_markers]),
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand scattered control pixels into fixed 4x4 glyphs, but only when the whole glyph fits.
++
++    Input structure:
++    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8, now scattered irregularly instead of sitting on a regular lattice.
++    - Some inputs also contain one legend entry: a 4x4 sample glyph in its output color plus a matching label marker one glyph-step down-right.
++
++    Rule:
++    - Use the same fixed glyph dictionary as the source task: marker color chooses one 4x4 output mask/color pair.
++    - Remove the legend sample and ignore its label marker.
++    - For every real marker, paint the glyph only if the entire 4x4 footprint stays inside the grid; markers whose glyph would cross the border contribute nothing at all.
++
++    Key insight:
++    - The mapping is still determined by marker color, but scattered placement means you must inspect each marker separately and filter out the edge-near ones instead of expecting cropped fragments.
++    """
++    return _render(grid, allow_clipping=False)
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++
++    for _ in range(MAX_RETRIES):
++        h = rng.choice((10, 20))
++        w = rng.choice((10, 20))
++        shape = (h, w)
++
++        try:
++            positions = _choose_scattered_positions(shape, rng)
++        except ValueError:
++            continue
++
++        grid = np.zeros(shape, dtype=int)
++        marker_boxes = [_box_for_marker(r, c) for r, c in positions]
++
++        used_count = min(rng.randint(1, len(MARKER_COLORS)), len(positions))
++        used_colors = tuple(sorted(rng.sample(MARKER_COLORS, used_count)))
++
++        color_bag = list(used_colors)
++        while len(color_bag) < len(positions):
++            color_bag.append(rng.choice(used_colors))
++        rng.shuffle(color_bag)
++
++        for (r, c), marker_color in zip(positions, color_bag):
++            grid[r, c] = marker_color
++
++        if rng.random() < 0.6:
++            _place_legend(grid, marker_boxes, used_colors, rng)
++
++        metrics = _sample_metrics(grid)
++        if int(metrics["skipped_marker_count"]) < 1:
++            continue
++        if int(metrics["diff_pixels"]) < 1:
++            continue
++        if bool(metrics["regular_scatter"]):
++            continue
++        if int(metrics["real_marker_count"]) - int(metrics["skipped_marker_count"]) < 1:
++            continue
++
++        out = main(grid)
++        if not np.any(out != 0):
++            continue
++
++        # New assumptions after the combo change:
++        # - generate_input() guarantees at least one surviving and one skipped real marker.
++        # - All intended 4x4 marker boxes are pairwise disjoint, so _render() remains
++        #   order-independent even though markers are no longer arranged on a lattice.
++        # - Any legend label always has a fully visible 4x4 sample up-left, matching
++        #   the _has_source_glyph() predicate used by main().
++        assert np.array_equal(out, _render(grid, allow_clipping=False))
++        return grid
++
++    raise RuntimeError("failed to generate a non-degenerate combo sample")
+
+diff --git a/ceshi/code_combo/dfadab01/29/code.py b/ceshi/code_combo/dfadab01/29/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc5a0e7b0b02a6ecb23159192bcecfa8fa3d9f62
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/29/code.py
+@@ -0,0 +1,373 @@
++# Combo variant of dfadab01 (index 29)
++# combo_spec: D6/3+D7/0
++# Name: 禁止裁剪+随机散布
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++# Design analysis for the combo variant
++# a) Concretization and behavior trace
++#    - The fixed alphabet is unchanged: marker colors {2, 3, 5, 8} still point to the
++#      same 4x4 output masks/colors, and an optional legend is still a painted sample
++#      glyph with its label marker at (+4, +4).
++#    - The two changes interact through position. Example on a 10x10 grid:
++#      markers at (1, 1), (2, 6), (6, 0), (8, 5), scattered without row/col spacing.
++#      Old task: every real marker expands, so (8, 5) contributes a cropped fragment.
++#      New combo: each marker is checked independently; (1, 1), (2, 6), (6, 0) survive
++#      only if their full 4x4 boxes fit, while (8, 5) is ignored because 8 + 4 > 10.
++#      Random scattering matters because edge-near markers can now appear anywhere,
++#      not only on the last row/column of a regular lattice.
++# b) Complexity calibration
++#    - The rule change stays single-branch: color chooses glyph, then position decides
++#      whether that glyph is active. There is no extra remapping or shape mutation.
++#    - The generator always includes both at least one fully fitting marker and at
++#      least one overflowing marker, so the "skip instead of crop" behavior is visible.
++#    - Scatter is constrained by 4x4 non-overlap boxes, keeping scenes readable while
++#      still breaking the original equal-spacing cue.
++# c) Implicit-assumption audit for main()
++#    - Original logic assumed every non-legend marker should paint something via
++#      clipping. That assumption is invalid now; painting must be gated by _fits_glyph().
++#    - Legend detection via _has_source_glyph() still works because the legend sample
++#      is always fully inside the grid and isolated from real markers by construction.
++#    - Iterating markers color-by-color remains safe because surviving glyphs never
++#      overlap, so paint order does not affect the output.
++# d) Placement legality
++#    - The generator treats every real marker as owning a 4x4 intended glyph box,
++#      even for overflowing markers. Those boxes are sampled without overlap, so the
++#      input is unambiguous and the clipped baseline would also stay non-overlapping.
++#    - The optional legend uses a disjoint 5x5 reservation box (4x4 sample + label),
++#      preventing collisions with marker pixels or intended glyph regions.
++# e) Visual observability
++#    - Each accepted sample has real scattered markers in several unrelated rows/cols,
++#      plus at least one edge-near marker that disappears entirely in the output.
++#    - The generator rejects any case where the new output matches the old clipped
++#      output, so the boundary-rule change is guaranteed to manifest.
++# f) Visual cleanliness
++#    - Non-overlapping 4x4 boxes keep glyphs separated even though marker pixels are
++#      irregularly placed. The legend is isolated, so it reads as a removable key.
++#    - Random scatter is limited to modest marker counts, avoiding dense clutter.
++# g) Color inference
++#    - Color semantics are unchanged from the source puzzle. The only new inference is
++#      that marker location relative to the bottom/right border can deactivate it.
++
++GLYPH_SIZE = 4
++LEGEND_SIZE = GLYPH_SIZE + 1
++MARKER_COLORS = (2, 3, 5, 8)
++GLYPH_COLORS = (1, 4, 6, 7)
++ALLOWED_COLORS = {0, *MARKER_COLORS, *GLYPH_COLORS}
++MAX_RETRIES = 500
++
++GLYPHS: dict[int, tuple[int, np.ndarray]] = {
++    2: (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    3: (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    5: (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    8: (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + GLYPH_SIZE > h or c0 + GLYPH_SIZE > w:
++        return False
++    patch = g[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _fits_glyph(shape: tuple[int, int], r0: int, c0: int) -> bool:
++    h, w = shape
++    return 0 <= r0 and 0 <= c0 and r0 + GLYPH_SIZE <= h and c0 + GLYPH_SIZE <= w
++
++
++def _paint_full(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    patch = out[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    patch[mask] = color
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(GLYPH_SIZE):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(GLYPH_SIZE):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _render(grid: np.ndarray, *, allow_clipping: bool) -> np.ndarray:
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(map(int, np.unique(g))).issubset(ALLOWED_COLORS)
++
++    out = np.zeros_like(g)
++    seen_marker = False
++    for marker_color, (glyph_color, mask) in GLYPHS.items():
++        coords = np.argwhere(g == marker_color)
++        if coords.size:
++            seen_marker = True
++        for r, c in coords:
++            rr = int(r)
++            cc = int(c)
++            if _has_source_glyph(g, rr - GLYPH_SIZE, cc - GLYPH_SIZE, glyph_color, mask):
++                continue
++            if allow_clipping:
++                _paint_clipped(out, rr, cc, glyph_color, mask)
++            elif _fits_glyph(g.shape, rr, cc):
++                _paint_full(out, rr, cc, glyph_color, mask)
++
++    assert seen_marker
++    return out
++
++
++def _iter_real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
++    real: list[tuple[int, int, int]] = []
++    for marker_color, (glyph_color, mask) in GLYPHS.items():
++        for r, c in np.argwhere(g == marker_color):
++            rr = int(r)
++            cc = int(c)
++            if _has_source_glyph(g, rr - GLYPH_SIZE, cc - GLYPH_SIZE, glyph_color, mask):
++                continue
++            real.append((rr, cc, marker_color))
++    return real
++
++
++def _box_for_marker(r0: int, c0: int) -> tuple[int, int, int, int]:
++    return (r0, c0, r0 + GLYPH_SIZE, c0 + GLYPH_SIZE)
++
++
++def _boxes_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
++    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
++
++
++def _axis_has_uniform_spacing(values: list[int]) -> bool:
++    if len(values) < 3:
++        return False
++    diffs = [b - a for a, b in zip(values, values[1:])]
++    return len(set(diffs)) == 1
++
++
++def _looks_regular_scatter(positions: list[tuple[int, int]]) -> bool:
++    rows = sorted({r for r, _ in positions})
++    cols = sorted({c for _, c in positions})
++    return _axis_has_uniform_spacing(rows) and _axis_has_uniform_spacing(cols)
++
++
++def _try_sample_positions(
++    shape: tuple[int, int],
++    fit_target: int,
++    overflow_target: int,
++    rng: random.Random,
++) -> list[tuple[int, int]] | None:
++    h, w = shape
++    fit_candidates = [(r, c) for r in range(h) for c in range(w) if _fits_glyph(shape, r, c)]
++    overflow_candidates = [(r, c) for r in range(h) for c in range(w) if not _fits_glyph(shape, r, c)]
++    rng.shuffle(fit_candidates)
++    rng.shuffle(overflow_candidates)
++
++    chosen: list[tuple[int, int]] = []
++    boxes: list[tuple[int, int, int, int]] = []
++
++    for pool, target in ((fit_candidates, fit_target), (overflow_candidates, overflow_target)):
++        added = 0
++        for r, c in pool:
++            box = _box_for_marker(r, c)
++            if any(_boxes_overlap(box, other) for other in boxes):
++                continue
++            chosen.append((r, c))
++            boxes.append(box)
++            added += 1
++            if added == target:
++                break
++        if added != target:
++            return None
++
++    return chosen
++
++
++def _choose_scattered_positions(shape: tuple[int, int], rng: random.Random) -> list[tuple[int, int]]:
++    h, w = shape
++    fit_range = (2, 3) if h == 10 and w == 10 else (4, 7)
++    overflow_range = (1, 2) if h == 10 and w == 10 else (2, 4)
++
++    for _ in range(200):
++        fit_target = rng.randint(*fit_range)
++        overflow_target = rng.randint(*overflow_range)
++        positions = _try_sample_positions(shape, fit_target, overflow_target, rng)
++        if positions is None:
++            continue
++        rows = {r for r, _ in positions}
++        cols = {c for _, c in positions}
++        if len(rows) < 3 or len(cols) < 3:
++            continue
++        if _looks_regular_scatter(positions):
++            continue
++        return positions
++
++    raise ValueError("could not choose irregular scattered marker positions")
++
++
++def _place_legend(
++    grid: np.ndarray,
++    marker_boxes: list[tuple[int, int, int, int]],
++    used_colors: tuple[int, ...],
++    rng: random.Random,
++) -> bool:
++    h, w = grid.shape
++    candidates: list[tuple[int, int, int]] = []
++    for marker_color in used_colors:
++        for r0 in range(h - GLYPH_SIZE):
++            for c0 in range(w - GLYPH_SIZE):
++                legend_box = (r0, c0, r0 + LEGEND_SIZE, c0 + LEGEND_SIZE)
++                if any(_boxes_overlap(legend_box, box) for box in marker_boxes):
++                    continue
++                if np.any(grid[r0 : r0 + LEGEND_SIZE, c0 : c0 + LEGEND_SIZE] != 0):
++                    continue
++                candidates.append((marker_color, r0, c0))
++
++    if not candidates:
++        return False
++
++    marker_color, r0, c0 = rng.choice(candidates)
++    glyph_color, mask = GLYPHS[marker_color]
++    patch = grid[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    patch[mask] = glyph_color
++    grid[r0 + GLYPH_SIZE, c0 + GLYPH_SIZE] = marker_color
++    return True
++
++
++def _sample_metrics(grid: np.ndarray) -> dict[str, int | bool]:
++    g = np.asarray(grid, dtype=int)
++    real_markers = _iter_real_markers(g)
++    skipped = sum(1 for r, c, _ in real_markers if not _fits_glyph(g.shape, r, c))
++    old_out = _render(g, allow_clipping=True)
++    new_out = _render(g, allow_clipping=False)
++    return {
++        "real_marker_count": len(real_markers),
++        "skipped_marker_count": skipped,
++        "diff_pixels": int(np.count_nonzero(old_out != new_out)),
++        "regular_scatter": _looks_regular_scatter([(r, c) for r, c, _ in real_markers]),
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand scattered control pixels into fixed 4x4 glyphs, but only when the whole glyph fits.
++
++    Input structure:
++    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8, now scattered irregularly instead of sitting on a regular lattice.
++    - Some inputs also contain one legend entry: a 4x4 sample glyph in its output color plus a matching label marker one glyph-step down-right.
++
++    Rule:
++    - Use the same fixed glyph dictionary as the source task: marker color chooses one 4x4 output mask/color pair.
++    - Remove the legend sample and ignore its label marker.
++    - For every real marker, paint the glyph only if the entire 4x4 footprint stays inside the grid; markers whose glyph would cross the border contribute nothing at all.
++
++    Key insight:
++    - The mapping is still determined by marker color, but scattered placement means you must inspect each marker separately and filter out the edge-near ones instead of expecting cropped fragments.
++    """
++    return _render(grid, allow_clipping=False)
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++
++    for _ in range(MAX_RETRIES):
++        h = rng.choice((10, 20))
++        w = rng.choice((10, 20))
++        shape = (h, w)
++
++        try:
++            positions = _choose_scattered_positions(shape, rng)
++        except ValueError:
++            continue
++
++        grid = np.zeros(shape, dtype=int)
++        marker_boxes = [_box_for_marker(r, c) for r, c in positions]
++
++        used_count = min(rng.randint(1, len(MARKER_COLORS)), len(positions))
++        used_colors = tuple(sorted(rng.sample(MARKER_COLORS, used_count)))
++
++        color_bag = list(used_colors)
++        while len(color_bag) < len(positions):
++            color_bag.append(rng.choice(used_colors))
++        rng.shuffle(color_bag)
++
++        for (r, c), marker_color in zip(positions, color_bag):
++            grid[r, c] = marker_color
++
++        if rng.random() < 0.6:
++            _place_legend(grid, marker_boxes, used_colors, rng)
++
++        metrics = _sample_metrics(grid)
++        if int(metrics["skipped_marker_count"]) < 1:
++            continue
++        if int(metrics["diff_pixels"]) < 1:
++            continue
++        if bool(metrics["regular_scatter"]):
++            continue
++        if int(metrics["real_marker_count"]) - int(metrics["skipped_marker_count"]) < 1:
++            continue
++
++        out = main(grid)
++        if not np.any(out != 0):
++            continue
++
++        # New assumptions after the combo change:
++        # - generate_input() guarantees at least one surviving and one skipped real marker.
++        # - All intended 4x4 marker boxes are pairwise disjoint, so _render() remains
++        #   order-independent even though markers are no longer arranged on a lattice.
++        # - Any legend label always has a fully visible 4x4 sample up-left, matching
++        #   the _has_source_glyph() predicate used by main().
++        assert np.array_equal(out, _render(grid, allow_clipping=False))
++        return grid
++
++    raise RuntimeError("failed to generate a non-degenerate combo sample")
+
+codex
+代码已落盘。现在先跑 50 次成功率测试，再看是否有退化样本或生成器卡在特定网格尺寸上的问题。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/29/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/29/code.py b/ceshi/code_combo/dfadab01/29/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc5a0e7b0b02a6ecb23159192bcecfa8fa3d9f62
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/29/code.py
+@@ -0,0 +1,373 @@
++# Combo variant of dfadab01 (index 29)
++# combo_spec: D6/3+D7/0
++# Name: 禁止裁剪+随机散布
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++# Design analysis for the combo variant
++# a) Concretization and behavior trace
++#    - The fixed alphabet is unchanged: marker colors {2, 3, 5, 8} still point to the
++#      same 4x4 output masks/colors, and an optional legend is still a painted sample
++#      glyph with its label marker at (+4, +4).
++#    - The two changes interact through position. Example on a 10x10 grid:
++#      markers at (1, 1), (2, 6), (6, 0), (8, 5), scattered without row/col spacing.
++#      Old task: every real marker expands, so (8, 5) contributes a cropped fragment.
++#      New combo: each marker is checked independently; (1, 1), (2, 6), (6, 0) survive
++#      only if their full 4x4 boxes fit, while (8, 5) is ignored because 8 + 4 > 10.
++#      Random scattering matters because edge-near markers can now appear anywhere,
++#      not only on the last row/column of a regular lattice.
++# b) Complexity calibration
++#    - The rule change stays single-branch: color chooses glyph, then position decides
++#      whether that glyph is active. There is no extra remapping or shape mutation.
++#    - The generator always includes both at least one fully fitting marker and at
++#      least one overflowing marker, so the "skip instead of crop" behavior is visible.
++#    - Scatter is constrained by 4x4 non-overlap boxes, keeping scenes readable while
++#      still breaking the original equal-spacing cue.
++# c) Implicit-assumption audit for main()
++#    - Original logic assumed every non-legend marker should paint something via
++#      clipping. That assumption is invalid now; painting must be gated by _fits_glyph().
++#    - Legend detection via _has_source_glyph() still works because the legend sample
++#      is always fully inside the grid and isolated from real markers by construction.
++#    - Iterating markers color-by-color remains safe because surviving glyphs never
++#      overlap, so paint order does not affect the output.
++# d) Placement legality
++#    - The generator treats every real marker as owning a 4x4 intended glyph box,
++#      even for overflowing markers. Those boxes are sampled without overlap, so the
++#      input is unambiguous and the clipped baseline would also stay non-overlapping.
++#    - The optional legend uses a disjoint 5x5 reservation box (4x4 sample + label),
++#      preventing collisions with marker pixels or intended glyph regions.
++# e) Visual observability
++#    - Each accepted sample has real scattered markers in several unrelated rows/cols,
++#      plus at least one edge-near marker that disappears entirely in the output.
++#    - The generator rejects any case where the new output matches the old clipped
++#      output, so the boundary-rule change is guaranteed to manifest.
++# f) Visual cleanliness
++#    - Non-overlapping 4x4 boxes keep glyphs separated even though marker pixels are
++#      irregularly placed. The legend is isolated, so it reads as a removable key.
++#    - Random scatter is limited to modest marker counts, avoiding dense clutter.
++# g) Color inference
++#    - Color semantics are unchanged from the source puzzle. The only new inference is
++#      that marker location relative to the bottom/right border can deactivate it.
++
++GLYPH_SIZE = 4
++LEGEND_SIZE = GLYPH_SIZE + 1
++MARKER_COLORS = (2, 3, 5, 8)
++GLYPH_COLORS = (1, 4, 6, 7)
++ALLOWED_COLORS = {0, *MARKER_COLORS, *GLYPH_COLORS}
++MAX_RETRIES = 500
++
++GLYPHS: dict[int, tuple[int, np.ndarray]] = {
++    2: (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    3: (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    5: (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    8: (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + GLYPH_SIZE > h or c0 + GLYPH_SIZE > w:
++        return False
++    patch = g[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _fits_glyph(shape: tuple[int, int], r0: int, c0: int) -> bool:
++    h, w = shape
++    return 0 <= r0 and 0 <= c0 and r0 + GLYPH_SIZE <= h and c0 + GLYPH_SIZE <= w
++
++
++def _paint_full(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    patch = out[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    patch[mask] = color
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(GLYPH_SIZE):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(GLYPH_SIZE):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _render(grid: np.ndarray, *, allow_clipping: bool) -> np.ndarray:
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(map(int, np.unique(g))).issubset(ALLOWED_COLORS)
++
++    out = np.zeros_like(g)
++    seen_marker = False
++    for marker_color, (glyph_color, mask) in GLYPHS.items():
++        coords = np.argwhere(g == marker_color)
++        if coords.size:
++            seen_marker = True
++        for r, c in coords:
++            rr = int(r)
++            cc = int(c)
++            if _has_source_glyph(g, rr - GLYPH_SIZE, cc - GLYPH_SIZE, glyph_color, mask):
++                continue
++            if allow_clipping:
++                _paint_clipped(out, rr, cc, glyph_color, mask)
++            elif _fits_glyph(g.shape, rr, cc):
++                _paint_full(out, rr, cc, glyph_color, mask)
++
++    assert seen_marker
++    return out
++
++
++def _iter_real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
++    real: list[tuple[int, int, int]] = []
++    for marker_color, (glyph_color, mask) in GLYPHS.items():
++        for r, c in np.argwhere(g == marker_color):
++            rr = int(r)
++            cc = int(c)
++            if _has_source_glyph(g, rr - GLYPH_SIZE, cc - GLYPH_SIZE, glyph_color, mask):
++                continue
++            real.append((rr, cc, marker_color))
++    return real
++
++
++def _box_for_marker(r0: int, c0: int) -> tuple[int, int, int, int]:
++    return (r0, c0, r0 + GLYPH_SIZE, c0 + GLYPH_SIZE)
++
++
++def _boxes_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
++    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
++
++
++def _axis_has_uniform_spacing(values: list[int]) -> bool:
++    if len(values) < 3:
++        return False
++    diffs = [b - a for a, b in zip(values, values[1:])]
++    return len(set(diffs)) == 1
++
++
++def _looks_regular_scatter(positions: list[tuple[int, int]]) -> bool:
++    rows = sorted({r for r, _ in positions})
++    cols = sorted({c for _, c in positions})
++    return _axis_has_uniform_spacing(rows) and _axis_has_uniform_spacing(cols)
++
++
++def _try_sample_positions(
++    shape: tuple[int, int],
++    fit_target: int,
++    overflow_target: int,
++    rng: random.Random,
++) -> list[tuple[int, int]] | None:
++    h, w = shape
++    fit_candidates = [(r, c) for r in range(h) for c in range(w) if _fits_glyph(shape, r, c)]
++    overflow_candidates = [(r, c) for r in range(h) for c in range(w) if not _fits_glyph(shape, r, c)]
++    rng.shuffle(fit_candidates)
++    rng.shuffle(overflow_candidates)
++
++    chosen: list[tuple[int, int]] = []
++    boxes: list[tuple[int, int, int, int]] = []
++
++    for pool, target in ((fit_candidates, fit_target), (overflow_candidates, overflow_target)):
++        added = 0
++        for r, c in pool:
++            box = _box_for_marker(r, c)
++            if any(_boxes_overlap(box, other) for other in boxes):
++                continue
++            chosen.append((r, c))
++            boxes.append(box)
++            added += 1
++            if added == target:
++                break
++        if added != target:
++            return None
++
++    return chosen
++
++
++def _choose_scattered_positions(shape: tuple[int, int], rng: random.Random) -> list[tuple[int, int]]:
++    h, w = shape
++    fit_range = (2, 3) if h == 10 and w == 10 else (4, 7)
++    overflow_range = (1, 2) if h == 10 and w == 10 else (2, 4)
++
++    for _ in range(200):
++        fit_target = rng.randint(*fit_range)
++        overflow_target = rng.randint(*overflow_range)
++        positions = _try_sample_positions(shape, fit_target, overflow_target, rng)
++        if positions is None:
++            continue
++        rows = {r for r, _ in positions}
++        cols = {c for _, c in positions}
++        if len(rows) < 3 or len(cols) < 3:
++            continue
++        if _looks_regular_scatter(positions):
++            continue
++        return positions
++
++    raise ValueError("could not choose irregular scattered marker positions")
++
++
++def _place_legend(
++    grid: np.ndarray,
++    marker_boxes: list[tuple[int, int, int, int]],
++    used_colors: tuple[int, ...],
++    rng: random.Random,
++) -> bool:
++    h, w = grid.shape
++    candidates: list[tuple[int, int, int]] = []
++    for marker_color in used_colors:
++        for r0 in range(h - GLYPH_SIZE):
++            for c0 in range(w - GLYPH_SIZE):
++                legend_box = (r0, c0, r0 + LEGEND_SIZE, c0 + LEGEND_SIZE)
++                if any(_boxes_overlap(legend_box, box) for box in marker_boxes):
++                    continue
++                if np.any(grid[r0 : r0 + LEGEND_SIZE, c0 : c0 + LEGEND_SIZE] != 0):
++                    continue
++                candidates.append((marker_color, r0, c0))
++
++    if not candidates:
++        return False
++
++    marker_color, r0, c0 = rng.choice(candidates)
++    glyph_color, mask = GLYPHS[marker_color]
++    patch = grid[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    patch[mask] = glyph_color
++    grid[r0 + GLYPH_SIZE, c0 + GLYPH_SIZE] = marker_color
++    return True
++
++
++def _sample_metrics(grid: np.ndarray) -> dict[str, int | bool]:
++    g = np.asarray(grid, dtype=int)
++    real_markers = _iter_real_markers(g)
++    skipped = sum(1 for r, c, _ in real_markers if not _fits_glyph(g.shape, r, c))
++    old_out = _render(g, allow_clipping=True)
++    new_out = _render(g, allow_clipping=False)
++    return {
++        "real_marker_count": len(real_markers),
++        "skipped_marker_count": skipped,
++        "diff_pixels": int(np.count_nonzero(old_out != new_out)),
++        "regular_scatter": _looks_regular_scatter([(r, c) for r, c, _ in real_markers]),
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand scattered control pixels into fixed 4x4 glyphs, but only when the whole glyph fits.
++
++    Input structure:
++    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8, now scattered irregularly instead of sitting on a regular lattice.
++    - Some inputs also contain one legend entry: a 4x4 sample glyph in its output color plus a matching label marker one glyph-step down-right.
++
++    Rule:
++    - Use the same fixed glyph dictionary as the source task: marker color chooses one 4x4 output mask/color pair.
++    - Remove the legend sample and ignore its label marker.
++    - For every real marker, paint the glyph only if the entire 4x4 footprint stays inside the grid; markers whose glyph would cross the border contribute nothing at all.
++
++    Key insight:
++    - The mapping is still determined by marker color, but scattered placement means you must inspect each marker separately and filter out the edge-near ones instead of expecting cropped fragments.
++    """
++    return _render(grid, allow_clipping=False)
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++
++    for _ in range(MAX_RETRIES):
++        h = rng.choice((10, 20))
++        w = rng.choice((10, 20))
++        shape = (h, w)
++
++        try:
++            positions = _choose_scattered_positions(shape, rng)
++        except ValueError:
++            continue
++
++        grid = np.zeros(shape, dtype=int)
++        marker_boxes = [_box_for_marker(r, c) for r, c in positions]
++
++        used_count = min(rng.randint(1, len(MARKER_COLORS)), len(positions))
++        used_colors = tuple(sorted(rng.sample(MARKER_COLORS, used_count)))
++
++        color_bag = list(used_colors)
++        while len(color_bag) < len(positions):
++            color_bag.append(rng.choice(used_colors))
++        rng.shuffle(color_bag)
++
++        for (r, c), marker_color in zip(positions, color_bag):
++            grid[r, c] = marker_color
++
++        if rng.random() < 0.6:
++            _place_legend(grid, marker_boxes, used_colors, rng)
++
++        metrics = _sample_metrics(grid)
++        if int(metrics["skipped_marker_count"]) < 1:
++            continue
++        if int(metrics["diff_pixels"]) < 1:
++            continue
++        if bool(metrics["regular_scatter"]):
++            continue
++        if int(metrics["real_marker_count"]) - int(metrics["skipped_marker_count"]) < 1:
++            continue
++
++        out = main(grid)
++        if not np.any(out != 0):
++            continue
++
++        # New assumptions after the combo change:
++        # - generate_input() guarantees at least one surviving and one skipped real marker.
++        # - All intended 4x4 marker boxes are pairwise disjoint, so _render() remains
++        #   order-independent even though markers are no longer arranged on a lattice.
++        # - Any legend label always has a fully visible 4x4 sample up-left, matching
++        #   the _has_source_glyph() predicate used by main().
++        assert np.array_equal(out, _render(grid, allow_clipping=False))
++        return grid
++
++    raise RuntimeError("failed to generate a non-degenerate combo sample")
+
+ succeeded in 274ms:
+Success: 50/50, Time: 0.1s (2ms/call)
+
+codex
+成功率已经过线。接下来我做融合行为验证，不只看“不报错”，而是统计 100 个样本里有多少真实标记被边界规则过滤、与旧裁剪规则相差多少像素、以及散布是否退化回规则栅格。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util
+import statistics as st
+from collections import Counter
+
+path = '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/29/code.py'
+spec = importlib.util.spec_from_file_location('variant', path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+samples = 100
+skipped = []
+diff_pixels = []
+regular = 0
+row_uniques = []
+col_uniques = []
+shapes = Counter()
+for _ in range(samples):
+    g = mod.generate_input()
+    m = mod._sample_metrics(g)
+    real = mod._iter_real_markers(g)
+    skipped.append(int(m['skipped_marker_count']))
+    diff_pixels.append(int(m['diff_pixels']))
+    regular += int(bool(m['regular_scatter']))
+    row_uniques.append(len({r for r, _, _ in real}))
+    col_uniques.append(len({c for _, c, _ in real}))
+    shapes[g.shape] += 1
+
+print('shapes', dict(shapes))
+print('skipped counts', dict(sorted(Counter(skipped).items())))
+print('diff pixels', dict(sorted(Counter(diff_pixels).items())))
+print('regular_scatter_true', regular)
+print('row unique min/avg/max', min(row_uniques), round(st.mean(row_uniques), 2), max(row_uniques))
+print('col unique min/avg/max', min(col_uniques), round(st.mean(col_uniques), 2), max(col_uniques))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/29/code.py b/ceshi/code_combo/dfadab01/29/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc5a0e7b0b02a6ecb23159192bcecfa8fa3d9f62
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/29/code.py
+@@ -0,0 +1,373 @@
++# Combo variant of dfadab01 (index 29)
++# combo_spec: D6/3+D7/0
++# Name: 禁止裁剪+随机散布
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++# Design analysis for the combo variant
++# a) Concretization and behavior trace
++#    - The fixed alphabet is unchanged: marker colors {2, 3, 5, 8} still point to the
++#      same 4x4 output masks/colors, and an optional legend is still a painted sample
++#      glyph with its label marker at (+4, +4).
++#    - The two changes interact through position. Example on a 10x10 grid:
++#      markers at (1, 1), (2, 6), (6, 0), (8, 5), scattered without row/col spacing.
++#      Old task: every real marker expands, so (8, 5) contributes a cropped fragment.
++#      New combo: each marker is checked independently; (1, 1), (2, 6), (6, 0) survive
++#      only if their full 4x4 boxes fit, while (8, 5) is ignored because 8 + 4 > 10.
++#      Random scattering matters because edge-near markers can now appear anywhere,
++#      not only on the last row/column of a regular lattice.
++# b) Complexity calibration
++#    - The rule change stays single-branch: color chooses glyph, then position decides
++#      whether that glyph is active. There is no extra remapping or shape mutation.
++#    - The generator always includes both at least one fully fitting marker and at
++#      least one overflowing marker, so the "skip instead of crop" behavior is visible.
++#    - Scatter is constrained by 4x4 non-overlap boxes, keeping scenes readable while
++#      still breaking the original equal-spacing cue.
++# c) Implicit-assumption audit for main()
++#    - Original logic assumed every non-legend marker should paint something via
++#      clipping. That assumption is invalid now; painting must be gated by _fits_glyph().
++#    - Legend detection via _has_source_glyph() still works because the legend sample
++#      is always fully inside the grid and isolated from real markers by construction.
++#    - Iterating markers color-by-color remains safe because surviving glyphs never
++#      overlap, so paint order does not affect the output.
++# d) Placement legality
++#    - The generator treats every real marker as owning a 4x4 intended glyph box,
++#      even for overflowing markers. Those boxes are sampled without overlap, so the
++#      input is unambiguous and the clipped baseline would also stay non-overlapping.
++#    - The optional legend uses a disjoint 5x5 reservation box (4x4 sample + label),
++#      preventing collisions with marker pixels or intended glyph regions.
++# e) Visual observability
++#    - Each accepted sample has real scattered markers in several unrelated rows/cols,
++#      plus at least one edge-near marker that disappears entirely in the output.
++#    - The generator rejects any case where the new output matches the old clipped
++#      output, so the boundary-rule change is guaranteed to manifest.
++# f) Visual cleanliness
++#    - Non-overlapping 4x4 boxes keep glyphs separated even though marker pixels are
++#      irregularly placed. The legend is isolated, so it reads as a removable key.
++#    - Random scatter is limited to modest marker counts, avoiding dense clutter.
++# g) Color inference
++#    - Color semantics are unchanged from the source puzzle. The only new inference is
++#      that marker location relative to the bottom/right border can deactivate it.
++
++GLYPH_SIZE = 4
++LEGEND_SIZE = GLYPH_SIZE + 1
++MARKER_COLORS = (2, 3, 5, 8)
++GLYPH_COLORS = (1, 4, 6, 7)
++ALLOWED_COLORS = {0, *MARKER_COLORS, *GLYPH_COLORS}
++MAX_RETRIES = 500
++
++GLYPHS: dict[int, tuple[int, np.ndarray]] = {
++    2: (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    3: (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    5: (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    8: (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + GLYPH_SIZE > h or c0 + GLYPH_SIZE > w:
++        return False
++    patch = g[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _fits_glyph(shape: tuple[int, int], r0: int, c0: int) -> bool:
++    h, w = shape
++    return 0 <= r0 and 0 <= c0 and r0 + GLYPH_SIZE <= h and c0 + GLYPH_SIZE <= w
++
++
++def _paint_full(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    patch = out[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    patch[mask] = color
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(GLYPH_SIZE):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(GLYPH_SIZE):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _render(grid: np.ndarray, *, allow_clipping: bool) -> np.ndarray:
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(map(int, np.unique(g))).issubset(ALLOWED_COLORS)
++
++    out = np.zeros_like(g)
++    seen_marker = False
++    for marker_color, (glyph_color, mask) in GLYPHS.items():
++        coords = np.argwhere(g == marker_color)
++        if coords.size:
++            seen_marker = True
++        for r, c in coords:
++            rr = int(r)
++            cc = int(c)
++            if _has_source_glyph(g, rr - GLYPH_SIZE, cc - GLYPH_SIZE, glyph_color, mask):
++                continue
++            if allow_clipping:
++                _paint_clipped(out, rr, cc, glyph_color, mask)
++            elif _fits_glyph(g.shape, rr, cc):
++                _paint_full(out, rr, cc, glyph_color, mask)
++
++    assert seen_marker
++    return out
++
++
++def _iter_real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
++    real: list[tuple[int, int, int]] = []
++    for marker_color, (glyph_color, mask) in GLYPHS.items():
++        for r, c in np.argwhere(g == marker_color):
++            rr = int(r)
++            cc = int(c)
++            if _has_source_glyph(g, rr - GLYPH_SIZE, cc - GLYPH_SIZE, glyph_color, mask):
++                continue
++            real.append((rr, cc, marker_color))
++    return real
++
++
++def _box_for_marker(r0: int, c0: int) -> tuple[int, int, int, int]:
++    return (r0, c0, r0 + GLYPH_SIZE, c0 + GLYPH_SIZE)
++
++
++def _boxes_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
++    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
++
++
++def _axis_has_uniform_spacing(values: list[int]) -> bool:
++    if len(values) < 3:
++        return False
++    diffs = [b - a for a, b in zip(values, values[1:])]
++    return len(set(diffs)) == 1
++
++
++def _looks_regular_scatter(positions: list[tuple[int, int]]) -> bool:
++    rows = sorted({r for r, _ in positions})
++    cols = sorted({c for _, c in positions})
++    return _axis_has_uniform_spacing(rows) and _axis_has_uniform_spacing(cols)
++
++
++def _try_sample_positions(
++    shape: tuple[int, int],
++    fit_target: int,
++    overflow_target: int,
++    rng: random.Random,
++) -> list[tuple[int, int]] | None:
++    h, w = shape
++    fit_candidates = [(r, c) for r in range(h) for c in range(w) if _fits_glyph(shape, r, c)]
++    overflow_candidates = [(r, c) for r in range(h) for c in range(w) if not _fits_glyph(shape, r, c)]
++    rng.shuffle(fit_candidates)
++    rng.shuffle(overflow_candidates)
++
++    chosen: list[tuple[int, int]] = []
++    boxes: list[tuple[int, int, int, int]] = []
++
++    for pool, target in ((fit_candidates, fit_target), (overflow_candidates, overflow_target)):
++        added = 0
++        for r, c in pool:
++            box = _box_for_marker(r, c)
++            if any(_boxes_overlap(box, other) for other in boxes):
++                continue
++            chosen.append((r, c))
++            boxes.append(box)
++            added += 1
++            if added == target:
++                break
++        if added != target:
++            return None
++
++    return chosen
++
++
++def _choose_scattered_positions(shape: tuple[int, int], rng: random.Random) -> list[tuple[int, int]]:
++    h, w = shape
++    fit_range = (2, 3) if h == 10 and w == 10 else (4, 7)
++    overflow_range = (1, 2) if h == 10 and w == 10 else (2, 4)
++
++    for _ in range(200):
++        fit_target = rng.randint(*fit_range)
++        overflow_target = rng.randint(*overflow_range)
++        positions = _try_sample_positions(shape, fit_target, overflow_target, rng)
++        if positions is None:
++            continue
++        rows = {r for r, _ in positions}
++        cols = {c for _, c in positions}
++        if len(rows) < 3 or len(cols) < 3:
++            continue
++        if _looks_regular_scatter(positions):
++            continue
++        return positions
++
++    raise ValueError("could not choose irregular scattered marker positions")
++
++
++def _place_legend(
++    grid: np.ndarray,
++    marker_boxes: list[tuple[int, int, int, int]],
++    used_colors: tuple[int, ...],
++    rng: random.Random,
++) -> bool:
++    h, w = grid.shape
++    candidates: list[tuple[int, int, int]] = []
++    for marker_color in used_colors:
++        for r0 in range(h - GLYPH_SIZE):
++            for c0 in range(w - GLYPH_SIZE):
++                legend_box = (r0, c0, r0 + LEGEND_SIZE, c0 + LEGEND_SIZE)
++                if any(_boxes_overlap(legend_box, box) for box in marker_boxes):
++                    continue
++                if np.any(grid[r0 : r0 + LEGEND_SIZE, c0 : c0 + LEGEND_SIZE] != 0):
++                    continue
++                candidates.append((marker_color, r0, c0))
++
++    if not candidates:
++        return False
++
++    marker_color, r0, c0 = rng.choice(candidates)
++    glyph_color, mask = GLYPHS[marker_color]
++    patch = grid[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    patch[mask] = glyph_color
++    grid[r0 + GLYPH_SIZE, c0 + GLYPH_SIZE] = marker_color
++    return True
++
++
++def _sample_metrics(grid: np.ndarray) -> dict[str, int | bool]:
++    g = np.asarray(grid, dtype=int)
++    real_markers = _iter_real_markers(g)
++    skipped = sum(1 for r, c, _ in real_markers if not _fits_glyph(g.shape, r, c))
++    old_out = _render(g, allow_clipping=True)
++    new_out = _render(g, allow_clipping=False)
++    return {
++        "real_marker_count": len(real_markers),
++        "skipped_marker_count": skipped,
++        "diff_pixels": int(np.count_nonzero(old_out != new_out)),
++        "regular_scatter": _looks_regular_scatter([(r, c) for r, c, _ in real_markers]),
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand scattered control pixels into fixed 4x4 glyphs, but only when the whole glyph fits.
++
++    Input structure:
++    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8, now scattered irregularly instead of sitting on a regular lattice.
++    - Some inputs also contain one legend entry: a 4x4 sample glyph in its output color plus a matching label marker one glyph-step down-right.
++
++    Rule:
++    - Use the same fixed glyph dictionary as the source task: marker color chooses one 4x4 output mask/color pair.
++    - Remove the legend sample and ignore its label marker.
++    - For every real marker, paint the glyph only if the entire 4x4 footprint stays inside the grid; markers whose glyph would cross the border contribute nothing at all.
++
++    Key insight:
++    - The mapping is still determined by marker color, but scattered placement means you must inspect each marker separately and filter out the edge-near ones instead of expecting cropped fragments.
++    """
++    return _render(grid, allow_clipping=False)
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++
++    for _ in range(MAX_RETRIES):
++        h = rng.choice((10, 20))
++        w = rng.choice((10, 20))
++        shape = (h, w)
++
++        try:
++            positions = _choose_scattered_positions(shape, rng)
++        except ValueError:
++            continue
++
++        grid = np.zeros(shape, dtype=int)
++        marker_boxes = [_box_for_marker(r, c) for r, c in positions]
++
++        used_count = min(rng.randint(1, len(MARKER_COLORS)), len(positions))
++        used_colors = tuple(sorted(rng.sample(MARKER_COLORS, used_count)))
++
++        color_bag = list(used_colors)
++        while len(color_bag) < len(positions):
++            color_bag.append(rng.choice(used_colors))
++        rng.shuffle(color_bag)
++
++        for (r, c), marker_color in zip(positions, color_bag):
++            grid[r, c] = marker_color
++
++        if rng.random() < 0.6:
++            _place_legend(grid, marker_boxes, used_colors, rng)
++
++        metrics = _sample_metrics(grid)
++        if int(metrics["skipped_marker_count"]) < 1:
++            continue
++        if int(metrics["diff_pixels"]) < 1:
++            continue
++        if bool(metrics["regular_scatter"]):
++            continue
++        if int(metrics["real_marker_count"]) - int(metrics["skipped_marker_count"]) < 1:
++            continue
++
++        out = main(grid)
++        if not np.any(out != 0):
++            continue
++
++        # New assumptions after the combo change:
++        # - generate_input() guarantees at least one surviving and one skipped real marker.
++        # - All intended 4x4 marker boxes are pairwise disjoint, so _render() remains
++        #   order-independent even though markers are no longer arranged on a lattice.
++        # - Any legend label always has a fully visible 4x4 sample up-left, matching
++        #   the _has_source_glyph() predicate used by main().
++        assert np.array_equal(out, _render(grid, allow_clipping=False))
++        return grid
++
++    raise RuntimeError("failed to generate a non-degenerate combo sample")
+
+ succeeded in 407ms:
+shapes {(20, 20): 30, (10, 10): 30, (10, 20): 17, (20, 10): 23}
+skipped counts {1: 11, 2: 37, 3: 27, 4: 25}
+diff pixels {1: 1, 2: 5, 3: 4, 4: 7, 5: 3, 6: 13, 7: 3, 8: 14, 9: 2, 10: 9, 11: 4, 12: 10, 13: 3, 14: 9, 15: 3, 16: 5, 17: 1, 18: 3, 19: 1}
+regular_scatter_true 0
+row unique min/avg/max 3 6.01 11
+col unique min/avg/max 3 5.89 9
+
+codex
+融合版代码已写入 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/29/code.py)。文件里包含了 a-g 设计分析注释，并把 `main()` 的四段式说明改写为符合“禁止裁剪+随机散布”的规则。
+
+实现上，`main()` 现在只扩展“完整 4x4 字形能落在网格内”的真实标记，越界标记直接忽略；`generate_input()` 改成全图随机散布采样，用每个标记的 4x4 预期包围框保证互不重叠，并保留可选图例，同时强制样本里既有可保留标记也有会被边界规则过滤的标记。
+
+验证结果：
+- 50 次压力测试通过：`Success: 50/50, Time: 0.1s (2ms/call)`
+- 100 个生成样本的融合行为统计：
+  - `skipped_marker_count` 分布：`{1: 11, 2: 37, 3: 27, 4: 25}`
+  - 新规则与原裁剪规则的差异像素 `diff_pixels` 始终大于 0，分布覆盖 `1..19`
+  - `regular_scatter_true = 0`，没有退化回规则栅格散布
+  - 真实标记覆盖的唯一行数平均 `6.01`，唯一列数平均 `5.89`，说明散布确实是不规则的
+diff --git a/ceshi/code_combo/dfadab01/29/code.py b/ceshi/code_combo/dfadab01/29/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc5a0e7b0b02a6ecb23159192bcecfa8fa3d9f62
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/29/code.py
+@@ -0,0 +1,373 @@
++# Combo variant of dfadab01 (index 29)
++# combo_spec: D6/3+D7/0
++# Name: 禁止裁剪+随机散布
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++# Design analysis for the combo variant
++# a) Concretization and behavior trace
++#    - The fixed alphabet is unchanged: marker colors {2, 3, 5, 8} still point to the
++#      same 4x4 output masks/colors, and an optional legend is still a painted sample
++#      glyph with its label marker at (+4, +4).
++#    - The two changes interact through position. Example on a 10x10 grid:
++#      markers at (1, 1), (2, 6), (6, 0), (8, 5), scattered without row/col spacing.
++#      Old task: every real marker expands, so (8, 5) contributes a cropped fragment.
++#      New combo: each marker is checked independently; (1, 1), (2, 6), (6, 0) survive
++#      only if their full 4x4 boxes fit, while (8, 5) is ignored because 8 + 4 > 10.
++#      Random scattering matters because edge-near markers can now appear anywhere,
++#      not only on the last row/column of a regular lattice.
++# b) Complexity calibration
++#    - The rule change stays single-branch: color chooses glyph, then position decides
++#      whether that glyph is active. There is no extra remapping or shape mutation.
++#    - The generator always includes both at least one fully fitting marker and at
++#      least one overflowing marker, so the "skip instead of crop" behavior is visible.
++#    - Scatter is constrained by 4x4 non-overlap boxes, keeping scenes readable while
++#      still breaking the original equal-spacing cue.
++# c) Implicit-assumption audit for main()
++#    - Original logic assumed every non-legend marker should paint something via
++#      clipping. That assumption is invalid now; painting must be gated by _fits_glyph().
++#    - Legend detection via _has_source_glyph() still works because the legend sample
++#      is always fully inside the grid and isolated from real markers by construction.
++#    - Iterating markers color-by-color remains safe because surviving glyphs never
++#      overlap, so paint order does not affect the output.
++# d) Placement legality
++#    - The generator treats every real marker as owning a 4x4 intended glyph box,
++#      even for overflowing markers. Those boxes are sampled without overlap, so the
++#      input is unambiguous and the clipped baseline would also stay non-overlapping.
++#    - The optional legend uses a disjoint 5x5 reservation box (4x4 sample + label),
++#      preventing collisions with marker pixels or intended glyph regions.
++# e) Visual observability
++#    - Each accepted sample has real scattered markers in several unrelated rows/cols,
++#      plus at least one edge-near marker that disappears entirely in the output.
++#    - The generator rejects any case where the new output matches the old clipped
++#      output, so the boundary-rule change is guaranteed to manifest.
++# f) Visual cleanliness
++#    - Non-overlapping 4x4 boxes keep glyphs separated even though marker pixels are
++#      irregularly placed. The legend is isolated, so it reads as a removable key.
++#    - Random scatter is limited to modest marker counts, avoiding dense clutter.
++# g) Color inference
++#    - Color semantics are unchanged from the source puzzle. The only new inference is
++#      that marker location relative to the bottom/right border can deactivate it.
++
++GLYPH_SIZE = 4
++LEGEND_SIZE = GLYPH_SIZE + 1
++MARKER_COLORS = (2, 3, 5, 8)
++GLYPH_COLORS = (1, 4, 6, 7)
++ALLOWED_COLORS = {0, *MARKER_COLORS, *GLYPH_COLORS}
++MAX_RETRIES = 500
++
++GLYPHS: dict[int, tuple[int, np.ndarray]] = {
++    2: (
++        4,
++        np.array(
++            [
++                [1, 1, 1, 1],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [1, 1, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    3: (
++        1,
++        np.array(
++            [
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++            ],
++            dtype=bool,
++        ),
++    ),
++    5: (
++        6,
++        np.array(
++            [
++                [1, 1, 0, 0],
++                [1, 1, 0, 0],
++                [0, 0, 1, 1],
++                [0, 0, 1, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++    8: (
++        7,
++        np.array(
++            [
++                [1, 0, 0, 1],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [1, 0, 0, 1],
++            ],
++            dtype=bool,
++        ),
++    ),
++}
++
++
++def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
++    h, w = g.shape
++    if r0 < 0 or c0 < 0 or r0 + GLYPH_SIZE > h or c0 + GLYPH_SIZE > w:
++        return False
++    patch = g[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
++
++
++def _fits_glyph(shape: tuple[int, int], r0: int, c0: int) -> bool:
++    h, w = shape
++    return 0 <= r0 and 0 <= c0 and r0 + GLYPH_SIZE <= h and c0 + GLYPH_SIZE <= w
++
++
++def _paint_full(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    patch = out[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    patch[mask] = color
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(GLYPH_SIZE):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(GLYPH_SIZE):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _render(grid: np.ndarray, *, allow_clipping: bool) -> np.ndarray:
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert set(map(int, np.unique(g))).issubset(ALLOWED_COLORS)
++
++    out = np.zeros_like(g)
++    seen_marker = False
++    for marker_color, (glyph_color, mask) in GLYPHS.items():
++        coords = np.argwhere(g == marker_color)
++        if coords.size:
++            seen_marker = True
++        for r, c in coords:
++            rr = int(r)
++            cc = int(c)
++            if _has_source_glyph(g, rr - GLYPH_SIZE, cc - GLYPH_SIZE, glyph_color, mask):
++                continue
++            if allow_clipping:
++                _paint_clipped(out, rr, cc, glyph_color, mask)
++            elif _fits_glyph(g.shape, rr, cc):
++                _paint_full(out, rr, cc, glyph_color, mask)
++
++    assert seen_marker
++    return out
++
++
++def _iter_real_markers(g: np.ndarray) -> list[tuple[int, int, int]]:
++    real: list[tuple[int, int, int]] = []
++    for marker_color, (glyph_color, mask) in GLYPHS.items():
++        for r, c in np.argwhere(g == marker_color):
++            rr = int(r)
++            cc = int(c)
++            if _has_source_glyph(g, rr - GLYPH_SIZE, cc - GLYPH_SIZE, glyph_color, mask):
++                continue
++            real.append((rr, cc, marker_color))
++    return real
++
++
++def _box_for_marker(r0: int, c0: int) -> tuple[int, int, int, int]:
++    return (r0, c0, r0 + GLYPH_SIZE, c0 + GLYPH_SIZE)
++
++
++def _boxes_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
++    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
++
++
++def _axis_has_uniform_spacing(values: list[int]) -> bool:
++    if len(values) < 3:
++        return False
++    diffs = [b - a for a, b in zip(values, values[1:])]
++    return len(set(diffs)) == 1
++
++
++def _looks_regular_scatter(positions: list[tuple[int, int]]) -> bool:
++    rows = sorted({r for r, _ in positions})
++    cols = sorted({c for _, c in positions})
++    return _axis_has_uniform_spacing(rows) and _axis_has_uniform_spacing(cols)
++
++
++def _try_sample_positions(
++    shape: tuple[int, int],
++    fit_target: int,
++    overflow_target: int,
++    rng: random.Random,
++) -> list[tuple[int, int]] | None:
++    h, w = shape
++    fit_candidates = [(r, c) for r in range(h) for c in range(w) if _fits_glyph(shape, r, c)]
++    overflow_candidates = [(r, c) for r in range(h) for c in range(w) if not _fits_glyph(shape, r, c)]
++    rng.shuffle(fit_candidates)
++    rng.shuffle(overflow_candidates)
++
++    chosen: list[tuple[int, int]] = []
++    boxes: list[tuple[int, int, int, int]] = []
++
++    for pool, target in ((fit_candidates, fit_target), (overflow_candidates, overflow_target)):
++        added = 0
++        for r, c in pool:
++            box = _box_for_marker(r, c)
++            if any(_boxes_overlap(box, other) for other in boxes):
++                continue
++            chosen.append((r, c))
++            boxes.append(box)
++            added += 1
++            if added == target:
++                break
++        if added != target:
++            return None
++
++    return chosen
++
++
++def _choose_scattered_positions(shape: tuple[int, int], rng: random.Random) -> list[tuple[int, int]]:
++    h, w = shape
++    fit_range = (2, 3) if h == 10 and w == 10 else (4, 7)
++    overflow_range = (1, 2) if h == 10 and w == 10 else (2, 4)
++
++    for _ in range(200):
++        fit_target = rng.randint(*fit_range)
++        overflow_target = rng.randint(*overflow_range)
++        positions = _try_sample_positions(shape, fit_target, overflow_target, rng)
++        if positions is None:
++            continue
++        rows = {r for r, _ in positions}
++        cols = {c for _, c in positions}
++        if len(rows) < 3 or len(cols) < 3:
++            continue
++        if _looks_regular_scatter(positions):
++            continue
++        return positions
++
++    raise ValueError("could not choose irregular scattered marker positions")
++
++
++def _place_legend(
++    grid: np.ndarray,
++    marker_boxes: list[tuple[int, int, int, int]],
++    used_colors: tuple[int, ...],
++    rng: random.Random,
++) -> bool:
++    h, w = grid.shape
++    candidates: list[tuple[int, int, int]] = []
++    for marker_color in used_colors:
++        for r0 in range(h - GLYPH_SIZE):
++            for c0 in range(w - GLYPH_SIZE):
++                legend_box = (r0, c0, r0 + LEGEND_SIZE, c0 + LEGEND_SIZE)
++                if any(_boxes_overlap(legend_box, box) for box in marker_boxes):
++                    continue
++                if np.any(grid[r0 : r0 + LEGEND_SIZE, c0 : c0 + LEGEND_SIZE] != 0):
++                    continue
++                candidates.append((marker_color, r0, c0))
++
++    if not candidates:
++        return False
++
++    marker_color, r0, c0 = rng.choice(candidates)
++    glyph_color, mask = GLYPHS[marker_color]
++    patch = grid[r0 : r0 + GLYPH_SIZE, c0 : c0 + GLYPH_SIZE]
++    patch[mask] = glyph_color
++    grid[r0 + GLYPH_SIZE, c0 + GLYPH_SIZE] = marker_color
++    return True
++
++
++def _sample_metrics(grid: np.ndarray) -> dict[str, int | bool]:
++    g = np.asarray(grid, dtype=int)
++    real_markers = _iter_real_markers(g)
++    skipped = sum(1 for r, c, _ in real_markers if not _fits_glyph(g.shape, r, c))
++    old_out = _render(g, allow_clipping=True)
++    new_out = _render(g, allow_clipping=False)
++    return {
++        "real_marker_count": len(real_markers),
++        "skipped_marker_count": skipped,
++        "diff_pixels": int(np.count_nonzero(old_out != new_out)),
++        "regular_scatter": _looks_regular_scatter([(r, c) for r, c, _ in real_markers]),
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand scattered control pixels into fixed 4x4 glyphs, but only when the whole glyph fits.
++
++    Input structure:
++    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8, now scattered irregularly instead of sitting on a regular lattice.
++    - Some inputs also contain one legend entry: a 4x4 sample glyph in its output color plus a matching label marker one glyph-step down-right.
++
++    Rule:
++    - Use the same fixed glyph dictionary as the source task: marker color chooses one 4x4 output mask/color pair.
++    - Remove the legend sample and ignore its label marker.
++    - For every real marker, paint the glyph only if the entire 4x4 footprint stays inside the grid; markers whose glyph would cross the border contribute nothing at all.
++
++    Key insight:
++    - The mapping is still determined by marker color, but scattered placement means you must inspect each marker separately and filter out the edge-near ones instead of expecting cropped fragments.
++    """
++    return _render(grid, allow_clipping=False)
++
++
++def generate_input() -> np.ndarray:
++    rng = random.Random()
++
++    for _ in range(MAX_RETRIES):
++        h = rng.choice((10, 20))
++        w = rng.choice((10, 20))
++        shape = (h, w)
++
++        try:
++            positions = _choose_scattered_positions(shape, rng)
++        except ValueError:
++            continue
++
++        grid = np.zeros(shape, dtype=int)
++        marker_boxes = [_box_for_marker(r, c) for r, c in positions]
++
++        used_count = min(rng.randint(1, len(MARKER_COLORS)), len(positions))
++        used_colors = tuple(sorted(rng.sample(MARKER_COLORS, used_count)))
++
++        color_bag = list(used_colors)
++        while len(color_bag) < len(positions):
++            color_bag.append(rng.choice(used_colors))
++        rng.shuffle(color_bag)
++
++        for (r, c), marker_color in zip(positions, color_bag):
++            grid[r, c] = marker_color
++
++        if rng.random() < 0.6:
++            _place_legend(grid, marker_boxes, used_colors, rng)
++
++        metrics = _sample_metrics(grid)
++        if int(metrics["skipped_marker_count"]) < 1:
++            continue
++        if int(metrics["diff_pixels"]) < 1:
++            continue
++        if bool(metrics["regular_scatter"]):
++            continue
++        if int(metrics["real_marker_count"]) - int(metrics["skipped_marker_count"]) < 1:
++            continue
++
++        out = main(grid)
++        if not np.any(out != 0):
++            continue
++
++        # New assumptions after the combo change:
++        # - generate_input() guarantees at least one surviving and one skipped real marker.
++        # - All intended 4x4 marker boxes are pairwise disjoint, so _render() remains
++        #   order-independent even though markers are no longer arranged on a lattice.
++        # - Any legend label always has a fully visible 4x4 sample up-left, matching
++        #   the _has_source_glyph() predicate used by main().
++        assert np.array_equal(out, _render(grid, allow_clipping=False))
++        return grid
++
++    raise RuntimeError("failed to generate a non-degenerate combo sample")
+
+tokens used
+96,067
+融合版代码已写入 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/29/code.py)。文件里包含了 a-g 设计分析注释，并把 `main()` 的四段式说明改写为符合“禁止裁剪+随机散布”的规则。
+
+实现上，`main()` 现在只扩展“完整 4x4 字形能落在网格内”的真实标记，越界标记直接忽略；`generate_input()` 改成全图随机散布采样，用每个标记的 4x4 预期包围框保证互不重叠，并保留可选图例，同时强制样本里既有可保留标记也有会被边界规则过滤的标记。
+
+验证结果：
+- 50 次压力测试通过：`Success: 50/50, Time: 0.1s (2ms/call)`
+- 100 个生成样本的融合行为统计：
+  - `skipped_marker_count` 分布：`{1: 11, 2: 37, 3: 27, 4: 25}`
+  - 新规则与原裁剪规则的差异像素 `diff_pixels` 始终大于 0，分布覆盖 `1..19`
+  - `regular_scatter_true = 0`，没有退化回规则栅格散布
+  - 真实标记覆盖的唯一行数平均 `6.01`，唯一列数平均 `5.89`，说明散布确实是不规则的

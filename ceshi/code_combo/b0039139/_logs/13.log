@@ -1,0 +1,3972 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e2f75-d364-7a81-9fa2-ad4fdb79a47e
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: b0039139
+    **摘要**: 输入被蓝色分隔线划分为四个区段：形状模板、组件计数板、前景色色板、背景色色板；将模板裁剪到外接矩形后用色板重新着色，再按计数板中连通分量数量平铺副本，副本之间用背景色分隔列/行隔开
+
+    ## 要实现的融合组合
+    - **组合名称**: 正方形模板强制正方形输出
+    - **combo_spec**: D8/0+D10/0
+
+    ### 融合描述（实现规格）
+
+    模板裁剪为最小正方形(D8/0)，输出也强制为正方形(D10/0)。正方形模板平铺后可能无法恰好填满正方形输出，需要截断或填充。解题者需推断两层正方形约束的交互规则。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D8/0** — 模板裁剪方式 (`transform`)
+  - 当前值: 将区段1中的模板裁剪到色4像素的最小外接矩形(bbox)
+  - 改为: 裁剪到最大正方形区域 — 不使用最小外接矩形，而是裁剪为包含所有模板像素的最小正方形（短边补齐到与长边等长）。输出中每个副本变为正方形，解题者需推断正方形裁剪规则。
+  - 来源: creative（参考任务: None）
+- **D10/0** — 输出尺寸计算规则 (`grid_shape`)
+  - 当前值: 输出宽度/高度 = 副本数 × 裁剪模板尺寸 + (副本数-1) × 分隔带宽度，另一方向等于裁剪模板的对应尺寸
+  - 改为: 输出固定为正方形 — 无论副本数和模板尺寸如何，输出强制为正方形。副本数不足以填满时用背景色填充剩余空间，多余时截断。解题者需要推断正方形约束及截断/填充规则。
+  - 来源: creative（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/b0039139.py`
+
+    ```python
+    from __future__ import annotations
+
+import numpy as np
+
+from arc_utils import bbox, components_mask, crop_bbox, random_sprite
+import random
+
+
+def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
+    h, w = grid.shape
+    sep = 1
+
+    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == sep))]
+    if sep_rows:
+        cuts = [-1] + sep_rows + [h]
+        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == sep))]
+    cuts = [-1] + sep_cols + [w]
+    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+
+def _solid_color(block: np.ndarray) -> int:
+    vals, counts = np.unique(block, return_counts=True)
+    return int(vals[int(np.argmax(counts))])
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Recolor a cropped template and repeat it according to a component-count stencil.
+
+    Input structure:
+    - Solid blue (1) separator rows or columns split the grid into four sections.
+    - Section 1 is a black-background shape template; section 2 is a component-count stencil.
+    - Sections 3 and 4 are solid color swatches for output foreground and background.
+
+    Rule:
+    - Crop section 1 to the bbox of its non-black pixels and recolor it with the two swatches.
+    - Count 4-connected non-black components in section 2.
+    - Repeat the recolored crop that many times, inserting one background-colored row/column between copies.
+
+    Key insight: The second section encodes only the repeat count; the output orientation
+    is inherited from whether the input separators are columns or rows.
+    """
+    g = np.asarray(grid, dtype=int)
+    orientation, sections = _split_sections(g)
+    template, repetition_pattern, foreground_block, background_block = sections[:4]
+
+    template_mask = template != 0
+    template_bbox = bbox(template_mask)
+    if template_bbox is None:
+        return np.empty((0, 0), dtype=int)
+
+    foreground = _solid_color(foreground_block)
+    background = _solid_color(background_block)
+    tile_mask = crop_bbox(template_mask, template_bbox)
+    tile = np.where(tile_mask, foreground, background).astype(int)
+
+    n_repeats = len(components_mask(repetition_pattern != 0, connectivity=4))
+    if n_repeats <= 1:
+        return tile
+
+    if orientation == "horizontal":
+        sep = np.full((tile.shape[0], 1), background, dtype=int)
+        pieces = [tile] + [x for _ in range(n_repeats - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+
+    sep = np.full((1, tile.shape[1]), background, dtype=int)
+    pieces = [tile] + [x for _ in range(n_repeats - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+# --------------- generator (c) ---------------
+
+# --- CFG: tunable generation parameters ---
+REPEAT_COUNT_RANGE = (2, 6)          # blob count N (= tile repetitions)
+CROP_SIZE_RANGE = (2, 5)             # crop height/width bounds
+DENSITY_RANGE = (0.55, 0.85)         # fill ratio of shape bounding box
+COLOR_POOL = list(range(2, 10))      # fg/bg color choices (2-9 inclusive)
+TEMPLATE_COLOR = 4                   # shape drawn in yellow inside template
+STENCIL_COLOR = 3                    # blob color in stencil section
+SEPARATOR_COLOR = 1                  # blue separator rows/cols
+SWATCH_DIM_RANGE = (3, 8)           # varying-axis size for color swatches
+STENCIL_VARYING_EXTRA = 4            # max extra cells beyond minimum stencil size
+BLOB_PLACE_RETRIES = 200             # per-blob placement attempts in stencil
+GEN_RETRIES = 300                    # outer generate_input retry limit
+
+
+def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
+    """Repeat `tile` n times along the given axis with 1-pixel bg_color separator."""
+    if horizontal:
+        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
+        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
+    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+
+def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
+    """Create a solid color swatch. shared_dim is the fixed axis; varying axis is random."""
+    varying = random.randint(*SWATCH_DIM_RANGE)
+    if horizontal:
+        return np.full((shared_dim, varying), color, dtype=int)
+    return np.full((varying, shared_dim), color, dtype=int)
+
+
+def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
+    """Join sections with single-pixel separator lines of SEPARATOR_COLOR."""
+    if horizontal:
+        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
+        parts = [sections[0]]
+        for s in sections[1:]:
+            parts.extend([sep, s])
+        return np.hstack(parts)
+    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
+    parts = [sections[0]]
+    for s in sections[1:]:
+        parts.extend([sep, s])
+    return np.vstack(parts)
+
+
+def _build_stencil(n_blobs: int, shared_dim: int, horizontal: bool) -> np.ndarray | None:
+    """Place n_blobs 2-cell blobs (1x2 or 2x1) of STENCIL_COLOR on a black grid.
+    Blobs are separated by >=1 cell of black in all directions."""
+    min_varying = max(4, n_blobs * 2 + 2)
+    varying_dim = random.randint(min_varying, min_varying + STENCIL_VARYING_EXTRA)
+
+    h, w = (shared_dim, varying_dim) if horizontal else (varying_dim, shared_dim)
+    grid = np.zeros((h, w), dtype=int)
+
+    placed = 0
+    for _ in range(BLOB_PLACE_RETRIES):
+        if placed >= n_blobs:
+            break
+        br, bc = (1, 2) if random.choice([True, False]) else (2, 1)
+
+        if h - 1 - br < 1 or w - 1 - bc < 1:
+            continue
+        r = random.randint(1, h - 1 - br)
+        c = random.randint(1, w - 1 - bc)
+
+        # Check blob cells + 1-cell neighborhood are all black
+        r0, c0 = max(0, r - 1), max(0, c - 1)
+        r1, c1 = min(h, r + br + 1), min(w, c + bc + 1)
+        if np.any(grid[r0:r1, c0:c1] != 0):
+            continue
+
+        grid[r:r + br, c:c + bc] = STENCIL_COLOR
+        placed += 1
+
+    return grid if placed == n_blobs else None
+
+
+def _gen_attempt() -> np.ndarray | None:
+    horizontal = random.choice([True, False])
+    N = random.randint(*REPEAT_COUNT_RANGE)
+
+    # Generate connected tile shape
+    crop_h = random.randint(*CROP_SIZE_RANGE)
+    crop_w = random.randint(*CROP_SIZE_RANGE)
+    density = random.uniform(*DENSITY_RANGE)
+    shape = random_sprite(crop_h, crop_w, density=density, color_palette=[TEMPLATE_COLOR],
+                          connectivity=4, symmetry="not_symmetric")
+
+    # Pick distinct fg/bg colors
+    fg_color, bg_color = random.sample(COLOR_POOL, 2)
+
+    # Build output
+    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
+    output = _tile_repeat(tile, N, bg_color, horizontal)
+
+    # Build template: shape in (crop_h+2) x (crop_w+2) black border
+    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
+    template[1:crop_h + 1, 1:crop_w + 1] = shape
+
+    # Build stencil
+    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
+    stencil = _build_stencil(N, shared_dim, horizontal)
+    if stencil is None:
+        return None
+
+    # Assemble: template | stencil | fg_swatch | bg_swatch
+    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
+    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
+    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
+
+    # Oracle check
+    try:
+        if np.array_equal(main(inp), output):
+            return inp
+    except Exception:
+        pass
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        result = _gen_attempt()
+        if result is not None:
+            return result
+    raise RuntimeError("Failed to generate valid input after %d attempts" % GEN_RETRIES)
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  layout:
+    orientation: horizontal (column separators) or vertical (row separators), chosen randomly
+    separator_color: 1 (blue), single-pixel-wide rows or columns
+    sections: 4, separated by 3 blue separator lines; order is template, stencil, fg_swatch, bg_swatch
+  template:
+    section_size: (crop_h + 2) x (crop_w + 2); 1-pixel black border on all sides around the shape bbox
+    shape_color: 4 (yellow) on black (0) background
+    crop_size: 2-5 rows x 2-5 cols
+    connectivity: single 4-connected component
+    fill_ratio: 0.55-0.85 of bounding box
+  stencil:
+    background: black (0); blobs drawn in color 3 (green)
+    each blob is exactly 2 cells (either 1x2 or 2x1), 4-connected
+    blob_count: 2-6; this encodes the repeat count N for the output
+    blobs separated by >=1 cell of black in all directions
+    section_size: loosely sized, at least large enough to hold the blobs with 1-cell border
+  swatches:
+    fg_swatch and bg_swatch are each a solid rectangle of a single color
+    fg_color != bg_color; both from {2-9} excluding 3 and 4 [observed: fg,bg can be 3 or 4]
+    swatch dimensions: >=3 in varying axis; shared axis matches all sections
+  output:
+    tile: crop recolored so shape pixels -> fg_color, background pixels -> bg_color
+    tile repeated N times along layout axis, with 1 bg_color separator row/col between copies
+    output_size: along repeat axis = crop_dim * N + (N-1); cross axis = crop_dim
+
+generation_strategy:
+  approach: output-first
+  steps:
+    1. Pick orientation (horizontal or vertical) and N (repeat count, 2-6).
+    2. Generate tile shape: random connected binary mask of size crop_h x crop_w (each 2-5), fill ratio 0.55-0.85.
+    3. Pick fg_color and bg_color (distinct, from 2-9).
+    4. Build output by tiling recolored shape N times with bg_color separator.
+    5. Build template section: embed shape (drawn in color 4) centered in (crop_h+2) x (crop_w+2) black grid.
+    6. Build stencil section: place N 2-cell blobs (1x2 or 2x1) of color 3 on a black grid, spaced apart.
+    7. Build fg_swatch and bg_swatch: solid rectangles of their colors (>=3 in varying dim).
+    8. Assemble input: join 4 sections with blue (1) separator rows/cols matching orientation.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/b0039139/13/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/b0039139.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/b0039139/13/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of b0039139 (index 13)
+    # combo_spec: D8/0+D10/0
+    # Name: 正方形模板强制正方形输出
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/b0039139/13` 存在（如不存在则创建）。
+codex
+我会先读取原始 solver、工具函数和原题样例，确认四段式规则与生成约束，再据此设计融合后的正方形裁剪和正方形输出逻辑。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/b0039139.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+
+import numpy as np
+
+from arc_utils import bbox, components_mask, crop_bbox, random_sprite
+import random
+
+
+def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
+    h, w = grid.shape
+    sep = 1
+
+    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == sep))]
+    if sep_rows:
+        cuts = [-1] + sep_rows + [h]
+        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == sep))]
+    cuts = [-1] + sep_cols + [w]
+    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+
+def _solid_color(block: np.ndarray) -> int:
+    vals, counts = np.unique(block, return_counts=True)
+    return int(vals[int(np.argmax(counts))])
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Recolor a cropped template and repeat it according to a component-count stencil.
+
+    Input structure:
+    - Solid blue (1) separator rows or columns split the grid into four sections.
+    - Section 1 is a black-background shape template; section 2 is a component-count stencil.
+    - Sections 3 and 4 are solid color swatches for output foreground and background.
+
+    Rule:
+    - Crop section 1 to the bbox of its non-black pixels and recolor it with the two swatches.
+    - Count 4-connected non-black components in section 2.
+    - Repeat the recolored crop that many times, inserting one background-colored row/column between copies.
+
+    Key insight: The second section encodes only the repeat count; the output orientation
+    is inherited from whether the input separators are columns or rows.
+    """
+    g = np.asarray(grid, dtype=int)
+    orientation, sections = _split_sections(g)
+    template, repetition_pattern, foreground_block, background_block = sections[:4]
+
+    template_mask = template != 0
+    template_bbox = bbox(template_mask)
+    if template_bbox is None:
+        return np.empty((0, 0), dtype=int)
+
+    foreground = _solid_color(foreground_block)
+    background = _solid_color(background_block)
+    tile_mask = crop_bbox(template_mask, template_bbox)
+    tile = np.where(tile_mask, foreground, background).astype(int)
+
+    n_repeats = len(components_mask(repetition_pattern != 0, connectivity=4))
+    if n_repeats <= 1:
+        return tile
+
+    if orientation == "horizontal":
+        sep = np.full((tile.shape[0], 1), background, dtype=int)
+        pieces = [tile] + [x for _ in range(n_repeats - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+
+    sep = np.full((1, tile.shape[1]), background, dtype=int)
+    pieces = [tile] + [x for _ in range(n_repeats - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+# --------------- generator (c) ---------------
+
+# --- CFG: tunable generation parameters ---
+REPEAT_COUNT_RANGE = (2, 6)          # blob count N (= tile repetitions)
+CROP_SIZE_RANGE = (2, 5)             # crop height/width bounds
+DENSITY_RANGE = (0.55, 0.85)         # fill ratio of shape bounding box
+COLOR_POOL = list(range(2, 10))      # fg/bg color choices (2-9 inclusive)
+TEMPLATE_COLOR = 4                   # shape drawn in yellow inside template
+STENCIL_COLOR = 3                    # blob color in stencil section
+SEPARATOR_COLOR = 1                  # blue separator rows/cols
+SWATCH_DIM_RANGE = (3, 8)           # varying-axis size for color swatches
+STENCIL_VARYING_EXTRA = 4            # max extra cells beyond minimum stencil size
+BLOB_PLACE_RETRIES = 200             # per-blob placement attempts in stencil
+GEN_RETRIES = 300                    # outer generate_input retry limit
+
+
+def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
+    """Repeat `tile` n times along the given axis with 1-pixel bg_color separator."""
+    if horizontal:
+        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
+        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
+    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+
+def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
+    """Create a solid color swatch. shared_dim is the fixed axis; varying axis is random."""
+    varying = random.randint(*SWATCH_DIM_RANGE)
+    if horizontal:
+        return np.full((shared_dim, varying), color, dtype=int)
+    return np.full((varying, shared_dim), color, dtype=int)
+
+
+def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
+    """Join sections with single-pixel separator lines of SEPARATOR_COLOR."""
+    if horizontal:
+        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
+        parts = [sections[0]]
+        for s in sections[1:]:
+            parts.extend([sep, s])
+        return np.hstack(parts)
+    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
+    parts = [sections[0]]
+    for s in sections[1:]:
+        parts.extend([sep, s])
+    return np.vstack(parts)
+
+
+def _build_stencil(n_blobs: int, shared_dim: int, horizontal: bool) -> np.ndarray | None:
+    """Place n_blobs 2-cell blobs (1x2 or 2x1) of STENCIL_COLOR on a black grid.
+    Blobs are separated by >=1 cell of black in all directions."""
+    min_varying = max(4, n_blobs * 2 + 2)
+    varying_dim = random.randint(min_varying, min_varying + STENCIL_VARYING_EXTRA)
+
+    h, w = (shared_dim, varying_dim) if horizontal else (varying_dim, shared_dim)
+    grid = np.zeros((h, w), dtype=int)
+
+    placed = 0
+    for _ in range(BLOB_PLACE_RETRIES):
+        if placed >= n_blobs:
+            break
+        br, bc = (1, 2) if random.choice([True, False]) else (2, 1)
+
+        if h - 1 - br < 1 or w - 1 - bc < 1:
+            continue
+        r = random.randint(1, h - 1 - br)
+        c = random.randint(1, w - 1 - bc)
+
+        # Check blob cells + 1-cell neighborhood are all black
+        r0, c0 = max(0, r - 1), max(0, c - 1)
+        r1, c1 = min(h, r + br + 1), min(w, c + bc + 1)
+        if np.any(grid[r0:r1, c0:c1] != 0):
+            continue
+
+        grid[r:r + br, c:c + bc] = STENCIL_COLOR
+        placed += 1
+
+    return grid if placed == n_blobs else None
+
+
+def _gen_attempt() -> np.ndarray | None:
+    horizontal = random.choice([True, False])
+    N = random.randint(*REPEAT_COUNT_RANGE)
+
+    # Generate connected tile shape
+    crop_h = random.randint(*CROP_SIZE_RANGE)
+    crop_w = random.randint(*CROP_SIZE_RANGE)
+    density = random.uniform(*DENSITY_RANGE)
+    shape = random_sprite(crop_h, crop_w, density=density, color_palette=[TEMPLATE_COLOR],
+                          connectivity=4, symmetry="not_symmetric")
+
+    # Pick distinct fg/bg colors
+    fg_color, bg_color = random.sample(COLOR_POOL, 2)
+
+    # Build output
+    tile = np.where(shape != 0, fg_color, bg_color).astype(int)
+    output = _tile_repeat(tile, N, bg_color, horizontal)
+
+    # Build template: shape in (crop_h+2) x (crop_w+2) black border
+    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
+    template[1:crop_h + 1, 1:crop_w + 1] = shape
+
+    # Build stencil
+    shared_dim = (crop_h + 2) if horizontal else (crop_w + 2)
+    stencil = _build_stencil(N, shared_dim, horizontal)
+    if stencil is None:
+        return None
+
+    # Assemble: template | stencil | fg_swatch | bg_swatch
+    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
+    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
+    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
+
+    # Oracle check
+    try:
+        if np.array_equal(main(inp), output):
+            return inp
+    except Exception:
+        pass
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        result = _gen_attempt()
+        if result is not None:
+            return result
+    raise RuntimeError("Failed to generate valid input after %d attempts" % GEN_RETRIES)
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+    r0 = min(b[0] for b in bbs)
+    c0 = min(b[1] for b in bbs)
+    r1 = max(b[2] for b in bbs)
+    c1 = max(b[3] for b in bbs)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox_h(b: BBox) -> int:
+    r0, _c0, r1, _c1 = b
+    return int(r1 - r0 + 1)
+
+
+def bbox_w(b: BBox) -> int:
+    _r0, c0, _r1, c1 = b
+    return int(c1 - c0 + 1)
+
+
+def bbox_anchor(b: BBox, *, anchor: str = "upper left") -> Coord:
+    """
+    Return an anchor point (r,c) for a bbox.
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+path='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/b0039139.json'
+with open(path) as f:
+    data=json.load(f)
+print('train', len(data.get('train', [])), 'test', len(data.get('test', [])))
+for split in ('train','test'):
+    for i,ex in enumerate(data.get(split, [])[:3]):
+        inp=ex['input']; out=ex['output']
+        print(split, i, 'input', len(inp), len(inp[0]), 'output', len(out), len(out[0]))
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+train 4 test 2
+train 0 input 18 4 output 5 2
+train 1 input 5 23 output 3 11
+train 2 input 6 27 output 4 15
+test 0 input 26 7 output 19 5
+test 1 input 7 29 output 5 29
+
+codex
+我已经确认原题是纯四分区拼贴，下一步会逐行对照哪些隐式前提被“正方形模板 + 正方形输出”打破，并据此重写生成器，避免样本退化回原题。
+exec
+/bin/bash -lc 'rg -n "def components_mask|def crop_bbox|def random_sprite" /home/lixinyu/snap/new/solvers/arc_utils.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+297:def crop_bbox(grid: np.ndarray, bbox: BBox) -> np.ndarray:
+398:def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+774:def random_sprite(
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json, numpy as np
+path='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/b0039139.json'
+with open(path) as f:
+    data=json.load(f)
+for split in ('train',):
+    for i,ex in enumerate(data[split]):
+        arr=np.array(ex['input'])
+        print('\\nexample',i)
+        print(arr)
+        print('out')
+        print(np.array(ex['output']))
+PY" in /home/lixinyu/snap/new
+ succeeded in 182ms:
+
+example 0
+[[0 0 0 0]
+ [0 4 4 0]
+ [0 4 0 0]
+ [0 0 0 0]
+ [1 1 1 1]
+ [0 0 0 0]
+ [0 3 0 3]
+ [0 3 0 3]
+ [0 0 0 0]
+ [1 1 1 1]
+ [2 2 2 2]
+ [2 2 2 2]
+ [2 2 2 2]
+ [2 2 2 2]
+ [1 1 1 1]
+ [9 9 9 9]
+ [9 9 9 9]
+ [9 9 9 9]]
+out
+[[2 2]
+ [2 9]
+ [9 9]
+ [2 2]
+ [2 9]]
+
+example 1
+[[0 0 0 0 0 1 0 0 0 0 0 0 0 1 8 8 8 8 8 1 3 3 3]
+ [0 4 4 4 0 1 0 3 0 3 0 3 0 1 8 8 8 8 8 1 3 3 3]
+ [0 0 4 0 0 1 0 3 0 3 0 3 0 1 8 8 8 8 8 1 3 3 3]
+ [0 4 4 4 0 1 0 0 0 0 0 0 0 1 8 8 8 8 8 1 3 3 3]
+ [0 0 0 0 0 1 0 0 0 0 0 0 0 1 8 8 8 8 8 1 3 3 3]]
+out
+[[8 8 8 3 8 8 8 3 8 8 8]
+ [3 8 3 3 3 8 3 3 3 8 3]
+ [8 8 8 3 8 8 8 3 8 8 8]]
+
+example 2
+[[0 0 0 0 0 1 0 0 0 0 0 0 0 1 6 6 6 6 6 6 1 4 4 4 4 4 4]
+ [0 4 4 0 0 1 0 3 0 3 0 0 0 1 6 6 6 6 6 6 1 4 4 4 4 4 4]
+ [0 4 0 0 0 1 0 3 0 3 0 0 0 1 6 6 6 6 6 6 1 4 4 4 4 4 4]
+ [0 4 4 4 0 1 0 0 0 0 0 0 0 1 6 6 6 6 6 6 1 4 4 4 4 4 4]
+ [0 0 4 0 0 1 0 3 3 0 3 3 0 1 6 6 6 6 6 6 1 4 4 4 4 4 4]
+ [0 0 0 0 0 1 0 0 0 0 0 0 0 1 6 6 6 6 6 6 1 4 4 4 4 4 4]]
+out
+[[6 6 4 4 6 6 4 4 6 6 4 4 6 6 4]
+ [6 4 4 4 6 4 4 4 6 4 4 4 6 4 4]
+ [6 6 6 4 6 6 6 4 6 6 6 4 6 6 6]
+ [4 6 4 4 4 6 4 4 4 6 4 4 4 6 4]]
+
+example 3
+[[0 0 0 0 0 1 0 0 0 0 0 0 1 2 2 2 2 2 1 8 8 8 8]
+ [0 4 4 4 0 1 0 3 0 3 0 0 1 2 2 2 2 2 1 8 8 8 8]
+ [0 4 0 4 0 1 0 3 0 3 0 0 1 2 2 2 2 2 1 8 8 8 8]
+ [0 0 0 0 0 1 0 0 0 0 0 0 1 2 2 2 2 2 1 8 8 8 8]]
+out
+[[2 2 2 8 2 2 2]
+ [2 8 2 8 2 8 2]]
+
+exec
+/bin/bash -lc "sed -n '288,430p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+        rr, cc = r0 + (h - 1) / 2, c0
+    elif anchor == "rightcenter":
+        rr, cc = r0 + (h - 1) / 2, c1
+    else:
+        raise ValueError("bbox_anchor: invalid anchor")
+
+    return int(round(rr)), int(round(cc))
+
+
+def crop_bbox(grid: np.ndarray, bbox: BBox) -> np.ndarray:
+    """Crop a grid to bbox (inclusive)."""
+    r0, c0, r1, c1 = map(int, bbox)
+    return grid[r0 : r1 + 1, c0 : c1 + 1].copy()
+
+
+# =============================================================================
+# Paste (single canonical placement primitive)
+# =============================================================================
+
+
+def paste(
+    dst: np.ndarray,
+    patch: np.ndarray,
+    r0: int,
+    c0: int,
+    *,
+    transparent: int | None = None,
+    mask: np.ndarray | None = None,
+    overwrite: bool = True,
+    clip: bool = False,
+) -> np.ndarray:
+    """
+    Paste `patch` into `dst` at top-left (r0,c0).
+
+    This is the ONE placement primitive solver examples should use.
+
+    - Opaque paste: `paste(dst, patch, r0, c0)`
+    - Transparent overlay: `paste(dst, patch, r0, c0, transparent=bg)`
+    - Masked paste: `paste(dst, patch, r0, c0, mask=m)`
+    - Non-overwriting overlay: `paste(dst, patch, r0, c0, transparent=bg, overwrite=False)`
+    - Strict vs clip: default `clip=False` (fail fast); set `clip=True` to clip out-of-bounds.
+    """
+    H, W = dst.shape
+    r0 = int(r0)
+    c0 = int(c0)
+    h, w = map(int, patch.shape)
+
+    if not clip:
+        if r0 < 0 or c0 < 0 or r0 + h > H or c0 + w > W:
+            raise ValueError("paste: patch out of bounds (set clip=True to allow clipping)")
+        rr0, cc0 = r0, c0
+        rr1, cc1 = r0 + h, c0 + w
+        pr0, pc0 = 0, 0
+    else:
+        rr0 = max(0, r0)
+        cc0 = max(0, c0)
+        rr1 = min(H, r0 + h)
+        cc1 = min(W, c0 + w)
+        if rr0 >= rr1 or cc0 >= cc1:
+            return dst
+        pr0 = rr0 - r0
+        pc0 = cc0 - c0
+
+    pr1 = pr0 + (rr1 - rr0)
+    pc1 = pc0 + (cc1 - cc0)
+
+    dst_view = dst[rr0:rr1, cc0:cc1]
+    patch_view = patch[pr0:pr1, pc0:pc1]
+
+    m = np.ones(patch_view.shape, dtype=bool)
+    if mask is not None:
+        m &= mask[pr0:pr1, pc0:pc1].astype(bool)
+    if transparent is not None:
+        m &= (patch_view != int(transparent))
+        if not overwrite:
+            m &= (dst_view == int(transparent))
+    else:
+        if not overwrite:
+            raise ValueError("paste: overwrite=False requires transparent to be set")
+
+    dst_view[m] = patch_view[m]
+    return dst
+
+
+def paint_coords(out: np.ndarray, coords: Iterable[Coord], color: int) -> None:
+    """Set out[r,c]=color for each coord (in-bounds only)."""
+    H, W = out.shape
+    v = int(color)
+    for r, c in coords:
+        rr = int(r)
+        cc = int(c)
+        if 0 <= rr < H and 0 <= cc < W:
+            out[rr, cc] = v
+
+
+# =============================================================================
+# Connected components (single unified entrypoint: find_components)
+# =============================================================================
+
+STRUCT4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=int)
+STRUCT8 = np.ones((3, 3), dtype=int)
+
+
+def label_mask(mask: np.ndarray, connectivity: int = 4) -> tuple[np.ndarray, int]:
+    """Connected-components labeling for a boolean mask."""
+    struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+    lab, n = label(mask.astype(bool), structure=struct)
+    return lab, int(n)
+
+
+def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+    """List of components from a boolean mask, each as an (N,2) coords array."""
+    lab, n = label_mask(mask, connectivity=connectivity)
+    return [np.argwhere(lab == k) for k in range(1, n + 1)]
+
+
+def find_components(
+    grid: np.ndarray,
+    *,
+    bg: int | None = None,
+    connectivity: int = 4,
+    monochromatic: bool = True,
+    colors: Sequence[int] | None = None,
+    min_area: int = 1,
+    return_format: str = "dict",
+) -> list[dict] | list[np.ndarray]:
+    """
+    Find connected components in a grid (unified API for ARC-2 + migrated seeds).
+
+    return_format:
+      - \"dict\": list of dicts {color, coords, bbox, area}
+      - \"objects\": list of full-grid arrays containing exactly one component
+    """
+    if bg is None:
+        bg = get_bg(grid)
+    bg = int(bg)
+
+    return_format = str(return_format).lower().strip()
+    if return_format not in {"dict", "objects"}:
+        raise ValueError("find_components: return_format must be 'dict' or 'objects'")
+
+    if colors is None:
+        colors_set = None
+
+exec
+/bin/bash -lc "sed -n '774,900p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def random_sprite(
+    m,
+    n,
+    *,
+    density: float = 0.5,
+    symmetry: str | None = None,
+    color_palette: list[int] | None = None,
+    connectivity: int = 4,
+    background: int = Color.BLACK,
+    no_repeated_colors: bool = False,
+) -> np.ndarray:
+    """Generate a contiguous sprite of shape (m,n) with random symmetry and palette (for puzzle generation)."""
+    if isinstance(m, range):
+        m = list(m)
+    if isinstance(n, range):
+        n = list(n)
+    if not isinstance(m, list):
+        m = [m]
+    if not isinstance(n, list):
+        n = [n]
+
+    m_original, n_original = m, n
+    density_original, symmetry_original = density, symmetry
+    palette_original, conn_original, bg_original = color_palette, connectivity, background
+
+    can_be_square = any(m_ == n_ for m_ in m for n_ in n)
+    symmetry_types = ["horizontal", "vertical", "not_symmetric", "mirror"]
+    if can_be_square:
+        symmetry_types += ["diagonal", "radial"]
+    symmetry = symmetry or random.choice(symmetry_types)
+
+    has_to_be_square = symmetry in ("diagonal", "radial")
+    if has_to_be_square:
+        m, n = random.choice([(m_, n_) for m_ in m_original for n_ in n_original if m_ == n_])
+    else:
+        m = random.choice(m)
+        n = random.choice(n)
+
+    if m == 1 or n == 1:
+        density = 1.0
+    elif m == 2 or n == 2:
+        density = max(float(density), 0.6)
+    elif m == 3 or n == 3:
+        density = max(float(density), 0.5)
+    else:
+        density = max(0.4, min(0.95, random.gauss(float(density), 0.1)))
+
+    sprite = generate_sprite(
+        n=int(m),
+        m=int(n),
+        symmetry_type=symmetry,
+        color_palate=color_palette,
+        fill_percentage=density,
+        connectivity=connectivity,
+        background=background,
+        no_repeated_colors=no_repeated_colors,
+    )
+    assert is_contiguous(sprite, connectivity=connectivity, background=background), "Generated sprite is not contiguous."
+
+    bg = int(background)
+    if (
+        np.sum(sprite[0, :] != bg) > 0
+        and np.sum(sprite[-1, :] != bg) > 0
+        and np.sum(sprite[:, 0] != bg) > 0
+        and np.sum(sprite[:, -1] != bg) > 0
+    ):
+        return sprite
+
+    return random_sprite(
+        m_original,
+        n_original,
+        density=density_original,
+        symmetry=symmetry_original,
+        color_palette=palette_original,
+        connectivity=conn_original,
+        background=bg_original,
+        no_repeated_colors=no_repeated_colors,
+    )
+
+
+def random_free_location(
+    canvas: np.ndarray,
+    patch: np.ndarray,
+    *,
+    transparent: int,
+    border: int = 0,
+    padding: int = 0,
+    padding_connectivity: int = 8,
+) -> Coord:
+    """
+    Return a random (r,c) top-left location where `patch` fits without overlap.
+
+    This is the generator-friendly counterpart of `first_free_location` and mirrors the
+    legacy seeds' `random_free_location_for_sprite` behavior.
+
+    Raises:
+        ValueError: if no free location exists.
+    """
+    H, W = canvas.shape
+    h, w = patch.shape
+    border = int(border)
+    padding = int(padding)
+    pad_conn = int(padding_connectivity)
+    bg = int(transparent)
+
+    if h <= 0 or w <= 0:
+        raise ValueError("random_free_location: patch must be non-empty")
+    if H <= 0 or W <= 0:
+        raise ValueError("random_free_location: canvas must be non-empty")
+
+    if border < 0:
+        raise ValueError("random_free_location: border must be >= 0")
+    if padding < 0:
+        raise ValueError("random_free_location: padding must be >= 0")
+    if pad_conn not in (4, 8):
+        raise ValueError("random_free_location: padding_connectivity must be 4 or 8")
+
+    r_min = border
+    c_min = border
+    r_max = H - border - h
+    c_max = W - border - w
+    if r_max < r_min or c_max < c_min:
+        raise ValueError("random_free_location: patch cannot fit (border too large or patch too big)")
+
+    occ = (canvas != bg)
+    if padding > 0:
+        struct = STRUCT4 if pad_conn == 4 else STRUCT8
+
+codex
+设计已经收敛到一个可观察的规则：先把模板裁成“最小包围正方形”，再把重复条带贴到一个边长为 `正方形边长 × 重复数` 的正方形画布左上角，超出的末端截断，空余的下方或右方用背景色补齐。接下来我会把这套规则写进新文件，并在代码里附上设计分析与隐式假设审查。
+Implement the fused square-crop + forced-square-output variant, then validate both runtime success and non-degenerate behavior.
+  ✓ Inspect original solver/generator and utility assumptions
+  → Implement fused solver and generator in target file with in-code design analysis
+  • Run robustness test, then measure fusion-specific behavior against original logic
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/b0039139/13' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+exec
+/bin/bash -lc "rg -n \"sys.path|from arc_utils import|Combo variant\" /home/lixinyu/snap/new/ceshi/code_combo -g 'code.py' | head -n 40" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/29/code.py:1:# Combo variant of 2d0172a1 (index 29)
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/29/code.py:59:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/18/code.py:1:# Combo variant of 2d0172a1 (index 18)
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/18/code.py:42:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/5961cc34/29/code.py:1:# Combo variant of 5961cc34 (index 29)
+/home/lixinyu/snap/new/ceshi/code_combo/5961cc34/29/code.py:12:from arc_utils import colors_present, components_mask, get_bg, paint_coords, paste
+/home/lixinyu/snap/new/ceshi/code_combo/5545f144/18/code.py:1:# Combo variant of 5545f144 (index 18)
+/home/lixinyu/snap/new/ceshi/code_combo/5545f144/18/code.py:7:from arc_utils import Color
+/home/lixinyu/snap/new/ceshi/code_combo/5545f144/18/code.py:8:from arc_utils import get_bg as _bg_color
+/home/lixinyu/snap/new/ceshi/code_combo/5545f144/18/code.py:9:from arc_utils import paste
+/home/lixinyu/snap/new/ceshi/code_combo/78332cb0/8/code.py:1:# Combo variant of 78332cb0 (index 8)
+/home/lixinyu/snap/new/ceshi/code_combo/78332cb0/8/code.py:14:from arc_utils import get_bg, is_contiguous, paste
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/29/code.py:1:# Combo variant of eee78d87 (index 29)
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/29/code.py:14:if str(SOLVER_DIR) not in sys.path:
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/29/code.py:15:    sys.path.append(str(SOLVER_DIR))
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/29/code.py:17:from arc_utils import Color, colors_present, get_bg, tile_fill
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/16/code.py:1:# Combo variant of 2d0172a1 (index 16)
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/16/code.py:47:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/25/code.py:1:# Combo variant of 2d0172a1 (index 25)
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/25/code.py:12:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/5545f144/25/code.py:1:# Combo variant of 5545f144 (index 25)
+/home/lixinyu/snap/new/ceshi/code_combo/5545f144/25/code.py:105:from arc_utils import get_bg as _bg_color
+/home/lixinyu/snap/new/ceshi/code_combo/5545f144/25/code.py:106:from arc_utils import paste
+/home/lixinyu/snap/new/ceshi/code_combo/78332cb0/1/code.py:1:# Combo variant of 78332cb0 (index 1)
+/home/lixinyu/snap/new/ceshi/code_combo/78332cb0/1/code.py:88:from arc_utils import get_bg, is_contiguous, paste
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/18/code.py:1:# Combo variant of eee78d87 (index 18)
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/18/code.py:17:if str(SOLVER_DIR) not in sys.path:
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/18/code.py:18:    sys.path.append(str(SOLVER_DIR))
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/18/code.py:20:from arc_utils import Color, bbox, colors_present, crop_bbox, get_bg, tile_fill
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/26/code.py:1:# Combo variant of 2d0172a1 (index 26)
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/26/code.py:78:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/9/code.py:1:# Combo variant of 2d0172a1 (index 9)
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/9/code.py:11:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/78332cb0/3/code.py:1:# Combo variant of 78332cb0 (index 3)
+/home/lixinyu/snap/new/ceshi/code_combo/78332cb0/3/code.py:62:from arc_utils import get_bg, is_contiguous, paste
+/home/lixinyu/snap/new/ceshi/code_combo/5961cc34/18/code.py:1:# Combo variant of 5961cc34 (index 18)
+/home/lixinyu/snap/new/ceshi/code_combo/5961cc34/18/code.py:63:from arc_utils import colors_present, components_mask, get_bg, paint_coords, paste
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/43/code.py:1:# Combo variant of eee78d87 (index 43)
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/43/code.py:14:if str(SOLVER_DIR) not in sys.path:
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/43/code.py:15:    sys.path.append(str(SOLVER_DIR))
+
+exec
+/bin/bash -lc "sed -n '1,220p' /home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/29/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Combo variant of 2d0172a1 (index 29)
+# combo_spec: D4/2+D8/3
+# Name: 外部色块包裹独立边框+双层嵌套边框
+#
+# Design analysis
+# a) Concrete behavior and trace:
+#    - Source task:
+#      * each recovered frame became one 1px rectangle with child offset +2,
+#      * each outside blob stayed a lone pixel in a 3x3 slot beside the outer frame.
+#    - Fused task:
+#      * every canonical frame uses the D4/2 motif:
+#        outer border / 1 bg gap / inner border / 1 bg gap / children,
+#        so a child layout of size (h, w) becomes (h+8, w+8) with child offset +4;
+#      * an outside blob is no longer rendered bare: it is promoted to its own tiny
+#        double frame, i.e. the canonical rendering of "a frame whose only child is one dot".
+#    - Small trace:
+#      * one inside blob under a frame: old output was a 5x5 single rectangle with a centered dot;
+#        fused output is a 9x9 double rectangle with the same centered dot.
+#      * one outside blob on the right: old output placed only the dot center at
+#        (mapped_row, frame_w + 1); fused output places a 9x9 double-frame mini-object with
+#        its center still at that mapped row and with one bg cell between the two objects.
+# b) Complexity calibration:
+#    - The change is visually strong but still deterministic: frames always use exactly two
+#      borders, and the outside promoted object always uses the same 9x9 size.
+#    - We keep the original binary-color input language, containment logic, and sibling-order
+#      rule so the task remains inferable instead of introducing many unrelated freedoms.
+# c) Hidden assumption review:
+#    - Original _build_layout assumed frame padding +4 and child offset +2; this breaks under
+#      D4/2, so both the mask extent and propagated axis_map offsets must become +8 and +4.
+#    - Original _layout_root assumed root blobs reserve only a 3x3 slot and can be drawn as a
+#      single cell. Under the fusion this is false: extents must reserve the full 9x9 mini-frame.
+#    - _outside_side(), _axis_coordinates(), and _layout_group() depend only on recovered
+#      containment/order and on mask extents, so they stay valid once the new masks are used.
+# d) Placement legality:
+#    - The generator still creates only one true outer root frame and at most one outside blob.
+#      This guarantees the root-side attachment branch is unambiguous.
+#    - The outside blob stays separated from the rough outer frame by OUTSIDE_GAP_RANGE >= 2,
+#      so containment never becomes ambiguous in the input.
+# e) Visual observability:
+#    - Double borders appear in every output sample containing any frame.
+#    - We raise outside-blob probability so several samples also display the promoted outside
+#      mini-frame, making the second rule visible within a small ARC training set.
+# f) Visual cleanliness:
+#    - The mini-frame is isolated on a single side with a fixed one-cell output gap, so it reads
+#      as a separate object rather than cluttering the main frame interior.
+# g) Color inferability:
+#    - No color remapping is introduced; the single foreground color is reused everywhere.
+# h) Generator-side new assumptions:
+#    - Any root-level non-frame component is intended to be outside the unique outer frame.
+#    - Depth remains 1-2 and children still occupy distinct overlap/order bands, so the solver's
+#      band-based canonical placement remains well-defined for all generated inputs.
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+from arc_utils import find_components, get_bg, label_mask, paste
+
+
+FRAME_CHILD_OFFSET = 4
+FRAME_TOTAL_PAD = 8
+INNER_BORDER_OFFSET = 2
+OUTSIDE_FRAME_SIZE = 9
+OUTSIDE_ANCHOR = 4
+ROOT_SIDE_GAP = 1
+
+
+class _Node:
+    def __init__(self, coords: np.ndarray, bbox: tuple[int, int, int, int], center: np.ndarray):
+        self.coords = coords
+        self.bbox = bbox
+        self.center = center
+        self.is_frame = False
+        self.parent: _Node | None = None
+        self.children: list[_Node] = []
+        self.mask: np.ndarray | None = None
+        self.anchor: tuple[int, int] | None = None
+        self.axis_map: dict[str, list[tuple[float, int]]] = {"row": [], "col": []}
+
+
+def _component_holes(shape: tuple[int, int], coords: np.ndarray) -> list[np.ndarray]:
+    mask = np.zeros(shape, dtype=bool)
+    mask[tuple(coords.T)] = True
+    lab, n = label_mask(~mask, connectivity=4)
+    boundary = set(lab[0, :]) | set(lab[-1, :]) | set(lab[:, 0]) | set(lab[:, -1])
+    return [(lab == k) for k in range(1, n + 1) if k not in boundary]
+
+
+def _intervals_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return max(a[0], b[0]) <= min(a[1], b[1])
+
+
+def _paint_rect_border(mask: np.ndarray, inset: int) -> None:
+    r1 = mask.shape[0] - 1 - inset
+    c1 = mask.shape[1] - 1 - inset
+    mask[inset, inset : c1 + 1] = True
+    mask[r1, inset : c1 + 1] = True
+    mask[inset : r1 + 1, inset] = True
+    mask[inset : r1 + 1, c1] = True
+
+
+def _double_frame_mask(child_mask: np.ndarray) -> np.ndarray:
+    h, w = child_mask.shape
+    out = np.zeros((h + FRAME_TOTAL_PAD, w + FRAME_TOTAL_PAD), dtype=bool)
+    _paint_rect_border(out, inset=0)
+    _paint_rect_border(out, inset=INNER_BORDER_OFFSET)
+    out[
+        FRAME_CHILD_OFFSET : FRAME_CHILD_OFFSET + h,
+        FRAME_CHILD_OFFSET : FRAME_CHILD_OFFSET + w,
+    ] |= child_mask
+    return out
+
+
+def _outside_frame_mask() -> tuple[np.ndarray, tuple[int, int]]:
+    child = np.ones((1, 1), dtype=bool)
+    out = _double_frame_mask(child)
+    assert out.shape == (OUTSIDE_FRAME_SIZE, OUTSIDE_FRAME_SIZE)
+    return out, (OUTSIDE_ANCHOR, OUTSIDE_ANCHOR)
+
+
+def _build_layout(node: _Node) -> None:
+    if node.mask is not None:
+        return
+
+    if not node.is_frame:
+        node.mask = np.ones((1, 1), dtype=bool)
+        node.anchor = (0, 0)
+        node.axis_map = {
+            "row": [(float(node.center[0]), 0)],
+            "col": [(float(node.center[1]), 0)],
+        }
+        return
+
+    assert node.children
+    child_mask, _placements, axis_map = _layout_group(node.children)
+    out = _double_frame_mask(child_mask)
+    node.mask = out
+    node.anchor = (out.shape[0] // 2, out.shape[1] // 2)
+    node.axis_map = {
+        "row": [(orig, pos + FRAME_CHILD_OFFSET) for orig, pos in axis_map["row"]],
+        "col": [(orig, pos + FRAME_CHILD_OFFSET) for orig, pos in axis_map["col"]],
+    }
+
+
+def _axis_coordinates(nodes: list[_Node], axis: int) -> dict[_Node, int]:
+    items = []
+    for node in nodes:
+        assert node.mask is not None and node.anchor is not None
+        r0, c0, r1, c1 = node.bbox
+        interval = (r0, r1) if axis == 0 else (c0, c1)
+        mid = (interval[0] + interval[1]) / 2
+        items.append((node, interval, mid, node.anchor[axis], node.mask.shape[axis]))
+
+    bands: list[dict] = []
+    for item in sorted(items, key=lambda x: x[2]):
+        interval = item[1]
+        for band in bands:
+            if any(_intervals_overlap(interval, other[1]) for other in band["items"]):
+                band["items"].append(item)
+                band["interval"] = (
+                    min(band["interval"][0], interval[0]),
+                    max(band["interval"][1], interval[1]),
+                )
+                break
+        else:
+            bands.append({"items": [item], "interval": interval})
+
+    coord_by_node: dict[_Node, int] = {}
+    coord = 0
+    for i, band in enumerate(bands):
+        if i:
+            prev = bands[i - 1]
+            prev_down = max(item[4] - 1 - item[3] for item in prev["items"])
+            curr_up = max(item[3] for item in band["items"])
+            coord += prev_down + 2 + curr_up
+        for item in band["items"]:
+            coord_by_node[item[0]] = int(coord)
+
+    return coord_by_node
+
+
+def _layout_group(nodes: list[_Node]) -> tuple[np.ndarray, dict[_Node, tuple[int, int]], dict[str, list[tuple[float, int]]]]:
+    assert nodes
+    for node in nodes:
+        _build_layout(node)
+
+    row_coord = _axis_coordinates(nodes, axis=0)
+    col_coord = _axis_coordinates(nodes, axis=1)
+
+    min_r = min(row_coord[n] - n.anchor[0] for n in nodes if n.anchor is not None)
+    min_c = min(col_coord[n] - n.anchor[1] for n in nodes if n.anchor is not None)
+    max_r = max(
+        row_coord[n] - n.anchor[0] - min_r + n.mask.shape[0]
+        for n in nodes
+        if n.anchor is not None and n.mask is not None
+    )
+    max_c = max(
+        col_coord[n] - n.anchor[1] - min_c + n.mask.shape[1]
+        for n in nodes
+        if n.anchor is not None and n.mask is not None
+    )
+
+    out = np.zeros((max_r, max_c), dtype=bool)
+    placements: dict[_Node, tuple[int, int]] = {}
+    axis_map = {"row": [], "col": []}
+    for node in nodes:
+        assert node.mask is not None and node.anchor is not None
+        r = row_coord[node] - node.anchor[0] - min_r
+        c = col_coord[node] - node.anchor[1] - min_c
+        placements[node] = (int(r), int(c))
+        out[r : r + node.mask.shape[0], c : c + node.mask.shape[1]] |= node.mask
+        axis_map["row"].append((float(node.center[0]), int(r + node.anchor[0])))
+        axis_map["col"].append((float(node.center[1]), int(c + node.anchor[1])))
+
+    return out, placements, axis_map
+
+
+def _outside_side(dot: _Node, frame: _Node) -> str:
+
+exec
+/bin/bash -lc "sed -n '1,220p' /home/lixinyu/snap/new/ceshi/code_combo/eee78d87/18/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Combo variant of eee78d87 (index 18)
+# combo_spec: D3/3+D13/2
+# Name: 铺贴后擦除+中心空洞
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+
+THIS_FILE = Path(__file__).resolve()
+ROOT = next((parent for parent in THIS_FILE.parents if (parent / "solvers" / "arc_utils.py").exists()), None)
+if ROOT is None:
+    raise RuntimeError("Could not locate solvers/arc_utils.py from combo variant path")
+SOLVER_DIR = ROOT / "solvers"
+if str(SOLVER_DIR) not in sys.path:
+    sys.path.append(str(SOLVER_DIR))
+
+from arc_utils import Color, bbox, colors_present, crop_bbox, get_bg, tile_fill
+
+
+# Design analysis for combo D3/3 + D13/2
+# ---------------------------------------
+# a) Concrete behavior and trace
+#    - Input remains the original 6x6 orange field with exactly one tight 3x3 contour glyph.
+#    - Original task:
+#        glyph -> decode 3x3 phase tile -> tile full 16x16 lattice -> stamp 2x2 maroon glyph at center.
+#    - This combo:
+#        glyph -> decode 3x3 phase tile -> tile full 16x16 lattice
+#              -> classify the glyph's symmetry family
+#              -> keep only a large cross window (plus/H) or a large diamond window (X/4corners)
+#              -> force the centered 6x6 block to pure black
+#              -> stamp one maroon 3x3 glyph in each corner.
+#    - Example trace:
+#        plus:
+#          source output = full periodic lattice + centered maroon 2x2 plus
+#          combo output  = cross-shaped lattice silhouette with a 6x6 black hole in the middle
+#                          + four corner maroon plus stamps
+#        X:
+#          source output = full periodic lattice + centered maroon 2x2 X
+#          combo output  = diamond-shaped lattice silhouette with the same 6x6 black hole
+#                          + four corner maroon X stamps
+#    - The fusion is not additive-only: the erase stage changes which lattice survives,
+#      and the old center stamp is removed entirely so the center can stay empty.
+#
+# b) Complexity calibration
+#    - The phase decoding still depends on the exact glyph, so all four glyph types matter.
+#    - The erase stage uses only two large window families: cross or diamond.
+#      That keeps the branch count small enough for ARC while still being visually obvious.
+#    - The orthogonal family (plus/H) and diagonal-corner family (X/4corners) each contain
+#      two glyphs, so the branch split is balanced and repeated across samples.
+#
+# c) Hidden assumptions from the original main()
+#    - The original shape assertions still hold: 6x6 input, orange background, one non-orange
+#      color, and a tight 3x3 motif bbox.
+#    - The original centered 2x2 maroon stamp assumption is invalid now and must be removed.
+#    - A new assumption appears: the glyph must be one of the four known contour codes so that
+#      both phase decoding and symmetry-family classification are valid. The generator preserves this.
+#    - Ordering matters more than before:
+#        1. tile lattice first
+#        2. erase by window
+#        3. carve the center hole
+#        4. stamp corners last
+#      If corner stamping happened earlier, the erase pass would delete the maroon markers.
+#
+# d) Placement legality
+#    - Output size is still fixed at 16x16, so the center hole is rows 5:11 and cols 5:11.
+#    - Corner anchors (0,0), (0,13), (13,0), (13,13) fit four non-overlapping 3x3 stamps.
+#    - The 6x6 center hole is disjoint from all corner stamps.
+#    - Input placement is unchanged from the source task: the 3x3 motif can start at any
+#      top-left in rows/cols 0..3 without leaving the 6x6 canvas.
+#
+# e) Visual observability
+#    - A human can infer the new rule from a few examples because two stable cues repeat:
+#        1. the center is always a black 6x6 void,
+#        2. the surviving lattice silhouette flips between a cross and a diamond depending
+#           on whether the glyph has orthogonal middle-row arms or diagonal/corner emphasis.
+#    - The branch is driven by visible geometry, not hidden metadata such as color ids.
+#
+# f) Visual cleanliness
+#    - The lattice layer is orange on black only inside one large aperture.
+#    - The center hole is a single clean black block, not a noisy partial overwrite.
+#    - Maroon appears only in the four corners, far away from the erased center and from the
+#      main silhouette boundary, so the three roles are visually separated.
+#
+# g) Change inferability
+#    - No extra color mapping is introduced: output colors stay {black, orange, maroon}.
+#    - The meaning of maroon is still "decoded glyph marker", but its placement changes from
+#      center to corners, which is a strong positional cue rather than an arbitrary recoloring rule.
+#
+# h) New main() assumptions after the fusion
+#    - _window_kind() assumes the four source glyphs split cleanly into two symmetry families.
+#      It reads motif[1,0] (equivalently motif[1,2]) to distinguish orthogonal vs diagonal families.
+#      The generator only emits plus/H/X/4corners, so this assumption is guaranteed.
+#    - The corner-stamp routine assumes a 3x3 motif; main() asserts that before any stamping.
+#    - The erase window is defined for the fixed 16x16 output size used by the source spec;
+#      generate_input() leaves the source input size unchanged so output size remains 16x16.
+
+
+OUT_SHAPE = (16, 16)
+CENTER_HOLE = (slice(5, 11), slice(5, 11))
+CORNER_ANCHORS = ((0, 0), (0, 13), (13, 0), (13, 13))
+
+
+def _decode_phase_tile(motif: np.ndarray) -> np.ndarray:
+    """Decode the 3x3 contour glyph into the period-3 orange phase mask."""
+    assert motif.shape == (3, 3)
+
+    corners = np.array([motif[0, 0], motif[0, 2], motif[2, 0], motif[2, 2]], dtype=bool)
+    edge_centers = np.array([motif[0, 1], motif[1, 0], motif[1, 2], motif[2, 1]], dtype=bool)
+    phase = np.zeros((3, 3), dtype=bool)
+
+    if not bool(corners.any()):
+        assert bool(motif[1, 1])
+        assert bool(edge_centers.all())
+        phase[1:, 1:] = True
+        return phase
+
+    assert bool(corners.all())
+    assert not bool(motif[0, 1])
+    assert not bool(motif[2, 1])
+    assert bool(motif[1, 0]) == bool(motif[1, 2])
+
+    phase[1:, 0] = True
+    if bool(motif[1, 0]):
+        assert bool(motif[1, 1])
+    else:
+        phase[0, 1:] = True
+
+    if not bool(motif[1, 1]):
+        phase[0, 0] = True
+
+    return phase
+
+
+def _window_kind(motif: np.ndarray) -> str:
+    """Use orthogonal middle-row arms for cross windows; diagonal/corner-only forms get diamonds."""
+    assert motif.shape == (3, 3)
+    return "cross" if bool(motif[1, 0]) else "diamond"
+
+
+def _window_mask(shape: tuple[int, int], kind: str) -> np.ndarray:
+    """Return the keep-mask used by the erase stage."""
+    h, w = shape
+    rr, cc = np.indices((h, w))
+    center_r = (h - 1) / 2.0
+    center_c = (w - 1) / 2.0
+
+    if kind == "cross":
+        return (np.abs(rr - center_r) <= 2.5) | (np.abs(cc - center_c) <= 2.5)
+    if kind == "diamond":
+        return (np.abs(rr - center_r) + np.abs(cc - center_c)) <= 8.5
+    raise ValueError(f"unknown window kind: {kind}")
+
+
+def _stamp_corner_glyphs(out: np.ndarray, motif: np.ndarray) -> None:
+    for r0, c0 in CORNER_ANCHORS:
+        out[r0 : r0 + 3, c0 : c0 + 3][motif] = Color.MAROON
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Decode the 3x3 contour glyph into a tiled lattice, erase that lattice down to a symmetry-selected aperture, and leave the center as a black hole with maroon corner stamps.
+
+    Input structure:
+    - The grid is 6x6 with orange background and exactly one other color.
+    - The non-orange cells form one tight 3x3 contour glyph.
+    - The glyph is one of the four valid code shapes: plus, H, X, or four corners.
+
+    Rule:
+    - Decode the 3x3 glyph into the source task's period-3 orange phase tile.
+    - Repeat that phase tile across a 16x16 black canvas.
+    - Use the glyph's visible symmetry family to choose an erase window: plus/H keep a cross, X/four-corners keep a diamond.
+    - Black out everything outside that window, then black out the centered 6x6 block as a permanent hole.
+    - Stamp one maroon 3x3 copy of the glyph into each of the four output corners.
+
+    Key insight:
+    - The same small contour now controls two different spatial decisions: its exact shape still decodes the lattice phase, while its orthogonal-vs-diagonal arm structure decides which large aperture survives around the central void.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.shape == (6, 6)
+
+    bg = int(get_bg(g))
+    assert bg == Color.ORANGE
+    assert len(colors_present(g, exclude={bg})) == 1
+
+    fg = g != bg
+    b = bbox(fg)
+    assert b is not None
+    motif = crop_bbox(fg, b).astype(bool)
+    assert motif.shape == (3, 3)
+
+    phase = _decode_phase_tile(motif)
+    phase_colors = np.where(phase, bg, Color.BLACK).astype(int)
+
+    tiled = tile_fill(OUT_SHAPE, phase_colors)
+    keep = _window_mask(OUT_SHAPE, _window_kind(motif))
+    out = np.where(keep, tiled, Color.BLACK).astype(int)
+
+    out[CENTER_HOLE] = Color.BLACK
+    _stamp_corner_glyphs(out, motif)
+    return out
+
+
+# --------------- generator (cx) ---------------
+
+# --- CFG: tunable generation parameters ---
+GRID_H, GRID_W = 6, 6
+MOTIF_SIZE = 3
+MOTIF_POS_MAX = 4
+FG_COLORS = [1, 2, 3, 4, 5, 6, 8]
+MAX_RETRIES = 300
+
+GLYPHS = {
+    "plus": np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool),
+    "H": np.array([[1, 0, 1], [1, 1, 1], [1, 0, 1]], dtype=bool),
+    "X": np.array([[1, 0, 1], [0, 1, 0], [1, 0, 1]], dtype=bool),
+    "4corners": np.array([[1, 0, 1], [0, 0, 0], [1, 0, 1]], dtype=bool),
+}
+
+codex
+我要开始写新文件了：会先加入模块头注释和设计分析，再实现两个核心函数 `_square_crop_mask()` 与 `_force_square_output()`，最后把生成器改成只产出真正触发这两个规则的样本。
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/b0039139/13/code.py
+diff --git a/ceshi/code_combo/b0039139/13/code.py b/ceshi/code_combo/b0039139/13/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2992c2415c9a14829fdd3977e1a51d28d1fa8845
+--- /dev/null
++++ b/ceshi/code_combo/b0039139/13/code.py
+@@ -0,0 +1,303 @@
++# Combo variant of b0039139 (index 13)
++# combo_spec: D8/0+D10/0
++# Name: 正方形模板强制正方形输出
++
++from __future__ import annotations
++
++import random
++import sys
++from pathlib import Path
++
++import numpy as np
++
++THIS_FILE = Path(__file__).resolve()
++ROOT = next((parent for parent in THIS_FILE.parents if (parent / "solvers" / "arc_utils.py").exists()), None)
++if ROOT is None:
++    raise RuntimeError("Could not locate solvers/arc_utils.py from combo variant path")
++SOLVER_DIR = ROOT / "solvers"
++if str(SOLVER_DIR) not in sys.path:
++    sys.path.append(str(SOLVER_DIR))
++
++from arc_utils import bbox, components_mask, crop_bbox, random_sprite
++
++
++# Design analysis for combo D8/0 + D10/0
++# ---------------------------------------
++# a) Concrete behavior and trace
++#    - Source task:
++#      * take the template's tight non-black bbox,
++#      * recolor that rectangle,
++#      * repeat it N times as a 1-row/1-col-separated strip.
++#    - This combo:
++#      * first replace the tight rectangle with the smallest enclosing square tile,
++#        implemented as "bbox crop, then extend the shorter axis with background cells";
++#      * then place the repeated strip into a square canvas whose side is
++#        (square_tile_side * N), keeping the strip at the top-left;
++#      * because the strip still contains N-1 separator bands, it is usually longer than the
++#        square side on the repeat axis, so the far end is truncated; the unused orthogonal
++#        region of the square is filled with the background color.
++#    - Small trace:
++#      * suppose the visible shape bbox is 2x4 and N=3, horizontal layout.
++#      * source tile: 2x4, source output: 2x14.
++#      * combo tile: 4x4 (same 2x4 shape plus 2 background rows below).
++#      * repeated strip before square forcing: 4x14.
++#      * combo output canvas: 12x12, so rows 0:4 hold the strip clipped to width 12 and
++#        rows 4:12 are pure background.
++#    - The fusion is real rather than additive-only: D8 changes the tile side that D10 uses,
++#      and D10 then turns that square tile into a larger square canvas with both clipping and fill.
++#
++# b) Complexity calibration
++#    - Only two new geometric ideas are introduced: square crop and square output.
++#    - Both are anchored the same way (top-left preserved, extra space goes toward the lower/right
++#      side), so the learner sees one consistent convention rather than many branches.
++#    - We deliberately keep the repeat count range and stencil language from the source task so
++#      the new difficulty comes from geometry, not from additional symbolic cases.
++#
++# c) Hidden assumption review against the original main()
++#    - Original assumption: bbox dimensions directly become output tile dimensions.
++#      Broken by D8; tile height and width now both equal max(bbox_h, bbox_w).
++#    - Original assumption: output cross-axis equals the crop cross-axis.
++#      Broken by D10; both output axes now equal square_tile_side * N.
++#    - Original assumption: repeating the strip never overflows.
++#      Broken by D10; overflow is now expected and must be clipped on the repeat axis.
++#    - Original assumption: N<=1 can just return the tile.
++#      The solver still supports it, but the generator keeps N>=2 so square forcing is visible.
++#
++# d) Placement legality
++#    - The template section still uses a 1-cell black border around the non-square source bbox,
++#      so no object overlap is introduced in the input.
++#    - The stencil keeps the original separated 2-cell blobs, so component counting remains valid.
++#    - In the output, the repeated strip is pasted onto a preallocated square canvas and clipped
++#      by slicing, so there is no out-of-bounds write.
++#
++# e) Visual observability
++#    - The generator forbids square source bboxes, so the square-crop rule is visible.
++#    - N is always at least 2, so the square-output rule is also visible: the result is never the
++#      original thin strip, and the far edge of the strip is clipped while the orthogonal side
++#      shows a large uniform background band.
++#    - No rule depends on hidden properties such as numeric color order.
++#
++# f) Visual cleanliness
++#    - The four-section input layout is unchanged, so the clue structure stays readable.
++#    - The output contains only three roles: recolored tile content, separator slivers, and the
++#      square canvas fill, all using the same fg/bg pair as the source task.
++#    - Clipping happens only at the far right or far bottom edge, never in the middle.
++#
++# g) Change inferability
++#    - There is no new color remapping beyond the original swatches.
++#    - The new pattern is structural and repeated across samples:
++#      "rectangle template becomes square tile" and "strip becomes square canvas".
++#
++# h) New main() assumptions after the fusion
++#    - _square_crop_mask() assumes at least one non-black template pixel exists; generate_input()
++#      always uses random_sprite(), which returns a connected non-empty shape.
++#    - _force_square_output() assumes the tile is square because its side length determines both
++#      output axes; main() enforces that by always calling _square_crop_mask() first.
++#    - The clipping convention assumes the repeated strip is anchored at the top-left of the
++#      square canvas; generate_input() uses the same oracle, so all training examples match it.
++
++
++REPEAT_COUNT_RANGE = (2, 6)
++CROP_SIZE_RANGE = (2, 5)
++DENSITY_RANGE = (0.55, 0.85)
++COLOR_POOL = list(range(2, 10))
++TEMPLATE_COLOR = 4
++STENCIL_COLOR = 3
++SEPARATOR_COLOR = 1
++SWATCH_DIM_RANGE = (3, 8)
++STENCIL_VARYING_EXTRA = 4
++BLOB_PLACE_RETRIES = 200
++GEN_RETRIES = 400
++
++
++def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
++    h, w = grid.shape
++    sep = SEPARATOR_COLOR
++
++    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == sep))]
++    if sep_rows:
++        cuts = [-1] + sep_rows + [h]
++        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == sep))]
++    cuts = [-1] + sep_cols + [w]
++    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++
++def _solid_color(block: np.ndarray) -> int:
++    vals, counts = np.unique(block, return_counts=True)
++    return int(vals[int(np.argmax(counts))])
++
++
++def _square_crop_mask(template_mask: np.ndarray) -> np.ndarray:
++    """Crop to the tight bbox, then extend the shorter axis with False cells to make a square."""
++    template_bbox = bbox(template_mask)
++    if template_bbox is None:
++        return np.empty((0, 0), dtype=bool)
++
++    rect = crop_bbox(template_mask, template_bbox).astype(bool)
++    h, w = rect.shape
++    side = max(h, w)
++    square = np.zeros((side, side), dtype=bool)
++    square[:h, :w] = rect
++    return square
++
++
++def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
++    if n <= 1:
++        return tile.copy()
++    if horizontal:
++        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
++        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
++        return np.hstack(pieces)
++    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
++    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
++    return np.vstack(pieces)
++
++
++def _force_square_output(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
++    """Place the repeated strip into a square canvas of side tile_side * n, clipping overflow."""
++    side = int(tile.shape[0]) * max(int(n), 1)
++    out = np.full((side, side), bg_color, dtype=int)
++    strip = _tile_repeat(tile, n, bg_color, horizontal)
++    hh = min(side, strip.shape[0])
++    ww = min(side, strip.shape[1])
++    out[:hh, :ww] = strip[:hh, :ww]
++    return out
++
++
++def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
++    varying = random.randint(*SWATCH_DIM_RANGE)
++    if horizontal:
++        return np.full((shared_dim, varying), color, dtype=int)
++    return np.full((varying, shared_dim), color, dtype=int)
++
++
++def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
++    if horizontal:
++        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
++        parts = [sections[0]]
++        for s in sections[1:]:
++            parts.extend([sep, s])
++        return np.hstack(parts)
++    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
++    parts = [sections[0]]
++    for s in sections[1:]:
++        parts.extend([sep, s])
++    return np.vstack(parts)
++
++
++def _build_stencil(n_blobs: int, shared_dim: int, horizontal: bool) -> np.ndarray | None:
++    min_varying = max(4, n_blobs * 2 + 2)
++    varying_dim = random.randint(min_varying, min_varying + STENCIL_VARYING_EXTRA)
++
++    h, w = (shared_dim, varying_dim) if horizontal else (varying_dim, shared_dim)
++    grid = np.zeros((h, w), dtype=int)
++
++    placed = 0
++    for _ in range(BLOB_PLACE_RETRIES):
++        if placed >= n_blobs:
++            break
++        br, bc = (1, 2) if random.choice([True, False]) else (2, 1)
++
++        if h - 1 - br < 1 or w - 1 - bc < 1:
++            continue
++        r = random.randint(1, h - 1 - br)
++        c = random.randint(1, w - 1 - bc)
++
++        r0, c0 = max(0, r - 1), max(0, c - 1)
++        r1, c1 = min(h, r + br + 1), min(w, c + bc + 1)
++        if np.any(grid[r0:r1, c0:c1] != 0):
++            continue
++
++        grid[r : r + br, c : c + bc] = STENCIL_COLOR
++        placed += 1
++
++    return grid if placed == n_blobs else None
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Recolor a template after promoting its tight crop to a square tile, then place the repeated strip into a forced square canvas.
++
++    Input structure:
++    - Blue separator rows or columns split the grid into four sections.
++    - Section 1 is a black template carrying one yellow shape; section 2 is the component-count stencil.
++    - Sections 3 and 4 are solid swatches that supply the output foreground and background colors.
++
++    Rule:
++    - Count the 4-connected non-black components in section 2 to obtain the repetition count.
++    - Crop the template to the tight non-black bbox, but then enlarge that crop to the smallest square by extending only the shorter axis with background cells.
++    - Recolor the resulting square mask with the foreground/background swatches.
++    - Repeat that square tile along the separator-controlled orientation with 1-cell background separators, then place the strip at the top-left of a square output whose side length is tile_side times the repetition count; clip any overflow and leave the rest as background.
++
++    Key insight:
++    - The stencil still says how many copies to make, but the template no longer yields a rectangle: it yields a square tile, and that same square side also determines the final square canvas that can both truncate the strip and leave a padded empty zone.
++    """
++    g = np.asarray(grid, dtype=int)
++    orientation, sections = _split_sections(g)
++    template, repetition_pattern, foreground_block, background_block = sections[:4]
++
++    foreground = _solid_color(foreground_block)
++    background = _solid_color(background_block)
++
++    tile_mask = _square_crop_mask(template != 0)
++    if tile_mask.size == 0:
++        return np.empty((0, 0), dtype=int)
++
++    tile = np.where(tile_mask, foreground, background).astype(int)
++    n_repeats = len(components_mask(repetition_pattern != 0, connectivity=4))
++    return _force_square_output(tile, n_repeats, background, orientation == "horizontal")
++
++
++def _gen_attempt() -> np.ndarray | None:
++    horizontal = random.choice([True, False])
++    n_repeats = random.randint(*REPEAT_COUNT_RANGE)
++
++    crop_h = random.randint(*CROP_SIZE_RANGE)
++    crop_w = random.randint(*CROP_SIZE_RANGE)
++    if crop_h == crop_w:
++        return None
++
++    density = random.uniform(*DENSITY_RANGE)
++    shape = random_sprite(
++        crop_h,
++        crop_w,
++        density=density,
++        color_palette=[TEMPLATE_COLOR],
++        connectivity=4,
++        symmetry="not_symmetric",
++    )
++
++    fg_color, bg_color = random.sample(COLOR_POOL, 2)
++
++    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
++    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
++
++    tile_mask = _square_crop_mask(template != 0)
++    tile = np.where(tile_mask, fg_color, bg_color).astype(int)
++    output = _force_square_output(tile, n_repeats, bg_color, horizontal)
++
++    shared_dim = template.shape[0] if horizontal else template.shape[1]
++    stencil = _build_stencil(n_repeats, shared_dim, horizontal)
++    if stencil is None:
++        return None
++
++    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
++    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
++    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        return None
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+diff --git a/ceshi/code_combo/b0039139/13/code.py b/ceshi/code_combo/b0039139/13/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2992c2415c9a14829fdd3977e1a51d28d1fa8845
+--- /dev/null
++++ b/ceshi/code_combo/b0039139/13/code.py
+@@ -0,0 +1,303 @@
++# Combo variant of b0039139 (index 13)
++# combo_spec: D8/0+D10/0
++# Name: 正方形模板强制正方形输出
++
++from __future__ import annotations
++
++import random
++import sys
++from pathlib import Path
++
++import numpy as np
++
++THIS_FILE = Path(__file__).resolve()
++ROOT = next((parent for parent in THIS_FILE.parents if (parent / "solvers" / "arc_utils.py").exists()), None)
++if ROOT is None:
++    raise RuntimeError("Could not locate solvers/arc_utils.py from combo variant path")
++SOLVER_DIR = ROOT / "solvers"
++if str(SOLVER_DIR) not in sys.path:
++    sys.path.append(str(SOLVER_DIR))
++
++from arc_utils import bbox, components_mask, crop_bbox, random_sprite
++
++
++# Design analysis for combo D8/0 + D10/0
++# ---------------------------------------
++# a) Concrete behavior and trace
++#    - Source task:
++#      * take the template's tight non-black bbox,
++#      * recolor that rectangle,
++#      * repeat it N times as a 1-row/1-col-separated strip.
++#    - This combo:
++#      * first replace the tight rectangle with the smallest enclosing square tile,
++#        implemented as "bbox crop, then extend the shorter axis with background cells";
++#      * then place the repeated strip into a square canvas whose side is
++#        (square_tile_side * N), keeping the strip at the top-left;
++#      * because the strip still contains N-1 separator bands, it is usually longer than the
++#        square side on the repeat axis, so the far end is truncated; the unused orthogonal
++#        region of the square is filled with the background color.
++#    - Small trace:
++#      * suppose the visible shape bbox is 2x4 and N=3, horizontal layout.
++#      * source tile: 2x4, source output: 2x14.
++#      * combo tile: 4x4 (same 2x4 shape plus 2 background rows below).
++#      * repeated strip before square forcing: 4x14.
++#      * combo output canvas: 12x12, so rows 0:4 hold the strip clipped to width 12 and
++#        rows 4:12 are pure background.
++#    - The fusion is real rather than additive-only: D8 changes the tile side that D10 uses,
++#      and D10 then turns that square tile into a larger square canvas with both clipping and fill.
++#
++# b) Complexity calibration
++#    - Only two new geometric ideas are introduced: square crop and square output.
++#    - Both are anchored the same way (top-left preserved, extra space goes toward the lower/right
++#      side), so the learner sees one consistent convention rather than many branches.
++#    - We deliberately keep the repeat count range and stencil language from the source task so
++#      the new difficulty comes from geometry, not from additional symbolic cases.
++#
++# c) Hidden assumption review against the original main()
++#    - Original assumption: bbox dimensions directly become output tile dimensions.
++#      Broken by D8; tile height and width now both equal max(bbox_h, bbox_w).
++#    - Original assumption: output cross-axis equals the crop cross-axis.
++#      Broken by D10; both output axes now equal square_tile_side * N.
++#    - Original assumption: repeating the strip never overflows.
++#      Broken by D10; overflow is now expected and must be clipped on the repeat axis.
++#    - Original assumption: N<=1 can just return the tile.
++#      The solver still supports it, but the generator keeps N>=2 so square forcing is visible.
++#
++# d) Placement legality
++#    - The template section still uses a 1-cell black border around the non-square source bbox,
++#      so no object overlap is introduced in the input.
++#    - The stencil keeps the original separated 2-cell blobs, so component counting remains valid.
++#    - In the output, the repeated strip is pasted onto a preallocated square canvas and clipped
++#      by slicing, so there is no out-of-bounds write.
++#
++# e) Visual observability
++#    - The generator forbids square source bboxes, so the square-crop rule is visible.
++#    - N is always at least 2, so the square-output rule is also visible: the result is never the
++#      original thin strip, and the far edge of the strip is clipped while the orthogonal side
++#      shows a large uniform background band.
++#    - No rule depends on hidden properties such as numeric color order.
++#
++# f) Visual cleanliness
++#    - The four-section input layout is unchanged, so the clue structure stays readable.
++#    - The output contains only three roles: recolored tile content, separator slivers, and the
++#      square canvas fill, all using the same fg/bg pair as the source task.
++#    - Clipping happens only at the far right or far bottom edge, never in the middle.
++#
++# g) Change inferability
++#    - There is no new color remapping beyond the original swatches.
++#    - The new pattern is structural and repeated across samples:
++#      "rectangle template becomes square tile" and "strip becomes square canvas".
++#
++# h) New main() assumptions after the fusion
++#    - _square_crop_mask() assumes at least one non-black template pixel exists; generate_input()
++#      always uses random_sprite(), which returns a connected non-empty shape.
++#    - _force_square_output() assumes the tile is square because its side length determines both
++#      output axes; main() enforces that by always calling _square_crop_mask() first.
++#    - The clipping convention assumes the repeated strip is anchored at the top-left of the
++#      square canvas; generate_input() uses the same oracle, so all training examples match it.
++
++
++REPEAT_COUNT_RANGE = (2, 6)
++CROP_SIZE_RANGE = (2, 5)
++DENSITY_RANGE = (0.55, 0.85)
++COLOR_POOL = list(range(2, 10))
++TEMPLATE_COLOR = 4
++STENCIL_COLOR = 3
++SEPARATOR_COLOR = 1
++SWATCH_DIM_RANGE = (3, 8)
++STENCIL_VARYING_EXTRA = 4
++BLOB_PLACE_RETRIES = 200
++GEN_RETRIES = 400
++
++
++def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
++    h, w = grid.shape
++    sep = SEPARATOR_COLOR
++
++    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == sep))]
++    if sep_rows:
++        cuts = [-1] + sep_rows + [h]
++        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == sep))]
++    cuts = [-1] + sep_cols + [w]
++    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++
++def _solid_color(block: np.ndarray) -> int:
++    vals, counts = np.unique(block, return_counts=True)
++    return int(vals[int(np.argmax(counts))])
++
++
++def _square_crop_mask(template_mask: np.ndarray) -> np.ndarray:
++    """Crop to the tight bbox, then extend the shorter axis with False cells to make a square."""
++    template_bbox = bbox(template_mask)
++    if template_bbox is None:
++        return np.empty((0, 0), dtype=bool)
++
++    rect = crop_bbox(template_mask, template_bbox).astype(bool)
++    h, w = rect.shape
++    side = max(h, w)
++    square = np.zeros((side, side), dtype=bool)
++    square[:h, :w] = rect
++    return square
++
++
++def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
++    if n <= 1:
++        return tile.copy()
++    if horizontal:
++        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
++        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
++        return np.hstack(pieces)
++    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
++    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
++    return np.vstack(pieces)
++
++
++def _force_square_output(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
++    """Place the repeated strip into a square canvas of side tile_side * n, clipping overflow."""
++    side = int(tile.shape[0]) * max(int(n), 1)
++    out = np.full((side, side), bg_color, dtype=int)
++    strip = _tile_repeat(tile, n, bg_color, horizontal)
++    hh = min(side, strip.shape[0])
++    ww = min(side, strip.shape[1])
++    out[:hh, :ww] = strip[:hh, :ww]
++    return out
++
++
++def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
++    varying = random.randint(*SWATCH_DIM_RANGE)
++    if horizontal:
++        return np.full((shared_dim, varying), color, dtype=int)
++    return np.full((varying, shared_dim), color, dtype=int)
++
++
++def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
++    if horizontal:
++        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
++        parts = [sections[0]]
++        for s in sections[1:]:
++            parts.extend([sep, s])
++        return np.hstack(parts)
++    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
++    parts = [sections[0]]
++    for s in sections[1:]:
++        parts.extend([sep, s])
++    return np.vstack(parts)
++
++
++def _build_stencil(n_blobs: int, shared_dim: int, horizontal: bool) -> np.ndarray | None:
++    min_varying = max(4, n_blobs * 2 + 2)
++    varying_dim = random.randint(min_varying, min_varying + STENCIL_VARYING_EXTRA)
++
++    h, w = (shared_dim, varying_dim) if horizontal else (varying_dim, shared_dim)
++    grid = np.zeros((h, w), dtype=int)
++
++    placed = 0
++    for _ in range(BLOB_PLACE_RETRIES):
++        if placed >= n_blobs:
++            break
++        br, bc = (1, 2) if random.choice([True, False]) else (2, 1)
++
++        if h - 1 - br < 1 or w - 1 - bc < 1:
++            continue
++        r = random.randint(1, h - 1 - br)
++        c = random.randint(1, w - 1 - bc)
++
++        r0, c0 = max(0, r - 1), max(0, c - 1)
++        r1, c1 = min(h, r + br + 1), min(w, c + bc + 1)
++        if np.any(grid[r0:r1, c0:c1] != 0):
++            continue
++
++        grid[r : r + br, c : c + bc] = STENCIL_COLOR
++        placed += 1
++
++    return grid if placed == n_blobs else None
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Recolor a template after promoting its tight crop to a square tile, then place the repeated strip into a forced square canvas.
++
++    Input structure:
++    - Blue separator rows or columns split the grid into four sections.
++    - Section 1 is a black template carrying one yellow shape; section 2 is the component-count stencil.
++    - Sections 3 and 4 are solid swatches that supply the output foreground and background colors.
++
++    Rule:
++    - Count the 4-connected non-black components in section 2 to obtain the repetition count.
++    - Crop the template to the tight non-black bbox, but then enlarge that crop to the smallest square by extending only the shorter axis with background cells.
++    - Recolor the resulting square mask with the foreground/background swatches.
++    - Repeat that square tile along the separator-controlled orientation with 1-cell background separators, then place the strip at the top-left of a square output whose side length is tile_side times the repetition count; clip any overflow and leave the rest as background.
++
++    Key insight:
++    - The stencil still says how many copies to make, but the template no longer yields a rectangle: it yields a square tile, and that same square side also determines the final square canvas that can both truncate the strip and leave a padded empty zone.
++    """
++    g = np.asarray(grid, dtype=int)
++    orientation, sections = _split_sections(g)
++    template, repetition_pattern, foreground_block, background_block = sections[:4]
++
++    foreground = _solid_color(foreground_block)
++    background = _solid_color(background_block)
++
++    tile_mask = _square_crop_mask(template != 0)
++    if tile_mask.size == 0:
++        return np.empty((0, 0), dtype=int)
++
++    tile = np.where(tile_mask, foreground, background).astype(int)
++    n_repeats = len(components_mask(repetition_pattern != 0, connectivity=4))
++    return _force_square_output(tile, n_repeats, background, orientation == "horizontal")
++
++
++def _gen_attempt() -> np.ndarray | None:
++    horizontal = random.choice([True, False])
++    n_repeats = random.randint(*REPEAT_COUNT_RANGE)
++
++    crop_h = random.randint(*CROP_SIZE_RANGE)
++    crop_w = random.randint(*CROP_SIZE_RANGE)
++    if crop_h == crop_w:
++        return None
++
++    density = random.uniform(*DENSITY_RANGE)
++    shape = random_sprite(
++        crop_h,
++        crop_w,
++        density=density,
++        color_palette=[TEMPLATE_COLOR],
++        connectivity=4,
++        symmetry="not_symmetric",
++    )
++
++    fg_color, bg_color = random.sample(COLOR_POOL, 2)
++
++    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
++    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
++
++    tile_mask = _square_crop_mask(template != 0)
++    tile = np.where(tile_mask, fg_color, bg_color).astype(int)
++    output = _force_square_output(tile, n_repeats, bg_color, horizontal)
++
++    shared_dim = template.shape[0] if horizontal else template.shape[1]
++    stencil = _build_stencil(n_repeats, shared_dim, horizontal)
++    if stencil is None:
++        return None
++
++    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
++    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
++    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        return None
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+codex
+代码已经落盘。我先跑题目要求的 50 次稳定性测试；如果通过，再补一轮“是否真的偏离原题”的量化检查，而不是只看 `main(input)` 不报错。
+exec
+/bin/bash -lc 'python -m py_compile /home/lixinyu/snap/new/ceshi/code_combo/b0039139/13/code.py' in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/b0039139/13/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+diff --git a/ceshi/code_combo/b0039139/13/code.py b/ceshi/code_combo/b0039139/13/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2992c2415c9a14829fdd3977e1a51d28d1fa8845
+--- /dev/null
++++ b/ceshi/code_combo/b0039139/13/code.py
+@@ -0,0 +1,303 @@
++# Combo variant of b0039139 (index 13)
++# combo_spec: D8/0+D10/0
++# Name: 正方形模板强制正方形输出
++
++from __future__ import annotations
++
++import random
++import sys
++from pathlib import Path
++
++import numpy as np
++
++THIS_FILE = Path(__file__).resolve()
++ROOT = next((parent for parent in THIS_FILE.parents if (parent / "solvers" / "arc_utils.py").exists()), None)
++if ROOT is None:
++    raise RuntimeError("Could not locate solvers/arc_utils.py from combo variant path")
++SOLVER_DIR = ROOT / "solvers"
++if str(SOLVER_DIR) not in sys.path:
++    sys.path.append(str(SOLVER_DIR))
++
++from arc_utils import bbox, components_mask, crop_bbox, random_sprite
++
++
++# Design analysis for combo D8/0 + D10/0
++# ---------------------------------------
++# a) Concrete behavior and trace
++#    - Source task:
++#      * take the template's tight non-black bbox,
++#      * recolor that rectangle,
++#      * repeat it N times as a 1-row/1-col-separated strip.
++#    - This combo:
++#      * first replace the tight rectangle with the smallest enclosing square tile,
++#        implemented as "bbox crop, then extend the shorter axis with background cells";
++#      * then place the repeated strip into a square canvas whose side is
++#        (square_tile_side * N), keeping the strip at the top-left;
++#      * because the strip still contains N-1 separator bands, it is usually longer than the
++#        square side on the repeat axis, so the far end is truncated; the unused orthogonal
++#        region of the square is filled with the background color.
++#    - Small trace:
++#      * suppose the visible shape bbox is 2x4 and N=3, horizontal layout.
++#      * source tile: 2x4, source output: 2x14.
++#      * combo tile: 4x4 (same 2x4 shape plus 2 background rows below).
++#      * repeated strip before square forcing: 4x14.
++#      * combo output canvas: 12x12, so rows 0:4 hold the strip clipped to width 12 and
++#        rows 4:12 are pure background.
++#    - The fusion is real rather than additive-only: D8 changes the tile side that D10 uses,
++#      and D10 then turns that square tile into a larger square canvas with both clipping and fill.
++#
++# b) Complexity calibration
++#    - Only two new geometric ideas are introduced: square crop and square output.
++#    - Both are anchored the same way (top-left preserved, extra space goes toward the lower/right
++#      side), so the learner sees one consistent convention rather than many branches.
++#    - We deliberately keep the repeat count range and stencil language from the source task so
++#      the new difficulty comes from geometry, not from additional symbolic cases.
++#
++# c) Hidden assumption review against the original main()
++#    - Original assumption: bbox dimensions directly become output tile dimensions.
++#      Broken by D8; tile height and width now both equal max(bbox_h, bbox_w).
++#    - Original assumption: output cross-axis equals the crop cross-axis.
++#      Broken by D10; both output axes now equal square_tile_side * N.
++#    - Original assumption: repeating the strip never overflows.
++#      Broken by D10; overflow is now expected and must be clipped on the repeat axis.
++#    - Original assumption: N<=1 can just return the tile.
++#      The solver still supports it, but the generator keeps N>=2 so square forcing is visible.
++#
++# d) Placement legality
++#    - The template section still uses a 1-cell black border around the non-square source bbox,
++#      so no object overlap is introduced in the input.
++#    - The stencil keeps the original separated 2-cell blobs, so component counting remains valid.
++#    - In the output, the repeated strip is pasted onto a preallocated square canvas and clipped
++#      by slicing, so there is no out-of-bounds write.
++#
++# e) Visual observability
++#    - The generator forbids square source bboxes, so the square-crop rule is visible.
++#    - N is always at least 2, so the square-output rule is also visible: the result is never the
++#      original thin strip, and the far edge of the strip is clipped while the orthogonal side
++#      shows a large uniform background band.
++#    - No rule depends on hidden properties such as numeric color order.
++#
++# f) Visual cleanliness
++#    - The four-section input layout is unchanged, so the clue structure stays readable.
++#    - The output contains only three roles: recolored tile content, separator slivers, and the
++#      square canvas fill, all using the same fg/bg pair as the source task.
++#    - Clipping happens only at the far right or far bottom edge, never in the middle.
++#
++# g) Change inferability
++#    - There is no new color remapping beyond the original swatches.
++#    - The new pattern is structural and repeated across samples:
++#      "rectangle template becomes square tile" and "strip becomes square canvas".
++#
++# h) New main() assumptions after the fusion
++#    - _square_crop_mask() assumes at least one non-black template pixel exists; generate_input()
++#      always uses random_sprite(), which returns a connected non-empty shape.
++#    - _force_square_output() assumes the tile is square because its side length determines both
++#      output axes; main() enforces that by always calling _square_crop_mask() first.
++#    - The clipping convention assumes the repeated strip is anchored at the top-left of the
++#      square canvas; generate_input() uses the same oracle, so all training examples match it.
++
++
++REPEAT_COUNT_RANGE = (2, 6)
++CROP_SIZE_RANGE = (2, 5)
++DENSITY_RANGE = (0.55, 0.85)
++COLOR_POOL = list(range(2, 10))
++TEMPLATE_COLOR = 4
++STENCIL_COLOR = 3
++SEPARATOR_COLOR = 1
++SWATCH_DIM_RANGE = (3, 8)
++STENCIL_VARYING_EXTRA = 4
++BLOB_PLACE_RETRIES = 200
++GEN_RETRIES = 400
++
++
++def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
++    h, w = grid.shape
++    sep = SEPARATOR_COLOR
++
++    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == sep))]
++    if sep_rows:
++        cuts = [-1] + sep_rows + [h]
++        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == sep))]
++    cuts = [-1] + sep_cols + [w]
++    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++
++def _solid_color(block: np.ndarray) -> int:
++    vals, counts = np.unique(block, return_counts=True)
++    return int(vals[int(np.argmax(counts))])
++
++
++def _square_crop_mask(template_mask: np.ndarray) -> np.ndarray:
++    """Crop to the tight bbox, then extend the shorter axis with False cells to make a square."""
++    template_bbox = bbox(template_mask)
++    if template_bbox is None:
++        return np.empty((0, 0), dtype=bool)
++
++    rect = crop_bbox(template_mask, template_bbox).astype(bool)
++    h, w = rect.shape
++    side = max(h, w)
++    square = np.zeros((side, side), dtype=bool)
++    square[:h, :w] = rect
++    return square
++
++
++def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
++    if n <= 1:
++        return tile.copy()
++    if horizontal:
++        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
++        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
++        return np.hstack(pieces)
++    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
++    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
++    return np.vstack(pieces)
++
++
++def _force_square_output(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
++    """Place the repeated strip into a square canvas of side tile_side * n, clipping overflow."""
++    side = int(tile.shape[0]) * max(int(n), 1)
++    out = np.full((side, side), bg_color, dtype=int)
++    strip = _tile_repeat(tile, n, bg_color, horizontal)
++    hh = min(side, strip.shape[0])
++    ww = min(side, strip.shape[1])
++    out[:hh, :ww] = strip[:hh, :ww]
++    return out
++
++
++def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
++    varying = random.randint(*SWATCH_DIM_RANGE)
++    if horizontal:
++        return np.full((shared_dim, varying), color, dtype=int)
++    return np.full((varying, shared_dim), color, dtype=int)
++
++
++def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
++    if horizontal:
++        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
++        parts = [sections[0]]
++        for s in sections[1:]:
++            parts.extend([sep, s])
++        return np.hstack(parts)
++    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
++    parts = [sections[0]]
++    for s in sections[1:]:
++        parts.extend([sep, s])
++    return np.vstack(parts)
++
++
++def _build_stencil(n_blobs: int, shared_dim: int, horizontal: bool) -> np.ndarray | None:
++    min_varying = max(4, n_blobs * 2 + 2)
++    varying_dim = random.randint(min_varying, min_varying + STENCIL_VARYING_EXTRA)
++
++    h, w = (shared_dim, varying_dim) if horizontal else (varying_dim, shared_dim)
++    grid = np.zeros((h, w), dtype=int)
++
++    placed = 0
++    for _ in range(BLOB_PLACE_RETRIES):
++        if placed >= n_blobs:
++            break
++        br, bc = (1, 2) if random.choice([True, False]) else (2, 1)
++
++        if h - 1 - br < 1 or w - 1 - bc < 1:
++            continue
++        r = random.randint(1, h - 1 - br)
++        c = random.randint(1, w - 1 - bc)
++
++        r0, c0 = max(0, r - 1), max(0, c - 1)
++        r1, c1 = min(h, r + br + 1), min(w, c + bc + 1)
++        if np.any(grid[r0:r1, c0:c1] != 0):
++            continue
++
++        grid[r : r + br, c : c + bc] = STENCIL_COLOR
++        placed += 1
++
++    return grid if placed == n_blobs else None
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Recolor a template after promoting its tight crop to a square tile, then place the repeated strip into a forced square canvas.
++
++    Input structure:
++    - Blue separator rows or columns split the grid into four sections.
++    - Section 1 is a black template carrying one yellow shape; section 2 is the component-count stencil.
++    - Sections 3 and 4 are solid swatches that supply the output foreground and background colors.
++
++    Rule:
++    - Count the 4-connected non-black components in section 2 to obtain the repetition count.
++    - Crop the template to the tight non-black bbox, but then enlarge that crop to the smallest square by extending only the shorter axis with background cells.
++    - Recolor the resulting square mask with the foreground/background swatches.
++    - Repeat that square tile along the separator-controlled orientation with 1-cell background separators, then place the strip at the top-left of a square output whose side length is tile_side times the repetition count; clip any overflow and leave the rest as background.
++
++    Key insight:
++    - The stencil still says how many copies to make, but the template no longer yields a rectangle: it yields a square tile, and that same square side also determines the final square canvas that can both truncate the strip and leave a padded empty zone.
++    """
++    g = np.asarray(grid, dtype=int)
++    orientation, sections = _split_sections(g)
++    template, repetition_pattern, foreground_block, background_block = sections[:4]
++
++    foreground = _solid_color(foreground_block)
++    background = _solid_color(background_block)
++
++    tile_mask = _square_crop_mask(template != 0)
++    if tile_mask.size == 0:
++        return np.empty((0, 0), dtype=int)
++
++    tile = np.where(tile_mask, foreground, background).astype(int)
++    n_repeats = len(components_mask(repetition_pattern != 0, connectivity=4))
++    return _force_square_output(tile, n_repeats, background, orientation == "horizontal")
++
++
++def _gen_attempt() -> np.ndarray | None:
++    horizontal = random.choice([True, False])
++    n_repeats = random.randint(*REPEAT_COUNT_RANGE)
++
++    crop_h = random.randint(*CROP_SIZE_RANGE)
++    crop_w = random.randint(*CROP_SIZE_RANGE)
++    if crop_h == crop_w:
++        return None
++
++    density = random.uniform(*DENSITY_RANGE)
++    shape = random_sprite(
++        crop_h,
++        crop_w,
++        density=density,
++        color_palette=[TEMPLATE_COLOR],
++        connectivity=4,
++        symmetry="not_symmetric",
++    )
++
++    fg_color, bg_color = random.sample(COLOR_POOL, 2)
++
++    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
++    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
++
++    tile_mask = _square_crop_mask(template != 0)
++    tile = np.where(tile_mask, fg_color, bg_color).astype(int)
++    output = _force_square_output(tile, n_repeats, bg_color, horizontal)
++
++    shared_dim = template.shape[0] if horizontal else template.shape[1]
++    stencil = _build_stencil(n_repeats, shared_dim, horizontal)
++    if stencil is None:
++        return None
++
++    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
++    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
++    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        return None
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+ succeeded in 381ms:
+Success: 50/50, Time: 0.1s (2ms/call)
+
+codex
+稳定性测试已经过了。现在我在做退化检查：把新生成样本同时喂给原 solver 和新 solver，统计“是否仍然和原题同输出”、截断量、以及正方形填充带的分布，确认融合行为不是纸面上的。
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util
+import numpy as np
+from collections import Counter
+
+new_path='/home/lixinyu/snap/new/ceshi/code_combo/b0039139/13/code.py'
+old_path='/home/lixinyu/snap/new/arc2_solver_select/b0039139.py'
+
+def load(path, name):
+    spec=importlib.util.spec_from_file_location(name, path)
+    mod=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+new=load(new_path,'newmod')
+old=load(old_path,'oldmod')
+
+same_count=0
+square_outputs=0
+non_square_templates=0
+clip_counter=Counter()
+pad_counter=Counter()
+side_counter=Counter()
+orient_counter=Counter()
+
+for _ in range(200):
+    inp=new.generate_input()
+    out_new=new.main(inp)
+    out_old=old.main(inp)
+    same_count += int(np.array_equal(out_new, out_old))
+    square_outputs += int(out_new.shape[0] == out_new.shape[1])
+
+    orientation, sections = new._split_sections(np.asarray(inp, dtype=int))
+    template, repetition_pattern = sections[:2]
+    rect = new._square_crop_mask(template "'!= 0)
+    b = new.bbox(template != 0)
+    r0,c0,r1,c1 = b
+    rect_h = r1 - r0 + 1
+    rect_w = c1 - c0 + 1
+    non_square_templates += int(rect_h != rect_w)
+    n = len(new.components_mask(repetition_pattern != 0, connectivity=4))
+    side = rect.shape[0]
+    natural_len = side * n + (n - 1)
+    forced_len = side * n
+    clip_counter[natural_len - forced_len] += 1
+    pad_counter[forced_len - side] += 1
+    side_counter[side] += 1
+    orient_counter[orientation] += 1
+
+print('"'same_as_original', same_count)
+print('square_outputs', square_outputs)
+print('non_square_templates', non_square_templates)
+print('clip_amounts', dict(sorted(clip_counter.items())))
+print('pad_band_sizes', dict(sorted(pad_counter.items())))
+print('tile_sides', dict(sorted(side_counter.items())))
+print('orientations', dict(sorted(orient_counter.items())))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/b0039139/13/code.py b/ceshi/code_combo/b0039139/13/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2992c2415c9a14829fdd3977e1a51d28d1fa8845
+--- /dev/null
++++ b/ceshi/code_combo/b0039139/13/code.py
+@@ -0,0 +1,303 @@
++# Combo variant of b0039139 (index 13)
++# combo_spec: D8/0+D10/0
++# Name: 正方形模板强制正方形输出
++
++from __future__ import annotations
++
++import random
++import sys
++from pathlib import Path
++
++import numpy as np
++
++THIS_FILE = Path(__file__).resolve()
++ROOT = next((parent for parent in THIS_FILE.parents if (parent / "solvers" / "arc_utils.py").exists()), None)
++if ROOT is None:
++    raise RuntimeError("Could not locate solvers/arc_utils.py from combo variant path")
++SOLVER_DIR = ROOT / "solvers"
++if str(SOLVER_DIR) not in sys.path:
++    sys.path.append(str(SOLVER_DIR))
++
++from arc_utils import bbox, components_mask, crop_bbox, random_sprite
++
++
++# Design analysis for combo D8/0 + D10/0
++# ---------------------------------------
++# a) Concrete behavior and trace
++#    - Source task:
++#      * take the template's tight non-black bbox,
++#      * recolor that rectangle,
++#      * repeat it N times as a 1-row/1-col-separated strip.
++#    - This combo:
++#      * first replace the tight rectangle with the smallest enclosing square tile,
++#        implemented as "bbox crop, then extend the shorter axis with background cells";
++#      * then place the repeated strip into a square canvas whose side is
++#        (square_tile_side * N), keeping the strip at the top-left;
++#      * because the strip still contains N-1 separator bands, it is usually longer than the
++#        square side on the repeat axis, so the far end is truncated; the unused orthogonal
++#        region of the square is filled with the background color.
++#    - Small trace:
++#      * suppose the visible shape bbox is 2x4 and N=3, horizontal layout.
++#      * source tile: 2x4, source output: 2x14.
++#      * combo tile: 4x4 (same 2x4 shape plus 2 background rows below).
++#      * repeated strip before square forcing: 4x14.
++#      * combo output canvas: 12x12, so rows 0:4 hold the strip clipped to width 12 and
++#        rows 4:12 are pure background.
++#    - The fusion is real rather than additive-only: D8 changes the tile side that D10 uses,
++#      and D10 then turns that square tile into a larger square canvas with both clipping and fill.
++#
++# b) Complexity calibration
++#    - Only two new geometric ideas are introduced: square crop and square output.
++#    - Both are anchored the same way (top-left preserved, extra space goes toward the lower/right
++#      side), so the learner sees one consistent convention rather than many branches.
++#    - We deliberately keep the repeat count range and stencil language from the source task so
++#      the new difficulty comes from geometry, not from additional symbolic cases.
++#
++# c) Hidden assumption review against the original main()
++#    - Original assumption: bbox dimensions directly become output tile dimensions.
++#      Broken by D8; tile height and width now both equal max(bbox_h, bbox_w).
++#    - Original assumption: output cross-axis equals the crop cross-axis.
++#      Broken by D10; both output axes now equal square_tile_side * N.
++#    - Original assumption: repeating the strip never overflows.
++#      Broken by D10; overflow is now expected and must be clipped on the repeat axis.
++#    - Original assumption: N<=1 can just return the tile.
++#      The solver still supports it, but the generator keeps N>=2 so square forcing is visible.
++#
++# d) Placement legality
++#    - The template section still uses a 1-cell black border around the non-square source bbox,
++#      so no object overlap is introduced in the input.
++#    - The stencil keeps the original separated 2-cell blobs, so component counting remains valid.
++#    - In the output, the repeated strip is pasted onto a preallocated square canvas and clipped
++#      by slicing, so there is no out-of-bounds write.
++#
++# e) Visual observability
++#    - The generator forbids square source bboxes, so the square-crop rule is visible.
++#    - N is always at least 2, so the square-output rule is also visible: the result is never the
++#      original thin strip, and the far edge of the strip is clipped while the orthogonal side
++#      shows a large uniform background band.
++#    - No rule depends on hidden properties such as numeric color order.
++#
++# f) Visual cleanliness
++#    - The four-section input layout is unchanged, so the clue structure stays readable.
++#    - The output contains only three roles: recolored tile content, separator slivers, and the
++#      square canvas fill, all using the same fg/bg pair as the source task.
++#    - Clipping happens only at the far right or far bottom edge, never in the middle.
++#
++# g) Change inferability
++#    - There is no new color remapping beyond the original swatches.
++#    - The new pattern is structural and repeated across samples:
++#      "rectangle template becomes square tile" and "strip becomes square canvas".
++#
++# h) New main() assumptions after the fusion
++#    - _square_crop_mask() assumes at least one non-black template pixel exists; generate_input()
++#      always uses random_sprite(), which returns a connected non-empty shape.
++#    - _force_square_output() assumes the tile is square because its side length determines both
++#      output axes; main() enforces that by always calling _square_crop_mask() first.
++#    - The clipping convention assumes the repeated strip is anchored at the top-left of the
++#      square canvas; generate_input() uses the same oracle, so all training examples match it.
++
++
++REPEAT_COUNT_RANGE = (2, 6)
++CROP_SIZE_RANGE = (2, 5)
++DENSITY_RANGE = (0.55, 0.85)
++COLOR_POOL = list(range(2, 10))
++TEMPLATE_COLOR = 4
++STENCIL_COLOR = 3
++SEPARATOR_COLOR = 1
++SWATCH_DIM_RANGE = (3, 8)
++STENCIL_VARYING_EXTRA = 4
++BLOB_PLACE_RETRIES = 200
++GEN_RETRIES = 400
++
++
++def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
++    h, w = grid.shape
++    sep = SEPARATOR_COLOR
++
++    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == sep))]
++    if sep_rows:
++        cuts = [-1] + sep_rows + [h]
++        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == sep))]
++    cuts = [-1] + sep_cols + [w]
++    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++
++def _solid_color(block: np.ndarray) -> int:
++    vals, counts = np.unique(block, return_counts=True)
++    return int(vals[int(np.argmax(counts))])
++
++
++def _square_crop_mask(template_mask: np.ndarray) -> np.ndarray:
++    """Crop to the tight bbox, then extend the shorter axis with False cells to make a square."""
++    template_bbox = bbox(template_mask)
++    if template_bbox is None:
++        return np.empty((0, 0), dtype=bool)
++
++    rect = crop_bbox(template_mask, template_bbox).astype(bool)
++    h, w = rect.shape
++    side = max(h, w)
++    square = np.zeros((side, side), dtype=bool)
++    square[:h, :w] = rect
++    return square
++
++
++def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
++    if n <= 1:
++        return tile.copy()
++    if horizontal:
++        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
++        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
++        return np.hstack(pieces)
++    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
++    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
++    return np.vstack(pieces)
++
++
++def _force_square_output(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
++    """Place the repeated strip into a square canvas of side tile_side * n, clipping overflow."""
++    side = int(tile.shape[0]) * max(int(n), 1)
++    out = np.full((side, side), bg_color, dtype=int)
++    strip = _tile_repeat(tile, n, bg_color, horizontal)
++    hh = min(side, strip.shape[0])
++    ww = min(side, strip.shape[1])
++    out[:hh, :ww] = strip[:hh, :ww]
++    return out
++
++
++def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
++    varying = random.randint(*SWATCH_DIM_RANGE)
++    if horizontal:
++        return np.full((shared_dim, varying), color, dtype=int)
++    return np.full((varying, shared_dim), color, dtype=int)
++
++
++def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
++    if horizontal:
++        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
++        parts = [sections[0]]
++        for s in sections[1:]:
++            parts.extend([sep, s])
++        return np.hstack(parts)
++    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
++    parts = [sections[0]]
++    for s in sections[1:]:
++        parts.extend([sep, s])
++    return np.vstack(parts)
++
++
++def _build_stencil(n_blobs: int, shared_dim: int, horizontal: bool) -> np.ndarray | None:
++    min_varying = max(4, n_blobs * 2 + 2)
++    varying_dim = random.randint(min_varying, min_varying + STENCIL_VARYING_EXTRA)
++
++    h, w = (shared_dim, varying_dim) if horizontal else (varying_dim, shared_dim)
++    grid = np.zeros((h, w), dtype=int)
++
++    placed = 0
++    for _ in range(BLOB_PLACE_RETRIES):
++        if placed >= n_blobs:
++            break
++        br, bc = (1, 2) if random.choice([True, False]) else (2, 1)
++
++        if h - 1 - br < 1 or w - 1 - bc < 1:
++            continue
++        r = random.randint(1, h - 1 - br)
++        c = random.randint(1, w - 1 - bc)
++
++        r0, c0 = max(0, r - 1), max(0, c - 1)
++        r1, c1 = min(h, r + br + 1), min(w, c + bc + 1)
++        if np.any(grid[r0:r1, c0:c1] != 0):
++            continue
++
++        grid[r : r + br, c : c + bc] = STENCIL_COLOR
++        placed += 1
++
++    return grid if placed == n_blobs else None
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Recolor a template after promoting its tight crop to a square tile, then place the repeated strip into a forced square canvas.
++
++    Input structure:
++    - Blue separator rows or columns split the grid into four sections.
++    - Section 1 is a black template carrying one yellow shape; section 2 is the component-count stencil.
++    - Sections 3 and 4 are solid swatches that supply the output foreground and background colors.
++
++    Rule:
++    - Count the 4-connected non-black components in section 2 to obtain the repetition count.
++    - Crop the template to the tight non-black bbox, but then enlarge that crop to the smallest square by extending only the shorter axis with background cells.
++    - Recolor the resulting square mask with the foreground/background swatches.
++    - Repeat that square tile along the separator-controlled orientation with 1-cell background separators, then place the strip at the top-left of a square output whose side length is tile_side times the repetition count; clip any overflow and leave the rest as background.
++
++    Key insight:
++    - The stencil still says how many copies to make, but the template no longer yields a rectangle: it yields a square tile, and that same square side also determines the final square canvas that can both truncate the strip and leave a padded empty zone.
++    """
++    g = np.asarray(grid, dtype=int)
++    orientation, sections = _split_sections(g)
++    template, repetition_pattern, foreground_block, background_block = sections[:4]
++
++    foreground = _solid_color(foreground_block)
++    background = _solid_color(background_block)
++
++    tile_mask = _square_crop_mask(template != 0)
++    if tile_mask.size == 0:
++        return np.empty((0, 0), dtype=int)
++
++    tile = np.where(tile_mask, foreground, background).astype(int)
++    n_repeats = len(components_mask(repetition_pattern != 0, connectivity=4))
++    return _force_square_output(tile, n_repeats, background, orientation == "horizontal")
++
++
++def _gen_attempt() -> np.ndarray | None:
++    horizontal = random.choice([True, False])
++    n_repeats = random.randint(*REPEAT_COUNT_RANGE)
++
++    crop_h = random.randint(*CROP_SIZE_RANGE)
++    crop_w = random.randint(*CROP_SIZE_RANGE)
++    if crop_h == crop_w:
++        return None
++
++    density = random.uniform(*DENSITY_RANGE)
++    shape = random_sprite(
++        crop_h,
++        crop_w,
++        density=density,
++        color_palette=[TEMPLATE_COLOR],
++        connectivity=4,
++        symmetry="not_symmetric",
++    )
++
++    fg_color, bg_color = random.sample(COLOR_POOL, 2)
++
++    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
++    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
++
++    tile_mask = _square_crop_mask(template != 0)
++    tile = np.where(tile_mask, fg_color, bg_color).astype(int)
++    output = _force_square_output(tile, n_repeats, bg_color, horizontal)
++
++    shared_dim = template.shape[0] if horizontal else template.shape[1]
++    stencil = _build_stencil(n_repeats, shared_dim, horizontal)
++    if stencil is None:
++        return None
++
++    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
++    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
++    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        return None
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+ succeeded in 841ms:
+same_as_original 0
+square_outputs 200
+non_square_templates 200
+clip_amounts {1: 47, 2: 29, 3: 45, 4: 38, 5: 41}
+pad_band_sizes {3: 9, 4: 17, 5: 21, 6: 6, 8: 13, 9: 7, 10: 10, 12: 23, 15: 32, 16: 13, 20: 29, 25: 20}
+tile_sides {3: 39, 4: 70, 5: 91}
+orientations {'horizontal': 103, 'vertical': 97}
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/ceshi/code_combo/b0039139/13/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Combo variant of b0039139 (index 13)
+# combo_spec: D8/0+D10/0
+# Name: 正方形模板强制正方形输出
+
+from __future__ import annotations
+
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+
+THIS_FILE = Path(__file__).resolve()
+ROOT = next((parent for parent in THIS_FILE.parents if (parent / "solvers" / "arc_utils.py").exists()), None)
+if ROOT is None:
+    raise RuntimeError("Could not locate solvers/arc_utils.py from combo variant path")
+SOLVER_DIR = ROOT / "solvers"
+if str(SOLVER_DIR) not in sys.path:
+    sys.path.append(str(SOLVER_DIR))
+
+from arc_utils import bbox, components_mask, crop_bbox, random_sprite
+
+
+# Design analysis for combo D8/0 + D10/0
+# ---------------------------------------
+# a) Concrete behavior and trace
+#    - Source task:
+#      * take the template's tight non-black bbox,
+#      * recolor that rectangle,
+#      * repeat it N times as a 1-row/1-col-separated strip.
+#    - This combo:
+#      * first replace the tight rectangle with the smallest enclosing square tile,
+#        implemented as "bbox crop, then extend the shorter axis with background cells";
+#      * then place the repeated strip into a square canvas whose side is
+#        (square_tile_side * N), keeping the strip at the top-left;
+#      * because the strip still contains N-1 separator bands, it is usually longer than the
+#        square side on the repeat axis, so the far end is truncated; the unused orthogonal
+#        region of the square is filled with the background color.
+#    - Small trace:
+#      * suppose the visible shape bbox is 2x4 and N=3, horizontal layout.
+#      * source tile: 2x4, source output: 2x14.
+#      * combo tile: 4x4 (same 2x4 shape plus 2 background rows below).
+#      * repeated strip before square forcing: 4x14.
+#      * combo output canvas: 12x12, so rows 0:4 hold the strip clipped to width 12 and
+#        rows 4:12 are pure background.
+#    - The fusion is real rather than additive-only: D8 changes the tile side that D10 uses,
+#      and D10 then turns that square tile into a larger square canvas with both clipping and fill.
+#
+# b) Complexity calibration
+#    - Only two new geometric ideas are introduced: square crop and square output.
+#    - Both are anchored the same way (top-left preserved, extra space goes toward the lower/right
+#      side), so the learner sees one consistent convention rather than many branches.
+#    - We deliberately keep the repeat count range and stencil language from the source task so
+#      the new difficulty comes from geometry, not from additional symbolic cases.
+#
+# c) Hidden assumption review against the original main()
+#    - Original assumption: bbox dimensions directly become output tile dimensions.
+#      Broken by D8; tile height and width now both equal max(bbox_h, bbox_w).
+#    - Original assumption: output cross-axis equals the crop cross-axis.
+#      Broken by D10; both output axes now equal square_tile_side * N.
+#    - Original assumption: repeating the strip never overflows.
+#      Broken by D10; overflow is now expected and must be clipped on the repeat axis.
+#    - Original assumption: N<=1 can just return the tile.
+#      The solver still supports it, but the generator keeps N>=2 so square forcing is visible.
+#
+# d) Placement legality
+#    - The template section still uses a 1-cell black border around the non-square source bbox,
+#      so no object overlap is introduced in the input.
+#    - The stencil keeps the original separated 2-cell blobs, so component counting remains valid.
+#    - In the output, the repeated strip is pasted onto a preallocated square canvas and clipped
+#      by slicing, so there is no out-of-bounds write.
+#
+# e) Visual observability
+#    - The generator forbids square source bboxes, so the square-crop rule is visible.
+#    - N is always at least 2, so the square-output rule is also visible: the result is never the
+#      original thin strip, and the far edge of the strip is clipped while the orthogonal side
+#      shows a large uniform background band.
+#    - No rule depends on hidden properties such as numeric color order.
+#
+# f) Visual cleanliness
+#    - The four-section input layout is unchanged, so the clue structure stays readable.
+#    - The output contains only three roles: recolored tile content, separator slivers, and the
+#      square canvas fill, all using the same fg/bg pair as the source task.
+#    - Clipping happens only at the far right or far bottom edge, never in the middle.
+#
+# g) Change inferability
+#    - There is no new color remapping beyond the original swatches.
+#    - The new pattern is structural and repeated across samples:
+#      "rectangle template becomes square tile" and "strip becomes square canvas".
+#
+# h) New main() assumptions after the fusion
+#    - _square_crop_mask() assumes at least one non-black template pixel exists; generate_input()
+#      always uses random_sprite(), which returns a connected non-empty shape.
+#    - _force_square_output() assumes the tile is square because its side length determines both
+#      output axes; main() enforces that by always calling _square_crop_mask() first.
+#    - The clipping convention assumes the repeated strip is anchored at the top-left of the
+#      square canvas; generate_input() uses the same oracle, so all training examples match it.
+
+
+REPEAT_COUNT_RANGE = (2, 6)
+CROP_SIZE_RANGE = (2, 5)
+DENSITY_RANGE = (0.55, 0.85)
+COLOR_POOL = list(range(2, 10))
+TEMPLATE_COLOR = 4
+STENCIL_COLOR = 3
+SEPARATOR_COLOR = 1
+SWATCH_DIM_RANGE = (3, 8)
+STENCIL_VARYING_EXTRA = 4
+BLOB_PLACE_RETRIES = 200
+GEN_RETRIES = 400
+
+
+def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
+    h, w = grid.shape
+    sep = SEPARATOR_COLOR
+
+    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == sep))]
+    if sep_rows:
+        cuts = [-1] + sep_rows + [h]
+        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == sep))]
+    cuts = [-1] + sep_cols + [w]
+    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
+
+
+def _solid_color(block: np.ndarray) -> int:
+    vals, counts = np.unique(block, return_counts=True)
+    return int(vals[int(np.argmax(counts))])
+
+
+def _square_crop_mask(template_mask: np.ndarray) -> np.ndarray:
+    """Crop to the tight bbox, then extend the shorter axis with False cells to make a square."""
+    template_bbox = bbox(template_mask)
+    if template_bbox is None:
+        return np.empty((0, 0), dtype=bool)
+
+    rect = crop_bbox(template_mask, template_bbox).astype(bool)
+    h, w = rect.shape
+    side = max(h, w)
+    square = np.zeros((side, side), dtype=bool)
+    square[:h, :w] = rect
+    return square
+
+
+def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
+    if n <= 1:
+        return tile.copy()
+    if horizontal:
+        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
+        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+        return np.hstack(pieces)
+    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
+    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
+    return np.vstack(pieces)
+
+
+def _force_square_output(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
+    """Place the repeated strip into a square canvas of side tile_side * n, clipping overflow."""
+    side = int(tile.shape[0]) * max(int(n), 1)
+    out = np.full((side, side), bg_color, dtype=int)
+    strip = _tile_repeat(tile, n, bg_color, horizontal)
+    hh = min(side, strip.shape[0])
+    ww = min(side, strip.shape[1])
+    out[:hh, :ww] = strip[:hh, :ww]
+    return out
+
+
+def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
+    varying = random.randint(*SWATCH_DIM_RANGE)
+    if horizontal:
+        return np.full((shared_dim, varying), color, dtype=int)
+    return np.full((varying, shared_dim), color, dtype=int)
+
+
+def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
+    if horizontal:
+        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
+        parts = [sections[0]]
+        for s in sections[1:]:
+            parts.extend([sep, s])
+        return np.hstack(parts)
+    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
+    parts = [sections[0]]
+    for s in sections[1:]:
+        parts.extend([sep, s])
+    return np.vstack(parts)
+
+
+def _build_stencil(n_blobs: int, shared_dim: int, horizontal: bool) -> np.ndarray | None:
+    min_varying = max(4, n_blobs * 2 + 2)
+    varying_dim = random.randint(min_varying, min_varying + STENCIL_VARYING_EXTRA)
+
+    h, w = (shared_dim, varying_dim) if horizontal else (varying_dim, shared_dim)
+    grid = np.zeros((h, w), dtype=int)
+
+    placed = 0
+    for _ in range(BLOB_PLACE_RETRIES):
+        if placed >= n_blobs:
+            break
+        br, bc = (1, 2) if random.choice([True, False]) else (2, 1)
+
+        if h - 1 - br < 1 or w - 1 - bc < 1:
+            continue
+        r = random.randint(1, h - 1 - br)
+        c = random.randint(1, w - 1 - bc)
+
+        r0, c0 = max(0, r - 1), max(0, c - 1)
+        r1, c1 = min(h, r + br + 1), min(w, c + bc + 1)
+        if np.any(grid[r0:r1, c0:c1] != 0):
+            continue
+
+        grid[r : r + br, c : c + bc] = STENCIL_COLOR
+        placed += 1
+
+    return grid if placed == n_blobs else None
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Recolor a template after promoting its tight crop to a square tile, then place the repeated strip into a forced square canvas.
+
+    Input structure:
+    - Blue separator rows or columns split the grid into four sections.
+    - Section 1 is a black template carrying one yellow shape; section 2 is the component-count stencil.
+    - Sections 3 and 4 are solid swatches that supply the output foreground and background colors.
+
+    Rule:
+    - Count the 4-connected non-black components in section 2 to obtain the repetition count.
+    - Crop the template to the tight non-black bbox, but then enlarge that crop to the smallest square by extending only the shorter axis with background cells.
+    - Recolor the resulting square mask with the foreground/background swatches.
+    - Repeat that square tile along the separator-controlled orientation with 1-cell background separators, then place the strip at the top-left of a square output whose side length is tile_side times the repetition count; clip any overflow and leave the rest as background.
+
+    Key insight:
+    - The stencil still says how many copies to make, but the template no longer yields a rectangle: it yields a square tile, and that same square side also determines the final square canvas that can both truncate the strip and leave a padded empty zone.
+    """
+    g = np.asarray(grid, dtype=int)
+    orientation, sections = _split_sections(g)
+    template, repetition_pattern, foreground_block, background_block = sections[:4]
+
+    foreground = _solid_color(foreground_block)
+    background = _solid_color(background_block)
+
+    tile_mask = _square_crop_mask(template != 0)
+    if tile_mask.size == 0:
+        return np.empty((0, 0), dtype=int)
+
+    tile = np.where(tile_mask, foreground, background).astype(int)
+    n_repeats = len(components_mask(repetition_pattern != 0, connectivity=4))
+    return _force_square_output(tile, n_repeats, background, orientation == "horizontal")
+
+
+def _gen_attempt() -> np.ndarray | None:
+    horizontal = random.choice([True, False])
+    n_repeats = random.randint(*REPEAT_COUNT_RANGE)
+
+    crop_h = random.randint(*CROP_SIZE_RANGE)
+    crop_w = random.randint(*CROP_SIZE_RANGE)
+    if crop_h == crop_w:
+        return None
+
+diff --git a/ceshi/code_combo/b0039139/13/code.py b/ceshi/code_combo/b0039139/13/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2992c2415c9a14829fdd3977e1a51d28d1fa8845
+--- /dev/null
++++ b/ceshi/code_combo/b0039139/13/code.py
+@@ -0,0 +1,303 @@
++# Combo variant of b0039139 (index 13)
++# combo_spec: D8/0+D10/0
++# Name: 正方形模板强制正方形输出
++
++from __future__ import annotations
++
++import random
++import sys
++from pathlib import Path
++
++import numpy as np
++
++THIS_FILE = Path(__file__).resolve()
++ROOT = next((parent for parent in THIS_FILE.parents if (parent / "solvers" / "arc_utils.py").exists()), None)
++if ROOT is None:
++    raise RuntimeError("Could not locate solvers/arc_utils.py from combo variant path")
++SOLVER_DIR = ROOT / "solvers"
++if str(SOLVER_DIR) not in sys.path:
++    sys.path.append(str(SOLVER_DIR))
++
++from arc_utils import bbox, components_mask, crop_bbox, random_sprite
++
++
++# Design analysis for combo D8/0 + D10/0
++# ---------------------------------------
++# a) Concrete behavior and trace
++#    - Source task:
++#      * take the template's tight non-black bbox,
++#      * recolor that rectangle,
++#      * repeat it N times as a 1-row/1-col-separated strip.
++#    - This combo:
++#      * first replace the tight rectangle with the smallest enclosing square tile,
++#        implemented as "bbox crop, then extend the shorter axis with background cells";
++#      * then place the repeated strip into a square canvas whose side is
++#        (square_tile_side * N), keeping the strip at the top-left;
++#      * because the strip still contains N-1 separator bands, it is usually longer than the
++#        square side on the repeat axis, so the far end is truncated; the unused orthogonal
++#        region of the square is filled with the background color.
++#    - Small trace:
++#      * suppose the visible shape bbox is 2x4 and N=3, horizontal layout.
++#      * source tile: 2x4, source output: 2x14.
++#      * combo tile: 4x4 (same 2x4 shape plus 2 background rows below).
++#      * repeated strip before square forcing: 4x14.
++#      * combo output canvas: 12x12, so rows 0:4 hold the strip clipped to width 12 and
++#        rows 4:12 are pure background.
++#    - The fusion is real rather than additive-only: D8 changes the tile side that D10 uses,
++#      and D10 then turns that square tile into a larger square canvas with both clipping and fill.
++#
++# b) Complexity calibration
++#    - Only two new geometric ideas are introduced: square crop and square output.
++#    - Both are anchored the same way (top-left preserved, extra space goes toward the lower/right
++#      side), so the learner sees one consistent convention rather than many branches.
++#    - We deliberately keep the repeat count range and stencil language from the source task so
++#      the new difficulty comes from geometry, not from additional symbolic cases.
++#
++# c) Hidden assumption review against the original main()
++#    - Original assumption: bbox dimensions directly become output tile dimensions.
++#      Broken by D8; tile height and width now both equal max(bbox_h, bbox_w).
++#    - Original assumption: output cross-axis equals the crop cross-axis.
++#      Broken by D10; both output axes now equal square_tile_side * N.
++#    - Original assumption: repeating the strip never overflows.
++#      Broken by D10; overflow is now expected and must be clipped on the repeat axis.
++#    - Original assumption: N<=1 can just return the tile.
++#      The solver still supports it, but the generator keeps N>=2 so square forcing is visible.
++#
++# d) Placement legality
++#    - The template section still uses a 1-cell black border around the non-square source bbox,
++#      so no object overlap is introduced in the input.
++#    - The stencil keeps the original separated 2-cell blobs, so component counting remains valid.
++#    - In the output, the repeated strip is pasted onto a preallocated square canvas and clipped
++#      by slicing, so there is no out-of-bounds write.
++#
++# e) Visual observability
++#    - The generator forbids square source bboxes, so the square-crop rule is visible.
++#    - N is always at least 2, so the square-output rule is also visible: the result is never the
++#      original thin strip, and the far edge of the strip is clipped while the orthogonal side
++#      shows a large uniform background band.
++#    - No rule depends on hidden properties such as numeric color order.
++#
++# f) Visual cleanliness
++#    - The four-section input layout is unchanged, so the clue structure stays readable.
++#    - The output contains only three roles: recolored tile content, separator slivers, and the
++#      square canvas fill, all using the same fg/bg pair as the source task.
++#    - Clipping happens only at the far right or far bottom edge, never in the middle.
++#
++# g) Change inferability
++#    - There is no new color remapping beyond the original swatches.
++#    - The new pattern is structural and repeated across samples:
++#      "rectangle template becomes square tile" and "strip becomes square canvas".
++#
++# h) New main() assumptions after the fusion
++#    - _square_crop_mask() assumes at least one non-black template pixel exists; generate_input()
++#      always uses random_sprite(), which returns a connected non-empty shape.
++#    - _force_square_output() assumes the tile is square because its side length determines both
++#      output axes; main() enforces that by always calling _square_crop_mask() first.
++#    - The clipping convention assumes the repeated strip is anchored at the top-left of the
++#      square canvas; generate_input() uses the same oracle, so all training examples match it.
++
++
++REPEAT_COUNT_RANGE = (2, 6)
++CROP_SIZE_RANGE = (2, 5)
++DENSITY_RANGE = (0.55, 0.85)
++COLOR_POOL = list(range(2, 10))
++TEMPLATE_COLOR = 4
++STENCIL_COLOR = 3
++SEPARATOR_COLOR = 1
++SWATCH_DIM_RANGE = (3, 8)
++STENCIL_VARYING_EXTRA = 4
++BLOB_PLACE_RETRIES = 200
++GEN_RETRIES = 400
++
++
++def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
++    h, w = grid.shape
++    sep = SEPARATOR_COLOR
++
++    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == sep))]
++    if sep_rows:
++        cuts = [-1] + sep_rows + [h]
++        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == sep))]
++    cuts = [-1] + sep_cols + [w]
++    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++
++def _solid_color(block: np.ndarray) -> int:
++    vals, counts = np.unique(block, return_counts=True)
++    return int(vals[int(np.argmax(counts))])
++
++
++def _square_crop_mask(template_mask: np.ndarray) -> np.ndarray:
++    """Crop to the tight bbox, then extend the shorter axis with False cells to make a square."""
++    template_bbox = bbox(template_mask)
++    if template_bbox is None:
++        return np.empty((0, 0), dtype=bool)
++
++    rect = crop_bbox(template_mask, template_bbox).astype(bool)
++    h, w = rect.shape
++    side = max(h, w)
++    square = np.zeros((side, side), dtype=bool)
++    square[:h, :w] = rect
++    return square
++
++
++def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
++    if n <= 1:
++        return tile.copy()
++    if horizontal:
++        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
++        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
++        return np.hstack(pieces)
++    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
++    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
++    return np.vstack(pieces)
++
++
++def _force_square_output(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
++    """Place the repeated strip into a square canvas of side tile_side * n, clipping overflow."""
++    side = int(tile.shape[0]) * max(int(n), 1)
++    out = np.full((side, side), bg_color, dtype=int)
++    strip = _tile_repeat(tile, n, bg_color, horizontal)
++    hh = min(side, strip.shape[0])
++    ww = min(side, strip.shape[1])
++    out[:hh, :ww] = strip[:hh, :ww]
++    return out
++
++
++def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
++    varying = random.randint(*SWATCH_DIM_RANGE)
++    if horizontal:
++        return np.full((shared_dim, varying), color, dtype=int)
++    return np.full((varying, shared_dim), color, dtype=int)
++
++
++def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
++    if horizontal:
++        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
++        parts = [sections[0]]
++        for s in sections[1:]:
++            parts.extend([sep, s])
++        return np.hstack(parts)
++    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
++    parts = [sections[0]]
++    for s in sections[1:]:
++        parts.extend([sep, s])
++    return np.vstack(parts)
++
++
++def _build_stencil(n_blobs: int, shared_dim: int, horizontal: bool) -> np.ndarray | None:
++    min_varying = max(4, n_blobs * 2 + 2)
++    varying_dim = random.randint(min_varying, min_varying + STENCIL_VARYING_EXTRA)
++
++    h, w = (shared_dim, varying_dim) if horizontal else (varying_dim, shared_dim)
++    grid = np.zeros((h, w), dtype=int)
++
++    placed = 0
++    for _ in range(BLOB_PLACE_RETRIES):
++        if placed >= n_blobs:
++            break
++        br, bc = (1, 2) if random.choice([True, False]) else (2, 1)
++
++        if h - 1 - br < 1 or w - 1 - bc < 1:
++            continue
++        r = random.randint(1, h - 1 - br)
++        c = random.randint(1, w - 1 - bc)
++
++        r0, c0 = max(0, r - 1), max(0, c - 1)
++        r1, c1 = min(h, r + br + 1), min(w, c + bc + 1)
++        if np.any(grid[r0:r1, c0:c1] != 0):
++            continue
++
++        grid[r : r + br, c : c + bc] = STENCIL_COLOR
++        placed += 1
++
++    return grid if placed == n_blobs else None
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Recolor a template after promoting its tight crop to a square tile, then place the repeated strip into a forced square canvas.
++
++    Input structure:
++    - Blue separator rows or columns split the grid into four sections.
++    - Section 1 is a black template carrying one yellow shape; section 2 is the component-count stencil.
++    - Sections 3 and 4 are solid swatches that supply the output foreground and background colors.
++
++    Rule:
++    - Count the 4-connected non-black components in section 2 to obtain the repetition count.
++    - Crop the template to the tight non-black bbox, but then enlarge that crop to the smallest square by extending only the shorter axis with background cells.
++    - Recolor the resulting square mask with the foreground/background swatches.
++    - Repeat that square tile along the separator-controlled orientation with 1-cell background separators, then place the strip at the top-left of a square output whose side length is tile_side times the repetition count; clip any overflow and leave the rest as background.
++
++    Key insight:
++    - The stencil still says how many copies to make, but the template no longer yields a rectangle: it yields a square tile, and that same square side also determines the final square canvas that can both truncate the strip and leave a padded empty zone.
++    """
++    g = np.asarray(grid, dtype=int)
++    orientation, sections = _split_sections(g)
++    template, repetition_pattern, foreground_block, background_block = sections[:4]
++
++    foreground = _solid_color(foreground_block)
++    background = _solid_color(background_block)
++
++    tile_mask = _square_crop_mask(template != 0)
++    if tile_mask.size == 0:
++        return np.empty((0, 0), dtype=int)
++
++    tile = np.where(tile_mask, foreground, background).astype(int)
++    n_repeats = len(components_mask(repetition_pattern != 0, connectivity=4))
++    return _force_square_output(tile, n_repeats, background, orientation == "horizontal")
++
++
++def _gen_attempt() -> np.ndarray | None:
++    horizontal = random.choice([True, False])
++    n_repeats = random.randint(*REPEAT_COUNT_RANGE)
++
++    crop_h = random.randint(*CROP_SIZE_RANGE)
++    crop_w = random.randint(*CROP_SIZE_RANGE)
++    if crop_h == crop_w:
++        return None
++
++    density = random.uniform(*DENSITY_RANGE)
++    shape = random_sprite(
++        crop_h,
++        crop_w,
++        density=density,
++        color_palette=[TEMPLATE_COLOR],
++        connectivity=4,
++        symmetry="not_symmetric",
++    )
++
++    fg_color, bg_color = random.sample(COLOR_POOL, 2)
++
++    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
++    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
++
++    tile_mask = _square_crop_mask(template != 0)
++    tile = np.where(tile_mask, fg_color, bg_color).astype(int)
++    output = _force_square_output(tile, n_repeats, bg_color, horizontal)
++
++    shared_dim = template.shape[0] if horizontal else template.shape[1]
++    stencil = _build_stencil(n_repeats, shared_dim, horizontal)
++    if stencil is None:
++        return None
++
++    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
++    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
++    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        return None
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+codex
+已将融合变体写入 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/b0039139/13/code.py)。
+
+实现要点是：`main()` 先把模板的紧致 bbox 扩成最小正方形，再按组件数生成带 1 像素背景分隔的重复条带，最后把条带贴到左上角的正方形输出画布中；画布边长固定为 `正方形模板边长 × 重复数`，因此会在重复方向发生截断，在另一方向留下背景填充。代码里也补了融合设计分析、隐式假设审查，以及符合要求的四段式说明文档字符串。
+
+验证已完成。题目给定的 50 次测试结果是 `Success: 50/50`。另外做了 200 个样本的退化检查：`output` 为正方形的比例 `200/200`，模板 bbox 为非正方形的比例 `200/200`，与原始 solver 在相同输入上输出完全相同的比例是 `0/200`。截断量分布为 `{1:47, 2:29, 3:45, 4:38, 5:41}`，说明 D10 的强制正方形输出确实稳定生效。
+diff --git a/ceshi/code_combo/b0039139/13/code.py b/ceshi/code_combo/b0039139/13/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2992c2415c9a14829fdd3977e1a51d28d1fa8845
+--- /dev/null
++++ b/ceshi/code_combo/b0039139/13/code.py
+@@ -0,0 +1,303 @@
++# Combo variant of b0039139 (index 13)
++# combo_spec: D8/0+D10/0
++# Name: 正方形模板强制正方形输出
++
++from __future__ import annotations
++
++import random
++import sys
++from pathlib import Path
++
++import numpy as np
++
++THIS_FILE = Path(__file__).resolve()
++ROOT = next((parent for parent in THIS_FILE.parents if (parent / "solvers" / "arc_utils.py").exists()), None)
++if ROOT is None:
++    raise RuntimeError("Could not locate solvers/arc_utils.py from combo variant path")
++SOLVER_DIR = ROOT / "solvers"
++if str(SOLVER_DIR) not in sys.path:
++    sys.path.append(str(SOLVER_DIR))
++
++from arc_utils import bbox, components_mask, crop_bbox, random_sprite
++
++
++# Design analysis for combo D8/0 + D10/0
++# ---------------------------------------
++# a) Concrete behavior and trace
++#    - Source task:
++#      * take the template's tight non-black bbox,
++#      * recolor that rectangle,
++#      * repeat it N times as a 1-row/1-col-separated strip.
++#    - This combo:
++#      * first replace the tight rectangle with the smallest enclosing square tile,
++#        implemented as "bbox crop, then extend the shorter axis with background cells";
++#      * then place the repeated strip into a square canvas whose side is
++#        (square_tile_side * N), keeping the strip at the top-left;
++#      * because the strip still contains N-1 separator bands, it is usually longer than the
++#        square side on the repeat axis, so the far end is truncated; the unused orthogonal
++#        region of the square is filled with the background color.
++#    - Small trace:
++#      * suppose the visible shape bbox is 2x4 and N=3, horizontal layout.
++#      * source tile: 2x4, source output: 2x14.
++#      * combo tile: 4x4 (same 2x4 shape plus 2 background rows below).
++#      * repeated strip before square forcing: 4x14.
++#      * combo output canvas: 12x12, so rows 0:4 hold the strip clipped to width 12 and
++#        rows 4:12 are pure background.
++#    - The fusion is real rather than additive-only: D8 changes the tile side that D10 uses,
++#      and D10 then turns that square tile into a larger square canvas with both clipping and fill.
++#
++# b) Complexity calibration
++#    - Only two new geometric ideas are introduced: square crop and square output.
++#    - Both are anchored the same way (top-left preserved, extra space goes toward the lower/right
++#      side), so the learner sees one consistent convention rather than many branches.
++#    - We deliberately keep the repeat count range and stencil language from the source task so
++#      the new difficulty comes from geometry, not from additional symbolic cases.
++#
++# c) Hidden assumption review against the original main()
++#    - Original assumption: bbox dimensions directly become output tile dimensions.
++#      Broken by D8; tile height and width now both equal max(bbox_h, bbox_w).
++#    - Original assumption: output cross-axis equals the crop cross-axis.
++#      Broken by D10; both output axes now equal square_tile_side * N.
++#    - Original assumption: repeating the strip never overflows.
++#      Broken by D10; overflow is now expected and must be clipped on the repeat axis.
++#    - Original assumption: N<=1 can just return the tile.
++#      The solver still supports it, but the generator keeps N>=2 so square forcing is visible.
++#
++# d) Placement legality
++#    - The template section still uses a 1-cell black border around the non-square source bbox,
++#      so no object overlap is introduced in the input.
++#    - The stencil keeps the original separated 2-cell blobs, so component counting remains valid.
++#    - In the output, the repeated strip is pasted onto a preallocated square canvas and clipped
++#      by slicing, so there is no out-of-bounds write.
++#
++# e) Visual observability
++#    - The generator forbids square source bboxes, so the square-crop rule is visible.
++#    - N is always at least 2, so the square-output rule is also visible: the result is never the
++#      original thin strip, and the far edge of the strip is clipped while the orthogonal side
++#      shows a large uniform background band.
++#    - No rule depends on hidden properties such as numeric color order.
++#
++# f) Visual cleanliness
++#    - The four-section input layout is unchanged, so the clue structure stays readable.
++#    - The output contains only three roles: recolored tile content, separator slivers, and the
++#      square canvas fill, all using the same fg/bg pair as the source task.
++#    - Clipping happens only at the far right or far bottom edge, never in the middle.
++#
++# g) Change inferability
++#    - There is no new color remapping beyond the original swatches.
++#    - The new pattern is structural and repeated across samples:
++#      "rectangle template becomes square tile" and "strip becomes square canvas".
++#
++# h) New main() assumptions after the fusion
++#    - _square_crop_mask() assumes at least one non-black template pixel exists; generate_input()
++#      always uses random_sprite(), which returns a connected non-empty shape.
++#    - _force_square_output() assumes the tile is square because its side length determines both
++#      output axes; main() enforces that by always calling _square_crop_mask() first.
++#    - The clipping convention assumes the repeated strip is anchored at the top-left of the
++#      square canvas; generate_input() uses the same oracle, so all training examples match it.
++
++
++REPEAT_COUNT_RANGE = (2, 6)
++CROP_SIZE_RANGE = (2, 5)
++DENSITY_RANGE = (0.55, 0.85)
++COLOR_POOL = list(range(2, 10))
++TEMPLATE_COLOR = 4
++STENCIL_COLOR = 3
++SEPARATOR_COLOR = 1
++SWATCH_DIM_RANGE = (3, 8)
++STENCIL_VARYING_EXTRA = 4
++BLOB_PLACE_RETRIES = 200
++GEN_RETRIES = 400
++
++
++def _split_sections(grid: np.ndarray) -> tuple[str, list[np.ndarray]]:
++    h, w = grid.shape
++    sep = SEPARATOR_COLOR
++
++    sep_rows = [r for r in range(h) if bool(np.all(grid[r, :] == sep))]
++    if sep_rows:
++        cuts = [-1] + sep_rows + [h]
++        return "vertical", [grid[a + 1 : b, :] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++    sep_cols = [c for c in range(w) if bool(np.all(grid[:, c] == sep))]
++    cuts = [-1] + sep_cols + [w]
++    return "horizontal", [grid[:, a + 1 : b] for a, b in zip(cuts, cuts[1:]) if b > a + 1]
++
++
++def _solid_color(block: np.ndarray) -> int:
++    vals, counts = np.unique(block, return_counts=True)
++    return int(vals[int(np.argmax(counts))])
++
++
++def _square_crop_mask(template_mask: np.ndarray) -> np.ndarray:
++    """Crop to the tight bbox, then extend the shorter axis with False cells to make a square."""
++    template_bbox = bbox(template_mask)
++    if template_bbox is None:
++        return np.empty((0, 0), dtype=bool)
++
++    rect = crop_bbox(template_mask, template_bbox).astype(bool)
++    h, w = rect.shape
++    side = max(h, w)
++    square = np.zeros((side, side), dtype=bool)
++    square[:h, :w] = rect
++    return square
++
++
++def _tile_repeat(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
++    if n <= 1:
++        return tile.copy()
++    if horizontal:
++        sep = np.full((tile.shape[0], 1), bg_color, dtype=int)
++        pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
++        return np.hstack(pieces)
++    sep = np.full((1, tile.shape[1]), bg_color, dtype=int)
++    pieces = [tile] + [x for _ in range(n - 1) for x in (sep, tile)]
++    return np.vstack(pieces)
++
++
++def _force_square_output(tile: np.ndarray, n: int, bg_color: int, horizontal: bool) -> np.ndarray:
++    """Place the repeated strip into a square canvas of side tile_side * n, clipping overflow."""
++    side = int(tile.shape[0]) * max(int(n), 1)
++    out = np.full((side, side), bg_color, dtype=int)
++    strip = _tile_repeat(tile, n, bg_color, horizontal)
++    hh = min(side, strip.shape[0])
++    ww = min(side, strip.shape[1])
++    out[:hh, :ww] = strip[:hh, :ww]
++    return out
++
++
++def _make_swatch(shared_dim: int, color: int, horizontal: bool) -> np.ndarray:
++    varying = random.randint(*SWATCH_DIM_RANGE)
++    if horizontal:
++        return np.full((shared_dim, varying), color, dtype=int)
++    return np.full((varying, shared_dim), color, dtype=int)
++
++
++def _join_sections(sections: list[np.ndarray], shared_dim: int, horizontal: bool) -> np.ndarray:
++    if horizontal:
++        sep = np.full((shared_dim, 1), SEPARATOR_COLOR, dtype=int)
++        parts = [sections[0]]
++        for s in sections[1:]:
++            parts.extend([sep, s])
++        return np.hstack(parts)
++    sep = np.full((1, shared_dim), SEPARATOR_COLOR, dtype=int)
++    parts = [sections[0]]
++    for s in sections[1:]:
++        parts.extend([sep, s])
++    return np.vstack(parts)
++
++
++def _build_stencil(n_blobs: int, shared_dim: int, horizontal: bool) -> np.ndarray | None:
++    min_varying = max(4, n_blobs * 2 + 2)
++    varying_dim = random.randint(min_varying, min_varying + STENCIL_VARYING_EXTRA)
++
++    h, w = (shared_dim, varying_dim) if horizontal else (varying_dim, shared_dim)
++    grid = np.zeros((h, w), dtype=int)
++
++    placed = 0
++    for _ in range(BLOB_PLACE_RETRIES):
++        if placed >= n_blobs:
++            break
++        br, bc = (1, 2) if random.choice([True, False]) else (2, 1)
++
++        if h - 1 - br < 1 or w - 1 - bc < 1:
++            continue
++        r = random.randint(1, h - 1 - br)
++        c = random.randint(1, w - 1 - bc)
++
++        r0, c0 = max(0, r - 1), max(0, c - 1)
++        r1, c1 = min(h, r + br + 1), min(w, c + bc + 1)
++        if np.any(grid[r0:r1, c0:c1] != 0):
++            continue
++
++        grid[r : r + br, c : c + bc] = STENCIL_COLOR
++        placed += 1
++
++    return grid if placed == n_blobs else None
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Recolor a template after promoting its tight crop to a square tile, then place the repeated strip into a forced square canvas.
++
++    Input structure:
++    - Blue separator rows or columns split the grid into four sections.
++    - Section 1 is a black template carrying one yellow shape; section 2 is the component-count stencil.
++    - Sections 3 and 4 are solid swatches that supply the output foreground and background colors.
++
++    Rule:
++    - Count the 4-connected non-black components in section 2 to obtain the repetition count.
++    - Crop the template to the tight non-black bbox, but then enlarge that crop to the smallest square by extending only the shorter axis with background cells.
++    - Recolor the resulting square mask with the foreground/background swatches.
++    - Repeat that square tile along the separator-controlled orientation with 1-cell background separators, then place the strip at the top-left of a square output whose side length is tile_side times the repetition count; clip any overflow and leave the rest as background.
++
++    Key insight:
++    - The stencil still says how many copies to make, but the template no longer yields a rectangle: it yields a square tile, and that same square side also determines the final square canvas that can both truncate the strip and leave a padded empty zone.
++    """
++    g = np.asarray(grid, dtype=int)
++    orientation, sections = _split_sections(g)
++    template, repetition_pattern, foreground_block, background_block = sections[:4]
++
++    foreground = _solid_color(foreground_block)
++    background = _solid_color(background_block)
++
++    tile_mask = _square_crop_mask(template != 0)
++    if tile_mask.size == 0:
++        return np.empty((0, 0), dtype=int)
++
++    tile = np.where(tile_mask, foreground, background).astype(int)
++    n_repeats = len(components_mask(repetition_pattern != 0, connectivity=4))
++    return _force_square_output(tile, n_repeats, background, orientation == "horizontal")
++
++
++def _gen_attempt() -> np.ndarray | None:
++    horizontal = random.choice([True, False])
++    n_repeats = random.randint(*REPEAT_COUNT_RANGE)
++
++    crop_h = random.randint(*CROP_SIZE_RANGE)
++    crop_w = random.randint(*CROP_SIZE_RANGE)
++    if crop_h == crop_w:
++        return None
++
++    density = random.uniform(*DENSITY_RANGE)
++    shape = random_sprite(
++        crop_h,
++        crop_w,
++        density=density,
++        color_palette=[TEMPLATE_COLOR],
++        connectivity=4,
++        symmetry="not_symmetric",
++    )
++
++    fg_color, bg_color = random.sample(COLOR_POOL, 2)
++
++    template = np.zeros((crop_h + 2, crop_w + 2), dtype=int)
++    template[1 : crop_h + 1, 1 : crop_w + 1] = shape
++
++    tile_mask = _square_crop_mask(template != 0)
++    tile = np.where(tile_mask, fg_color, bg_color).astype(int)
++    output = _force_square_output(tile, n_repeats, bg_color, horizontal)
++
++    shared_dim = template.shape[0] if horizontal else template.shape[1]
++    stencil = _build_stencil(n_repeats, shared_dim, horizontal)
++    if stencil is None:
++        return None
++
++    fg_swatch = _make_swatch(shared_dim, fg_color, horizontal)
++    bg_swatch = _make_swatch(shared_dim, bg_color, horizontal)
++    inp = _join_sections([template, stencil, fg_swatch, bg_swatch], shared_dim, horizontal)
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        return None
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+tokens used
+48,821
+已将融合变体写入 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/b0039139/13/code.py)。
+
+实现要点是：`main()` 先把模板的紧致 bbox 扩成最小正方形，再按组件数生成带 1 像素背景分隔的重复条带，最后把条带贴到左上角的正方形输出画布中；画布边长固定为 `正方形模板边长 × 重复数`，因此会在重复方向发生截断，在另一方向留下背景填充。代码里也补了融合设计分析、隐式假设审查，以及符合要求的四段式说明文档字符串。
+
+验证已完成。题目给定的 50 次测试结果是 `Success: 50/50`。另外做了 200 个样本的退化检查：`output` 为正方形的比例 `200/200`，模板 bbox 为非正方形的比例 `200/200`，与原始 solver 在相同输入上输出完全相同的比例是 `0/200`。截断量分布为 `{1:47, 2:29, 3:45, 4:38, 5:41}`，说明 D10 的强制正方形输出确实稳定生效。

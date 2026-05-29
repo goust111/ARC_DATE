@@ -1,0 +1,2415 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e2fe0-e88f-7eb0-a95b-fab40c571f36
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: b9e38dc0
+    **摘要**: 半包围区域内的像素向外洪水填充并沿开口方向辐射，孤立像素沿同方向直线移动至网格边缘并留下背景色轨迹
+
+    ## 要实现的融合组合
+    - **组合名称**: 射线交汇终止+链式反应+开口相对配对
+    - **combo_spec**: D5/2+D10/3+D12/2
+
+    ### 融合描述（实现规格）
+
+    精灵两两配对开口相对，射线在路径上相遇时双方终止。但配对中先被触发的精灵发射射线触发对方，形成链式反应——第一条射线到达对方开口触发其填充辐射，第二条射线反向射出直到与某条射线交汇。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D5/2** — 目标/终止条件 (`dst`)
+  - 当前值: 辐射射线延伸到网格边缘终止；孤立像素同样移动到网格边缘
+  - 改为: 辐射到遇到同色射线终止 — 当两个不同精灵的辐射射线在路径上相遇时，两条射线都在交汇点终止。这引入了射线间的交互和顺序依赖关系，增加了动态推理难度。
+  - 来源: collision_detection（参考任务: e12f9a14）
+- **D10/3** — 多步处理顺序 (`multi_step`)
+  - 当前值: 两步处理：第一步填充半包围区域并辐射，第二步孤立像素直线移动（第一步结果作为障碍物影响第二步）
+  - 改为: 链式反应：辐射触发相邻精灵 — 第一个精灵的辐射射线如果到达另一个精灵的开口处，则触发该精灵的填充和辐射，形成连锁反应。处理从某个起始精灵开始传播。解题者需要追踪整个连锁传播路径。
+  - 来源: chain_reaction（参考任务: 5961cc34）
+- **D12/2** — 精灵数量与空间排列 (`meta`)
+  - 当前值: 多个半包围精灵分布在网格中，各自独立，开口方向可能不同
+  - 改为: 精灵两两成对且开口相对 — 精灵成对出现，每对中两个精灵开口相对（如一个向左一个向右）。辐射射线在中间区域相遇或交叉。解题者需要理解配对关系和射线交互规则。
+  - 来源: creative（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/b9e38dc0.py`
+
+    ```python
+    import numpy as np
+
+from arc_utils import neighbors4, neighbors8, components_mask, get_bg
+import random
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Fill the region enclosed by a wall sprite and radiate color outward through its opening.
+
+    Input structure:
+    - bg = most common color. Wall = most frequent non-bg color, forming a partial enclosure (e.g. U-shape).
+    - A fill-color pixel sits inside the enclosed area. Other non-bg pixels may act as obstacles.
+    Rule:
+    - Flood-fill the enclosed area with the fill color, radiating outward through the wall's open end.
+    - Obstacles cast "shadows" along the radiate direction, blocking fill behind them.
+
+    Key insight: The wall endpoints define the opening direction; fill radiates outward through it, and obstacles block propagation along that same axis.
+    """
+    g = np.array(grid, copy=True)
+    h, w = g.shape
+
+    vals = np.unique(g)
+    bg = get_bg(g)
+
+    non_bg = [int(v) for v in vals if int(v) != bg]
+    assert non_bg, "expected at least one non-background color"
+
+    # Wall: most frequent non-background color.
+    wall = max(non_bg, key=lambda c: int((g == c).sum()))
+
+    wall_mask = g == wall
+
+    # Wall connected components (8-neigh).
+    comps = [set((int(r), int(c)) for r, c in pts) for pts in components_mask(wall_mask, connectivity=8)]
+    assert comps, "expected at least one wall connected component"
+
+    def sgn(x: int) -> int:
+        return (x > 0) - (x < 0)
+
+    other_colors = [c for c in non_bg if c != wall]
+    assert other_colors, "expected at least one non-wall color (fill color)"
+
+    # Pick fill color as the non-wall color closest (Manhattan distance) to the wall pixels.
+    wall_points = [p for comp in comps for p in comp]
+
+    def min_dist_to_wall(color: int) -> tuple[int, int]:
+        pts = list(zip(*np.where(g == color)))
+        pts = [(int(r), int(c)) for r, c in pts]
+        best_d = 10**9
+        for r, c in pts:
+            for wr, wc in wall_points:
+                d = abs(r - wr) + abs(c - wc)
+                if d < best_d:
+                    best_d = d
+                    if best_d == 0:
+                        return 0, len(pts)
+        return best_d, len(pts)
+
+    fill = min(other_colors, key=lambda c: (min_dist_to_wall(c)[0], min_dist_to_wall(c)[1]))
+
+    fill_pos = list(zip(*np.where(g == fill)))
+    fill_pos = [(int(r), int(c)) for r, c in fill_pos]
+    if not fill_pos:
+        return g
+
+    # Choose the closest wall component to the fill seed (ties: larger component).
+    def comp_min_dist(comp: set[tuple[int, int]]) -> int:
+        best_d = 10**9
+        for r, c in fill_pos:
+            for wr, wc in comp:
+                d = abs(r - wr) + abs(c - wc)
+                if d < best_d:
+                    best_d = d
+                    if best_d == 0:
+                        return 0
+        return best_d
+
+    wall_comp = min(comps, key=lambda comp: (comp_min_dist(comp), -len(comp)))
+
+    comp_mask = np.zeros_like(wall_mask, dtype=bool)
+    for r, c in wall_comp:
+        comp_mask[r, c] = True
+
+    def comp_neighbors(r: int, c: int) -> list[tuple[int, int]]:
+        out = []
+        for rr, cc in neighbors8(r, c):
+            if 0 <= rr < h and 0 <= cc < w and comp_mask[rr, cc]:
+                out.append((rr, cc))
+        return out
+
+    endpoints: list[tuple[int, int]] = []
+    for r, c in wall_comp:
+        if len(comp_neighbors(r, c)) == 1:
+            endpoints.append((r, c))
+
+    assert endpoints, "expected wall component to have endpoints (degree-1 pixels)"
+
+    def outward_dir(ep: tuple[int, int]) -> tuple[tuple[int, int], bool]:
+        n1 = comp_neighbors(*ep)[0]
+        d1 = (sgn(n1[0] - ep[0]), sgn(n1[1] - ep[1]))  # inward
+        d_use = d1
+        is_12 = False
+        n2s = [p for p in comp_neighbors(*n1) if p != ep]
+        if n2s:
+            n2 = n2s[0]
+            d2 = (sgn(n2[0] - n1[0]), sgn(n2[1] - n1[1]))
+            if (d1[0] == 0) ^ (d1[1] == 0):
+                if d2[0] != 0 and d2[1] != 0:
+                    d_use = d2
+                    is_12 = True
+        return (-d_use[0], -d_use[1]), is_12
+
+    out_info = [outward_dir(ep) for ep in endpoints]
+    out_dirs = [d for d, _ in out_info]
+    tip_12 = [f for _, f in out_info]
+
+    dr_sum = sum(d[0] for d in out_dirs)
+    dc_sum = sum(d[1] for d in out_dirs)
+    rad = (sgn(dr_sum), sgn(dc_sum))
+
+    barrier = comp_mask.copy()
+
+    def add_ray(start: tuple[int, int], d: tuple[int, int], skip: int = 0) -> None:
+        rr, cc = start
+        for _ in range(skip):
+            rr += d[0]
+            cc += d[1]
+        while True:
+            rr += d[0]
+            cc += d[1]
+            if not (0 <= rr < h and 0 <= cc < w):
+                break
+            barrier[rr, cc] = True
+
+    def add_ray_12(start: tuple[int, int], d: tuple[int, int]) -> None:
+        rr, cc = start
+        step = 0
+        while True:
+            step += 1
+            if step % 2 == 1:
+                rr += d[0]; cc += d[1]
+            else:
+                if rad[0] != 0:
+                    rr += d[0]
+                else:
+                    cc += d[1]
+            if not (0 <= rr < h and 0 <= cc < w):
+                break
+            barrier[rr, cc] = True
+
+    for ep, d, is_12 in zip(endpoints, out_dirs, tip_12):
+        if is_12:
+            add_ray_12(ep, d)
+        else:
+            add_ray(ep, d, skip=0)
+
+    passable = (~barrier) & ((g == bg) | (g == fill))
+    q = fill_pos[:]
+    seen = np.zeros_like(passable, dtype=bool)
+    for r, c in q:
+        if passable[r, c]:
+            seen[r, c] = True
+    while q:
+        r, c = q.pop()
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and passable[rr, cc] and not seen[rr, cc]:
+                seen[rr, cc] = True
+                q.append((rr, cc))
+
+    filled_mask = (seen & (g == bg))
+
+    out = g.copy()
+    out[filled_mask] = fill
+
+    # Shadow behind obstacles (non-bg, non-fill, non-wall) along radiate direction.
+    obstacles = (g != bg) & (g != fill) & (g != wall)
+
+    def shadow_process(coords: list[tuple[int, int]]) -> None:
+        started = False
+        blocked = False
+        for r, c in coords:
+            if filled_mask[r, c]:
+                started = True
+            if started and obstacles[r, c]:
+                blocked = True
+                continue
+            if blocked and filled_mask[r, c]:
+                out[r, c] = bg
+                filled_mask[r, c] = False
+
+    if rad != (0, 0):
+        dr, dc = rad
+        if dr != 0 and dc == 0:
+            for c in range(w):
+                rows = range(h) if dr > 0 else range(h - 1, -1, -1)
+                shadow_process([(r, c) for r in rows])
+        elif dc != 0 and dr == 0:
+            for r in range(h):
+                cols = range(w) if dc > 0 else range(w - 1, -1, -1)
+                shadow_process([(r, c) for c in cols])
+        else:
+            # Diagonal scanlines
+            if dr == dc:
+                # r - c = const
+                for k in range(-(w - 1), h):
+                    coords = [(r, r - k) for r in range(h) if 0 <= r - k < w]
+                    coords.sort(key=lambda rc: rc[0], reverse=(dr < 0))
+                    shadow_process(coords)
+            else:
+                # r + c = const
+                for k in range(h + w - 1):
+                    coords = [(r, k - r) for r in range(h) if 0 <= k - r < w]
+                    coords.sort(key=lambda rc: rc[0], reverse=(dr < 0))
+                    shadow_process(coords)
+
+    return out
+
+# --------------- generator (o5x) ---------------
+
+from scipy.ndimage import distance_transform_cdt
+
+# -- Configuration constants --------------------------------------------------
+# Canvas size bounds
+GRID_H_VERT = (11, 18)       # height range when radiate_dir is vertical
+GRID_H_HORIZ = (8, 18)       # height range when radiate_dir is horizontal
+GRID_W = (15, 19)             # width range (all directions)
+
+# Wall geometry
+WALL_PIXELS_MIN = 17          # minimum wall pixel count
+WALL_PIXELS_MAX = 25          # maximum wall pixel count
+DEPTH_VERT = (5, 10)          # arm depth range for vertical radiate
+DEPTH_HORIZ = (6, 8)          # arm depth range for horizontal radiate
+GAP_VERT = (6, 7)             # endpoint gap for vertical radiate
+GAP_HORIZ = (5, 7)            # endpoint gap for horizontal radiate
+TIP_12_PROB = 0.5             # probability of 1:2 arm-angle mode (when eligible)
+
+# Placement margins
+OPEN_END_MARGIN = 3           # min cells from open end to radiate grid edge
+
+# Fill seed
+SEED_SIZE_WEIGHTS = [1, 1, 1, 1, 2, 2, 3, 4, 5, 6]  # weighted choices for blob size
+SEED_DEPTH_LOOKBACK = 3       # seed must be within this many rows of closed end
+
+# Obstacles
+MAX_OBSTACLES = 5             # maximum obstacle pixel count
+OBSTACLE_IN_FILL_PROB = 0.65  # probability of forcing at least one obstacle in fill zone
+OBSTACLE_MIN_SEP = 2          # Chebyshev distance between obstacles (> this value)
+
+# Validation
+MIN_NEW_FILL = 20             # minimum newly-filled pixels for a valid output
+PALETTE_SIZE = (3, 5)         # number of distinct colors (bg + wall + fill + obstacle(s))
+GEN_RETRIES = 300             # max attempts in generate_input
+
+
+def _degree1_pixels(points):
+    """Return degree-1 pixels (exactly one 8-neighbor in the set)."""
+    pts = set(points)
+    return [(r, c) for r, c in pts
+            if sum((rr, cc) in pts for rr, cc in neighbors8(r, c)) == 1]
+
+
+def _make_arm(depth, start_v, target_v, extra_steps, tip_12=False):
+    """Build one zigzag arm from (0, start_v) toward (depth, target_v)."""
+    sign = 1 if target_v > start_v else -1
+    n_side_steps = abs(target_v - start_v)
+    chosen_rows = []
+    if n_side_steps:
+        if tip_12:
+            chosen_rows = [2 * (i + 1) for i in range(n_side_steps)]
+            extra_steps = 0
+        else:
+            chosen_rows = [1]
+            if n_side_steps > 1:
+                chosen_rows += random.sample(range(2, depth + 1), n_side_steps - 1)
+            chosen_rows.sort()
+
+    first_row = chosen_rows[0] if chosen_rows else 1
+    extra_rows = [r for r in chosen_rows if r != first_row]
+    random.shuffle(extra_rows)
+    orthogonal_rows = set(extra_rows[:extra_steps])
+
+    pts = [(0, start_v)]
+    u, v = 0, start_v
+    for row in range(1, depth + 1):
+        u += 1
+        if row in orthogonal_rows:
+            pts.append((u, v))
+            v += sign
+        elif row in chosen_rows:
+            v += sign
+        pts.append((u, v))
+    return pts
+
+
+def _build_local_wall(rad, h, w):
+    """Construct wall shape in local (u, v) coordinates. Returns (pts, depth, gap) or None."""
+    if rad[0]:
+        max_depth = min(DEPTH_VERT[1], h - 6)
+        if max_depth < DEPTH_VERT[0]:
+            return None
+        depth = random.randint(DEPTH_VERT[0], max_depth)
+        gap = random.randint(*GAP_VERT)
+    else:
+        depth = random.randint(DEPTH_HORIZ[0], min(DEPTH_HORIZ[1], w - 6))
+        gap = random.randint(GAP_HORIZ[0], min(GAP_HORIZ[1], h - 1))
+
+    if gap == 5:
+        left_bottom, right_bottom = 2, 3
+    elif gap == 6:
+        left_bottom, right_bottom = 2, 4
+    else:
+        left_bottom, right_bottom = random.choice([(2, 5), (3, 4)])
+
+    bridge_extra = max(0, right_bottom - left_bottom - 1)
+    base_count = 2 * (depth + 1) + bridge_extra
+    max_extra_l = max(0, left_bottom - 1)
+    max_extra_r = max(0, gap - right_bottom - 1)
+    min_extra = max(0, WALL_PIXELS_MIN - base_count)
+    max_extra = min(max_extra_l + max_extra_r, WALL_PIXELS_MAX - base_count)
+    if min_extra > max_extra:
+        return None
+
+    extra = random.randint(min_extra, max_extra)
+    extra_l = random.randint(max(0, extra - max_extra_r), min(max_extra_l, extra))
+    extra_r = extra - extra_l
+
+    max_n_side = max(left_bottom, gap - right_bottom)
+    tip_12 = depth >= 2 * max_n_side and random.random() < TIP_12_PROB
+    left = _make_arm(depth, 0, left_bottom, extra_l, tip_12=tip_12)
+    right = _make_arm(depth, gap, right_bottom, extra_r, tip_12=tip_12)
+    pts = set(left) | set(right)
+    for v in range(left_bottom, right_bottom + 1):
+        pts.add((depth, v))
+
+    # Pad wall to minimum size by adding 8-connected pixels that preserve 2 endpoints
+    while len(pts) < WALL_PIXELS_MIN:
+        candidates = [
+            (u, v) for u in range(max(0, depth - 3), depth + 1)
+            for v in range(gap + 1) if (u, v) not in pts
+            and sum((uu, vv) in pts
+                    for uu in range(u - 1, u + 2)
+                    for vv in range(v - 1, v + 2)
+                    if (uu, vv) != (u, v)) >= 2
+        ]
+        random.shuffle(candidates)
+        added = False
+        for p in candidates:
+            trial = pts | {p}
+            if len(trial) <= WALL_PIXELS_MAX and len(_degree1_pixels(trial)) == 2:
+                pts = trial
+                added = True
+                break
+        if not added:
+            return None
+
+    if not (WALL_PIXELS_MIN <= len(pts) <= WALL_PIXELS_MAX) or len(_degree1_pixels(pts)) != 2:
+        return None
+    return pts, depth, gap
+
+
+def _map_local(u, v, rad, anchor):
+    """Map local (u, v) to grid (r, c) given radiate direction and anchor."""
+    r0, c0 = anchor
+    if rad == (-1, 0):
+        return r0 + u, c0 + v
+    if rad == (1, 0):
+        return r0 - u, c0 + v
+    if rad == (0, -1):
+        return r0 + v, c0 + u
+    return r0 + v, c0 - u
+
+
+def _place_anchor(rad, h, w, depth, gap):
+    """Choose anchor so the wall fits within margins."""
+    if rad == (-1, 0):
+        return random.randint(OPEN_END_MARGIN, h - depth - 3), random.randint(0, w - gap - 1)
+    if rad == (1, 0):
+        return random.randint(depth + 2, h - 4), random.randint(0, w - gap - 1)
+    if rad == (0, -1):
+        return random.randint(0, h - gap - 1), random.randint(OPEN_END_MARGIN, w - depth - 3)
+    return random.randint(0, h - gap - 1), random.randint(depth + 2, w - 4)
+
+
+def _local_interior(wall, depth, gap):
+    """Return bg cells strictly between the two wall arms in local coords."""
+    by_row = {}
+    for u, v in wall:
+        by_row.setdefault(u, []).append(v)
+    interior = []
+    for u in range(1, depth):
+        if u not in by_row or len(by_row[u]) < 2:
+            continue
+        lo, hi = min(by_row[u]), max(by_row[u])
+        for v in range(lo + 1, hi):
+            if (u, v) not in wall:
+                interior.append((u, v))
+    return interior
+
+
+def _grow_seed_blob(seed, interior_set):
+    """Grow a small 4-connected blob from seed within interior cells."""
+    blob = {seed}
+    target_size = random.choice(SEED_SIZE_WEIGHTS)
+    frontier = [seed]
+    while len(blob) < target_size and frontier:
+        p = frontier.pop(random.randrange(len(frontier)))
+        u, v = p
+        for q in random.sample([(u - 1, v), (u + 1, v), (u, v - 1), (u, v + 1)], 4):
+            if q in interior_set and q not in blob:
+                blob.add(q)
+                frontier.append(q)
+                if len(blob) >= target_size:
+                    break
+    return blob
+
+
+def _obstacle_fits(pos, placed):
+    """Check that pos is at least Chebyshev OBSTACLE_MIN_SEP from all placed obstacles."""
+    r, c = pos
+    return all(max(abs(r - rr), abs(c - cc)) >= OBSTACLE_MIN_SEP for rr, cc in placed)
+
+
+def _find_obstacle_candidates(grid, bg, wall_color, nominal_fill_zone):
+    """Find bg cells far enough from wall for obstacle placement, using distance transform."""
+    wall_mask = grid == wall_color
+    # distance_transform_cdt with chessboard metric gives Chebyshev distance to wall
+    dist = distance_transform_cdt(~wall_mask, metric='taxicab')
+    far_from_wall = dist > 1
+    eligible = (grid == bg) & far_from_wall
+    all_coords = list(zip(*np.where(eligible)))
+    fill_coords = [p for p in all_coords if nominal_fill_zone[p[0], p[1]]]
+    random.shuffle(all_coords)
+    random.shuffle(fill_coords)
+    return [(int(r), int(c)) for r, c in all_coords], [(int(r), int(c)) for r, c in fill_coords]
+
+
+def _place_obstacles(n_obstacles, candidates, fill_candidates, obstacle_colors, grid):
+    """Place up to n_obstacles on the grid, preferring some in the fill zone."""
+    placed = []
+    n_fill = random.randint(0, min(n_obstacles, len(fill_candidates)))
+    if fill_candidates and random.random() < OBSTACLE_IN_FILL_PROB:
+        n_fill = max(1, n_fill)
+    for p in fill_candidates:
+        if len(placed) >= n_fill:
+            break
+        if _obstacle_fits(p, placed):
+            placed.append(p)
+    placed_set = set(placed)
+    for p in candidates:
+        if len(placed) >= n_obstacles:
+            break
+        if p not in placed_set and _obstacle_fits(p, placed):
+            placed.append(p)
+            placed_set.add(p)
+    for i, (r, c) in enumerate(placed):
+        grid[r, c] = obstacle_colors[i % len(obstacle_colors)]
+
+
+def _touches_border(mask):
+    """Check if any True cell in mask lies on the grid border."""
+    return bool(mask[0, :].any() or mask[-1, :].any() or mask[:, 0].any() or mask[:, -1].any())
+
+
+def _gen_attempt():
+    """Single attempt to generate a valid input grid."""
+    rad = random.choice([(-1, 0), (1, 0), (0, -1), (0, 1)])
+    h = random.randint(*GRID_H_VERT) if rad[0] else random.randint(*GRID_H_HORIZ)
+    w = random.randint(*GRID_W)
+
+    built = _build_local_wall(rad, h, w)
+    if built is None:
+        return None
+    local_wall, depth, gap = built
+    anchor = _place_anchor(rad, h, w, depth, gap)
+
+    # Choose palette
+    palette = random.sample(range(10), random.randint(*PALETTE_SIZE))
+    bg, wall_color, fill_color = palette[:3]
+    obstacle_colors = palette[3:]
+
+    # Render wall onto grid
+    grid = np.full((h, w), bg, dtype=int)
+    for u, v in local_wall:
+        r, c = _map_local(u, v, rad, anchor)
+        grid[r, c] = wall_color
+
+    # Place fill seed near the closed end
+    interior = _local_interior(local_wall, depth, gap)
+    wall_set = set(local_wall)
+    adjacent = [
+        p for p in interior
+        if any((p[0] + dr, p[1] + dc) in wall_set for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)])
+    ]
+    seed_pool = [p for p in adjacent if p[0] >= max(1, depth - SEED_DEPTH_LOOKBACK)]
+    if not seed_pool:
+        return None
+
+    blob = _grow_seed_blob(random.choice(seed_pool), set(interior))
+    for u, v in blob:
+        r, c = _map_local(u, v, rad, anchor)
+        if grid[r, c] != bg:
+            return None
+        grid[r, c] = fill_color
+
+    # Run solver to find nominal fill zone (used for obstacle placement)
+    try:
+        nominal_out = main(grid)
+    except Exception:
+        return None
+    nominal_fill_zone = (nominal_out == fill_color) & (grid == bg)
+
+    # Place obstacles
+    n_obstacles = random.randint(0, MAX_OBSTACLES)
+    if n_obstacles and not obstacle_colors:
+        available = [c for c in range(10) if c not in (bg, wall_color, fill_color)]
+        obstacle_colors = random.sample(available, random.randint(1, 2))
+    if n_obstacles:
+        candidates, fill_candidates = _find_obstacle_candidates(grid, bg, wall_color, nominal_fill_zone)
+        _place_obstacles(n_obstacles, candidates, fill_candidates, obstacle_colors, grid)
+
+    # Validate: solver must produce enough fill that reaches a border
+    try:
+        out = main(grid)
+    except Exception:
+        return None
+    new_fill = (out == fill_color) & (grid == bg)
+    if int(new_fill.sum()) < MIN_NEW_FILL or not _touches_border(new_fill):
+        return None
+    return grid
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate valid b9e38dc0 input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 8-18 rows x 15-19 cols; bg = most common color
+  wall:
+    color: most frequent non-bg color; single 8-connected component of 17-25 pixels
+    shape: |
+      V/U/funnel partial enclosure with two arms diverging from a closed end toward an open end.
+      Arms are zigzag staircases mixing diagonal and orthogonal steps; may have horizontal/vertical
+      bars at turns creating branch points (degree-3/4 nodes allowed). Exactly 2 degree-1 endpoints.
+      Two arm-angle modes (both arms always same mode within one example):
+        - 1:1 (45°): arm steps are diagonal (1 lateral per 1 depth)
+        - 1:2 (<45°): arm steps strictly alternate depth-only and diagonal (1 lateral per 2 depth)
+    bbox: spans 6-11 rows x 7-9 cols
+    endpoints: both on same row, same col, or diagonally close; Chebyshev gap 5-7
+    opening: endpoints define the open end; radiate_dir is the cardinal direction (up/down/left/right) pointing outward from the opening, derived from the vector sum of endpoint outward directions
+    placement: closed end >=2 cells from its grid edge; open end >=3 cells from the radiate-edge
+  fill_seed:
+    color: non-bg non-wall color closest (Manhattan) to the wall
+    shape: 1-6 pixels, single 4-connected component (usually 1 pixel) [observed]
+    location: inside the enclosure near the closed end; Manhattan distance 1-2 from wall; always 8-adjacent to wall
+  obstacles:
+    count: 0-2 distinct colors, 0-5 singleton pixels total (one 2-pixel pair allowed)
+    location: scattered on bg cells; some in the radiate zone (between opening and grid edge), some elsewhere
+    effect: preserved unchanged; those in the fill zone cast bg shadows behind them along radiate_dir
+  output:
+    fill_interior: flood-fill (4-conn) all bg cells reachable from seed inside enclosure with fill color
+    radiate: fill continues outward through the opening, bounded by rays from endpoints
+      until grid edge. Ray slope matches arm-angle mode: 1:1 arms → 45° diagonal rays,
+      1:2 arms → 1:2 slope rays (alternating diagonal and depth-only steps)
+    shadows: obstacles in the fill zone block fill propagation along radiate_dir behind them
+    preserved: wall, fill seed, all obstacle pixels remain unchanged
+
+generation_strategy: |
+  Output-first: build the wall + fill output, then strip the fill to get the input.
+  1. Pick grid size, 3-5 colors {bg, wall, fill, obstacle(s)}, and radiate_dir.
+  2. Build the wall: place it so the closed end has >=2 margin from its edge and the
+     opening has >=3 cells toward the radiate edge. Pick arm-angle mode (1:1 or 1:2,
+     same for both arms). Draw two arms as zigzag chains from the closed end outward:
+     1:1 mode uses diagonal steps; 1:2 mode strictly alternates depth-only and diagonal
+     steps (evenly spaced at rows 2,4,6,...). Optionally add short bars at turns. Verify single 8-connected component, exactly 2 endpoints,
+     17-25 pixels, Chebyshev endpoint gap 5-7.
+  3. Place fill seed: pick a bg cell inside the enclosure near the closed end,
+     8-adjacent to a wall pixel. Optionally grow to a small blob (size 1-6).
+  4. Place 0-5 obstacle pixels on bg cells (0-2 distinct colors, singletons).
+  5. Run the solver to produce the output; reject if <20 newly-filled cells or
+     fill does not reach at least one grid border.
+  6. The constructed grid (before running solver) is the input; solver output is the output.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+## 已有单变体参考代码
+
+以下组成项已有单变体实现，可作为融合时的参考：
+
+            ### 参考代码: D5/2
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/b9e38dc0/D5/2/code.py`
+
+            ```python
+            # Variant of b9e38dc0
+# Dimension: D5 — 目标/终止条件 (dst)
+# Change: 辐射射线延伸到网格边缘终止；孤立像素同样移动到网格边缘... → 辐射到遇到同色射线终止
+
+import random
+
+import numpy as np
+from scipy.ndimage import distance_transform_cdt
+
+from arc_utils import neighbors4, neighbors8, components_mask, get_bg
+
+
+# Design analysis
+# yaml-like notes:
+#   concretization:
+#     - 原题只有一个半封闭墙体，因此“射线遇到另一条射线”在输入里不可发生。
+#       为了让 D5 可观察，生成器最小化地扩成 2 个同向、同墙色、同填充色的墙体精灵。
+#     - 每个精灵仍然是原题的 V/U 型半包围墙、内部小填充种子、外部单像素障碍。
+#       差异只放在“开口两端发出的边界射线”的终止条件：原题到边界，本变体到另一精灵的同色射线。
+#     - 具体小例子（向上辐射）：
+#       左精灵右侧边界线向右上走，右精灵左侧边界线向左上走。
+#       原逻辑：两条线都继续到顶边，因此两块外放填充会一直开到网格顶端。
+#       新逻辑：两条线第一次落到同一格时，都停在该格，后面的尾部被裁掉，
+#       因而两块填充在上方更早收口，输出会比原题少一块明显的顶端填充区域。
+#   complexity_calibration:
+#     - 只生成 2 个精灵，避免多重碰撞导致视觉杂乱，也足够体现“射线交互”。
+#     - 两个精灵共享同一 radiate_dir，阴影扫描仍沿同一轴，保留原题结构。
+#     - 每个样例至少 1 个碰撞格，且“碰撞版输出”和“原版到边界输出”必须不同，防止退化。
+#   implicit_assumptions_review:
+#     - 原 main 里 `wall_comp = min(...)` 依赖“只有一个相关墙体”；变体里必须改成“每个 fill blob 绑定最近墙体”。
+#     - 原 `add_ray/add_ray_12` 依赖“射线永不相交”；变体里改成同步推进的 ray simulation，
+#       并在撞到已存在射线格时截断旧尾部。
+#     - 原阴影逻辑隐含单一辐射方向；生成器因此保证两个精灵同向，solver 也断言所有相关墙体方向一致。
+#   placement_legality:
+#     - 两个墙体按同一开口高度对齐、沿横向排开，保证不重叠、不开到网格外，并给内侧射线留下相遇空间。
+#     - 障碍仍只放在离墙至少 2 格的背景格上，避免被误认成靠墙 fill。
+#   observability:
+#     - 颜色不参与任何排序；只有几何位置决定哪个墙体与哪个 fill blob 对应、哪两条射线会相撞。
+#     - 人眼可直接比较“上方/下方是否一直开到边界”来归纳新规则。
+#   cleanliness:
+#     - 只保留两层语义：墙体/填充区域/少量障碍；不额外引入新标记。
+#     - 两个精灵共享颜色但空间分离，碰撞发生在它们之间的空带里，画面整洁。
+#   new_main_assumptions:
+#     - 所有相关墙体共享同一个 wall color、fill color、radiate_dir。
+#     - 不处理几何意义上的“对角线穿叉但不落同一格”的碰撞；生成器专门构造为同格相遇。
+#     - 同一墙体自己的两条边界线不会先互撞；生成器通过间距与朝向保证这一点。
+
+
+# -- Configuration constants --------------------------------------------------
+GRID_H = (11, 18)
+GRID_W = (17, 22)
+
+WALL_PIXELS_MIN = 17
+WALL_PIXELS_MAX = 25
+DEPTH_VERT = (5, 10)
+GAP_VERT = (6, 7)
+TIP_12_PROB = 0.5
+
+OPEN_END_MARGIN = 3
+SPRITE_COUNT = 2
+SPRITE_BBOX_GAP = (1, 3)
+ALIGN_JITTER = 0
+
+SEED_SIZE_WEIGHTS = [1, 1, 1, 1, 2, 2, 3, 4, 5, 6]
+SEED_DEPTH_LOOKBACK = 3
+
+MAX_OBSTACLES = 4
+OBSTACLE_IN_FILL_PROB = 0.55
+OBSTACLE_MIN_SEP = 2
+
+MIN_NEW_FILL = 18
+MIN_COLLISION_DIFF = 6
+PALETTE_SIZE = (3, 5)
+GEN_RETRIES = 400
+
+
+def _sgn(x: int) -> int:
+    return (x > 0) - (x < 0)
+
+
+def _degree1_pixels(points):
+    pts = set(points)
+    return [
+        (r, c)
+        for r, c in pts
+        if sum((rr, cc) in pts for rr, cc in neighbors8(r, c)) == 1
+    ]
+
+
+def _make_arm(depth, start_v, target_v, extra_steps, tip_12=False):
+    sign = 1 if target_v > start_v else -1
+    n_side_steps = abs(target_v - start_v)
+    chosen_rows = []
+    if n_side_steps:
+        if tip_12:
+            chosen_rows = [2 * (i + 1) for i in range(n_side_steps)]
+            extra_steps = 0
+        else:
+            chosen_rows = [1]
+            if n_side_steps > 1:
+                chosen_rows += random.sample(range(2, depth + 1), n_side_steps - 1)
+            chosen_rows.sort()
+
+    first_row = chosen_rows[0] if chosen_rows else 1
+    extra_rows = [r for r in chosen_rows if r != first_row]
+    random.shuffle(extra_rows)
+    orthogonal_rows = set(extra_rows[:extra_steps])
+
+    pts = [(0, start_v)]
+    u, v = 0, start_v
+    for row in range(1, depth + 1):
+        u += 1
+        if row in orthogonal_rows:
+            pts.append((u, v))
+            v += sign
+        elif row in chosen_rows:
+            v += sign
+        pts.append((u, v))
+    return pts
+
+
+def _build_local_wall(h, force_tip_12=None):
+    max_depth = min(DEPTH_VERT[1], h - 6)
+    if max_depth < DEPTH_VERT[0]:
+        return None
+    depth = random.randint(DEPTH_VERT[0], max_depth)
+    gap = random.randint(*GAP_VERT)
+
+    if gap == 5:
+        left_bottom, right_bottom = 2, 3
+    elif gap == 6:
+        left_bottom, right_bottom = 2, 4
+    else:
+        left_bottom, right_bottom = random.choice([(2, 5), (3, 4)])
+
+    bridge_extra = max(0, right_bottom - left_bottom - 1)
+    base_count = 2 * (depth + 1) + bridge_extra
+    max_extra_l = max(0, left_bottom - 1)
+    max_extra_r = max(0, gap - right_bottom - 1)
+    min_extra = max(0, WALL_PIXELS_MIN - base_count)
+    max_extra = min(max_extra_l + max_extra_r, WALL_PIXELS_MAX - base_count)
+    if min_extra > max_extra:
+        return None
+
+    extra = random.randint(min_extra, max_extra)
+    extra_l = random.randint(max(0, extra - max_extra_r), min(max_extra_l, extra))
+    extra_r = extra - extra_l
+
+    max_n_side = max(left_bottom, gap - right_bottom)
+    if force_tip_12 is None:
+        tip_12 = depth >= 2 * max_n_side and random.random() < TIP_12_PROB
+    elif force_tip_12:
+        if depth < 2 * max_n_side:
+            return None
+        tip_12 = True
+    else:
+        tip_12 = False
+
+    left = _make_arm(depth, 0, left_bottom, extra_l, tip_12=tip_12)
+    right = _make_arm(depth, gap, right_bottom, extra_r, tip_12=tip_12)
+    pts = set(left) | set(right)
+    for v in range(left_bottom, right_bottom + 1):
+        pts.add((depth, v))
+
+    while len(pts) < WALL_PIXELS_MIN:
+        candidates = [
+            (u, v)
+            for u in range(max(0, depth - 3), depth + 1)
+            for v in range(gap + 1)
+            if (u, v) not in pts
+            and sum(
+                (uu, vv) in pts
+                for uu in range(u - 1, u + 2)
+                for vv in range(v - 1, v + 2)
+                if (uu, vv) != (u, v)
+            ) >= 2
+        ]
+        random.shuffle(candidates)
+        added = False
+        for p in candidates:
+            trial = pts | {p}
+            if len(trial) <= WALL_PIXELS_MAX and len(_degree1_pixels(trial)) == 2:
+                pts = trial
+                added = True
+                break
+        if not added:
+            return None
+
+    if not (WALL_PIXELS_MIN <= len(pts) <= WALL_PIXELS_MAX) or len(_degree1_pixels(pts)) != 2:
+        return None
+    return pts, depth, gap, tip_12
+
+
+def _map_local(u, v, rad, anchor):
+    r0, c0 = anchor
+    if rad == (-1, 0):
+        return r0 + u, c0 + v
+    if rad == (1, 0):
+        return r0 - u, c0 + v
+    if rad == (0, -1):
+        return r0 + v, c0 + u
+    return r0 + v, c0 - u
+
+
+def _wall_anchor_bounds(rad, h, w, depth, gap):
+    if rad == (-1, 0):
+        return OPEN_END_MARGIN, h - depth - 3, 0, w - gap - 1
+    if rad == (1, 0):
+        return depth + 2, h - 4, 0, w - gap - 1
+    if rad == (0, -1):
+        return 0, h - gap - 1, OPEN_END_MARGIN, w - depth - 3
+    return 0, h - gap - 1, depth + 2, w - 4
+
+
+def _local_interior(wall, depth):
+    by_row = {}
+    for u, v in wall:
+        by_row.setdefault(u, []).append(v)
+    interior = []
+    for u in range(1, depth):
+        if u not in by_row or len(by_row[u]) < 2:
+            continue
+        lo, hi = min(by_row[u]), max(by_row[u])
+        for v in range(lo + 1, hi):
+            if (u, v) not in wall:
+                interior.append((u, v))
+    return interior
+
+
+def _grow_seed_blob(seed, interior_set):
+    blob = {seed}
+    target_size = random.choice(SEED_SIZE_WEIGHTS)
+    frontier = [seed]
+    while len(blob) < target_size and frontier:
+        p = frontier.pop(random.randrange(len(frontier)))
+        u, v = p
+        for q in random.sample([(u - 1, v), (u + 1, v), (u, v - 1), (u, v + 1)], 4):
+            if q in interior_set and q not in blob:
+                blob.add(q)
+                frontier.append(q)
+                if len(blob) >= target_size:
+                    break
+    return blob
+
+
+def _obstacle_fits(pos, placed):
+    r, c = pos
+    return all(max(abs(r - rr), abs(c - cc)) >= OBSTACLE_MIN_SEP for rr, cc in placed)
+
+
+def _find_obstacle_candidates(grid, bg, wall_color, nominal_fill_zone):
+    wall_mask = grid == wall_color
+    dist = distance_transform_cdt(~wall_mask, metric="taxicab")
+    far_from_wall = dist > 1
+    eligible = (grid == bg) & far_from_wall
+    all_coords = list(zip(*np.where(eligible)))
+    fill_coords = [p for p in all_coords if nominal_fill_zone[p[0], p[1]]]
+    random.shuffle(all_coords)
+    random.shuffle(fill_coords)
+    return [(int(r), int(c)) for r, c in all_coords], [(int(r), int(c)) for r, c in fill_coords]
+
+
+def _place_obstacles(n_obstacles, candidates, fill_candidates, obstacle_colors, grid):
+    placed = []
+    n_fill = random.randint(0, min(n_obstacles, len(fill_candidates)))
+    if fill_candidates and random.random() < OBSTACLE_IN_FILL_PROB:
+        n_fill = max(1, n_fill)
+    for p in fill_candidates:
+        if len(placed) >= n_fill:
+            break
+        if _obstacle_fits(p, placed):
+            placed.append(p)
+    placed_set = set(placed)
+    for p in candidates:
+        if len(placed) >= n_obstacles:
+            break
+        if p not in placed_set and _obstacle_fits(p, placed):
+            placed.append(p)
+            placed_set.add(p)
+    for i, (r, c) in enumerate(placed):
+        grid[r, c] = obstacle_colors[i % len(obstacle_colors)]
+
+
+def _extract_scene(g):
+    h, w = g.shape
+    bg = get_bg(g)
+    vals = np.unique(g)
+    non_bg = [int(v) for v in vals if int(v) != bg]
+    assert non_bg, "expected at least one non-background color"
+
+    wall = max(non_bg, key=lambda c: int((g == c).sum()))
+    other_colors = [c for c in non_bg if c != wall]
+    assert other_colors, "expected at least one non-wall color"
+
+    wall_comps = [
+        set((int(r), int(c)) for r, c in pts)
+        for pts in components_mask(g == wall, connectivity=8)
+    ]
+    assert wall_comps, "expected wall components"
+
+    wall_points = [p for comp in wall_comps for p in comp]
+
+    def min_dist_to_wall(color):
+        pts = [(int(r), int(c)) for r, c in zip(*np.where(g == color))]
+        best_d = 10**9
+        for r, c in pts:
+            for wr, wc in wall_points:
+                d = abs(r - wr) + abs(c - wc)
+                if d < best_d:
+                    best_d = d
+                    if best_d == 0:
+                        return 0, len(pts)
+        return best_d, len(pts)
+
+    fill = min(other_colors, key=lambda c: (min_dist_to_wall(c)[0], min_dist_to_wall(c)[1]))
+    fill_pos = [(int(r), int(c)) for r, c in zip(*np.where(g == fill))]
+    if not fill_pos:
+        return None
+
+    fill_comps = [
+        set((int(r), int(c)) for r, c in pts)
+        for pts in components_mask(g == fill, connectivity=4)
+    ]
+    assert fill_comps, "expected fill component(s)"
+
+    def comp_min_dist(seed_comp, wall_comp):
+        best_d = 10**9
+        for r, c in seed_comp:
+            for wr, wc in wall_comp:
+                d = abs(r - wr) + abs(c - wc)
+                if d < best_d:
+                    best_d = d
+                    if best_d == 0:
+                        return 0
+        return best_d
+
+    selected_indices = []
+    for seed_comp in fill_comps:
+        idx = min(
+            range(len(wall_comps)),
+            key=lambda i: (comp_min_dist(seed_comp, wall_comps[i]), -len(wall_comps[i])),
+        )
+        selected_indices.append(idx)
+    selected_indices = sorted(set(selected_indices))
+
+    wall_mask = np.zeros_like(g, dtype=bool)
+    ray_specs = []
+    rads = []
+
+    for comp_id in selected_indices:
+        wall_comp = wall_comps[comp_id]
+        comp_mask = np.zeros_like(g, dtype=bool)
+        for r, c in wall_comp:
+            comp_mask[r, c] = True
+            wall_mask[r, c] = True
+
+        def comp_neighbors(r, c):
+            out = []
+            for rr, cc in neighbors8(r, c):
+                if 0 <= rr < h and 0 <= cc < w and comp_mask[rr, cc]:
+                    out.append((rr, cc))
+            return out
+
+        endpoints = sorted((r, c) for r, c in wall_comp if len(comp_neighbors(r, c)) == 1)
+        assert len(endpoints) == 2, "expected each wall component to have exactly 2 endpoints"
+
+        def outward_dir(ep):
+            n1 = comp_neighbors(*ep)[0]
+            d1 = (_sgn(n1[0] - ep[0]), _sgn(n1[1] - ep[1]))
+            d_use = d1
+            is_12 = False
+            n2s = [p for p in comp_neighbors(*n1) if p != ep]
+            if n2s:
+                n2 = n2s[0]
+                d2 = (_sgn(n2[0] - n1[0]), _sgn(n2[1] - n1[1]))
+                if (d1[0] == 0) ^ (d1[1] == 0):
+                    if d2[0] != 0 and d2[1] != 0:
+                        d_use = d2
+                        is_12 = True
+            return (-d_use[0], -d_use[1]), is_12
+
+        out_info = [outward_dir(ep) for ep in endpoints]
+        out_dirs = [d for d, _ in out_info]
+        tip_12 = [flag for _, flag in out_info]
+        rad = (_sgn(sum(d[0] for d in out_dirs)), _sgn(sum(d[1] for d in out_dirs)))
+        assert rad != (0, 0), "expected non-zero radiate direction"
+        rads.append(rad)
+
+        for ep, d, is_12 in zip(endpoints, out_dirs, tip_12):
+            ray_specs.append(
+                {
+                    "comp_id": comp_id,
+                    "start": ep,
+                    "dir": d,
+                    "is_12": is_12,
+                }
+            )
+
+    assert ray_specs, "expected at least one ray"
+    assert len(set(rads)) == 1, "expected all selected wall components to share one radiate direction"
+
+    return {
+        "bg": bg,
+        "wall": wall,
+        "fill": fill,
+        "fill_pos": fill_pos,
+        "wall_mask": wall_mask,
+        "ray_specs": ray_specs,
+        "rad": rads[0],
+    }
+
+
+def _build_barrier_to_edge(scene, shape):
+    h, w = shape
+    barrier = scene["wall_mask"].copy()
+    rad = scene["rad"]
+
+    def add_ray(start, d):
+        rr, cc = start
+        while True:
+            rr += d[0]
+            cc += d[1]
+            if not (0 <= rr < h and 0 <= cc < w):
+                break
+            barrier[rr, cc] = True
+
+    def add_ray_12(start, d):
+        rr, cc = start
+        step = 0
+        while True:
+            step += 1
+            if step % 2 == 1:
+                rr += d[0]
+                cc += d[1]
+            else:
+                if rad[0] != 0:
+                    rr += d[0]
+                else:
+                    cc += d[1]
+            if not (0 <= rr < h and 0 <= cc < w):
+                break
+            barrier[rr, cc] = True
+
+    for spec in scene["ray_specs"]:
+        if spec["is_12"]:
+            add_ray_12(spec["start"], spec["dir"])
+        else:
+            add_ray(spec["start"], spec["dir"])
+    return barrier
+
+
+def _build_barrier_with_collisions(scene, shape):
+    h, w = shape
+    barrier = scene["wall_mask"].copy()
+    rad = scene["rad"]
+    cell_rays = {}
+    collision_cells = set()
+    collided_rays = set()
+
+    rays = {}
+    for rid, spec in enumerate(scene["ray_specs"]):
+        rays[rid] = {
+            "rid": rid,
+            "comp_id": spec["comp_id"],
+            "pos": spec["start"],
+            "dir": spec["dir"],
+            "is_12": spec["is_12"],
+            "phase": 0,
+            "path": [],
+            "index": {},
+            "active": True,
+        }
+
+    def next_step(ray):
+        if not ray["is_12"]:
+            return ray["dir"]
+        if ray["phase"] % 2 == 0:
+            return ray["dir"]
+        if rad[0] != 0:
+            return (ray["dir"][0], 0)
+        return (0, ray["dir"][1])
+
+    def advance_phase(ray):
+        if ray["is_12"]:
+            ray["phase"] = (ray["phase"] + 1) % 2
+
+    def append_cell(ray, cell):
+        if cell in ray["index"]:
+            return
+        ray["index"][cell] = len(ray["path"])
+        ray["path"].append(cell)
+        barrier[cell[0], cell[1]] = True
+        cell_rays.setdefault(cell, set()).add(ray["rid"])
+
+    def truncate_at_cell(ray, cell):
+        if cell not in ray["index"]:
+            return
+        idx = ray["index"][cell]
+        tail = ray["path"][idx + 1 :]
+        for old in tail:
+            owners = cell_rays.get(old)
+            if owners is not None:
+                owners.discard(ray["rid"])
+                if not owners:
+                    cell_rays.pop(old, None)
+                    barrier[old[0], old[1]] = False
+            ray["index"].pop(old, None)
+        ray["path"] = ray["path"][: idx + 1]
+        ray["pos"] = cell
+        ray["active"] = False
+
+    max_iters = h * w * max(4, len(rays))
+    for _ in range(max_iters):
+        active_ids = [rid for rid, ray in rays.items() if ray["active"]]
+        if not active_ids:
+            break
+
+        proposals = {}
+        by_cell = {}
+        for rid in sorted(active_ids):
+            ray = rays[rid]
+            step = next_step(ray)
+            nxt = (ray["pos"][0] + step[0], ray["pos"][1] + step[1])
+            if not (0 <= nxt[0] < h and 0 <= nxt[1] < w):
+                ray["active"] = False
+                continue
+            if scene["wall_mask"][nxt[0], nxt[1]]:
+                ray["active"] = False
+                continue
+            proposals[rid] = (nxt, step)
+            by_cell.setdefault(nxt, []).append(rid)
+
+        if not proposals:
+            break
+
+        handled = set()
+        for cell in sorted(by_cell):
+            bidders = by_cell[cell]
+            existing = cell_rays.get(cell, set())
+            involved = {rays[rid]["comp_id"] for rid in bidders}
+            involved |= {rays[oid]["comp_id"] for oid in existing}
+            if len(involved) < 2:
+                continue
+            collision_cells.add(cell)
+            for oid in list(existing):
+                truncate_at_cell(rays[oid], cell)
+                collided_rays.add(oid)
+            for rid in bidders:
+                append_cell(rays[rid], cell)
+                rays[rid]["pos"] = cell
+                rays[rid]["active"] = False
+                collided_rays.add(rid)
+                handled.add(rid)
+
+        for rid in sorted(proposals):
+            if rid in handled or not rays[rid]["active"]:
+                continue
+            cell, _step = proposals[rid]
+            owners = cell_rays.get(cell)
+            if owners:
+                owner_comps = {rays[oid]["comp_id"] for oid in owners}
+                if any(comp != rays[rid]["comp_id"] for comp in owner_comps):
+                    collision_cells.add(cell)
+                    for oid in list(owners):
+                        truncate_at_cell(rays[oid], cell)
+                        collided_rays.add(oid)
+                    append_cell(rays[rid], cell)
+                    rays[rid]["pos"] = cell
+                    rays[rid]["active"] = False
+                    collided_rays.add(rid)
+                    continue
+                rays[rid]["active"] = False
+                continue
+            append_cell(rays[rid], cell)
+            rays[rid]["pos"] = cell
+            advance_phase(rays[rid])
+    else:
+        raise AssertionError("ray simulation did not converge")
+
+    return barrier, {
+        "collision_cells": len(collision_cells),
+        "collided_rays": len(collided_rays),
+    }
+
+
+def _solve_with_mode(grid, stop_on_collision):
+    g = np.array(grid, copy=True)
+    scene = _extract_scene(g)
+    if scene is None:
+        return g, {"collision_cells": 0, "collided_rays": 0}
+
+    if stop_on_collision:
+        barrier, stats = _build_barrier_with_collisions(scene, g.shape)
+    else:
+        barrier = _build_barrier_to_edge(scene, g.shape)
+        stats = {"collision_cells": 0, "collided_rays": 0}
+
+    bg = scene["bg"]
+    fill = scene["fill"]
+    wall = scene["wall"]
+    h, w = g.shape
+
+    passable = (~barrier) & ((g == bg) | (g == fill))
+    q = scene["fill_pos"][:]
+    seen = np.zeros_like(passable, dtype=bool)
+    for r, c in q:
+        if passable[r, c]:
+            seen[r, c] = True
+    while q:
+        r, c = q.pop()
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and passable[rr, cc] and not seen[rr, cc]:
+                seen[rr, cc] = True
+                q.append((rr, cc))
+
+    filled_mask = seen & (g == bg)
+    out = g.copy()
+    out[filled_mask] = fill
+
+    obstacles = (g != bg) & (g != fill) & (g != wall)
+
+    def shadow_process(coords):
+        started = False
+        blocked = False
+        for r, c in coords:
+            if filled_mask[r, c]:
+                started = True
+            if started and obstacles[r, c]:
+                blocked = True
+                continue
+            if blocked and filled_mask[r, c]:
+                out[r, c] = bg
+                filled_mask[r, c] = False
+
+    dr, dc = scene["rad"]
+    if dr != 0 and dc == 0:
+        for c in range(w):
+            rows = range(h) if dr > 0 else range(h - 1, -1, -1)
+            shadow_process([(r, c) for r in rows])
+    elif dc != 0 and dr == 0:
+        for r in range(h):
+            cols = range(w) if dc > 0 else range(w - 1, -1, -1)
+            shadow_process([(r, c) for c in cols])
+    else:
+        raise AssertionError("expected cardinal radiate direction")
+
+    stats["new_fill"] = int(np.count_nonzero((out == fill) & (g == bg)))
+    return out, stats
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Fill each partial enclosure and let its boundary rays stop when they collide with another sprite's rays.
+
+    Input structure:
+    - The background is the most common color. The wall color is the most frequent non-background color and may form two separate funnel-like wall components.
+    - A single fill color appears as one small blob inside each wall component. Extra non-background colors are singleton obstacles.
+
+    Rule:
+    - Flood-fill from every fill blob through the interior and out through the opening, using the endpoint rays as the outer boundary just like the base task.
+    - The only changed termination rule is for those rays: instead of always running to the grid edge, a ray halts at the first cell already reached by a ray from a different wall sprite, and the older ray is truncated back to that meeting cell as well.
+    - Obstacles still stay fixed and cast background shadows behind themselves along the shared radiate direction.
+
+    Key insight: The fill is still controlled by wall geometry, but now the decisive stopping event is ray-to-ray interaction between separate sprites rather than the outer frame of the grid.
+    """
+    out, _stats = _solve_with_mode(grid, stop_on_collision=True)
+    return out
+
+
+def _sample_walls(h, force_tip_12):
+    walls = []
+    for _ in range(SPRITE_COUNT):
+        built = _build_local_wall(h, force_tip_12=force_tip_12)
+        if built is None:
+            return None
+        walls.append(built)
+    return walls
+
+
+def _choose_aligned_anchors(rad, h, w, walls):
+    row_los = []
+    row_his = []
+    col_los = []
+    col_his = []
+    for _pts, depth, gap, _tip_12 in walls:
+        rlo, rhi, clo, chi = _wall_anchor_bounds(rad, h, w, depth, gap)
+        row_los.append(rlo)
+        row_his.append(rhi)
+        col_los.append(clo)
+        col_his.append(chi)
+
+    if rad[0] != 0:
+        shared_lo = max(row_los)
+        shared_hi = min(row_his)
+        if shared_lo > shared_hi:
+            return None
+        for _ in range(40):
+            base_r = random.randint(shared_lo, shared_hi)
+            widths = [gap + 1 for _pts, _depth, gap, _tip_12 in walls]
+            spacings = [random.randint(*SPRITE_BBOX_GAP) for _ in range(SPRITE_COUNT - 1)]
+            total_w = sum(widths) + sum(spacings)
+            if total_w > w:
+                continue
+            start_c = random.randint(0, w - total_w)
+            anchors = []
+            cur_c = start_c
+            ok = True
+            for i, (_pts, depth, gap, _tip_12) in enumerate(walls):
+                _rlo, _rhi, clo, chi = _wall_anchor_bounds(rad, h, w, depth, gap)
+                r0 = base_r + random.randint(-ALIGN_JITTER, ALIGN_JITTER)
+                if not (_rlo <= r0 <= _rhi):
+                    ok = False
+                    break
+                c0 = cur_c
+                if not (clo <= c0 <= chi):
+                    ok = False
+                    break
+                anchors.append((r0, c0))
+                cur_c += gap + 1
+                if i < len(spacings):
+                    cur_c += spacings[i]
+            if ok:
+                return anchors
+        return None
+
+    shared_lo = max(col_los)
+    shared_hi = min(col_his)
+    if shared_lo > shared_hi:
+        return None
+    for _ in range(40):
+        base_c = random.randint(shared_lo, shared_hi)
+        heights = [gap + 1 for _pts, _depth, gap, _tip_12 in walls]
+        spacings = [random.randint(*SPRITE_BBOX_GAP) for _ in range(SPRITE_COUNT - 1)]
+        total_h = sum(heights) + sum(spacings)
+        if total_h > h:
+            continue
+        start_r = random.randint(0, h - total_h)
+        anchors = []
+        cur_r = start_r
+        ok = True
+        for i, (_pts, depth, gap, _tip_12) in enumerate(walls):
+            rlo, rhi, _clo, _chi = _wall_anchor_bounds(rad, h, w, depth, gap)
+            c0 = base_c + random.randint(-ALIGN_JITTER, ALIGN_JITTER)
+            if not (_clo <= c0 <= _chi):
+                ok = False
+                break
+            r0 = cur_r
+            if not (rlo <= r0 <= rhi):
+                ok = False
+                break
+            anchors.append((r0, c0))
+            cur_r += gap + 1
+            if i < len(spacings):
+                cur_r += spacings[i]
+        if ok:
+            return anchors
+    return None
+
+
+def _render_core_grid():
+    rad = random.choice([(-1, 0), (1, 0)])
+    h = random.randint(*GRID_H)
+    w = random.randint(*GRID_W)
+    force_tip_12 = random.random() < TIP_12_PROB
+
+    walls = _sample_walls(h, force_tip_12)
+    if walls is None:
+        return None
+    anchors = _choose_aligned_anchors(rad, h, w, walls)
+    if anchors is None:
+        return None
+
+    palette = random.sample(range(10), random.randint(*PALETTE_SIZE))
+    bg, wall_color, fill_color = palette[:3]
+
+    grid = np.full((h, w), bg, dtype=int)
+
+    for (local_wall, depth, _gap, _tip_12), anchor in zip(walls, anchors):
+        for u, v in local_wall:
+            r, c = _map_local(u, v, rad, anchor)
+            if grid[r, c] != bg:
+                return None
+            grid[r, c] = wall_color
+
+        interior = _local_interior(local_wall, depth)
+        wall_set = set(local_wall)
+        adjacent = [
+            p
+            for p in interior
+            if any(
+                (p[0] + dr, p[1] + dc) in wall_set
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            )
+        ]
+        seed_pool = [p for p in adjacent if p[0] >= max(1, depth - SEED_DEPTH_LOOKBACK)]
+        if not seed_pool:
+            return None
+        blob = _grow_seed_blob(random.choice(seed_pool), set(interior))
+        for u, v in blob:
+            r, c = _map_local(u, v, rad, anchor)
+            if grid[r, c] != bg:
+                return None
+            grid[r, c] = fill_color
+
+    return grid, bg, wall_color, fill_color
+
+
+def _gen_attempt():
+    built = _render_core_grid()
+    if built is None:
+        return None
+    grid, bg, wall_color, fill_color = built
+
+    try:
+        out_collision, stats_collision = _solve_with_mode(grid, stop_on_collision=True)
+        out_edge, _stats_edge = _solve_with_mode(grid, stop_on_collision=False)
+    except Exception:
+        return None
+
+    diff_pixels = int(np.count_nonzero(out_collision != out_edge))
+    if stats_collision["collision_cells"] < 1:
+        return None
+    if diff_pixels < MIN_COLLISION_DIFF:
+        return None
+    if stats_collision["new_fill"] < MIN_NEW_FILL:
+        return None
+
+    obstacle_colors = [c for c in range(10) if c not in (bg, wall_color, fill_color)]
+    n_obstacles = random.randint(0, MAX_OBSTACLES)
+    if n_obstacles:
+        candidates, fill_candidates = _find_obstacle_candidates(
+            grid,
+            bg,
+            wall_color,
+            (out_collision == fill_color) & (grid == bg),
+        )
+        _place_obstacles(n_obstacles, candidates, fill_candidates, obstacle_colors, grid)
+
+    try:
+        out_collision, stats_collision = _solve_with_mode(grid, stop_on_collision=True)
+        out_edge, _stats_edge = _solve_with_mode(grid, stop_on_collision=False)
+    except Exception:
+        return None
+
+    diff_pixels = int(np.count_nonzero(out_collision != out_edge))
+    if stats_collision["collision_cells"] < 1:
+        return None
+    if diff_pixels < MIN_COLLISION_DIFF:
+        return None
+    if stats_collision["new_fill"] < MIN_NEW_FILL:
+        return None
+    return grid
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate valid b9e38dc0 D5 input")
+
+            ```
+
+            ### 参考代码: D10/3
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/b9e38dc0/D10/3/code.py`
+
+            ```python
+            # Variant of b9e38dc0
+# Dimension: D10 — 多步处理顺序 (multi_step)
+# Change: 两步处理：第一步填充半包围区域并辐射，第二步孤立像素直线移动（第一步结果作为障碍物影响第二步）... → 链式反应：辐射触发相邻精灵
+
+import random
+
+import numpy as np
+
+from arc_utils import components_mask, get_bg, neighbors4, neighbors8
+
+
+# Design analysis for the D10 chain-reaction variant
+# --------------------------------------------------
+# variant_spec:
+#   carried_over_geometry:
+#     - Each wall sprite keeps the original task's partial-enclosure geometry:
+#       one 8-connected wall component with exactly two degree-1 endpoints and
+#       one cardinal radiate direction inferred from those endpoints.
+#     - The radiated region is still the original "wall + endpoint rays" wedge,
+#       and obstacle shadows still cut away fill behind obstacles along the
+#       sprite's radiate direction.
+#   new_objects_and_trigger:
+#     - Instead of one wall sprite, the grid contains 2-3 same-colored wall
+#       sprites. Only one sprite contains the actual fill seed blob in the input;
+#       this is the start sprite.
+#     - Every sprite has a visible opening segment: the bg cells strictly between
+#       its two endpoints. When a previously activated sprite's radiated fill
+#       reaches any cell of another sprite's opening segment, that second sprite
+#       activates.
+#     - A triggered sprite uses those reached opening cells as its local seeds,
+#       then performs its own fill+shadowed-radiate step. This may activate yet
+#       more sprites, so the solver must propagate with a queue rather than a
+#       single flood fill.
+#   concrete_example:
+#     - Original behavior: one upward-facing funnel contains a seed, so the fill
+#       floods its pocket and expands to the top border. No second object reacts.
+#     - Variant behavior: that first wedge hits the opening row of a second
+#       funnel placed higher up. The second funnel had no interior seed in the
+#       input, but once its opening is touched, it fills and emits its own wedge,
+#       which can hit a third funnel. The visual difference is a staggered,
+#       multi-hop spread instead of one independent expansion.
+#   complexity_guardrails:
+#     - Chain depth is restricted to 2 or 3 activated sprites. That is enough to
+#       make the ordering visible without turning the puzzle into an unreadable
+#       routing problem.
+#     - All activated sprites share the same wall color and fill color. The
+#       trigger is therefore geometric and positional only; no hidden ordering by
+#       color id is used.
+#     - The generator suppresses optional obstacle clutter. The solver still
+#       supports obstacle shadows, but the examples prioritize legible chain
+#       structure over unrelated noise.
+#   old-code_assumption_audit:
+#     - The original solver selected exactly one wall component and implicitly
+#       assumed all other non-bg pixels were either fill or obstacle. That is no
+#       longer safe because multiple wall components must coexist; each component
+#       needs its own geometry analysis and its own activation state.
+#     - The original flood fill always started from interior fill pixels. In the
+#       variant, later sprites start from opening cells that were filled by an
+#       earlier sprite, so the solver must accept external opening seeds.
+#     - The original shadow phase could directly erase newly filled cells in one
+#       global pass. In the variant, each sprite's shadow only limits that
+#       sprite's own propagation; earlier fill laid down by previous sprites must
+#       remain intact.
+#   placement_legality:
+#     - Generator placement guarantees that wall components are not 8-touching,
+#       all openings stay bg in the input, and each later opening lies inside the
+#       predecessor's radiated mask but outside masks from earlier non-parent
+#       sprites. That makes the chain causal and solver-detectable.
+#   visual_observability:
+#     - The start sprite is the only one with an interior seed blob, so the
+#       chain origin is obvious.
+#     - Later sprites are visibly dormant in the input and visibly become filled
+#       in the output only because a predecessor's wedge reaches their openings.
+#     - Because the generator validates parent-child activation links, examples
+#       do not silently collapse back to "one sprite independently fills itself".
+
+
+# ----------------------------- shared geometry ------------------------------
+
+GRID_H = (18, 24)
+GRID_W = (18, 24)
+
+WALL_PIXELS_MIN = 17
+WALL_PIXELS_MAX = 25
+DEPTH_VERT = (5, 9)
+DEPTH_HORIZ = (5, 9)
+GAP_VERT = (6, 7)
+GAP_HORIZ = (5, 7)
+TIP_12_PROB = 0.5
+
+OPEN_END_MARGIN = 4
+CHAIN_LEN_CHOICES = (2, 3)
+GEN_RETRIES = 400
+COMPONENT_PLACE_RETRIES = 90
+MIN_TOTAL_NEW_FILL = 28
+MIN_CHILD_NEW_FILL = 10
+
+SEED_SIZE_WEIGHTS = [1, 1, 1, 2, 2, 3, 4, 5]
+SEED_DEPTH_LOOKBACK = 3
+
+
+def _sgn(x: int) -> int:
+    return (x > 0) - (x < 0)
+
+
+def _coords_of_color(grid: np.ndarray, color: int) -> list[tuple[int, int]]:
+    pts = list(zip(*np.where(grid == color)))
+    return [(int(r), int(c)) for r, c in pts]
+
+
+def _degree1_pixels(points: set[tuple[int, int]]) -> list[tuple[int, int]]:
+    pts = set(points)
+    return [
+        (r, c)
+        for r, c in pts
+        if sum((rr, cc) in pts for rr, cc in neighbors8(r, c)) == 1
+    ]
+
+
+def _make_arm(depth: int, start_v: int, target_v: int, extra_steps: int, *, tip_12: bool = False) -> list[tuple[int, int]]:
+    sign = 1 if target_v > start_v else -1
+    n_side_steps = abs(target_v - start_v)
+    chosen_rows: list[int] = []
+    if n_side_steps:
+        if tip_12:
+            chosen_rows = [2 * (i + 1) for i in range(n_side_steps)]
+            extra_steps = 0
+        else:
+            chosen_rows = [1]
+            if n_side_steps > 1:
+                chosen_rows += random.sample(range(2, depth + 1), n_side_steps - 1)
+            chosen_rows.sort()
+
+    first_row = chosen_rows[0] if chosen_rows else 1
+    extra_rows = [r for r in chosen_rows if r != first_row]
+    random.shuffle(extra_rows)
+    orthogonal_rows = set(extra_rows[:extra_steps])
+
+    pts = [(0, start_v)]
+    u, v = 0, start_v
+    for row in range(1, depth + 1):
+        u += 1
+        if row in orthogonal_rows:
+            pts.append((u, v))
+            v += sign
+        elif row in chosen_rows:
+            v += sign
+        pts.append((u, v))
+    return pts
+
+
+def _build_local_wall(rad: tuple[int, int], h: int, w: int):
+    if rad[0]:
+        max_depth = min(DEPTH_VERT[1], h - 7)
+        if max_depth < DEPTH_VERT[0]:
+            return None
+        depth = random.randint(DEPTH_VERT[0], max_depth)
+        gap = random.randint(*GAP_VERT)
+    else:
+        max_depth = min(DEPTH_HORIZ[1], w - 7)
+        if max_depth < DEPTH_HORIZ[0]:
+            return None
+        depth = random.randint(DEPTH_HORIZ[0], max_depth)
+        gap = random.randint(GAP_HORIZ[0], min(GAP_HORIZ[1], h - 2))
+
+    if gap == 5:
+        left_bottom, right_bottom = 2, 3
+    elif gap == 6:
+        left_bottom, right_bottom = 2, 4
+    else:
+        left_bottom, right_bottom = random.choice([(2, 5), (3, 4)])
+
+    bridge_extra = max(0, right_bottom - left_bottom - 1)
+    base_count = 2 * (depth + 1) + bridge_extra
+    max_extra_l = max(0, left_bottom - 1)
+    max_extra_r = max(0, gap - right_bottom - 1)
+    min_extra = max(0, WALL_PIXELS_MIN - base_count)
+    max_extra = min(max_extra_l + max_extra_r, WALL_PIXELS_MAX - base_count)
+    if min_extra > max_extra:
+        return None
+
+    extra = random.randint(min_extra, max_extra)
+    extra_l = random.randint(max(0, extra - max_extra_r), min(max_extra_l, extra))
+    extra_r = extra - extra_l
+
+    max_n_side = max(left_bottom, gap - right_bottom)
+    tip_12 = depth >= 2 * max_n_side and random.random() < TIP_12_PROB
+    left = _make_arm(depth, 0, left_bottom, extra_l, tip_12=tip_12)
+    right = _make_arm(depth, gap, right_bottom, extra_r, tip_12=tip_12)
+    pts = set(left) | set(right)
+    for v in range(left_bottom, right_bottom + 1):
+        pts.add((depth, v))
+
+    while len(pts) < WALL_PIXELS_MIN:
+        candidates = [
+            (u, v)
+            for u in range(max(0, depth - 3), depth + 1)
+            for v in range(gap + 1)
+            if (u, v) not in pts
+            and sum(
+                (uu, vv) in pts
+                for uu in range(u - 1, u + 2)
+                for vv in range(v - 1, v + 2)
+                if (uu, vv) != (u, v)
+            )
+            >= 2
+        ]
+        random.shuffle(candidates)
+        added = False
+        for p in candidates:
+            trial = pts | {p}
+            if len(trial) <= WALL_PIXELS_MAX and len(_degree1_pixels(trial)) == 2:
+                pts = trial
+                added = True
+                break
+        if not added:
+            return None
+
+    if not (WALL_PIXELS_MIN <= len(pts) <= WALL_PIXELS_MAX):
+        return None
+    if len(_degree1_pixels(pts)) != 2:
+        return None
+    return pts, depth, gap
+
+
+def _map_local(u: int, v: int, rad: tuple[int, int], anchor: tuple[int, int]) -> tuple[int, int]:
+    r0, c0 = anchor
+    if rad == (-1, 0):
+        return r0 + u, c0 + v
+    if rad == (1, 0):
+        return r0 - u, c0 + v
+    if rad == (0, -1):
+        return r0 + v, c0 + u
+    return r0 + v, c0 - u
+
+
+def _map_points(points: list[tuple[int, int]] | set[tuple[int, int]], rad: tuple[int, int], anchor: tuple[int, int]) -> list[tuple[int, int]]:
+    return [_map_local(u, v, rad, anchor) for u, v in points]
+
+
+def _local_interior(wall: set[tuple[int, int]], depth: int) -> list[tuple[int, int]]:
+    by_row: dict[int, list[int]] = {}
+    for u, v in wall:
+        by_row.setdefault(u, []).append(v)
+    interior: list[tuple[int, int]] = []
+    for u in range(1, depth):
+        if u not in by_row or len(by_row[u]) < 2:
+            continue
+        lo, hi = min(by_row[u]), max(by_row[u])
+        for v in range(lo + 1, hi):
+            if (u, v) not in wall:
+                interior.append((u, v))
+    return interior
+
+
+def _grow_seed_blob(seed: tuple[int, int], interior_set: set[tuple[int, int]]) -> set[tuple[int, int]]:
+    blob = {seed}
+    target_size = random.choice(SEED_SIZE_WEIGHTS)
+    frontier = [seed]
+    while len(blob) < target_size and frontier:
+        u, v = frontier.pop(random.randrange(len(frontier)))
+        nbrs = [(u - 1, v), (u + 1, v), (u, v - 1), (u, v + 1)]
+        random.shuffle(nbrs)
+        for q in nbrs:
+            if q in interior_set and q not in blob:
+                blob.add(q)
+                frontier.append(q)
+                if len(blob) >= target_size:
+                    break
+    return blob
+
+
+def _place_anchor(rad: tuple[int, int], h: int, w: int, depth: int, gap: int) -> tuple[int, int]:
+    if rad == (-1, 0):
+        return random.randint(OPEN_END_MARGIN, h - depth - 3), random.randint(1, w - gap - 2)
+    if rad == (1, 0):
+        return random.randint(depth + 2, h - OPEN_END_MARGIN - 1), random.randint(1, w - gap - 2)
+    if rad == (0, -1):
+        return random.randint(1, h - gap - 2), random.randint(OPEN_END_MARGIN, w - depth - 3)
+    return random.randint(1, h - gap - 2), random.randint(depth + 2, w - OPEN_END_MARGIN - 1)
+
+
+def _in_bounds_all(points: list[tuple[int, int]], h: int, w: int) -> bool:
+    return all(0 <= r < h and 0 <= c < w for r, c in points)
+
+
+def _opening_cells_from_endpoints(endpoints: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    assert len(endpoints) == 2
+    (r1, c1), (r2, c2) = sorted(endpoints)
+    if r1 == r2:
+        lo, hi = sorted((c1, c2))
+        return [(r1, c) for c in range(lo + 1, hi)]
+    if c1 == c2:
+        lo, hi = sorted((r1, r2))
+        return [(r, c1) for r in range(lo + 1, hi)]
+    dr = _sgn(r2 - r1)
+    dc = _sgn(c2 - c1)
+    out = []
+    rr, cc = r1 + dr, c1 + dc
+    while (rr, cc) != (r2, c2):
+        out.append((rr, cc))
+        rr += dr
+        cc += dc
+    return out
+
+
+def _component_info(comp: set[tuple[int, int]], h: int, w: int) -> dict:
+    comp_mask = np.zeros((h, w), dtype=bool)
+    for r, c in comp:
+        comp_mask[r, c] = True
+
+    def comp_neighbors(r: int, c: int) -> list[tuple[int, int]]:
+        out = []
+        for rr, cc in neighbors8(r, c):
+            if 0 <= rr < h and 0 <= cc < w and comp_mask[rr, cc]:
+                out.append((rr, cc))
+        return out
+
+    endpoints = [(r, c) for r, c in comp if len(comp_neighbors(r, c)) == 1]
+    assert len(endpoints) == 2, "expected exactly two endpoints"
+
+    def outward_dir(ep: tuple[int, int]) -> tuple[tuple[int, int], bool]:
+        n1 = comp_neighbors(*ep)[0]
+        d1 = (_sgn(n1[0] - ep[0]), _sgn(n1[1] - ep[1]))
+        d_use = d1
+        is_12 = False
+        n2s = [p for p in comp_neighbors(*n1) if p != ep]
+        if n2s:
+            n2 = n2s[0]
+            d2 = (_sgn(n2[0] - n1[0]), _sgn(n2[1] - n1[1]))
+            if (d1[0] == 0) ^ (d1[1] == 0) and d2[0] != 0 and d2[1] != 0:
+                d_use = d2
+                is_12 = True
+        return (-d_use[0], -d_use[1]), is_12
+
+    out_info = [outward_dir(ep) for ep in endpoints]
+    out_dirs = [d for d, _ in out_info]
+    tip_12 = [f for _, f in out_info]
+    rad = (_sgn(sum(d[0] for d in out_dirs)), _sgn(sum(d[1] for d in out_dirs)))
+    assert rad in {(-1, 0), (1, 0), (0, -1), (0, 1)}, "expected cardinal radiate direction"
+
+    barrier = comp_mask.copy()
+
+    def add_ray(start: tuple[int, int], d: tuple[int, int]) -> None:
+        rr, cc = start
+        while True:
+            rr += d[0]
+            cc += d[1]
+            if not (0 <= rr < h and 0 <= cc < w):
+                break
+            barrier[rr, cc] = True
+
+    def add_ray_12(start: tuple[int, int], d: tuple[int, int]) -> None:
+        rr, cc = start
+        step = 0
+        while True:
+            step += 1
+            if step % 2 == 1:
+                rr += d[0]
+                cc += d[1]
+            else:
+                if rad[0] != 0:
+                    rr += d[0]
+                else:
+                    cc += d[1]
+            if not (0 <= rr < h and 0 <= cc < w):
+                break
+            barrier[rr, cc] = True
+
+    for ep, d, is_12 in zip(endpoints, out_dirs, tip_12):
+        if is_12:
+            add_ray_12(ep, d)
+        else:
+            add_ray(ep, d)
+
+    opening = _opening_cells_from_endpoints(endpoints)
+    return {
+        "points": frozenset(comp),
+        "mask": comp_mask,
+        "endpoints": tuple(sorted(endpoints)),
+        "opening": tuple(opening),
+        "rad": rad,
+        "barrier": barrier,
+    }
+
+
+def _reachable_from_seeds(out: np.ndarray, bg: int, fill: int, barrier: np.ndarray, seeds: list[tuple[int, int]]) -> np.ndarray:
+    passable = (~barrier) & ((out == bg) | (out == fill))
+    seen = np.zeros_like(passable, dtype=bool)
+    q: list[tuple[int, int]] = []
+    for r, c in seeds:
+        if 0 <= r < out.shape[0] and 0 <= c < out.shape[1] and passable[r, c] and not seen[r, c]:
+            seen[r, c] = True
+            q.append((r, c))
+    while q:
+        r, c = q.pop()
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < out.shape[0] and 0 <= cc < out.shape[1] and passable[rr, cc] and not seen[rr, cc]:
+                seen[rr, cc] = True
+                q.append((rr, cc))
+    return seen
+
+
+def _apply_shadow(orig: np.ndarray, reach: np.ndarray, *, bg: int, fill: int, wall: int, rad: tuple[int, int]) -> np.ndarray:
+    out = reach.copy()
+    obstacles = (orig != bg) & (orig != fill) & (orig != wall)
+    h, w = orig.shape
+
+    def shadow_process(coords: list[tuple[int, int]]) -> None:
+        started = False
+        blocked = False
+        for r, c in coords:
+            if out[r, c]:
+                started = True
+            if started and obstacles[r, c]:
+                blocked = True
+                continue
+            if blocked and out[r, c]:
+                out[r, c] = False
+
+    dr, dc = rad
+    if dr != 0:
+        for c in range(w):
+            rows = range(h) if dr > 0 else range(h - 1, -1, -1)
+            shadow_process([(r, c) for r in rows])
+    else:
+        for r in range(h):
+            cols = range(w) if dc > 0 else range(w - 1, -1, -1)
+            shadow_process([(r, c) for c in cols])
+    return out
+
+
+def _simulate_chain(grid: np.ndarray, *, want_details: bool = False):
+    g = np.array(grid, copy=True)
+    h, w = g.shape
+    bg = int(get_bg(g))
+    vals = [int(v) for v in np.unique(g)]
+    non_bg = [v for v in vals if v != bg]
+    assert non_bg, "expected at least one non-background color"
+
+    wall = max(non_bg, key=lambda c: int((g == c).sum()))
+    wall_mask = g == wall
+    comps = [set((int(r), int(c)) for r, c in pts) for pts in components_mask(wall_mask, connectivity=8)]
+    assert comps, "expected wall components"
+
+    other_colors = [c for c in non_bg if c != wall]
+    assert other_colors, "expected a fill color"
+
+    wall_points = [p for comp in comps for p in comp]
+
+    def min_dist_to_wall(color: int) -> tuple[int, int]:
+        pts = _coords_of_color(g, color)
+        best_d = 10**9
+        for r, c in pts:
+            for wr, wc in wall_points:
+                d = abs(r - wr) + abs(c - wc)
+                if d < best_d:
+                    best_d = d
+                    if best_d == 0:
+                        return 0, len(pts)
+        return best_d, len(pts)
+
+    fill = min(other_colors, key=lambda c: (min_dist_to_wall(c)[0], min_dist_to_wall(c)[1]))
+    fill_pos = _coords_of_color(g, fill)
+    if not fill_pos:
+        return g if not want_details else (g, {})
+
+    def comp_min_dist(comp: set[tuple[int, int]]) -> int:
+        best_d = 10**9
+        for r, c in fill_pos:
+            for wr, wc in comp:
+                d = abs(r - wr) + abs(c - wc)
+                if d < best_d:
+                    best_d = d
+                    if best_d == 0:
+                        return 0
+        return best_d
+
+    comp_infos = [_component_info(comp, h, w) for comp in comps]
+    comp_index_by_points = {info["points"]: idx for idx, info in enumerate(comp_infos)}
+    start_idx = min(range(len(comps)), key=lambda i: (comp_min_dist(comps[i]), -len(comps[i])))
+
+    out = g.copy()
+    activated: set[int] = {start_idx}
+    activation_order = [start_idx]
+    parent: dict[int, int | None] = {start_idx: None}
+    queue: list[tuple[int, list[tuple[int, int]]]] = [(start_idx, fill_pos[:])]
+    propagation_masks = [np.zeros((h, w), dtype=bool) for _ in comps]
+
+    while queue:
+        idx, seeds = queue.pop(0)
+        info = comp_infos[idx]
+        reach = _reachable_from_seeds(out, bg, fill, info["barrier"], seeds)
+        prop = _apply_shadow(g, reach, bg=bg, fill=fill, wall=wall, rad=info["rad"])
+        propagation_masks[idx] = prop
+        new_fill = prop & (out == bg)
+        out[new_fill] = fill
+
+        for j, other in enumerate(comp_infos):
+            if j in activated:
+                continue
+            hits = [(r, c) for r, c in other["opening"] if prop[r, c]]
+            if hits:
+                activated.add(j)
+                activation_order.append(j)
+                parent[j] = idx
+                queue.append((j, hits))
+
+    if not want_details:
+        return out
+    return out, {
+        "bg": bg,
+        "wall": wall,
+        "fill": fill,
+        "components": comp_infos,
+        "component_index_by_points": comp_index_by_points,
+        "start_idx": start_idx,
+        "activated": activated,
+        "activation_order": activation_order,
+        "parent": parent,
+        "propagation_masks": propagation_masks,
+    }
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Activate a chain of wall sprites by letting one sprite's radiation ignite another sprite's opening.
+
+    Input structure:
+    - bg is the most common color, and the dominant non-bg color forms several separate partial-wall sprites.
+    - Only one sprite contains the fill-color seed blob near its closed end; later sprites begin empty but expose visible opening cells between their endpoints.
+
+    Rule:
+    - The seeded sprite fills its enclosed region and radiates outward exactly as in the original funnel task, including obstacle shadows.
+    - If that radiated fill reaches another sprite's opening, the touched opening cells become that sprite's new seeds; the sprite then fills and radiates too, and this repeats as a chain reaction.
+
+    Key insight:
+    - The puzzle is no longer solved by analyzing one funnel in isolation: you must identify the start sprite, track which opening each radiation wedge reaches next, and follow the resulting activation order across multiple sprites.
+    """
+    return _simulate_chain(grid, want_details=False)
+
+
+# ------------------------------ generator -----------------------------------
+
+def _make_component(rad: tuple[int, int], h: int, w: int):
+    built = _build_local_wall(rad, h, w)
+    if built is None:
+        return None
+    local_wall, depth, gap = built
+    interior = _local_interior(local_wall, depth)
+    return {
+        "rad": rad,
+        "wall": local_wall,
+        "depth": depth,
+        "gap": gap,
+        "interior": interior,
+        "opening_local": [(0, v) for v in range(1, gap)],
+    }
+
+
+def _mapped_component_cells(comp_def: dict, anchor: tuple[int, int]) -> dict:
+    rad = comp_def["rad"]
+    wall = _map_points(comp_def["wall"], rad, anchor)
+    interior = _map_points(comp_def["interior"], rad, anchor)
+    opening = _map_points(comp_def["opening_local"], rad, anchor)
+    return {"wall": wall, "interior": interior, "opening": opening}
+
+
+def _wall_is_separate(existing_walls: set[tuple[int, int]], wall: list[tuple[int, int]]) -> bool:
+    for r, c in wall:
+        for rr in range(r - 1, r + 2):
+            for cc in range(c - 1, c + 2):
+                if (rr, cc) in existing_walls:
+                    return False
+    return True
+
+
+def _all_bg(grid: np.ndarray, cells: list[tuple[int, int]]) -> bool:
+    return all(grid[r, c] == grid[0, 0] or True for r, c in cells)
+
+
+def _place_start_component(grid: np.ndarray, wall_color: int, fill_color: int):
+    h, w = grid.shape
+    for _ in range(120):
+        rad = random.choice([(-1, 0), (1, 0), (0, -1), (0, 1)])
+        comp_def = _make_component(rad, h, w)
+        if comp_def is None:
+            continue
+        anchor = _place_anchor(rad, h, w, comp_def["depth"], comp_def["gap"])
+        mapped = _mapped_component_cells(comp_def, anchor)
+        footprint = mapped["wall"] + mapped["interior"] + mapped["opening"]
+        if not _in_bounds_all(footprint, h, w):
+            continue
+        if any(grid[r, c] != grid[0, 0] for r, c in footprint):
+            continue
+
+        wall_set = set(comp_def["wall"])
+        adjacent = [
+            p
+            for p in comp_def["interior"]
+            if any((p[0] + dr, p[1] + dc) in wall_set for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)])
+        ]
+        seed_pool = [p for p in adjacent if p[0] >= max(1, comp_def["depth"] - SEED_DEPTH_LOOKBACK)]
+        if not seed_pool:
+            continue
+        blob_local = _grow_seed_blob(random.choice(seed_pool), set(comp_def["interior"]))
+        blob = _map_points(blob_local, rad, anchor)
+        if any((r, c) in mapped["wall"] for r, c in blob):
+            continue
+
+        for r, c in mapped["wall"]:
+            grid[r, c] = wall_color
+        for r, c in blob:
+            if grid[r, c] != grid[0, 0]:
+                break
+            grid[r, c] = fill_color
+        else:
+            return {
+                "rad": rad,
+                "anchor": anchor,
+                "wall_points": frozenset(mapped["wall"]),
+            }
+
+        for r, c in mapped["wall"]:
+            grid[r, c] = grid[0, 0]
+        for r, c in blob:
+            if grid[r, c] == fill_color:
+                grid[r, c] = grid[0, 0]
+    return None
+
+
+def _run_positions(mask: np.ndarray, vertical: bool, length: int) -> list[tuple[int, int]]:
+    h, w = mask.shape
+    out: list[tuple[int, int]] = []
+    if vertical:
+        for c in range(w):
+            start = 0
+            while start < h:
+                while start < h and not mask[start, c]:
+                    start += 1
+                end = start
+                while end < h and mask[end, c]:
+                    end += 1
+                if end - start >= length:
+                    for r0 in range(start, end - length + 1):
+                        out.append((r0, c))
+                start = end + 1
+    else:
+        for r in range(h):
+            start = 0
+            while start < w:
+                while start < w and not mask[r, start]:
+                    start += 1
+                end = start
+                while end < w and mask[r, end]:
+                    end += 1
+                if end - start >= length:
+                    for c0 in range(start, end - length + 1):
+                        out.append((r, c0))
+                start = end + 1
+    return out
+
+
+def _anchor_from_opening_start(rad: tuple[int, int], opening_start: tuple[int, int]) -> tuple[int, int]:
+    r, c = opening_start
+    if rad[0]:
+        return r, c - 1
+    return r - 1, c
+
+
+def _candidate_anchors_from_parent_mask(parent_mask: np.ndarray, forbidden_mask: np.ndarray, rad: tuple[int, int], gap: int) -> list[tuple[int, int]]:
+    opening_len = gap - 1
+    usable = parent_mask & (~forbidden_mask)
+    vertical = rad[0] == 0
+    starts = _run_positions(usable, vertical, opening_len)
+    anchors = [_anchor_from_opening_start(rad, start) for start in starts]
+    random.shuffle(anchors)
+    return anchors
+
+
+def _paint_wall(grid: np.ndarray, wall_points: list[tuple[int, int]], color: int) -> None:
+    for r, c in wall_points:
+        grid[r, c] = color
+
+
+def _component_index_for_points(details: dict, wall_points: frozenset[tuple[int, int]]) -> int:
+    return details["component_index_by_points"][wall_points]
+
+
+def _try_add_component(grid: np.ndarray, *, wall_color: int, prev_wall_points: frozenset[tuple[int, int]], earlier_wall_points: list[frozenset[tuple[int, int]]]):
+    h, w = grid.shape
+    current_out, details = _simulate_chain(grid, want_details=True)
+    prev_idx = _component_index_for_points(details, prev_wall_points)
+    parent_mask = details["propagation_masks"][prev_idx]
+    forbidden_mask = np.zeros((h, w), dtype=bool)
+    for pts in earlier_wall_points:
+        idx = _component_index_for_points(details, pts)
+        if idx != prev_idx:
+            forbidden_mask |= details["propagation_masks"][idx]
+
+    existing_walls = set()
+    for pts in earlier_wall_points:
+        existing_walls |= set(pts)
+
+    for _ in range(COMPONENT_PLACE_RETRIES):
+        rad = random.choice([(-1, 0), (1, 0), (0, -1), (0, 1)])
+        comp_def = _make_component(rad, h, w)
+        if comp_def is None:
+            continue
+        anchors = _candidate_anchors_from_parent_mask(parent_mask, forbidden_mask, rad, comp_def["gap"])
+        if not anchors:
+            continue
+        for anchor in anchors[:20]:
+            mapped = _mapped_component_cells(comp_def, anchor)
+            footprint = mapped["wall"] + mapped["interior"] + mapped["opening"]
+            if not _in_bounds_all(footprint, h, w):
+                continue
+            if any(grid[r, c] != grid[0, 0] for r, c in footprint):
+                continue
+            if not _wall_is_separate(existing_walls, mapped["wall"]):
+                continue
+            opening = mapped["opening"]
+            if not all(parent_mask[r, c] and not forbidden_mask[r, c] for r, c in opening):
+                continue
+
+            temp = grid.copy()
+            _paint_wall(temp, mapped["wall"], wall_color)
+            try:
+                temp_out, temp_details = _simulate_chain(temp, want_details=True)
+            except Exception:
+                continue
+
+            new_wall_points = frozenset(mapped["wall"])
+            if new_wall_points not in temp_details["component_index_by_points"]:
+                continue
+            new_idx = _component_index_for_points(temp_details, new_wall_points)
+            if new_idx not in temp_details["activated"]:
+                continue
+            if temp_details["parent"].get(new_idx) != prev_idx:
+                continue
+            if len(temp_details["activated"]) != len(earlier_wall_points) + 1:
+                continue
+            child_new_fill = int((temp_details["propagation_masks"][new_idx] & (temp == temp_details["bg"])).sum())
+            total_added_vs_current = int((temp_out != current_out).sum())
+            if child_new_fill < MIN_CHILD_NEW_FILL or total_added_vs_current < MIN_CHILD_NEW_FILL:
+                continue
+
+            _paint_wall(grid, mapped["wall"], wall_color)
+            return {"rad": rad, "anchor": anchor, "wall_points": new_wall_points}
+    return None
+
+
+def _gen_attempt():
+    h = random.randint(*GRID_H)
+    w = random.randint(*GRID_W)
+    bg, wall_color, fill_color = random.sample(range(10), 3)
+    chain_len = random.choice(CHAIN_LEN_CHOICES)
+
+    grid = np.full((h, w), bg, dtype=int)
+    start = _place_start_component(grid, wall_color, fill_color)
+    if start is None:
+        return None
+
+    placed = [start["wall_points"]]
+    prev = start["wall_points"]
+    for _ in range(chain_len - 1):
+        added = _try_add_component(grid, wall_color=wall_color, prev_wall_points=prev, earlier_wall_points=placed)
+        if added is None:
+            return None
+        placed.append(added["wall_points"])
+        prev = added["wall_points"]
+
+    try:
+        out, details = _simulate_chain(grid, want_details=True)
+    except Exception:
+        return None
+
+    if len(details["activated"]) != chain_len:
+        return None
+    new_fill = (out == details["fill"]) & (grid == details["bg"])
+    if int(new_fill.sum()) < MIN_TOTAL_NEW_FILL:
+        return None
+    if not (new_fill[0, :].any() or new_fill[-1, :].any() or new_fill[:, 0].any() or new_fill[:, -1].any()):
+        return None
+    start_info = details["components"][details["start_idx"]]
+    seeds = _coords_of_color(grid, details["fill"])
+    base_reach = _reachable_from_seeds(grid.copy(), details["bg"], details["fill"], start_info["barrier"], seeds)
+    base_prop = _apply_shadow(grid, base_reach, bg=details["bg"], fill=details["fill"], wall=details["wall"], rad=start_info["rad"])
+    base = grid.copy()
+    base[base_prop & (base == details["bg"])] = details["fill"]
+    if int((out != base).sum()) < MIN_CHILD_NEW_FILL:
+        return None
+    return grid
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate valid D10 chain-reaction input")
+
+            ```
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/b9e38dc0/23/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/b9e38dc0.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/b9e38dc0/23/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of b9e38dc0 (index 23)
+    # combo_spec: D5/2+D10/3+D12/2
+    # Name: 射线交汇终止+链式反应+开口相对配对
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/b9e38dc0/23` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/e12f9a14.py` — 参考任务 e12f9a14 的 solver（D5/2 的灵感来源）
+    - `/home/lixinyu/snap/new/arc2_solver_select/5961cc34.py` — 参考任务 5961cc34 的 solver（D10/3 的灵感来源）
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 7:01 AM.
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 7:01 AM.

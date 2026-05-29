@@ -1,0 +1,358 @@
+# Variant of 58490d8a
+# Dimension: D15 — 圆点颜色 (transform)
+# Change: 每行圆点的颜色与该行关键色相同... → 所有圆点使用统一颜色
+
+from __future__ import annotations
+
+import random
+from functools import lru_cache
+from itertools import combinations
+
+import numpy as np
+
+from arc_utils import bbox_coords, components_mask, crop_bbox, get_bg, label_mask, paste, random_free_location
+
+
+# -----------------------------------------------------------------------------
+# Design analysis for the D15 variant
+#
+# variant_spec:
+#   core_change:
+#     dimension: D15
+#     old_behavior: each tally dot uses the same color as the key on that row
+#     new_behavior: every tally dot, on every row, is recolored to one fixed tally
+#       color; row identity now comes only from vertical position inside the legend
+#       box, not from the dot color itself
+#   concrete_pixel_effect:
+#     input:
+#       unchanged_layout:
+#         - a black legend box contains one colored key pixel on each odd row
+#         - outside the box, scattered connected sprites of those key colors encode
+#           the counts
+#       unchanged_object_rules:
+#         - legend placement, sprite spacing, sprite sizes, distractors, and count
+#           ranges stay aligned with the original task
+#     output:
+#       - same black canvas size as the legend box
+#       - on each key row, place one dot per counted component at columns
+#         key_col, key_col+2, key_col+4, ...
+#       - every dot uses the same fixed color TALLY_COLOR, including the first dot
+#         that overwrites the original key-pixel location
+#   behavior_trace:
+#     small_example:
+#       - key rows inside the legend hold colors [blue, red, yellow]
+#       - outside counts are [3, 1, 2]
+#       - original output rows would be [blue blue blue], [red], [yellow yellow]
+#       - new output rows become [maroon maroon maroon], [maroon],
+#         [maroon maroon]
+#       - the counted quantity is unchanged; only the rendering color is shared
+#         across all rows
+#   complexity_calibration:
+#     - the transform is not simplified to a trivial recolor because counting still
+#       depends on per-color connected components outside the legend
+#     - to keep the D15 change visually obvious, the fixed tally color is excluded
+#       from all input roles, so the new output cannot accidentally look identical
+#       to the original task
+#     - counts remain in the original 1..5 range and key count remains 2..4, which
+#       preserves repeated evidence without adding unrelated branching
+#   old_solver_dependency_audit:
+#     - legend detection via the largest black component with non-black pixels in
+#       its bbox does not rely on tally color and remains valid
+#     - key-column detection via the leftmost non-black column inside that bbox also
+#       remains valid because input legend pixels are unchanged
+#     - per-key component counting outside the legend still relies on the key color
+#       and remains valid
+#     - the only invalid old assumption is the drawing line
+#       out[rr, key_col + 2*i] = key_color
+#       because D15 requires a fixed tally color instead
+#   placement_legality:
+#     - the generator keeps the original output-first pipeline
+#     - legend width is still sized from max_count, so every tally sequence fits
+#     - sprite placement still uses random_free_location with 8-connected padding,
+#       preventing overlap and preventing accidental contact with the legend box
+#     - the fixed tally color appears only in the output, never in the input, so it
+#       cannot interfere with solver-side object counting
+#   observability_and_cleanliness:
+#     - humans can still align each output row to the corresponding input key row by
+#       row position inside the legend box
+#     - using one reserved tally color makes the change immediately visible across
+#       examples: output rows no longer inherit the key colors
+#     - because the legend box stays isolated and the output is still a clean black
+#       canvas with evenly spaced dots, visual clutter stays low
+#   new_solver_assumptions_and_generator_guarantees:
+#     - assumption: at least one key row exists
+#       guarantee: KEY_COUNT_RANGE stays at 2..4
+#     - assumption: the fixed tally color differs from all key colors
+#       guarantee: input colors are sampled from INPUT_COLOR_POOL, which excludes
+#         TALLY_COLOR
+#     - assumption: counts are positive so each row shows at least one tally dot
+#       guarantee: TARGET_COUNT_RANGE stays at 1..5
+# -----------------------------------------------------------------------------
+
+
+BLACK = 0
+TALLY_COLOR = 9
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Count outside objects and encode the totals inside the legend box.
+
+    Input structure:
+    - A solid black rectangular legend box contains one colored key pixel on each active row.
+    - Outside that box, separate same-colored sprites are scattered for each key color.
+
+    Rule:
+    - For each key row, count the connected components of that row's key color outside the legend.
+    - Repaint the legend-sized output as black and place one evenly spaced tally dot per counted component, but use one shared tally color for every row.
+
+    Key insight: The key pixels still tell you which outside color to count, while the output discards those colors and keeps only row position plus dot count.
+    """
+    g = np.array(grid, dtype=int)
+    H, W = g.shape
+    _bg = int(get_bg(g))
+
+    # STEP 1) Find the legend bbox: largest black CC whose bbox contains some non-black pixels.
+    best = None  # (area, bbox)
+    for coords in components_mask(g == BLACK, connectivity=8):
+        if coords.size == 0:
+            continue
+        b = bbox_coords(coords)
+        sub = crop_bbox(g, b)
+        if (sub != BLACK).any():
+            area = int(coords.shape[0])
+            cand = (area, tuple(map(int, b)))
+            if best is None or cand[0] > best[0]:
+                best = cand
+
+    assert best is not None
+
+    r0, c0, r1, c1 = map(int, best[1])
+    box = crop_bbox(g, (r0, c0, r1, c1))
+    bh, bw = map(int, box.shape)
+
+    # STEP 2) Inside the legend bbox, find the key column:
+    # leftmost column with any non-black pixels (the "key pixels").
+    key_col = None
+    for cc in range(bw):
+        if (box[:, int(cc)] != BLACK).any():
+            key_col = int(cc)
+            break
+    if key_col is None:
+        return np.zeros_like(box)
+
+    keys = [(int(rr), int(box[int(rr), int(key_col)])) for rr in range(bh) if int(box[int(rr), int(key_col)]) != BLACK]
+    keys.sort(key=lambda t: int(t[0]))
+
+    outside = np.ones((H, W), dtype=bool)
+    outside[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = False
+    out = np.zeros((bh, bw), dtype=int)
+
+    # STEP 3/4) Count CCs of each key color outside the legend, then draw one shared-color tally dot per CC.
+    for rr, col in keys:
+        mask = (g == int(col)) & outside
+        _labc, nc = label_mask(mask, connectivity=8)
+        for i in range(int(nc)):
+            cc = int(key_col + 2 * i)
+            if 0 <= cc < bw:
+                out[int(rr), int(cc)] = TALLY_COLOR
+
+    return out
+
+
+# --------------- generator (o5x) ---------------
+
+# Palette and legend color choices.
+INPUT_COLOR_POOL = tuple(range(1, TALLY_COLOR))
+DISTRACTOR_PROB = 0.5
+
+# Key rows and tally dimensions.
+KEY_COUNT_RANGE = (2, 4)
+TARGET_COUNT_RANGE = (1, 5)
+KEY_ROW_FIRST = 1
+KEY_ROW_STEP = 2
+KEY_COLUMN = 1
+TALLY_COL_STEP = 2
+LEGEND_HEIGHT_TAIL = 1
+LEGEND_WIDTH_TAIL = 1
+LEGEND_SLACK_RANGE = (0, 3)
+
+# Canvas size and legend placement bounds.
+GRID_HEIGHT_RANGE = (20, 25)
+GRID_WIDTH_RANGE = (20, 25)
+LEGEND_EDGE_MARGIN = 2
+
+# Sprite shape and placement constraints.
+SPRITE_AREA_RANGE = (4, 7)
+SPRITE_BBOXES = ((2, 2), (2, 3), (3, 2), (3, 3))
+SPRITE_CONNECTIVITY = 8
+SPRITE_PADDING = 1
+SPRITE_PADDING_CONNECTIVITY = 8
+
+# Retry budget for rejection sampling.
+GENERATION_ATTEMPTS = 300
+
+
+def _randint(bounds: tuple[int, int]) -> int:
+    """Return an inclusive randint from a configured (low, high) pair."""
+    return random.randint(bounds[0], bounds[1])
+
+
+@lru_cache(maxsize=None)
+def _valid_masks(h: int, w: int, area: int) -> tuple[np.ndarray, ...]:
+    """Return connected masks that span all four sides of the sprite bbox."""
+    masks = []
+    for cells in combinations(range(h * w), area):
+        mask = np.zeros((h, w), dtype=bool)
+        for cell in cells:
+            mask[cell // w, cell % w] = True
+        spans_edges = mask[0, :].any() and mask[-1, :].any() and mask[:, 0].any() and mask[:, -1].any()
+        if not spans_edges:
+            continue
+        _, n = label_mask(mask, connectivity=SPRITE_CONNECTIVITY)
+        if n == 1:
+            masks.append(mask)
+    return tuple(masks)
+
+
+def _make_sprite(color: int, bg: int) -> np.ndarray:
+    """Sample one connected same-color sprite drawn on the background color."""
+    area = _randint(SPRITE_AREA_RANGE)
+    dims = []
+    for h, w in SPRITE_BBOXES:
+        if h * w >= area and _valid_masks(h, w, area):
+            dims.append((h, w))
+    h, w = random.choice(dims)
+    mask = random.choice(_valid_masks(h, w, area))
+    sprite = np.full((h, w), int(bg), dtype=int)
+    sprite[mask] = int(color)
+    return sprite
+
+
+def _sample_palette() -> tuple[int, list[int], int | None]:
+    """Choose background, key colors, and optional distractor color, reserving TALLY_COLOR for output only."""
+    colors = list(INPUT_COLOR_POOL)
+    bg = random.choice(colors)
+
+    k = _randint(KEY_COUNT_RANGE)
+    remaining = [c for c in colors if c != bg]
+    key_colors = random.sample(remaining, k)
+    remaining = [c for c in remaining if c not in key_colors]
+    distractor_color = random.choice(remaining) if remaining and random.random() < DISTRACTOR_PROB else None
+    return bg, key_colors, distractor_color
+
+
+def _sample_counts(k: int) -> list[int]:
+    """Sample the target outside-component count for each key color."""
+    return [_randint(TARGET_COUNT_RANGE) for _ in range(k)]
+
+
+def _legend_shape(k: int, max_count: int) -> tuple[int, int]:
+    """Return legend height and width for the key count and largest tally."""
+    bh = KEY_ROW_STEP * k + LEGEND_HEIGHT_TAIL
+    bw = TALLY_COL_STEP * max_count + LEGEND_WIDTH_TAIL + _randint(LEGEND_SLACK_RANGE)
+    return bh, bw
+
+
+def _key_row(i: int) -> int:
+    """Map a zero-based key index to its row inside the legend/output box."""
+    return KEY_ROW_FIRST + KEY_ROW_STEP * i
+
+
+def _build_expected(key_colors: list[int], counts: list[int]) -> np.ndarray:
+    """Render the black output tally canvas implied by key colors and counts."""
+    del key_colors
+    max_count = max(counts)
+    bh, bw = _legend_shape(len(counts), max_count)
+
+    expected = np.full((bh, bw), BLACK, dtype=int)
+    for i, count in enumerate(counts):
+        rr = _key_row(i)
+        for j in range(count):
+            expected[rr, KEY_COLUMN + TALLY_COL_STEP * j] = TALLY_COLOR
+    return expected
+
+
+def _build_legend(shape: tuple[int, int], key_colors: list[int]) -> np.ndarray:
+    """Return a black legend patch with only the key-column pixels filled."""
+    legend = np.full(shape, BLACK, dtype=int)
+    for i, color in enumerate(key_colors):
+        legend[_key_row(i), KEY_COLUMN] = int(color)
+    return legend
+
+
+def _new_grid_with_legend(bg: int, legend: np.ndarray) -> np.ndarray | None:
+    """Sample a grid and paste the legend away from all canvas edges."""
+    bh, bw = map(int, legend.shape)
+    H = _randint(GRID_HEIGHT_RANGE)
+    W = _randint(GRID_WIDTH_RANGE)
+    min_h = bh + 2 * LEGEND_EDGE_MARGIN
+    min_w = bw + 2 * LEGEND_EDGE_MARGIN
+    if H < min_h or W < min_w:
+        return None
+
+    grid = np.full((H, W), int(bg), dtype=int)
+    r0 = random.randint(LEGEND_EDGE_MARGIN, H - bh - LEGEND_EDGE_MARGIN)
+    c0 = random.randint(LEGEND_EDGE_MARGIN, W - bw - LEGEND_EDGE_MARGIN)
+    paste(grid, legend, r0, c0)
+    return grid
+
+
+def _build_sprite_queue(
+    key_colors: list[int],
+    counts: list[int],
+    distractor_color: int | None,
+    bg: int,
+) -> list[np.ndarray]:
+    """Create canonical key sprites, optional distractor sprite, and shuffle them."""
+    sprites = []
+    for color, count in zip(key_colors, counts):
+        sprite = _make_sprite(color, bg)
+        for _ in range(count):
+            sprites.append(sprite.copy())
+    if distractor_color is not None:
+        sprites.append(_make_sprite(distractor_color, bg))
+    random.shuffle(sprites)
+    return sprites
+
+
+def _place_sprites(grid: np.ndarray, sprites: list[np.ndarray], bg: int) -> None:
+    """Paste sprites into random non-touching free locations in queue order."""
+    for sprite in sprites:
+        sr, sc = random_free_location(
+            grid,
+            sprite,
+            transparent=bg,
+            padding=SPRITE_PADDING,
+            padding_connectivity=SPRITE_PADDING_CONNECTIVITY,
+        )
+        paste(grid, sprite, sr, sc, transparent=bg)
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Run one output-first generation attempt and reject solver mismatches."""
+    bg, key_colors, distractor_color = _sample_palette()
+    counts = _sample_counts(len(key_colors))
+    expected = _build_expected(key_colors, counts)
+    legend = _build_legend(expected.shape, key_colors)
+    grid = _new_grid_with_legend(bg, legend)
+    if grid is None:
+        return None
+
+    sprites = _build_sprite_queue(key_colors, counts, distractor_color, bg)
+    try:
+        _place_sprites(grid, sprites, bg)
+    except ValueError:
+        return None
+
+    if not np.array_equal(main(grid), expected):
+        return None
+    return grid
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GENERATION_ATTEMPTS):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate a valid 58490d8a D15 input")

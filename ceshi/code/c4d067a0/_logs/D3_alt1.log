@@ -1,0 +1,4977 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e251d-742a-7c01-9518-d120607584bc
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个变体。
+
+    ## 原始任务: c4d067a0
+    **摘要**: 左上角的小型精灵图作为图例定义一个稀疏像素模式，网格中已存在部分对应的放大色块；通过已有色块推算缩放因子和偏移量，将图例中缺失的像素以相同比例放大后放置到网格对应位置
+
+    ## 要实现的变体
+    - **维度**: D3 — 目标位置：色块放置区域 (`dst`)
+    - **当前值**: 网格中通过缩放因子计算出的对应位置，每个图例像素映射为一个 NxN 的实心色块，色块之间以背景色分隔
+    - **改为**: 铺贴到周期性网格的指定单元 — 网格被分为 NxN 的重复瓦片，图例定义每个瓦片中哪些位置需要填色。目标是在所有瓦片的对应位置放置色块，形成周期性图案
+    - **来源**: tiling（参考任务: 65b59efc）
+
+    ## 修改原则 
+    以 D3 为核心变更，不要随意改动与该创新无关的部分。但如果其他维度需要做适配性调整才能让 D3 的变化在视觉上可观察、在逻辑上可行（例如：变换规则改为旋转/翻转，但原始对象是纯色对称的导致变换不可见，则应让对象带不对称内部结构），这种配合修改是允许且必要的。
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/c4d067a0.py`
+
+    ```python
+    import numpy as np
+from functools import reduce
+from math import gcd
+
+from arc_utils import bbox_coords, components_mask, get_bg
+import random
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Complete a grid of colored blocks to match a minimap legend in the top-left corner.
+
+    Input structure:
+    - bg = most common color.
+    - Top-left corner: a small sprite of single colored pixels forming a minimap pattern on a regular lattice.
+    - Main area: uniformly colored square blocks (NxN) arranged on a regular grid; some positions are empty (bg).
+
+    Rule:
+    - The legend pixels define a color pattern; each pixel's lattice position maps to a block position in the main grid via a fixed scale factor and offset.
+    - Existing colored blocks confirm the scale/offset alignment.
+    - For every legend pixel whose corresponding grid position is empty, place a new block of that color.
+
+    Key insight: The top-left pixel pattern is a scaled-down minimap of the block layout; the mapping is inferred from blocks already present.
+    """
+    g = np.asarray(grid, dtype=int)
+    h, w = g.shape
+    out = g.copy()
+    bg = get_bg(g)
+
+    comps = components_mask(g != bg, connectivity=4)
+    singles: list[tuple[int, int, int]] = []
+    blocks: list[tuple[int, int, int, int]] = []  # (r0,c0,size,color)
+    for pts in comps:
+        if len(pts) == 1:
+            r, c = pts[0]
+            singles.append((int(r), int(c), int(g[r, c])))
+            continue
+        r0, c0, r1, c1 = bbox_coords(pts)
+        hh, ww = r1 - r0 + 1, c1 - c0 + 1
+        if hh != ww or hh < 2:
+            continue
+        sub = g[r0 : r1 + 1, c0 : c1 + 1]
+        col = int(sub[0, 0])
+        if col == bg:
+            continue
+        if np.all(sub == col) and sub.size == len(pts):
+            blocks.append((int(r0), int(c0), int(hh), col))
+
+    assert singles and blocks, "grid must contain legend pixels and main blocks"
+
+    # Legend pixels: singleton colored pixels in a small top-left window.
+    win_r = min(h, 12)
+    win_c = min(w, 12)
+    legend = [(r, c, v) for (r, c, v) in singles if r < win_r and c < win_c]
+    assert legend, "top-left legend must contain singleton pixels"
+
+    # Infer legend lattice step (usually 2).
+    rs = sorted({r for r, _, _ in legend})
+    cs = sorted({c for _, c, _ in legend})
+    drs = [rs[i + 1] - rs[i] for i in range(len(rs) - 1)]
+    dcs = [cs[i + 1] - cs[i] for i in range(len(cs) - 1)]
+    stepL = reduce(gcd, drs + dcs)
+    assert stepL > 0, "legend lattice step must be positive"
+    rmin = min(r for r, _, _ in legend)
+    cmin = min(c for _, c, _ in legend)
+
+    legend_pts: list[tuple[int, int, int]] = []
+    for r, c, v in legend:
+        rr = (r - rmin) // stepL
+        cc = (c - cmin) // stepL
+        legend_pts.append((int(rr), int(cc), int(v)))
+
+    # Determine typical block size and step between blocks.
+    sizes = [s for _, _, s, _ in blocks]
+    _vals, _cnts = np.unique(np.array(sizes, dtype=int), return_counts=True)
+    block_size = int(_vals[_cnts.argmax()])
+    blocks = [b for b in blocks if b[2] == block_size]
+    assert blocks, "must contain at least one block of the dominant block size"
+
+    by_color: dict[int, list[tuple[int, int]]] = {}
+    for r0, c0, s, col in blocks:
+        by_color.setdefault(int(col), []).append((int(r0), int(c0)))
+    for col in by_color:
+        by_color[col].sort()
+
+    # Compute step from block top-left positions (gcd of diffs).
+    tops = sorted({r0 for r0, _, _, _ in blocks})
+    lefts = sorted({c0 for _, c0, _, _ in blocks})
+    step_candidates = []
+    step_candidates += [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
+    step_candidates += [lefts[i + 1] - lefts[i] for i in range(len(lefts) - 1)]
+    step = reduce(gcd, step_candidates)
+    assert step > 0, "block step must be positive"
+
+    # Infer base offset: choose base that best maps legend pixels with existing block colors.
+    bases: dict[tuple[int, int], int] = {}
+    for rr, cc, col in legend_pts:
+        if col not in by_color:
+            continue
+        for br0, bc0 in by_color[col]:
+            base_r = br0 - rr * step
+            base_c = bc0 - cc * step
+            bases[(base_r, base_c)] = bases.get((base_r, base_c), 0) + 1
+    assert bases, "existing blocks must determine the legend-to-grid offset"
+    max_votes = max(bases.values())
+    best_bases = [base for base, votes in bases.items() if votes == max_votes]
+    assert len(best_bases) == 1, "legend-to-grid offset must be unique"
+    base = best_bases[0]
+    base_r, base_c = base
+
+    # Paint blocks for all legend pixels (usually adding missing ones).
+    for rr, cc, col in legend_pts:
+        tr0 = base_r + rr * step
+        tc0 = base_c + cc * step
+        assert 0 <= tr0 <= h - block_size and 0 <= tc0 <= w - block_size, \
+            "legend block projection must fit in canvas"
+        out[tr0 : tr0 + block_size, tc0 : tc0 + block_size] = col
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# === CFG: canvas ===
+GRID_SIZE_MIN, GRID_SIZE_MAX = 23, 27  # square grid bounds
+NUM_COLORS = 10                         # total ARC color palette size
+
+# === CFG: legend lattice ===
+LEGEND_ORIGIN = (1, 1)                  # top-left pixel of the legend
+LEGEND_STEP = 2                         # pixel spacing between legend dots
+LEGEND_ROWS = (3, 4)                    # staircase row count options
+LEGEND_COLS = (2, 3)                    # staircase column count options
+LEGEND_EMPTIES = (0, 1, 2)             # how many lattice positions may be empty
+LEGEND_FILLED_MIN, LEGEND_FILLED_MAX = 6, 10
+PALETTE_SIZE_MIN, PALETTE_SIZE_MAX = 2, 4  # distinct non-bg colors in legend
+MAX_COUNT_PER_COLOR = 6                 # max legend pixels of one color
+
+# === CFG: block area ===
+BLOCK_SIZE_RANGE = range(2, 5)         # NxN block side length
+GAP_RANGE = range(1, 4)               # gap between adjacent blocks
+STEP_MIN, STEP_MAX = 3, 5             # block_size + gap bounds
+BASE_C_MIN = 8                         # minimum block-area column (separates from legend)
+BASE_R_MIN = 1                         # minimum block-area row
+
+# === CFG: generation ===
+MAX_RETRIES = 300
+
+
+def _enumerate_staircase_shapes():
+    """Enumerate all valid (widths) tuples for the staircase legend shape."""
+    shapes = []
+    for rows in LEGEND_ROWS:
+        for cols in LEGEND_COLS:
+            total = rows * cols
+            for empties in LEGEND_EMPTIES:
+                count = total - empties
+                if not (LEGEND_FILLED_MIN <= count <= LEGEND_FILLED_MAX):
+                    continue
+                def rec(prefix, remaining, r):
+                    if r == rows:
+                        if remaining == 0 and max(prefix) == cols:
+                            shapes.append(tuple(prefix))
+                        return
+                    left = rows - r - 1
+                    lo = max(1, remaining - left * cols)
+                    hi = min(cols, remaining - left)
+                    for width in range(lo, hi + 1):
+                        rec(prefix + [width], remaining - width, r + 1)
+                rec([], count, 0)
+    return shapes
+
+
+# Valid (block_size, gap) pairs satisfying STEP_MIN <= block_size+gap <= STEP_MAX
+_BLOCK_GAP_PAIRS = [
+    (n, g) for n in BLOCK_SIZE_RANGE for g in GAP_RANGE
+    if STEP_MIN <= n + g <= STEP_MAX
+]
+# All valid staircase width tuples, precomputed once
+_STAIRCASE_SHAPES = _enumerate_staircase_shapes()
+
+
+def _pick_staircase():
+    """Pick a random staircase shape; return (filled_pts, adjacent_pairs)."""
+    widths = random.choice(_STAIRCASE_SHAPES)
+    pts = [(r, c) for r, w in enumerate(widths) for c in range(w)]
+    pairs = [(r, c) for r, w in enumerate(widths) for c in range(w - 1)]
+    return pts, pairs
+
+
+def _random_color_counts(total, k):
+    """Distribute `total` among `k` bins, each in [1, MAX_COUNT_PER_COLOR]."""
+    counts = [1] * k
+    remaining = total - k
+    while remaining:
+        open_idxs = [i for i, v in enumerate(counts) if v < MAX_COUNT_PER_COLOR]
+        i = random.choice(open_idxs)
+        add = random.randint(1, min(remaining, MAX_COUNT_PER_COLOR - counts[i]))
+        counts[i] += add
+        remaining -= add
+    random.shuffle(counts)
+    return counts
+
+
+def _assign_legend_colors(pts, anchor_pair, palette):
+    """Assign colors to legend pts via backtracking, ensuring unique anchor-pair identification."""
+    pos_set = set(pts)
+    first = anchor_pair
+    second = (anchor_pair[0], anchor_pair[1] + 1)
+    a, b = random.sample(palette, 2)
+    counts = dict(zip(palette, _random_color_counts(len(pts), len(palette))))
+    colors = {first: a, second: b}
+    counts[a] -= 1
+    counts[b] -= 1
+    if counts[a] < 0 or counts[b] < 0:
+        return None
+
+    anchor_colors = (a, b)
+    cells = [p for p in pts if p not in colors]
+
+    def allowed(pos, col):
+        r, c = pos
+        left = (r, c - 1)
+        if left in pos_set and left in colors:
+            if (colors[left], col) == anchor_colors and (left, pos) != (first, second):
+                return False
+        right = (r, c + 1)
+        if right in pos_set and right in colors:
+            if (col, colors[right]) == anchor_colors and (pos, right) != (first, second):
+                return False
+        return True
+
+    def search():
+        if not cells:
+            return all(v == 0 for v in counts.values())
+        best_i, best_opts = None, None
+        for i, pos in enumerate(cells):
+            opts = [col for col in palette if counts[col] > 0 and allowed(pos, col)]
+            if best_opts is None or len(opts) < len(best_opts):
+                best_i, best_opts = i, opts
+        if not best_opts:
+            return False
+        pos = cells.pop(best_i)
+        random.shuffle(best_opts)
+        for col in best_opts:
+            colors[pos] = col
+            counts[col] -= 1
+            if search():
+                return True
+            counts[col] += 1
+            del colors[pos]
+        cells.insert(best_i, pos)
+        return False
+
+    if not search():
+        return None
+    return colors
+
+
+def _gen_attempt():
+    size = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
+    block_size, gap = random.choice(_BLOCK_GAP_PAIRS)
+    step = block_size + gap
+    pts, pairs = _pick_staircase()
+    anchor_pair = random.choice(pairs)
+
+    bg = random.randrange(NUM_COLORS)
+    k_min = max(PALETTE_SIZE_MIN, (len(pts) + MAX_COUNT_PER_COLOR - 1) // MAX_COUNT_PER_COLOR)
+    k = random.randint(k_min, min(PALETTE_SIZE_MAX, len(pts)))
+    palette = random.sample([c for c in range(NUM_COLORS) if c != bg], k)
+    legend_colors = _assign_legend_colors(pts, anchor_pair, palette)
+    if legend_colors is None:
+        return None
+
+    max_r = max(r for r, _ in pts)
+    max_c = max(c for _, c in pts)
+    r_hi = size - block_size - max_r * step - 1
+    c_hi = size - block_size - max_c * step - 1
+    if r_hi < BASE_R_MIN or c_hi < BASE_C_MIN:
+        return None
+    base_r = random.randint(BASE_R_MIN, r_hi)
+    base_c = random.randint(BASE_C_MIN, c_hi)
+
+    # Render output: legend pixels + all blocks
+    lr0, lc0 = LEGEND_ORIGIN
+    out = np.full((size, size), bg, dtype=int)
+    for (rr, cc), col in legend_colors.items():
+        out[lr0 + rr * LEGEND_STEP, lc0 + cc * LEGEND_STEP] = col
+        br, bc = base_r + rr * step, base_c + cc * step
+        out[br:br + block_size, bc:bc + block_size] = col
+
+    # Build input: keep only the 2 anchor blocks
+    inp = out.copy()
+    keep = {anchor_pair, (anchor_pair[0], anchor_pair[1] + 1)}
+    for rr, cc in pts:
+        if (rr, cc) in keep:
+            continue
+        br, bc = base_r + rr * step, base_c + cc * step
+        inp[br:br + block_size, bc:bc + block_size] = bg
+
+    try:
+        solved = main(inp)
+    except Exception:
+        return None
+    if not np.array_equal(solved, out):
+        return None
+    return inp
+
+
+def generate_input():
+    for _ in range(MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate valid c4d067a0 input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 23-27 rows x 23-27 cols, square, uniform bg color
+  legend:
+    position: top-left corner, starting at (1,1)
+    structure: single-pixel dots on a regular lattice with step=2 (every other cell)
+    size: 3-4 rows x 2-3 cols in lattice coords; 6-10 filled pixels
+    shape: not always a full rectangle; some lattice positions may be empty (0-2 empties), but filled positions form a connected staircase (each row has cols 0..k for some k)
+    colors: 2-4 distinct non-bg colors; pattern is arbitrary but each color appears 1-6 times
+  blocks:
+    count_in_input: exactly 2 square blocks (NxN uniform color, N=2-4)
+    placement: same legend-row, adjacent legend-columns (col gap = 1 in lattice coords)
+    block_step: block_size + gap where gap=1-3; step=3-5 in cells
+    role: anchor the scale/offset mapping from legend to main grid
+  block_area:
+    no spatial overlap with legend pixels (separated by columns)
+    all output blocks fit within the grid with margin
+  output:
+    fill every legend pixel position with its corresponding NxN block; input blocks are kept, missing ones are added
+  solver_constraint: the 2 input blocks must yield a unique base offset via color-position voting against legend
+
+generation_strategy:
+  approach: output-first
+  steps:
+    1. Pick bg color, grid size (23-27, square), block_size N (2-4), gap (1-3), block_step = N + gap.
+    2. Design the legend pattern in lattice coords (3-4 rows x 2-3 cols, 6-10 filled positions, 2-4 colors, staircase shape).
+    3. Choose base offset (base_r, base_c) for the block area such that all legend-mapped blocks fit in grid AND the block area columns don't overlap with legend pixel columns (base_c >= 8).
+    4. Place all NxN blocks on the grid per legend mapping (this is the output).
+    5. Pick one legend row with >=2 filled positions; pick 2 adjacent filled positions from it as the input blocks. Verify the 2 blocks yield a unique base offset via solver voting.
+    6. Remove all blocks except the 2 chosen ones to get the input. Legend pixels remain.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须保留这一结构，并根据**新的变体规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映变体后的输入结构、规则和关键洞察。
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考任务**（如有 source_task）: 变体描述中的 source_task 是该变体的灵感来源。**必须先阅读其 solver 代码**，理解参考任务中相关机制的实现方式和复杂度，作为你设计变体的基线。不存在就跳过。
+
+    3. **设计分析（写代码前必须完成，可仿照spec书写，尽可能的详细以供下面代码生成使用）**:
+
+       YAML 中的变体描述给出了变更的大致方向，但细节不够具体。你需要自行思考并确定完整的实现细节。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断变体改动的影响范围和实现方式。在写代码之前，完成以下分析：
+
+       a) **具体化与行为追踪**: 变体在 ARC 的像素网格中具体长什么样？变更的核心行为如何体现在输入/输出的结构上？不要停留在抽象概念上，要想清楚具体的形状、颜色、空间关系等细节。然后，确定变体的变化会影响整个流程（输入构造、solver 处理、输出生成等）中的哪个环节，在这个环节上用一个具体的小例子追踪：原始逻辑在这里是怎么执行的 → 变体要求的逻辑应该是怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 变体改变了原任务的某个属性。原始代码中哪些写法依赖了旧属性的不变性？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在变体中是否仍然成立？特别注意那些在原任务中"恰好无害"但在变体中会出错的模式（例如：原任务中某个值始终相同，所以无条件赋值不会产生覆盖问题——但变体让该值可变后，无条件赋值就会破坏已有的正确结果）。
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意（例如对象之间的空间关系、对齐方式、间距等应与任务规则一致）。同时要考虑放置后的网格是否能被 solver 正确处理并产生预期的输出。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。**禁止使用颜色id等不可见因素参与任何排序或者颜色变换（例如使用黑色=0参与排序等，禁用）**。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出变体的规则？如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。若规则本身允许多个合法分支或子情况，不要在生成器中长期固定成其中一种，除非题意本来就要求固定。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果变体后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **颜色变化可推断性**: 如果变体涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个变体设计就不合格。
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 基于第 3 步的设计分析实现变体的新规则。只改需要改的部分，其他逻辑保持不变。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发新规则。生成的输入必须能被新 `main()` 正确求解。
+    6. **保证 generator 的正确性**: 原 generator 采用 output-first 模式（先构造预期输出 → 反推输入 → 用 `main(input)` 验证一致）。修改变体时，你可以沿用或调整这个模式，但必须保证：生成的每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/c4d067a0/D3/1/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证变体行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了变体的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量变体核心行为（如交互深度、参与对象数等），统计生成样本中该指标和关键分支的分布。少量样本与原始行为相似不为退化；只有当关键控制变量不起作用，样本按照新的变体逻辑执行与原逻辑执行在相同输入网格上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/c4d067a0.json` — 原任务的 I/O 样例
+
+    只参考上述文件和原始 solver 代码。不要查看其他变体的实现代码（如 variants/ 目录下的已有文件），避免引入其他维度的改动。
+    - `/home/lixinyu/snap/new/arc2_solver_select/65b59efc.py` — **必读**：参考任务 65b59efc 的 solver（变体灵感来源，用于校准实现复杂度）
+
+## 输出
+
+将完整的变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+`/home/lixinyu/snap/new/ceshi/code/c4d067a0/D3/1/code.py`
+
+代码文件开头加一段注释说明这是什么变体:
+```python
+# Variant of c4d067a0
+# Dimension: D3 — 目标位置：色块放置区域 (dst)
+# Change: 网格中通过缩放因子计算出的对应位置，每个图例像素映射为一个 NxN 的实心色块，色块之间以背景色分隔... → 铺贴到周期性网格的指定单元
+```
+
+确保目录 `/home/lixinyu/snap/new/ceshi/code/c4d067a0/D3/1` 存在（如不存在则创建）。
+codex
+先检查原始 `c4d067a0` 和参考任务 `65b59efc` 的 solver，再据此写变体设计，最后实现并跑 50 次稳定性测试。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/c4d067a0.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+import numpy as np
+from functools import reduce
+from math import gcd
+
+from arc_utils import bbox_coords, components_mask, get_bg
+import random
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Complete a grid of colored blocks to match a minimap legend in the top-left corner.
+
+    Input structure:
+    - bg = most common color.
+    - Top-left corner: a small sprite of single colored pixels forming a minimap pattern on a regular lattice.
+    - Main area: uniformly colored square blocks (NxN) arranged on a regular grid; some positions are empty (bg).
+
+    Rule:
+    - The legend pixels define a color pattern; each pixel's lattice position maps to a block position in the main grid via a fixed scale factor and offset.
+    - Existing colored blocks confirm the scale/offset alignment.
+    - For every legend pixel whose corresponding grid position is empty, place a new block of that color.
+
+    Key insight: The top-left pixel pattern is a scaled-down minimap of the block layout; the mapping is inferred from blocks already present.
+    """
+    g = np.asarray(grid, dtype=int)
+    h, w = g.shape
+    out = g.copy()
+    bg = get_bg(g)
+
+    comps = components_mask(g != bg, connectivity=4)
+    singles: list[tuple[int, int, int]] = []
+    blocks: list[tuple[int, int, int, int]] = []  # (r0,c0,size,color)
+    for pts in comps:
+        if len(pts) == 1:
+            r, c = pts[0]
+            singles.append((int(r), int(c), int(g[r, c])))
+            continue
+        r0, c0, r1, c1 = bbox_coords(pts)
+        hh, ww = r1 - r0 + 1, c1 - c0 + 1
+        if hh != ww or hh < 2:
+            continue
+        sub = g[r0 : r1 + 1, c0 : c1 + 1]
+        col = int(sub[0, 0])
+        if col == bg:
+            continue
+        if np.all(sub == col) and sub.size == len(pts):
+            blocks.append((int(r0), int(c0), int(hh), col))
+
+    assert singles and blocks, "grid must contain legend pixels and main blocks"
+
+    # Legend pixels: singleton colored pixels in a small top-left window.
+    win_r = min(h, 12)
+    win_c = min(w, 12)
+    legend = [(r, c, v) for (r, c, v) in singles if r < win_r and c < win_c]
+    assert legend, "top-left legend must contain singleton pixels"
+
+    # Infer legend lattice step (usually 2).
+    rs = sorted({r for r, _, _ in legend})
+    cs = sorted({c for _, c, _ in legend})
+    drs = [rs[i + 1] - rs[i] for i in range(len(rs) - 1)]
+    dcs = [cs[i + 1] - cs[i] for i in range(len(cs) - 1)]
+    stepL = reduce(gcd, drs + dcs)
+    assert stepL > 0, "legend lattice step must be positive"
+    rmin = min(r for r, _, _ in legend)
+    cmin = min(c for _, c, _ in legend)
+
+    legend_pts: list[tuple[int, int, int]] = []
+    for r, c, v in legend:
+        rr = (r - rmin) // stepL
+        cc = (c - cmin) // stepL
+        legend_pts.append((int(rr), int(cc), int(v)))
+
+    # Determine typical block size and step between blocks.
+    sizes = [s for _, _, s, _ in blocks]
+    _vals, _cnts = np.unique(np.array(sizes, dtype=int), return_counts=True)
+    block_size = int(_vals[_cnts.argmax()])
+    blocks = [b for b in blocks if b[2] == block_size]
+    assert blocks, "must contain at least one block of the dominant block size"
+
+    by_color: dict[int, list[tuple[int, int]]] = {}
+    for r0, c0, s, col in blocks:
+        by_color.setdefault(int(col), []).append((int(r0), int(c0)))
+    for col in by_color:
+        by_color[col].sort()
+
+    # Compute step from block top-left positions (gcd of diffs).
+    tops = sorted({r0 for r0, _, _, _ in blocks})
+    lefts = sorted({c0 for _, c0, _, _ in blocks})
+    step_candidates = []
+    step_candidates += [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
+    step_candidates += [lefts[i + 1] - lefts[i] for i in range(len(lefts) - 1)]
+    step = reduce(gcd, step_candidates)
+    assert step > 0, "block step must be positive"
+
+    # Infer base offset: choose base that best maps legend pixels with existing block colors.
+    bases: dict[tuple[int, int], int] = {}
+    for rr, cc, col in legend_pts:
+        if col not in by_color:
+            continue
+        for br0, bc0 in by_color[col]:
+            base_r = br0 - rr * step
+            base_c = bc0 - cc * step
+            bases[(base_r, base_c)] = bases.get((base_r, base_c), 0) + 1
+    assert bases, "existing blocks must determine the legend-to-grid offset"
+    max_votes = max(bases.values())
+    best_bases = [base for base, votes in bases.items() if votes == max_votes]
+    assert len(best_bases) == 1, "legend-to-grid offset must be unique"
+    base = best_bases[0]
+    base_r, base_c = base
+
+    # Paint blocks for all legend pixels (usually adding missing ones).
+    for rr, cc, col in legend_pts:
+        tr0 = base_r + rr * step
+        tc0 = base_c + cc * step
+        assert 0 <= tr0 <= h - block_size and 0 <= tc0 <= w - block_size, \
+            "legend block projection must fit in canvas"
+        out[tr0 : tr0 + block_size, tc0 : tc0 + block_size] = col
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# === CFG: canvas ===
+GRID_SIZE_MIN, GRID_SIZE_MAX = 23, 27  # square grid bounds
+NUM_COLORS = 10                         # total ARC color palette size
+
+# === CFG: legend lattice ===
+LEGEND_ORIGIN = (1, 1)                  # top-left pixel of the legend
+LEGEND_STEP = 2                         # pixel spacing between legend dots
+LEGEND_ROWS = (3, 4)                    # staircase row count options
+LEGEND_COLS = (2, 3)                    # staircase column count options
+LEGEND_EMPTIES = (0, 1, 2)             # how many lattice positions may be empty
+LEGEND_FILLED_MIN, LEGEND_FILLED_MAX = 6, 10
+PALETTE_SIZE_MIN, PALETTE_SIZE_MAX = 2, 4  # distinct non-bg colors in legend
+MAX_COUNT_PER_COLOR = 6                 # max legend pixels of one color
+
+# === CFG: block area ===
+BLOCK_SIZE_RANGE = range(2, 5)         # NxN block side length
+GAP_RANGE = range(1, 4)               # gap between adjacent blocks
+STEP_MIN, STEP_MAX = 3, 5             # block_size + gap bounds
+BASE_C_MIN = 8                         # minimum block-area column (separates from legend)
+BASE_R_MIN = 1                         # minimum block-area row
+
+# === CFG: generation ===
+MAX_RETRIES = 300
+
+
+def _enumerate_staircase_shapes():
+    """Enumerate all valid (widths) tuples for the staircase legend shape."""
+    shapes = []
+    for rows in LEGEND_ROWS:
+        for cols in LEGEND_COLS:
+            total = rows * cols
+            for empties in LEGEND_EMPTIES:
+                count = total - empties
+                if not (LEGEND_FILLED_MIN <= count <= LEGEND_FILLED_MAX):
+                    continue
+                def rec(prefix, remaining, r):
+                    if r == rows:
+                        if remaining == 0 and max(prefix) == cols:
+                            shapes.append(tuple(prefix))
+                        return
+                    left = rows - r - 1
+                    lo = max(1, remaining - left * cols)
+                    hi = min(cols, remaining - left)
+                    for width in range(lo, hi + 1):
+                        rec(prefix + [width], remaining - width, r + 1)
+                rec([], count, 0)
+    return shapes
+
+
+# Valid (block_size, gap) pairs satisfying STEP_MIN <= block_size+gap <= STEP_MAX
+_BLOCK_GAP_PAIRS = [
+    (n, g) for n in BLOCK_SIZE_RANGE for g in GAP_RANGE
+    if STEP_MIN <= n + g <= STEP_MAX
+]
+# All valid staircase width tuples, precomputed once
+_STAIRCASE_SHAPES = _enumerate_staircase_shapes()
+
+
+def _pick_staircase():
+    """Pick a random staircase shape; return (filled_pts, adjacent_pairs)."""
+    widths = random.choice(_STAIRCASE_SHAPES)
+    pts = [(r, c) for r, w in enumerate(widths) for c in range(w)]
+    pairs = [(r, c) for r, w in enumerate(widths) for c in range(w - 1)]
+    return pts, pairs
+
+
+def _random_color_counts(total, k):
+    """Distribute `total` among `k` bins, each in [1, MAX_COUNT_PER_COLOR]."""
+    counts = [1] * k
+    remaining = total - k
+    while remaining:
+        open_idxs = [i for i, v in enumerate(counts) if v < MAX_COUNT_PER_COLOR]
+        i = random.choice(open_idxs)
+        add = random.randint(1, min(remaining, MAX_COUNT_PER_COLOR - counts[i]))
+        counts[i] += add
+        remaining -= add
+    random.shuffle(counts)
+    return counts
+
+
+def _assign_legend_colors(pts, anchor_pair, palette):
+    """Assign colors to legend pts via backtracking, ensuring unique anchor-pair identification."""
+    pos_set = set(pts)
+    first = anchor_pair
+    second = (anchor_pair[0], anchor_pair[1] + 1)
+    a, b = random.sample(palette, 2)
+    counts = dict(zip(palette, _random_color_counts(len(pts), len(palette))))
+    colors = {first: a, second: b}
+    counts[a] -= 1
+    counts[b] -= 1
+    if counts[a] < 0 or counts[b] < 0:
+        return None
+
+    anchor_colors = (a, b)
+    cells = [p for p in pts if p not in colors]
+
+    def allowed(pos, col):
+        r, c = pos
+        left = (r, c - 1)
+        if left in pos_set and left in colors:
+            if (colors[left], col) == anchor_colors and (left, pos) != (first, second):
+                return False
+        right = (r, c + 1)
+        if right in pos_set and right in colors:
+            if (col, colors[right]) == anchor_colors and (pos, right) != (first, second):
+                return False
+        return True
+
+    def search():
+        if not cells:
+            return all(v == 0 for v in counts.values())
+        best_i, best_opts = None, None
+        for i, pos in enumerate(cells):
+            opts = [col for col in palette if counts[col] > 0 and allowed(pos, col)]
+            if best_opts is None or len(opts) < len(best_opts):
+                best_i, best_opts = i, opts
+        if not best_opts:
+            return False
+        pos = cells.pop(best_i)
+        random.shuffle(best_opts)
+        for col in best_opts:
+            colors[pos] = col
+            counts[col] -= 1
+            if search():
+                return True
+            counts[col] += 1
+            del colors[pos]
+        cells.insert(best_i, pos)
+        return False
+
+    if not search():
+        return None
+    return colors
+
+
+def _gen_attempt():
+    size = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
+    block_size, gap = random.choice(_BLOCK_GAP_PAIRS)
+    step = block_size + gap
+    pts, pairs = _pick_staircase()
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+    r0 = min(b[0] for b in bbs)
+    c0 = min(b[1] for b in bbs)
+    r1 = max(b[2] for b in bbs)
+    c1 = max(b[3] for b in bbs)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox_h(b: BBox) -> int:
+    r0, _c0, r1, _c1 = b
+    return int(r1 - r0 + 1)
+
+
+def bbox_w(b: BBox) -> int:
+    _r0, c0, _r1, c1 = b
+    return int(c1 - c0 + 1)
+
+
+def bbox_anchor(b: BBox, *, anchor: str = "upper left") -> Coord:
+    """
+    Return an anchor point (r,c) for a bbox.
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/65b59efc.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+from collections import Counter
+import numpy as np
+import random
+from arc_utils import paste, random_sprite
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Decode a stamp map: read templates, markers, and palette from a tiled grid, then render stamps.
+
+    Input structure:
+    - Grid divided into K tile columns (each N wide) separated by 1-col dashed separators.
+    - Top band (rows 0..N-1): K template masks, one per tile column.
+    - Middle band (rows N+1..2N): marker pixels whose color picks a template.
+    - Bottom band (rows 2N+2..): K palette swatches giving the output color per template.
+    - Separator rows at rows N and 2N+1 (dashed pattern of sep color).
+
+    Rule:
+    - Each marker's local position (lr, lc) within its tile column determines which N×N output block to stamp.
+    - The marker's color identifies which template to use; the palette recolors the template.
+
+    Key insight: Marker color encodes template index; local position within tile column encodes stamp block.
+    """
+    g = np.array(grid, dtype=int)
+    H, W = g.shape
+    counts = Counter(map(int, g.flatten()))
+    bg = int(counts.most_common(1)[0][0])
+    sep = int(max((cnt, col) for col, cnt in counts.items() if col != bg)[1])
+
+    sep_cols = [c for c in range(W) if (g[:, c] == sep).sum() >= H // 2]
+    sep_rows = [r for r in range(H) if (g[r, :] == sep).sum() >= W // 2]
+    assert sep_cols and sep_rows
+
+    N = sep_cols[0]
+    starts = [0] + [c + 1 for c in sep_cols]
+    K = len(starts)
+
+    # Read K templates from the top band
+    tcols = []
+    tmasks = []
+    for st in starts:
+        sub = g[0:N, st:st + N]
+        vals = {int(v) for v in sub.flat} - {bg, sep}
+        assert len(vals) == 1
+        col = vals.pop()
+        tcols.append(col)
+        tmasks.append(sub == col)
+    assert len(set(tcols)) == K
+    tcol_to_j = {col: j for j, col in enumerate(tcols)}
+
+    # Read palette colors from the bottom band
+    pal_r0 = sep_rows[-1] + 1
+    pcols = []
+    for st in starts:
+        sub = g[pal_r0:H, st:st + N]
+        vals = {int(v) for v in sub.flat} - {bg, sep}
+        assert len(vals) == 1
+        pcols.append(vals.pop())
+
+    # Read markers from the middle band and build stamp placements
+    mid_r0 = N + 1
+    out = np.full((N * N, N * N), bg, dtype=int)
+    slot_owner = {}
+
+    for st in starts:
+        tile_color = None
+        for lr in range(N):
+            for lc in range(N):
+                v = int(g[mid_r0 + lr, st + lc])
+                if v == bg or v == sep:
+                    continue
+                assert tile_color is None or v == tile_color, "tile column must have uniform marker color"
+                tile_color = v
+                j = tcol_to_j[v]
+                assert (lr, lc) not in slot_owner or slot_owner[(lr, lc)] == j, "different templates must occupy different slots"
+                slot_owner[(lr, lc)] = j
+                tile = np.where(tmasks[j], pcols[j], bg)
+                out[lr * N:(lr + 1) * N, lc * N:(lc + 1) * N] = tile
+
+    return out
+
+# --------------- generator (att2) ---------------
+
+# -- CFG: colors --
+_BG = 0
+_SEP = 5
+_AVAILABLE_COLORS = [1, 2, 3, 4, 6, 7, 8, 9]  # all non-bg, non-sep
+
+# -- CFG: grid dimensions --
+_N_RANGE = (3, 5)          # tile size
+_K_RANGE = (3, 4)          # number of templates
+_PAL_H_CHOICES = [2, 3, 4]       # palette band height options
+_PAL_H_WEIGHTS = [8, 1, 1]       # probability weights for palette height
+_MAX_ROW_PAD = 2           # max trailing bg row padding
+_MAX_COL_PAD = 7           # max trailing bg col padding
+
+# -- CFG: template generation --
+_DENSITY_RANGE = (0.55, 0.92)    # template pixel density
+_SYMMETRY_OPTIONS = [None, "horizontal", "vertical", "mirror", "not_symmetric"]
+_TEMPLATE_CONNECTIVITY = 8
+
+# -- CFG: marker placement --
+_MIN_SLOT_COVERAGE = 0.60  # minimum fraction of NxN slots filled with markers
+
+# -- CFG: palette swatch --
+_SWATCH_DOUBLE_PROB = 0.35  # probability of 2-pixel swatch (vs 1-pixel)
+
+# -- CFG: retry --
+_MAX_RETRIES = 300
+
+
+def _dash_cell(pos: int, n: int) -> bool:
+    """True if position `pos` gets a separator pip in the dashed pattern for tile size `n`."""
+    k = pos % (n + 1)
+    return k == n or k % 2 == 0
+
+
+def _sep_count(length: int, n: int) -> int:
+    """Count how many separator pips appear in a span of `length` cells."""
+    return sum(1 for x in range(length) if _dash_cell(x, n))
+
+
+def _raw_col(tile_col: int, local_c: int, n: int) -> int:
+    """Map (tile column index, local column) to absolute grid column."""
+    return tile_col * (n + 1) + local_c
+
+
+def _sample_template(n: int, color: int) -> np.ndarray:
+    """Generate a random NxN boolean template mask via random_sprite."""
+    sprite = random_sprite(
+        n, n,
+        density=random.uniform(*_DENSITY_RANGE),
+        symmetry=random.choice(_SYMMETRY_OPTIONS),
+        color_palette=[color],
+        connectivity=_TEMPLATE_CONNECTIVITY,
+        background=_BG,
+    )
+    return sprite == color
+
+
+def _build_expected(n: int, templates: list[np.ndarray], pcols: list[int],
+                    placements: list[tuple[int, int, int]]) -> np.ndarray:
+    """Render the expected output grid from stamp placements."""
+    expected = np.full((n * n, n * n), _BG, dtype=int)
+    for j, rr, cc in placements:
+        tile = np.where(templates[j], pcols[j], _BG)
+        paste(expected, tile, rr * n, cc * n)
+    return expected
+
+
+def _draw_separators(grid: np.ndarray, n: int, k: int, core_h: int, core_w: int) -> None:
+    """Draw dashed horizontal and vertical separator lines in-place."""
+    for r in (n, 2 * n + 1):
+        for c in range(core_w):
+            if _dash_cell(c, n):
+                grid[r, c] = _SEP
+    for i in range(k - 1):
+        c = n + i * (n + 1)
+        for r in range(core_h):
+            if _dash_cell(r, n):
+                grid[r, c] = _SEP
+
+
+def _gen_attempt() -> np.ndarray | None:
+    n = random.randint(*_N_RANGE)
+    k = random.randint(*_K_RANGE)
+    tcols = random.sample(_AVAILABLE_COLORS, k)
+    pcols = random.sample(_AVAILABLE_COLORS, k)
+
+    # Grid dimensions with optional bg padding
+    pal_h = random.choices(_PAL_H_CHOICES, weights=_PAL_H_WEIGHTS)[0]
+    core_h = 2 * n + 2 + pal_h
+    core_w = k * n + (k - 1)
+    max_rpad = max(0, min(_MAX_ROW_PAD, 2 * _sep_count(core_h, n) + 1 - core_h))
+    max_cpad = max(0, min(_MAX_COL_PAD, 2 * _sep_count(core_w, n) + 1 - core_w))
+    h = core_h + random.randint(0, max_rpad)
+    w = core_w + random.randint(0, max_cpad)
+
+    templates = [_sample_template(n, col) for col in tcols]
+
+    # Assign random slots to templates for marker placement
+    all_slots = [(rr, cc) for rr in range(n) for cc in range(n)]
+    random.shuffle(all_slots)
+    min_marks = int(np.ceil(_MIN_SLOT_COVERAGE * n * n))
+    mark_count = random.randint(min_marks, n * n)
+    used_slots = all_slots[:mark_count]
+    assign_pool = (list(range(k)) * ((mark_count + k - 1) // k))[:mark_count]
+    random.shuffle(assign_pool)
+    placements = [(j, rr, cc) for (rr, cc), j in zip(used_slots, assign_pool)]
+
+    expected = _build_expected(n, templates, pcols, placements)
+
+    # Assemble input grid
+    grid = np.full((h, w), _BG, dtype=int)
+    _draw_separators(grid, n, k, core_h, core_w)
+
+    # Top band: templates
+    for j, mask in enumerate(templates):
+        paste(grid, np.where(mask, tcols[j], _BG), 0, j * (n + 1))
+
+    # Middle band: markers (shuffled tile-column assignment)
+    tile_assign = list(range(k))
+    random.shuffle(tile_assign)
+    for j, rr, cc in placements:
+        grid[n + 1 + rr, _raw_col(tile_assign[j], cc, n)] = tcols[j]
+
+    # Bottom band: palette swatches
+    swatch_r = 2 * n + 2 + pal_h - 1
+    for j, col in enumerate(pcols):
+        start = j * (n + 1)
+        size = 2 if random.random() < _SWATCH_DOUBLE_PROB else 1
+        c0 = start + max(0, (n - size) // 2)
+        grid[swatch_r, c0:c0 + size] = col
+
+    # Oracle check
+    try:
+        if np.array_equal(main(grid), expected):
+            return grid
+    except Exception:
+        return None
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(_MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate a valid 65b59efc input")
+
+codex
+原题的关键是“从两个已知块反推一次性的偏移”。参考题 `65b59efc` 的关键是“局部坐标在所有瓦片里重复生效”。我会把这两点合并成：仍然从少量已知块反推块网格，但输出不再补全单个图例形状，而是把图例当作一个周期模板，铺满整个目标块网格。
+codex
+设计已经收敛到一个可实现版本：图例仍是左上稀疏像素阵列，两个输入块仍只负责反推块步长与相位；变化点是把图例当作“单个瓦片的局部模板”，然后在主区域按整块瓦片周期重复。接下来我会把这份分析写进目标文件注释，并实现新的 solver/generator。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code/c4d067a0/D3/1' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+exec
+/bin/bash -lc 'ls -ld /home/lixinyu/snap/new/ceshi/code/c4d067a0/D3/1' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+drwxrwxr-x+ 2 lixinyu lixinyu 4096 May 14 02:13 /home/lixinyu/snap/new/ceshi/code/c4d067a0/D3/1
+
+codex
+实现分三步：先写带分析注释的新文件；再跑 50 次强制验证；最后补一个“非退化”统计，确认输出块数确实按瓦片重复而不是退回原题的一次性补全。
+  → Write variant code with design analysis comments, updated solver, and updated generator
+  • Run 50-trial validation and fix any failures
+  • Measure tiling-specific behavior to confirm non-degenerate variant
+codex
+目标文件将从头写入：保留原题的图例/块检测骨架，只替换 D3 相关的“投影到单次目标区域”为“按宏瓦片周期重复投影”。
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code/c4d067a0/D3/1/code.py
+diff --git a/ceshi/code/c4d067a0/D3/1/code.py b/ceshi/code/c4d067a0/D3/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e971ba1ec60d79a8f1bf26fdfe068595f4d341c
+--- /dev/null
++++ b/ceshi/code/c4d067a0/D3/1/code.py
+@@ -0,0 +1,410 @@
++# Variant of c4d067a0
++# Dimension: D3 — 目标位置：色块放置区域 (dst)
++# Change: 网格中通过缩放因子计算出的对应位置，每个图例像素映射为一个 NxN 的实心色块，色块之间以背景色分隔... → 铺贴到周期性网格的指定单元
++
++# Design analysis
++# ----------------
++# a) 具体化与行为追踪
++#    - 左上角图例仍然是 step=2 的单像素点阵，颜色和原题一致，表示一个小的“模板”。
++#    - 右侧主区域仍然由 NxN 实心色块组成，色块顶点落在步长为 step=block_size+gap 的块格点上。
++#    - 变体的核心改动：图例不再只映射到主区域中的一个单次形状，而是作为“一个宏瓦片内部的局部占位图”。
++#      设图例在格点坐标中的包围盒是 tile_rows x tile_cols，则主区域的宏瓦片周期就是
++#      period_r = tile_rows * step, period_c = tile_cols * step。每个瓦片里，图例中的每个点都映射为一个 NxN 色块。
++#    - 小例子：
++#      原题若图例局部坐标有 (0,0),(0,1),(1,0)，并从已有块反推出 base=(4,10), step=3，
++#      则只会在 (4,10),(4,13),(7,10) 放三块。
++#      本变体中，若图例包围盒是 2x2，则 period=(6,6)；除了 base 对应的那一组外，
++#      还会在 (4+6k,10+6m) 的每个瓦片里重复放置同样的三块，直到完整瓦片放不下为止。
++#
++# b) 复杂度校准
++#    - 仍保留原题的 2-4 种颜色、3-4 x 2-3 的小图例、2x2 以上实心色块，避免退化成过于规则的单色平铺。
++#    - 为了保证“周期性”肉眼可见，生成器强制至少 2x2 个宏瓦片，总块数严格大于单次图例块数。
++#    - 仍只保留两个输入锚块，但要求它们对应图例中唯一的水平相邻有序颜色对，这样既维持原题的稀疏提示，
++#      又能唯一锁定宏瓦片的相位。
++#
++# c) 隐式假设审查（相对原 main 的关键变化）
++#    - 原代码把 base_r + rr*step / base_c + cc*step 当成唯一绝对目标位置；本变体不成立，
++#      因为同一图例点会在多个瓦片中重复出现，所以 solver 必须改为推断“模周期的相位”而不是单次绝对偏移。
++#    - 原代码对同色 legend 点与 block 的投票是绝对坐标投票；本变体改为对
++#      ((br0 - rr*step) mod period_r, (bc0 - cc*step) mod period_c) 投票。
++#    - 原代码最后只绘制一轮 legend_pts；本变体必须在所有完整瓦片上循环绘制。
++#
++# d) 放置合法性
++#    - 生成器只接受完整瓦片可放置的布局：tile_span_r/tile_span_c 给出单个瓦片的实际占用范围，
++#      base 与 repetitions 的选择保证所有块都在画布内，且与左上角图例分离。
++#    - 输入只保留同一瓦片中的两个水平相邻锚块，因此它们既能给出 step，也不会与其他重复实例混淆。
++#
++# e) 视觉可观察性
++#    - 人类从样例能直接看到：左上角是一个小模板，右侧不是补一个局部缺块，而是整齐地在多块大瓦片中重复。
++#    - 重复次数固定至少 4 个瓦片，因此 D3 的差异不是边缘现象。
++#
++# f) 可视化整洁度
++#    - 宏瓦片之间只通过背景色间隔，没有额外标记线，视觉上会形成干净的重复阵列。
++#    - 图例保留在左上角，主区域从较右侧开始，避免与平铺区混在一起。
++#
++# g) 颜色变化可推断性
++#    - 颜色仍只表示“这个局部槽位要填什么色”，没有引入任何依赖颜色 id 的排序或运算。
++#    - 锚块的唯一性由“局部相邻颜色对”保证，而不是由颜色大小关系保证。
++
++import numpy as np
++from functools import reduce
++from math import gcd
++
++from arc_utils import bbox_coords, components_mask, get_bg
++import random
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Repeat a legend-defined block template across a periodic macro-tile grid.
++
++    Input structure:
++    - bg = most common color.
++    - Top-left corner: a sparse legend of singleton colored pixels on a regular lattice; these pixels describe one macro-tile's local block layout.
++    - Main area: a few uniformly colored square blocks (NxN) already placed on the same block lattice; they reveal block size, block step, and macro-tile phase.
++
++    Rule:
++    - Normalize the legend into lattice coordinates, and treat its bounding box as the row/column span of one repeating macro-tile.
++    - Infer the block lattice step from the existing blocks, then infer the macro-tile phase by matching block colors against legend colors modulo the macro-tile period.
++    - For every macro-tile that fully fits in the canvas, place an NxN block for every legend pixel at the corresponding local position inside that tile.
++
++    Key insight: The legend is no longer a one-off minimap of a single block cluster; it is a local template that repeats at a fixed 2D period across the destination lattice.
++    """
++    g = np.asarray(grid, dtype=int)
++    h, w = g.shape
++    out = g.copy()
++    bg = get_bg(g)
++
++    comps = components_mask(g != bg, connectivity=4)
++    singles: list[tuple[int, int, int]] = []
++    blocks: list[tuple[int, int, int, int]] = []  # (r0,c0,size,color)
++    for pts in comps:
++        if len(pts) == 1:
++            r, c = pts[0]
++            singles.append((int(r), int(c), int(g[r, c])))
++            continue
++        r0, c0, r1, c1 = bbox_coords(pts)
++        hh, ww = r1 - r0 + 1, c1 - c0 + 1
++        if hh != ww or hh < 2:
++            continue
++        sub = g[r0:r1 + 1, c0:c1 + 1]
++        col = int(sub[0, 0])
++        if col == bg:
++            continue
++        if np.all(sub == col) and sub.size == len(pts):
++            blocks.append((int(r0), int(c0), int(hh), col))
++
++    assert singles and blocks, "grid must contain legend pixels and main blocks"
++
++    win_r = min(h, 12)
++    win_c = min(w, 12)
++    legend = [(r, c, v) for (r, c, v) in singles if r < win_r and c < win_c]
++    assert legend, "top-left legend must contain singleton pixels"
++
++    rs = sorted({r for r, _, _ in legend})
++    cs = sorted({c for _, c, _ in legend})
++    drs = [rs[i + 1] - rs[i] for i in range(len(rs) - 1)]
++    dcs = [cs[i + 1] - cs[i] for i in range(len(cs) - 1)]
++    stepL = reduce(gcd, drs + dcs)
++    assert stepL > 0, "legend lattice step must be positive"
++    rmin = min(r for r, _, _ in legend)
++    cmin = min(c for _, c, _ in legend)
++
++    legend_pts: list[tuple[int, int, int]] = []
++    for r, c, v in legend:
++        rr = (r - rmin) // stepL
++        cc = (c - cmin) // stepL
++        legend_pts.append((int(rr), int(cc), int(v)))
++
++    tile_rows = max(rr for rr, _, _ in legend_pts) + 1
++    tile_cols = max(cc for _, cc, _ in legend_pts) + 1
++    max_rr = tile_rows - 1
++    max_cc = tile_cols - 1
++
++    sizes = [s for _, _, s, _ in blocks]
++    vals, cnts = np.unique(np.array(sizes, dtype=int), return_counts=True)
++    block_size = int(vals[cnts.argmax()])
++    blocks = [b for b in blocks if b[2] == block_size]
++    assert blocks, "must contain at least one block of the dominant block size"
++
++    tops = sorted({r0 for r0, _, _, _ in blocks})
++    lefts = sorted({c0 for _, c0, _, _ in blocks})
++    step_candidates = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
++    step_candidates += [lefts[i + 1] - lefts[i] for i in range(len(lefts) - 1)]
++    assert step_candidates, "existing blocks must reveal the block step"
++    step = reduce(gcd, step_candidates)
++    assert step > 0, "block step must be positive"
++
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    tile_span_r = max_rr * step + block_size
++    tile_span_c = max_cc * step + block_size
++
++    by_color: dict[int, list[tuple[int, int]]] = {}
++    for r0, c0, _, col in blocks:
++        by_color.setdefault(int(col), []).append((int(r0), int(c0)))
++
++    phases: dict[tuple[int, int], int] = {}
++    for rr, cc, col in legend_pts:
++        if col not in by_color:
++            continue
++        for br0, bc0 in by_color[col]:
++            phase_r = (br0 - rr * step) % period_r
++            phase_c = (bc0 - cc * step) % period_c
++            phases[(phase_r, phase_c)] = phases.get((phase_r, phase_c), 0) + 1
++    assert phases, "existing blocks must determine the macro-tile phase"
++    max_votes = max(phases.values())
++    best_phases = [phase for phase, votes in phases.items() if votes == max_votes]
++    assert len(best_phases) == 1, "macro-tile phase must be unique"
++    phase_r, phase_c = best_phases[0]
++
++    row_starts = range(phase_r, h - tile_span_r + 1, period_r)
++    col_starts = range(phase_c, w - tile_span_c + 1, period_c)
++    for tile_r in row_starts:
++        for tile_c in col_starts:
++            for rr, cc, col in legend_pts:
++                tr0 = tile_r + rr * step
++                tc0 = tile_c + cc * step
++                assert 0 <= tr0 <= h - block_size and 0 <= tc0 <= w - block_size, \
++                    "tiled legend block projection must fit in canvas"
++                out[tr0:tr0 + block_size, tc0:tc0 + block_size] = col
++    return out
++
++
++# --------------- generator (o5x -> D3 tiling) ---------------
++
++# === CFG: canvas ===
++GRID_SIZE_MIN, GRID_SIZE_MAX = 23, 27
++NUM_COLORS = 10
++
++# === CFG: legend lattice ===
++LEGEND_ORIGIN = (1, 1)
++LEGEND_STEP = 2
++LEGEND_ROWS = (3, 4)
++LEGEND_COLS = (2, 3)
++LEGEND_EMPTIES = (0, 1, 2)
++LEGEND_FILLED_MIN, LEGEND_FILLED_MAX = 6, 10
++PALETTE_SIZE_MIN, PALETTE_SIZE_MAX = 2, 4
++MAX_COUNT_PER_COLOR = 6
++
++# === CFG: block area ===
++BLOCK_SIZE_RANGE = range(2, 5)
++GAP_RANGE = range(1, 4)
++STEP_MIN, STEP_MAX = 3, 5
++BASE_C_MIN = 8
++BASE_R_MIN = 1
++TILE_REPS_R = (2, 3)
++TILE_REPS_C = (2, 3, 4)
++
++# === CFG: generation ===
++MAX_RETRIES = 400
++
++
++def _enumerate_staircase_shapes():
++    """Enumerate valid staircase width tuples."""
++    shapes = []
++    for rows in LEGEND_ROWS:
++        for cols in LEGEND_COLS:
++            total = rows * cols
++            for empties in LEGEND_EMPTIES:
++                count = total - empties
++                if not (LEGEND_FILLED_MIN <= count <= LEGEND_FILLED_MAX):
++                    continue
++
++                def rec(prefix, remaining, r):
++                    if r == rows:
++                        if remaining == 0 and max(prefix) == cols:
++                            shapes.append(tuple(prefix))
++                        return
++                    left = rows - r - 1
++                    lo = max(1, remaining - left * cols)
++                    hi = min(cols, remaining - left)
++                    for width in range(lo, hi + 1):
++                        rec(prefix + [width], remaining - width, r + 1)
++
++                rec([], count, 0)
++    return shapes
++
++
++_BLOCK_GAP_PAIRS = [
++    (n, g) for n in BLOCK_SIZE_RANGE for g in GAP_RANGE
++    if STEP_MIN <= n + g <= STEP_MAX
++]
++_STAIRCASE_SHAPES = _enumerate_staircase_shapes()
++
++
++def _pick_staircase():
++    """Pick a staircase legend shape; return filled points and horizontal adjacent pairs."""
++    widths = random.choice(_STAIRCASE_SHAPES)
++    pts = [(r, c) for r, width in enumerate(widths) for c in range(width)]
++    pairs = [(r, c) for r, width in enumerate(widths) for c in range(width - 1)]
++    return pts, pairs
++
++
++def _random_color_counts(total, k):
++    """Distribute `total` items among `k` colors with positive counts."""
++    counts = [1] * k
++    remaining = total - k
++    while remaining:
++        open_idxs = [i for i, v in enumerate(counts) if v < MAX_COUNT_PER_COLOR]
++        i = random.choice(open_idxs)
++        add = random.randint(1, min(remaining, MAX_COUNT_PER_COLOR - counts[i]))
++        counts[i] += add
++        remaining -= add
++    random.shuffle(counts)
++    return counts
++
++
++def _assign_legend_colors(pts, anchor_pair, palette):
++    """
++    Color the legend so the ordered horizontal anchor pair is unique.
++
++    This preserves the original task's sparse-anchors feel while giving the
++    tiling solver a unique phase vote.
++    """
++    pos_set = set(pts)
++    first = anchor_pair
++    second = (anchor_pair[0], anchor_pair[1] + 1)
++    a, b = random.sample(palette, 2)
++    counts = dict(zip(palette, _random_color_counts(len(pts), len(palette))))
++    colors = {first: a, second: b}
++    counts[a] -= 1
++    counts[b] -= 1
++    if counts[a] < 0 or counts[b] < 0:
++        return None
++
++    anchor_colors = (a, b)
++    cells = [p for p in pts if p not in colors]
++
++    def allowed(pos, col):
++        r, c = pos
++        left = (r, c - 1)
++        if left in pos_set and left in colors:
++            if (colors[left], col) == anchor_colors and (left, pos) != (first, second):
++                return False
++        right = (r, c + 1)
++        if right in pos_set and right in colors:
++            if (col, colors[right]) == anchor_colors and (pos, right) != (first, second):
++                return False
++        return True
++
++    def search():
++        if not cells:
++            return all(v == 0 for v in counts.values())
++        best_i, best_opts = None, None
++        for i, pos in enumerate(cells):
++            opts = [col for col in palette if counts[col] > 0 and allowed(pos, col)]
++            if best_opts is None or len(opts) < len(best_opts):
++                best_i, best_opts = i, opts
++        if not best_opts:
++            return False
++        pos = cells.pop(best_i)
++        random.shuffle(best_opts)
++        for col in best_opts:
++            colors[pos] = col
++            counts[col] -= 1
++            if search():
++                return True
++            counts[col] += 1
++            del colors[pos]
++        cells.insert(best_i, pos)
++        return False
++
++    if not search():
++        return None
++    return colors
++
++
++def _render_tiling(canvas, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols):
++    """Paint every block in every macro-tile."""
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for (rr, cc), col in legend_colors.items():
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                canvas[br:br + block_size, bc:bc + block_size] = col
++
++
++def _gen_attempt():
++    size = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    block_size, gap = random.choice(_BLOCK_GAP_PAIRS)
++    step = block_size + gap
++    pts, pairs = _pick_staircase()
++    anchor_pair = random.choice(pairs)
++
++    bg = random.randrange(NUM_COLORS)
++    k_min = max(PALETTE_SIZE_MIN, (len(pts) + MAX_COUNT_PER_COLOR - 1) // MAX_COUNT_PER_COLOR)
++    k = random.randint(k_min, min(PALETTE_SIZE_MAX, len(pts)))
++    palette = random.sample([c for c in range(NUM_COLORS) if c != bg], k)
++    legend_colors = _assign_legend_colors(pts, anchor_pair, palette)
++    if legend_colors is None:
++        return None
++
++    tile_rows = max(r for r, _ in pts) + 1
++    tile_cols = max(c for _, c in pts) + 1
++    tile_span_r = (tile_rows - 1) * step + block_size
++    tile_span_c = (tile_cols - 1) * step + block_size
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++
++    layout_options = []
++    for reps_r in TILE_REPS_R:
++        total_h = tile_span_r + (reps_r - 1) * period_r
++        r_hi = size - total_h
++        r_max = min(period_r - 1, r_hi)
++        if r_max < BASE_R_MIN:
++            continue
++        for reps_c in TILE_REPS_C:
++            total_w = tile_span_c + (reps_c - 1) * period_c
++            c_hi = size - total_w
++            c_max = min(period_c - 1, c_hi)
++            if c_max < BASE_C_MIN:
++                continue
++            if reps_r * reps_c < 4:
++                continue
++            layout_options.append((reps_r, reps_c, r_max, c_max))
++    if not layout_options:
++        return None
++
++    reps_r, reps_c, r_max, c_max = random.choice(layout_options)
++    base_r = random.randint(BASE_R_MIN, r_max)
++    base_c = random.randint(BASE_C_MIN, c_max)
++
++    lr0, lc0 = LEGEND_ORIGIN
++    out = np.full((size, size), bg, dtype=int)
++    for (rr, cc), col in legend_colors.items():
++        out[lr0 + rr * LEGEND_STEP, lc0 + cc * LEGEND_STEP] = col
++    _render_tiling(out, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols)
++
++    inp = out.copy()
++    keep = {anchor_pair, (anchor_pair[0], anchor_pair[1] + 1)}
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for rr, cc in pts:
++                if tile_idx_r == 0 and tile_idx_c == 0 and (rr, cc) in keep:
++                    continue
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                inp[br:br + block_size, bc:bc + block_size] = bg
++
++    try:
++        solved = main(inp)
++    except Exception:
++        return None
++    if not np.array_equal(solved, out):
++        return None
++    return inp
++
++
++def generate_input():
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid tiled c4d067a0 input")
+
+diff --git a/ceshi/code/c4d067a0/D3/1/code.py b/ceshi/code/c4d067a0/D3/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e971ba1ec60d79a8f1bf26fdfe068595f4d341c
+--- /dev/null
++++ b/ceshi/code/c4d067a0/D3/1/code.py
+@@ -0,0 +1,410 @@
++# Variant of c4d067a0
++# Dimension: D3 — 目标位置：色块放置区域 (dst)
++# Change: 网格中通过缩放因子计算出的对应位置，每个图例像素映射为一个 NxN 的实心色块，色块之间以背景色分隔... → 铺贴到周期性网格的指定单元
++
++# Design analysis
++# ----------------
++# a) 具体化与行为追踪
++#    - 左上角图例仍然是 step=2 的单像素点阵，颜色和原题一致，表示一个小的“模板”。
++#    - 右侧主区域仍然由 NxN 实心色块组成，色块顶点落在步长为 step=block_size+gap 的块格点上。
++#    - 变体的核心改动：图例不再只映射到主区域中的一个单次形状，而是作为“一个宏瓦片内部的局部占位图”。
++#      设图例在格点坐标中的包围盒是 tile_rows x tile_cols，则主区域的宏瓦片周期就是
++#      period_r = tile_rows * step, period_c = tile_cols * step。每个瓦片里，图例中的每个点都映射为一个 NxN 色块。
++#    - 小例子：
++#      原题若图例局部坐标有 (0,0),(0,1),(1,0)，并从已有块反推出 base=(4,10), step=3，
++#      则只会在 (4,10),(4,13),(7,10) 放三块。
++#      本变体中，若图例包围盒是 2x2，则 period=(6,6)；除了 base 对应的那一组外，
++#      还会在 (4+6k,10+6m) 的每个瓦片里重复放置同样的三块，直到完整瓦片放不下为止。
++#
++# b) 复杂度校准
++#    - 仍保留原题的 2-4 种颜色、3-4 x 2-3 的小图例、2x2 以上实心色块，避免退化成过于规则的单色平铺。
++#    - 为了保证“周期性”肉眼可见，生成器强制至少 2x2 个宏瓦片，总块数严格大于单次图例块数。
++#    - 仍只保留两个输入锚块，但要求它们对应图例中唯一的水平相邻有序颜色对，这样既维持原题的稀疏提示，
++#      又能唯一锁定宏瓦片的相位。
++#
++# c) 隐式假设审查（相对原 main 的关键变化）
++#    - 原代码把 base_r + rr*step / base_c + cc*step 当成唯一绝对目标位置；本变体不成立，
++#      因为同一图例点会在多个瓦片中重复出现，所以 solver 必须改为推断“模周期的相位”而不是单次绝对偏移。
++#    - 原代码对同色 legend 点与 block 的投票是绝对坐标投票；本变体改为对
++#      ((br0 - rr*step) mod period_r, (bc0 - cc*step) mod period_c) 投票。
++#    - 原代码最后只绘制一轮 legend_pts；本变体必须在所有完整瓦片上循环绘制。
++#
++# d) 放置合法性
++#    - 生成器只接受完整瓦片可放置的布局：tile_span_r/tile_span_c 给出单个瓦片的实际占用范围，
++#      base 与 repetitions 的选择保证所有块都在画布内，且与左上角图例分离。
++#    - 输入只保留同一瓦片中的两个水平相邻锚块，因此它们既能给出 step，也不会与其他重复实例混淆。
++#
++# e) 视觉可观察性
++#    - 人类从样例能直接看到：左上角是一个小模板，右侧不是补一个局部缺块，而是整齐地在多块大瓦片中重复。
++#    - 重复次数固定至少 4 个瓦片，因此 D3 的差异不是边缘现象。
++#
++# f) 可视化整洁度
++#    - 宏瓦片之间只通过背景色间隔，没有额外标记线，视觉上会形成干净的重复阵列。
++#    - 图例保留在左上角，主区域从较右侧开始，避免与平铺区混在一起。
++#
++# g) 颜色变化可推断性
++#    - 颜色仍只表示“这个局部槽位要填什么色”，没有引入任何依赖颜色 id 的排序或运算。
++#    - 锚块的唯一性由“局部相邻颜色对”保证，而不是由颜色大小关系保证。
++
++import numpy as np
++from functools import reduce
++from math import gcd
++
++from arc_utils import bbox_coords, components_mask, get_bg
++import random
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Repeat a legend-defined block template across a periodic macro-tile grid.
++
++    Input structure:
++    - bg = most common color.
++    - Top-left corner: a sparse legend of singleton colored pixels on a regular lattice; these pixels describe one macro-tile's local block layout.
++    - Main area: a few uniformly colored square blocks (NxN) already placed on the same block lattice; they reveal block size, block step, and macro-tile phase.
++
++    Rule:
++    - Normalize the legend into lattice coordinates, and treat its bounding box as the row/column span of one repeating macro-tile.
++    - Infer the block lattice step from the existing blocks, then infer the macro-tile phase by matching block colors against legend colors modulo the macro-tile period.
++    - For every macro-tile that fully fits in the canvas, place an NxN block for every legend pixel at the corresponding local position inside that tile.
++
++    Key insight: The legend is no longer a one-off minimap of a single block cluster; it is a local template that repeats at a fixed 2D period across the destination lattice.
++    """
++    g = np.asarray(grid, dtype=int)
++    h, w = g.shape
++    out = g.copy()
++    bg = get_bg(g)
++
++    comps = components_mask(g != bg, connectivity=4)
++    singles: list[tuple[int, int, int]] = []
++    blocks: list[tuple[int, int, int, int]] = []  # (r0,c0,size,color)
++    for pts in comps:
++        if len(pts) == 1:
++            r, c = pts[0]
++            singles.append((int(r), int(c), int(g[r, c])))
++            continue
++        r0, c0, r1, c1 = bbox_coords(pts)
++        hh, ww = r1 - r0 + 1, c1 - c0 + 1
++        if hh != ww or hh < 2:
++            continue
++        sub = g[r0:r1 + 1, c0:c1 + 1]
++        col = int(sub[0, 0])
++        if col == bg:
++            continue
++        if np.all(sub == col) and sub.size == len(pts):
++            blocks.append((int(r0), int(c0), int(hh), col))
++
++    assert singles and blocks, "grid must contain legend pixels and main blocks"
++
++    win_r = min(h, 12)
++    win_c = min(w, 12)
++    legend = [(r, c, v) for (r, c, v) in singles if r < win_r and c < win_c]
++    assert legend, "top-left legend must contain singleton pixels"
++
++    rs = sorted({r for r, _, _ in legend})
++    cs = sorted({c for _, c, _ in legend})
++    drs = [rs[i + 1] - rs[i] for i in range(len(rs) - 1)]
++    dcs = [cs[i + 1] - cs[i] for i in range(len(cs) - 1)]
++    stepL = reduce(gcd, drs + dcs)
++    assert stepL > 0, "legend lattice step must be positive"
++    rmin = min(r for r, _, _ in legend)
++    cmin = min(c for _, c, _ in legend)
++
++    legend_pts: list[tuple[int, int, int]] = []
++    for r, c, v in legend:
++        rr = (r - rmin) // stepL
++        cc = (c - cmin) // stepL
++        legend_pts.append((int(rr), int(cc), int(v)))
++
++    tile_rows = max(rr for rr, _, _ in legend_pts) + 1
++    tile_cols = max(cc for _, cc, _ in legend_pts) + 1
++    max_rr = tile_rows - 1
++    max_cc = tile_cols - 1
++
++    sizes = [s for _, _, s, _ in blocks]
++    vals, cnts = np.unique(np.array(sizes, dtype=int), return_counts=True)
++    block_size = int(vals[cnts.argmax()])
++    blocks = [b for b in blocks if b[2] == block_size]
++    assert blocks, "must contain at least one block of the dominant block size"
++
++    tops = sorted({r0 for r0, _, _, _ in blocks})
++    lefts = sorted({c0 for _, c0, _, _ in blocks})
++    step_candidates = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
++    step_candidates += [lefts[i + 1] - lefts[i] for i in range(len(lefts) - 1)]
++    assert step_candidates, "existing blocks must reveal the block step"
++    step = reduce(gcd, step_candidates)
++    assert step > 0, "block step must be positive"
++
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    tile_span_r = max_rr * step + block_size
++    tile_span_c = max_cc * step + block_size
++
++    by_color: dict[int, list[tuple[int, int]]] = {}
++    for r0, c0, _, col in blocks:
++        by_color.setdefault(int(col), []).append((int(r0), int(c0)))
++
++    phases: dict[tuple[int, int], int] = {}
++    for rr, cc, col in legend_pts:
++        if col not in by_color:
++            continue
++        for br0, bc0 in by_color[col]:
++            phase_r = (br0 - rr * step) % period_r
++            phase_c = (bc0 - cc * step) % period_c
++            phases[(phase_r, phase_c)] = phases.get((phase_r, phase_c), 0) + 1
++    assert phases, "existing blocks must determine the macro-tile phase"
++    max_votes = max(phases.values())
++    best_phases = [phase for phase, votes in phases.items() if votes == max_votes]
++    assert len(best_phases) == 1, "macro-tile phase must be unique"
++    phase_r, phase_c = best_phases[0]
++
++    row_starts = range(phase_r, h - tile_span_r + 1, period_r)
++    col_starts = range(phase_c, w - tile_span_c + 1, period_c)
++    for tile_r in row_starts:
++        for tile_c in col_starts:
++            for rr, cc, col in legend_pts:
++                tr0 = tile_r + rr * step
++                tc0 = tile_c + cc * step
++                assert 0 <= tr0 <= h - block_size and 0 <= tc0 <= w - block_size, \
++                    "tiled legend block projection must fit in canvas"
++                out[tr0:tr0 + block_size, tc0:tc0 + block_size] = col
++    return out
++
++
++# --------------- generator (o5x -> D3 tiling) ---------------
++
++# === CFG: canvas ===
++GRID_SIZE_MIN, GRID_SIZE_MAX = 23, 27
++NUM_COLORS = 10
++
++# === CFG: legend lattice ===
++LEGEND_ORIGIN = (1, 1)
++LEGEND_STEP = 2
++LEGEND_ROWS = (3, 4)
++LEGEND_COLS = (2, 3)
++LEGEND_EMPTIES = (0, 1, 2)
++LEGEND_FILLED_MIN, LEGEND_FILLED_MAX = 6, 10
++PALETTE_SIZE_MIN, PALETTE_SIZE_MAX = 2, 4
++MAX_COUNT_PER_COLOR = 6
++
++# === CFG: block area ===
++BLOCK_SIZE_RANGE = range(2, 5)
++GAP_RANGE = range(1, 4)
++STEP_MIN, STEP_MAX = 3, 5
++BASE_C_MIN = 8
++BASE_R_MIN = 1
++TILE_REPS_R = (2, 3)
++TILE_REPS_C = (2, 3, 4)
++
++# === CFG: generation ===
++MAX_RETRIES = 400
++
++
++def _enumerate_staircase_shapes():
++    """Enumerate valid staircase width tuples."""
++    shapes = []
++    for rows in LEGEND_ROWS:
++        for cols in LEGEND_COLS:
++            total = rows * cols
++            for empties in LEGEND_EMPTIES:
++                count = total - empties
++                if not (LEGEND_FILLED_MIN <= count <= LEGEND_FILLED_MAX):
++                    continue
++
++                def rec(prefix, remaining, r):
++                    if r == rows:
++                        if remaining == 0 and max(prefix) == cols:
++                            shapes.append(tuple(prefix))
++                        return
++                    left = rows - r - 1
++                    lo = max(1, remaining - left * cols)
++                    hi = min(cols, remaining - left)
++                    for width in range(lo, hi + 1):
++                        rec(prefix + [width], remaining - width, r + 1)
++
++                rec([], count, 0)
++    return shapes
++
++
++_BLOCK_GAP_PAIRS = [
++    (n, g) for n in BLOCK_SIZE_RANGE for g in GAP_RANGE
++    if STEP_MIN <= n + g <= STEP_MAX
++]
++_STAIRCASE_SHAPES = _enumerate_staircase_shapes()
++
++
++def _pick_staircase():
++    """Pick a staircase legend shape; return filled points and horizontal adjacent pairs."""
++    widths = random.choice(_STAIRCASE_SHAPES)
++    pts = [(r, c) for r, width in enumerate(widths) for c in range(width)]
++    pairs = [(r, c) for r, width in enumerate(widths) for c in range(width - 1)]
++    return pts, pairs
++
++
++def _random_color_counts(total, k):
++    """Distribute `total` items among `k` colors with positive counts."""
++    counts = [1] * k
++    remaining = total - k
++    while remaining:
++        open_idxs = [i for i, v in enumerate(counts) if v < MAX_COUNT_PER_COLOR]
++        i = random.choice(open_idxs)
++        add = random.randint(1, min(remaining, MAX_COUNT_PER_COLOR - counts[i]))
++        counts[i] += add
++        remaining -= add
++    random.shuffle(counts)
++    return counts
++
++
++def _assign_legend_colors(pts, anchor_pair, palette):
++    """
++    Color the legend so the ordered horizontal anchor pair is unique.
++
++    This preserves the original task's sparse-anchors feel while giving the
++    tiling solver a unique phase vote.
++    """
++    pos_set = set(pts)
++    first = anchor_pair
++    second = (anchor_pair[0], anchor_pair[1] + 1)
++    a, b = random.sample(palette, 2)
++    counts = dict(zip(palette, _random_color_counts(len(pts), len(palette))))
++    colors = {first: a, second: b}
++    counts[a] -= 1
++    counts[b] -= 1
++    if counts[a] < 0 or counts[b] < 0:
++        return None
++
++    anchor_colors = (a, b)
++    cells = [p for p in pts if p not in colors]
++
++    def allowed(pos, col):
++        r, c = pos
++        left = (r, c - 1)
++        if left in pos_set and left in colors:
++            if (colors[left], col) == anchor_colors and (left, pos) != (first, second):
++                return False
++        right = (r, c + 1)
++        if right in pos_set and right in colors:
++            if (col, colors[right]) == anchor_colors and (pos, right) != (first, second):
++                return False
++        return True
++
++    def search():
++        if not cells:
++            return all(v == 0 for v in counts.values())
++        best_i, best_opts = None, None
++        for i, pos in enumerate(cells):
++            opts = [col for col in palette if counts[col] > 0 and allowed(pos, col)]
++            if best_opts is None or len(opts) < len(best_opts):
++                best_i, best_opts = i, opts
++        if not best_opts:
++            return False
++        pos = cells.pop(best_i)
++        random.shuffle(best_opts)
++        for col in best_opts:
++            colors[pos] = col
++            counts[col] -= 1
++            if search():
++                return True
++            counts[col] += 1
++            del colors[pos]
++        cells.insert(best_i, pos)
++        return False
++
++    if not search():
++        return None
++    return colors
++
++
++def _render_tiling(canvas, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols):
++    """Paint every block in every macro-tile."""
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for (rr, cc), col in legend_colors.items():
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                canvas[br:br + block_size, bc:bc + block_size] = col
++
++
++def _gen_attempt():
++    size = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    block_size, gap = random.choice(_BLOCK_GAP_PAIRS)
++    step = block_size + gap
++    pts, pairs = _pick_staircase()
++    anchor_pair = random.choice(pairs)
++
++    bg = random.randrange(NUM_COLORS)
++    k_min = max(PALETTE_SIZE_MIN, (len(pts) + MAX_COUNT_PER_COLOR - 1) // MAX_COUNT_PER_COLOR)
++    k = random.randint(k_min, min(PALETTE_SIZE_MAX, len(pts)))
++    palette = random.sample([c for c in range(NUM_COLORS) if c != bg], k)
++    legend_colors = _assign_legend_colors(pts, anchor_pair, palette)
++    if legend_colors is None:
++        return None
++
++    tile_rows = max(r for r, _ in pts) + 1
++    tile_cols = max(c for _, c in pts) + 1
++    tile_span_r = (tile_rows - 1) * step + block_size
++    tile_span_c = (tile_cols - 1) * step + block_size
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++
++    layout_options = []
++    for reps_r in TILE_REPS_R:
++        total_h = tile_span_r + (reps_r - 1) * period_r
++        r_hi = size - total_h
++        r_max = min(period_r - 1, r_hi)
++        if r_max < BASE_R_MIN:
++            continue
++        for reps_c in TILE_REPS_C:
++            total_w = tile_span_c + (reps_c - 1) * period_c
++            c_hi = size - total_w
++            c_max = min(period_c - 1, c_hi)
++            if c_max < BASE_C_MIN:
++                continue
++            if reps_r * reps_c < 4:
++                continue
++            layout_options.append((reps_r, reps_c, r_max, c_max))
++    if not layout_options:
++        return None
++
++    reps_r, reps_c, r_max, c_max = random.choice(layout_options)
++    base_r = random.randint(BASE_R_MIN, r_max)
++    base_c = random.randint(BASE_C_MIN, c_max)
++
++    lr0, lc0 = LEGEND_ORIGIN
++    out = np.full((size, size), bg, dtype=int)
++    for (rr, cc), col in legend_colors.items():
++        out[lr0 + rr * LEGEND_STEP, lc0 + cc * LEGEND_STEP] = col
++    _render_tiling(out, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols)
++
++    inp = out.copy()
++    keep = {anchor_pair, (anchor_pair[0], anchor_pair[1] + 1)}
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for rr, cc in pts:
++                if tile_idx_r == 0 and tile_idx_c == 0 and (rr, cc) in keep:
++                    continue
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                inp[br:br + block_size, bc:bc + block_size] = bg
++
++    try:
++        solved = main(inp)
++    except Exception:
++        return None
++    if not np.array_equal(solved, out):
++        return None
++    return inp
++
++
++def generate_input():
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid tiled c4d067a0 input")
+
+exec
+/bin/bash -lc "rg --files /home/lixinyu/snap/new -g 'arc_utils.py'" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+/home/lixinyu/snap/new/arc_utils.py
+
+diff --git a/ceshi/code/c4d067a0/D3/1/code.py b/ceshi/code/c4d067a0/D3/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e971ba1ec60d79a8f1bf26fdfe068595f4d341c
+--- /dev/null
++++ b/ceshi/code/c4d067a0/D3/1/code.py
+@@ -0,0 +1,410 @@
++# Variant of c4d067a0
++# Dimension: D3 — 目标位置：色块放置区域 (dst)
++# Change: 网格中通过缩放因子计算出的对应位置，每个图例像素映射为一个 NxN 的实心色块，色块之间以背景色分隔... → 铺贴到周期性网格的指定单元
++
++# Design analysis
++# ----------------
++# a) 具体化与行为追踪
++#    - 左上角图例仍然是 step=2 的单像素点阵，颜色和原题一致，表示一个小的“模板”。
++#    - 右侧主区域仍然由 NxN 实心色块组成，色块顶点落在步长为 step=block_size+gap 的块格点上。
++#    - 变体的核心改动：图例不再只映射到主区域中的一个单次形状，而是作为“一个宏瓦片内部的局部占位图”。
++#      设图例在格点坐标中的包围盒是 tile_rows x tile_cols，则主区域的宏瓦片周期就是
++#      period_r = tile_rows * step, period_c = tile_cols * step。每个瓦片里，图例中的每个点都映射为一个 NxN 色块。
++#    - 小例子：
++#      原题若图例局部坐标有 (0,0),(0,1),(1,0)，并从已有块反推出 base=(4,10), step=3，
++#      则只会在 (4,10),(4,13),(7,10) 放三块。
++#      本变体中，若图例包围盒是 2x2，则 period=(6,6)；除了 base 对应的那一组外，
++#      还会在 (4+6k,10+6m) 的每个瓦片里重复放置同样的三块，直到完整瓦片放不下为止。
++#
++# b) 复杂度校准
++#    - 仍保留原题的 2-4 种颜色、3-4 x 2-3 的小图例、2x2 以上实心色块，避免退化成过于规则的单色平铺。
++#    - 为了保证“周期性”肉眼可见，生成器强制至少 2x2 个宏瓦片，总块数严格大于单次图例块数。
++#    - 仍只保留两个输入锚块，但要求它们对应图例中唯一的水平相邻有序颜色对，这样既维持原题的稀疏提示，
++#      又能唯一锁定宏瓦片的相位。
++#
++# c) 隐式假设审查（相对原 main 的关键变化）
++#    - 原代码把 base_r + rr*step / base_c + cc*step 当成唯一绝对目标位置；本变体不成立，
++#      因为同一图例点会在多个瓦片中重复出现，所以 solver 必须改为推断“模周期的相位”而不是单次绝对偏移。
++#    - 原代码对同色 legend 点与 block 的投票是绝对坐标投票；本变体改为对
++#      ((br0 - rr*step) mod period_r, (bc0 - cc*step) mod period_c) 投票。
++#    - 原代码最后只绘制一轮 legend_pts；本变体必须在所有完整瓦片上循环绘制。
++#
++# d) 放置合法性
++#    - 生成器只接受完整瓦片可放置的布局：tile_span_r/tile_span_c 给出单个瓦片的实际占用范围，
++#      base 与 repetitions 的选择保证所有块都在画布内，且与左上角图例分离。
++#    - 输入只保留同一瓦片中的两个水平相邻锚块，因此它们既能给出 step，也不会与其他重复实例混淆。
++#
++# e) 视觉可观察性
++#    - 人类从样例能直接看到：左上角是一个小模板，右侧不是补一个局部缺块，而是整齐地在多块大瓦片中重复。
++#    - 重复次数固定至少 4 个瓦片，因此 D3 的差异不是边缘现象。
++#
++# f) 可视化整洁度
++#    - 宏瓦片之间只通过背景色间隔，没有额外标记线，视觉上会形成干净的重复阵列。
++#    - 图例保留在左上角，主区域从较右侧开始，避免与平铺区混在一起。
++#
++# g) 颜色变化可推断性
++#    - 颜色仍只表示“这个局部槽位要填什么色”，没有引入任何依赖颜色 id 的排序或运算。
++#    - 锚块的唯一性由“局部相邻颜色对”保证，而不是由颜色大小关系保证。
++
++import numpy as np
++from functools import reduce
++from math import gcd
++
++from arc_utils import bbox_coords, components_mask, get_bg
++import random
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Repeat a legend-defined block template across a periodic macro-tile grid.
++
++    Input structure:
++    - bg = most common color.
++    - Top-left corner: a sparse legend of singleton colored pixels on a regular lattice; these pixels describe one macro-tile's local block layout.
++    - Main area: a few uniformly colored square blocks (NxN) already placed on the same block lattice; they reveal block size, block step, and macro-tile phase.
++
++    Rule:
++    - Normalize the legend into lattice coordinates, and treat its bounding box as the row/column span of one repeating macro-tile.
++    - Infer the block lattice step from the existing blocks, then infer the macro-tile phase by matching block colors against legend colors modulo the macro-tile period.
++    - For every macro-tile that fully fits in the canvas, place an NxN block for every legend pixel at the corresponding local position inside that tile.
++
++    Key insight: The legend is no longer a one-off minimap of a single block cluster; it is a local template that repeats at a fixed 2D period across the destination lattice.
++    """
++    g = np.asarray(grid, dtype=int)
++    h, w = g.shape
++    out = g.copy()
++    bg = get_bg(g)
++
++    comps = components_mask(g != bg, connectivity=4)
++    singles: list[tuple[int, int, int]] = []
++    blocks: list[tuple[int, int, int, int]] = []  # (r0,c0,size,color)
++    for pts in comps:
++        if len(pts) == 1:
++            r, c = pts[0]
++            singles.append((int(r), int(c), int(g[r, c])))
++            continue
++        r0, c0, r1, c1 = bbox_coords(pts)
++        hh, ww = r1 - r0 + 1, c1 - c0 + 1
++        if hh != ww or hh < 2:
++            continue
++        sub = g[r0:r1 + 1, c0:c1 + 1]
++        col = int(sub[0, 0])
++        if col == bg:
++            continue
++        if np.all(sub == col) and sub.size == len(pts):
++            blocks.append((int(r0), int(c0), int(hh), col))
++
++    assert singles and blocks, "grid must contain legend pixels and main blocks"
++
++    win_r = min(h, 12)
++    win_c = min(w, 12)
++    legend = [(r, c, v) for (r, c, v) in singles if r < win_r and c < win_c]
++    assert legend, "top-left legend must contain singleton pixels"
++
++    rs = sorted({r for r, _, _ in legend})
++    cs = sorted({c for _, c, _ in legend})
++    drs = [rs[i + 1] - rs[i] for i in range(len(rs) - 1)]
++    dcs = [cs[i + 1] - cs[i] for i in range(len(cs) - 1)]
++    stepL = reduce(gcd, drs + dcs)
++    assert stepL > 0, "legend lattice step must be positive"
++    rmin = min(r for r, _, _ in legend)
++    cmin = min(c for _, c, _ in legend)
++
++    legend_pts: list[tuple[int, int, int]] = []
++    for r, c, v in legend:
++        rr = (r - rmin) // stepL
++        cc = (c - cmin) // stepL
++        legend_pts.append((int(rr), int(cc), int(v)))
++
++    tile_rows = max(rr for rr, _, _ in legend_pts) + 1
++    tile_cols = max(cc for _, cc, _ in legend_pts) + 1
++    max_rr = tile_rows - 1
++    max_cc = tile_cols - 1
++
++    sizes = [s for _, _, s, _ in blocks]
++    vals, cnts = np.unique(np.array(sizes, dtype=int), return_counts=True)
++    block_size = int(vals[cnts.argmax()])
++    blocks = [b for b in blocks if b[2] == block_size]
++    assert blocks, "must contain at least one block of the dominant block size"
++
++    tops = sorted({r0 for r0, _, _, _ in blocks})
++    lefts = sorted({c0 for _, c0, _, _ in blocks})
++    step_candidates = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
++    step_candidates += [lefts[i + 1] - lefts[i] for i in range(len(lefts) - 1)]
++    assert step_candidates, "existing blocks must reveal the block step"
++    step = reduce(gcd, step_candidates)
++    assert step > 0, "block step must be positive"
++
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    tile_span_r = max_rr * step + block_size
++    tile_span_c = max_cc * step + block_size
++
++    by_color: dict[int, list[tuple[int, int]]] = {}
++    for r0, c0, _, col in blocks:
++        by_color.setdefault(int(col), []).append((int(r0), int(c0)))
++
++    phases: dict[tuple[int, int], int] = {}
++    for rr, cc, col in legend_pts:
++        if col not in by_color:
++            continue
++        for br0, bc0 in by_color[col]:
++            phase_r = (br0 - rr * step) % period_r
++            phase_c = (bc0 - cc * step) % period_c
++            phases[(phase_r, phase_c)] = phases.get((phase_r, phase_c), 0) + 1
++    assert phases, "existing blocks must determine the macro-tile phase"
++    max_votes = max(phases.values())
++    best_phases = [phase for phase, votes in phases.items() if votes == max_votes]
++    assert len(best_phases) == 1, "macro-tile phase must be unique"
++    phase_r, phase_c = best_phases[0]
++
++    row_starts = range(phase_r, h - tile_span_r + 1, period_r)
++    col_starts = range(phase_c, w - tile_span_c + 1, period_c)
++    for tile_r in row_starts:
++        for tile_c in col_starts:
++            for rr, cc, col in legend_pts:
++                tr0 = tile_r + rr * step
++                tc0 = tile_c + cc * step
++                assert 0 <= tr0 <= h - block_size and 0 <= tc0 <= w - block_size, \
++                    "tiled legend block projection must fit in canvas"
++                out[tr0:tr0 + block_size, tc0:tc0 + block_size] = col
++    return out
++
++
++# --------------- generator (o5x -> D3 tiling) ---------------
++
++# === CFG: canvas ===
++GRID_SIZE_MIN, GRID_SIZE_MAX = 23, 27
++NUM_COLORS = 10
++
++# === CFG: legend lattice ===
++LEGEND_ORIGIN = (1, 1)
++LEGEND_STEP = 2
++LEGEND_ROWS = (3, 4)
++LEGEND_COLS = (2, 3)
++LEGEND_EMPTIES = (0, 1, 2)
++LEGEND_FILLED_MIN, LEGEND_FILLED_MAX = 6, 10
++PALETTE_SIZE_MIN, PALETTE_SIZE_MAX = 2, 4
++MAX_COUNT_PER_COLOR = 6
++
++# === CFG: block area ===
++BLOCK_SIZE_RANGE = range(2, 5)
++GAP_RANGE = range(1, 4)
++STEP_MIN, STEP_MAX = 3, 5
++BASE_C_MIN = 8
++BASE_R_MIN = 1
++TILE_REPS_R = (2, 3)
++TILE_REPS_C = (2, 3, 4)
++
++# === CFG: generation ===
++MAX_RETRIES = 400
++
++
++def _enumerate_staircase_shapes():
++    """Enumerate valid staircase width tuples."""
++    shapes = []
++    for rows in LEGEND_ROWS:
++        for cols in LEGEND_COLS:
++            total = rows * cols
++            for empties in LEGEND_EMPTIES:
++                count = total - empties
++                if not (LEGEND_FILLED_MIN <= count <= LEGEND_FILLED_MAX):
++                    continue
++
++                def rec(prefix, remaining, r):
++                    if r == rows:
++                        if remaining == 0 and max(prefix) == cols:
++                            shapes.append(tuple(prefix))
++                        return
++                    left = rows - r - 1
++                    lo = max(1, remaining - left * cols)
++                    hi = min(cols, remaining - left)
++                    for width in range(lo, hi + 1):
++                        rec(prefix + [width], remaining - width, r + 1)
++
++                rec([], count, 0)
++    return shapes
++
++
++_BLOCK_GAP_PAIRS = [
++    (n, g) for n in BLOCK_SIZE_RANGE for g in GAP_RANGE
++    if STEP_MIN <= n + g <= STEP_MAX
++]
++_STAIRCASE_SHAPES = _enumerate_staircase_shapes()
++
++
++def _pick_staircase():
++    """Pick a staircase legend shape; return filled points and horizontal adjacent pairs."""
++    widths = random.choice(_STAIRCASE_SHAPES)
++    pts = [(r, c) for r, width in enumerate(widths) for c in range(width)]
++    pairs = [(r, c) for r, width in enumerate(widths) for c in range(width - 1)]
++    return pts, pairs
++
++
++def _random_color_counts(total, k):
++    """Distribute `total` items among `k` colors with positive counts."""
++    counts = [1] * k
++    remaining = total - k
++    while remaining:
++        open_idxs = [i for i, v in enumerate(counts) if v < MAX_COUNT_PER_COLOR]
++        i = random.choice(open_idxs)
++        add = random.randint(1, min(remaining, MAX_COUNT_PER_COLOR - counts[i]))
++        counts[i] += add
++        remaining -= add
++    random.shuffle(counts)
++    return counts
++
++
++def _assign_legend_colors(pts, anchor_pair, palette):
++    """
++    Color the legend so the ordered horizontal anchor pair is unique.
++
++    This preserves the original task's sparse-anchors feel while giving the
++    tiling solver a unique phase vote.
++    """
++    pos_set = set(pts)
++    first = anchor_pair
++    second = (anchor_pair[0], anchor_pair[1] + 1)
++    a, b = random.sample(palette, 2)
++    counts = dict(zip(palette, _random_color_counts(len(pts), len(palette))))
++    colors = {first: a, second: b}
++    counts[a] -= 1
++    counts[b] -= 1
++    if counts[a] < 0 or counts[b] < 0:
++        return None
++
++    anchor_colors = (a, b)
++    cells = [p for p in pts if p not in colors]
++
++    def allowed(pos, col):
++        r, c = pos
++        left = (r, c - 1)
++        if left in pos_set and left in colors:
++            if (colors[left], col) == anchor_colors and (left, pos) != (first, second):
++                return False
++        right = (r, c + 1)
++        if right in pos_set and right in colors:
++            if (col, colors[right]) == anchor_colors and (pos, right) != (first, second):
++                return False
++        return True
++
++    def search():
++        if not cells:
++            return all(v == 0 for v in counts.values())
++        best_i, best_opts = None, None
++        for i, pos in enumerate(cells):
++            opts = [col for col in palette if counts[col] > 0 and allowed(pos, col)]
++            if best_opts is None or len(opts) < len(best_opts):
++                best_i, best_opts = i, opts
++        if not best_opts:
++            return False
++        pos = cells.pop(best_i)
++        random.shuffle(best_opts)
++        for col in best_opts:
++            colors[pos] = col
++            counts[col] -= 1
++            if search():
++                return True
++            counts[col] += 1
++            del colors[pos]
++        cells.insert(best_i, pos)
++        return False
++
++    if not search():
++        return None
++    return colors
++
++
++def _render_tiling(canvas, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols):
++    """Paint every block in every macro-tile."""
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for (rr, cc), col in legend_colors.items():
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                canvas[br:br + block_size, bc:bc + block_size] = col
++
++
++def _gen_attempt():
++    size = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    block_size, gap = random.choice(_BLOCK_GAP_PAIRS)
++    step = block_size + gap
++    pts, pairs = _pick_staircase()
++    anchor_pair = random.choice(pairs)
++
++    bg = random.randrange(NUM_COLORS)
++    k_min = max(PALETTE_SIZE_MIN, (len(pts) + MAX_COUNT_PER_COLOR - 1) // MAX_COUNT_PER_COLOR)
++    k = random.randint(k_min, min(PALETTE_SIZE_MAX, len(pts)))
++    palette = random.sample([c for c in range(NUM_COLORS) if c != bg], k)
++    legend_colors = _assign_legend_colors(pts, anchor_pair, palette)
++    if legend_colors is None:
++        return None
++
++    tile_rows = max(r for r, _ in pts) + 1
++    tile_cols = max(c for _, c in pts) + 1
++    tile_span_r = (tile_rows - 1) * step + block_size
++    tile_span_c = (tile_cols - 1) * step + block_size
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++
++    layout_options = []
++    for reps_r in TILE_REPS_R:
++        total_h = tile_span_r + (reps_r - 1) * period_r
++        r_hi = size - total_h
++        r_max = min(period_r - 1, r_hi)
++        if r_max < BASE_R_MIN:
++            continue
++        for reps_c in TILE_REPS_C:
++            total_w = tile_span_c + (reps_c - 1) * period_c
++            c_hi = size - total_w
++            c_max = min(period_c - 1, c_hi)
++            if c_max < BASE_C_MIN:
++                continue
++            if reps_r * reps_c < 4:
++                continue
++            layout_options.append((reps_r, reps_c, r_max, c_max))
++    if not layout_options:
++        return None
++
++    reps_r, reps_c, r_max, c_max = random.choice(layout_options)
++    base_r = random.randint(BASE_R_MIN, r_max)
++    base_c = random.randint(BASE_C_MIN, c_max)
++
++    lr0, lc0 = LEGEND_ORIGIN
++    out = np.full((size, size), bg, dtype=int)
++    for (rr, cc), col in legend_colors.items():
++        out[lr0 + rr * LEGEND_STEP, lc0 + cc * LEGEND_STEP] = col
++    _render_tiling(out, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols)
++
++    inp = out.copy()
++    keep = {anchor_pair, (anchor_pair[0], anchor_pair[1] + 1)}
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for rr, cc in pts:
++                if tile_idx_r == 0 and tile_idx_c == 0 and (rr, cc) in keep:
++                    continue
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                inp[br:br + block_size, bc:bc + block_size] = bg
++
++    try:
++        solved = main(inp)
++    except Exception:
++        return None
++    if not np.array_equal(solved, out):
++        return None
++    return inp
++
++
++def generate_input():
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid tiled c4d067a0 input")
+
+codex
+代码已写入，先跑用户指定的 50 次稳定性测试；如果有失败，我会直接根据报错回修。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/c4d067a0/D3/1/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code/c4d067a0/D3/1/code.py b/ceshi/code/c4d067a0/D3/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e971ba1ec60d79a8f1bf26fdfe068595f4d341c
+--- /dev/null
++++ b/ceshi/code/c4d067a0/D3/1/code.py
+@@ -0,0 +1,410 @@
++# Variant of c4d067a0
++# Dimension: D3 — 目标位置：色块放置区域 (dst)
++# Change: 网格中通过缩放因子计算出的对应位置，每个图例像素映射为一个 NxN 的实心色块，色块之间以背景色分隔... → 铺贴到周期性网格的指定单元
++
++# Design analysis
++# ----------------
++# a) 具体化与行为追踪
++#    - 左上角图例仍然是 step=2 的单像素点阵，颜色和原题一致，表示一个小的“模板”。
++#    - 右侧主区域仍然由 NxN 实心色块组成，色块顶点落在步长为 step=block_size+gap 的块格点上。
++#    - 变体的核心改动：图例不再只映射到主区域中的一个单次形状，而是作为“一个宏瓦片内部的局部占位图”。
++#      设图例在格点坐标中的包围盒是 tile_rows x tile_cols，则主区域的宏瓦片周期就是
++#      period_r = tile_rows * step, period_c = tile_cols * step。每个瓦片里，图例中的每个点都映射为一个 NxN 色块。
++#    - 小例子：
++#      原题若图例局部坐标有 (0,0),(0,1),(1,0)，并从已有块反推出 base=(4,10), step=3，
++#      则只会在 (4,10),(4,13),(7,10) 放三块。
++#      本变体中，若图例包围盒是 2x2，则 period=(6,6)；除了 base 对应的那一组外，
++#      还会在 (4+6k,10+6m) 的每个瓦片里重复放置同样的三块，直到完整瓦片放不下为止。
++#
++# b) 复杂度校准
++#    - 仍保留原题的 2-4 种颜色、3-4 x 2-3 的小图例、2x2 以上实心色块，避免退化成过于规则的单色平铺。
++#    - 为了保证“周期性”肉眼可见，生成器强制至少 2x2 个宏瓦片，总块数严格大于单次图例块数。
++#    - 仍只保留两个输入锚块，但要求它们对应图例中唯一的水平相邻有序颜色对，这样既维持原题的稀疏提示，
++#      又能唯一锁定宏瓦片的相位。
++#
++# c) 隐式假设审查（相对原 main 的关键变化）
++#    - 原代码把 base_r + rr*step / base_c + cc*step 当成唯一绝对目标位置；本变体不成立，
++#      因为同一图例点会在多个瓦片中重复出现，所以 solver 必须改为推断“模周期的相位”而不是单次绝对偏移。
++#    - 原代码对同色 legend 点与 block 的投票是绝对坐标投票；本变体改为对
++#      ((br0 - rr*step) mod period_r, (bc0 - cc*step) mod period_c) 投票。
++#    - 原代码最后只绘制一轮 legend_pts；本变体必须在所有完整瓦片上循环绘制。
++#
++# d) 放置合法性
++#    - 生成器只接受完整瓦片可放置的布局：tile_span_r/tile_span_c 给出单个瓦片的实际占用范围，
++#      base 与 repetitions 的选择保证所有块都在画布内，且与左上角图例分离。
++#    - 输入只保留同一瓦片中的两个水平相邻锚块，因此它们既能给出 step，也不会与其他重复实例混淆。
++#
++# e) 视觉可观察性
++#    - 人类从样例能直接看到：左上角是一个小模板，右侧不是补一个局部缺块，而是整齐地在多块大瓦片中重复。
++#    - 重复次数固定至少 4 个瓦片，因此 D3 的差异不是边缘现象。
++#
++# f) 可视化整洁度
++#    - 宏瓦片之间只通过背景色间隔，没有额外标记线，视觉上会形成干净的重复阵列。
++#    - 图例保留在左上角，主区域从较右侧开始，避免与平铺区混在一起。
++#
++# g) 颜色变化可推断性
++#    - 颜色仍只表示“这个局部槽位要填什么色”，没有引入任何依赖颜色 id 的排序或运算。
++#    - 锚块的唯一性由“局部相邻颜色对”保证，而不是由颜色大小关系保证。
++
++import numpy as np
++from functools import reduce
++from math import gcd
++
++from arc_utils import bbox_coords, components_mask, get_bg
++import random
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Repeat a legend-defined block template across a periodic macro-tile grid.
++
++    Input structure:
++    - bg = most common color.
++    - Top-left corner: a sparse legend of singleton colored pixels on a regular lattice; these pixels describe one macro-tile's local block layout.
++    - Main area: a few uniformly colored square blocks (NxN) already placed on the same block lattice; they reveal block size, block step, and macro-tile phase.
++
++    Rule:
++    - Normalize the legend into lattice coordinates, and treat its bounding box as the row/column span of one repeating macro-tile.
++    - Infer the block lattice step from the existing blocks, then infer the macro-tile phase by matching block colors against legend colors modulo the macro-tile period.
++    - For every macro-tile that fully fits in the canvas, place an NxN block for every legend pixel at the corresponding local position inside that tile.
++
++    Key insight: The legend is no longer a one-off minimap of a single block cluster; it is a local template that repeats at a fixed 2D period across the destination lattice.
++    """
++    g = np.asarray(grid, dtype=int)
++    h, w = g.shape
++    out = g.copy()
++    bg = get_bg(g)
++
++    comps = components_mask(g != bg, connectivity=4)
++    singles: list[tuple[int, int, int]] = []
++    blocks: list[tuple[int, int, int, int]] = []  # (r0,c0,size,color)
++    for pts in comps:
++        if len(pts) == 1:
++            r, c = pts[0]
++            singles.append((int(r), int(c), int(g[r, c])))
++            continue
++        r0, c0, r1, c1 = bbox_coords(pts)
++        hh, ww = r1 - r0 + 1, c1 - c0 + 1
++        if hh != ww or hh < 2:
++            continue
++        sub = g[r0:r1 + 1, c0:c1 + 1]
++        col = int(sub[0, 0])
++        if col == bg:
++            continue
++        if np.all(sub == col) and sub.size == len(pts):
++            blocks.append((int(r0), int(c0), int(hh), col))
++
++    assert singles and blocks, "grid must contain legend pixels and main blocks"
++
++    win_r = min(h, 12)
++    win_c = min(w, 12)
++    legend = [(r, c, v) for (r, c, v) in singles if r < win_r and c < win_c]
++    assert legend, "top-left legend must contain singleton pixels"
++
++    rs = sorted({r for r, _, _ in legend})
++    cs = sorted({c for _, c, _ in legend})
++    drs = [rs[i + 1] - rs[i] for i in range(len(rs) - 1)]
++    dcs = [cs[i + 1] - cs[i] for i in range(len(cs) - 1)]
++    stepL = reduce(gcd, drs + dcs)
++    assert stepL > 0, "legend lattice step must be positive"
++    rmin = min(r for r, _, _ in legend)
++    cmin = min(c for _, c, _ in legend)
++
++    legend_pts: list[tuple[int, int, int]] = []
++    for r, c, v in legend:
++        rr = (r - rmin) // stepL
++        cc = (c - cmin) // stepL
++        legend_pts.append((int(rr), int(cc), int(v)))
++
++    tile_rows = max(rr for rr, _, _ in legend_pts) + 1
++    tile_cols = max(cc for _, cc, _ in legend_pts) + 1
++    max_rr = tile_rows - 1
++    max_cc = tile_cols - 1
++
++    sizes = [s for _, _, s, _ in blocks]
++    vals, cnts = np.unique(np.array(sizes, dtype=int), return_counts=True)
++    block_size = int(vals[cnts.argmax()])
++    blocks = [b for b in blocks if b[2] == block_size]
++    assert blocks, "must contain at least one block of the dominant block size"
++
++    tops = sorted({r0 for r0, _, _, _ in blocks})
++    lefts = sorted({c0 for _, c0, _, _ in blocks})
++    step_candidates = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
++    step_candidates += [lefts[i + 1] - lefts[i] for i in range(len(lefts) - 1)]
++    assert step_candidates, "existing blocks must reveal the block step"
++    step = reduce(gcd, step_candidates)
++    assert step > 0, "block step must be positive"
++
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    tile_span_r = max_rr * step + block_size
++    tile_span_c = max_cc * step + block_size
++
++    by_color: dict[int, list[tuple[int, int]]] = {}
++    for r0, c0, _, col in blocks:
++        by_color.setdefault(int(col), []).append((int(r0), int(c0)))
++
++    phases: dict[tuple[int, int], int] = {}
++    for rr, cc, col in legend_pts:
++        if col not in by_color:
++            continue
++        for br0, bc0 in by_color[col]:
++            phase_r = (br0 - rr * step) % period_r
++            phase_c = (bc0 - cc * step) % period_c
++            phases[(phase_r, phase_c)] = phases.get((phase_r, phase_c), 0) + 1
++    assert phases, "existing blocks must determine the macro-tile phase"
++    max_votes = max(phases.values())
++    best_phases = [phase for phase, votes in phases.items() if votes == max_votes]
++    assert len(best_phases) == 1, "macro-tile phase must be unique"
++    phase_r, phase_c = best_phases[0]
++
++    row_starts = range(phase_r, h - tile_span_r + 1, period_r)
++    col_starts = range(phase_c, w - tile_span_c + 1, period_c)
++    for tile_r in row_starts:
++        for tile_c in col_starts:
++            for rr, cc, col in legend_pts:
++                tr0 = tile_r + rr * step
++                tc0 = tile_c + cc * step
++                assert 0 <= tr0 <= h - block_size and 0 <= tc0 <= w - block_size, \
++                    "tiled legend block projection must fit in canvas"
++                out[tr0:tr0 + block_size, tc0:tc0 + block_size] = col
++    return out
++
++
++# --------------- generator (o5x -> D3 tiling) ---------------
++
++# === CFG: canvas ===
++GRID_SIZE_MIN, GRID_SIZE_MAX = 23, 27
++NUM_COLORS = 10
++
++# === CFG: legend lattice ===
++LEGEND_ORIGIN = (1, 1)
++LEGEND_STEP = 2
++LEGEND_ROWS = (3, 4)
++LEGEND_COLS = (2, 3)
++LEGEND_EMPTIES = (0, 1, 2)
++LEGEND_FILLED_MIN, LEGEND_FILLED_MAX = 6, 10
++PALETTE_SIZE_MIN, PALETTE_SIZE_MAX = 2, 4
++MAX_COUNT_PER_COLOR = 6
++
++# === CFG: block area ===
++BLOCK_SIZE_RANGE = range(2, 5)
++GAP_RANGE = range(1, 4)
++STEP_MIN, STEP_MAX = 3, 5
++BASE_C_MIN = 8
++BASE_R_MIN = 1
++TILE_REPS_R = (2, 3)
++TILE_REPS_C = (2, 3, 4)
++
++# === CFG: generation ===
++MAX_RETRIES = 400
++
++
++def _enumerate_staircase_shapes():
++    """Enumerate valid staircase width tuples."""
++    shapes = []
++    for rows in LEGEND_ROWS:
++        for cols in LEGEND_COLS:
++            total = rows * cols
++            for empties in LEGEND_EMPTIES:
++                count = total - empties
++                if not (LEGEND_FILLED_MIN <= count <= LEGEND_FILLED_MAX):
++                    continue
++
++                def rec(prefix, remaining, r):
++                    if r == rows:
++                        if remaining == 0 and max(prefix) == cols:
++                            shapes.append(tuple(prefix))
++                        return
++                    left = rows - r - 1
++                    lo = max(1, remaining - left * cols)
++                    hi = min(cols, remaining - left)
++                    for width in range(lo, hi + 1):
++                        rec(prefix + [width], remaining - width, r + 1)
++
++                rec([], count, 0)
++    return shapes
++
++
++_BLOCK_GAP_PAIRS = [
++    (n, g) for n in BLOCK_SIZE_RANGE for g in GAP_RANGE
++    if STEP_MIN <= n + g <= STEP_MAX
++]
++_STAIRCASE_SHAPES = _enumerate_staircase_shapes()
++
++
++def _pick_staircase():
++    """Pick a staircase legend shape; return filled points and horizontal adjacent pairs."""
++    widths = random.choice(_STAIRCASE_SHAPES)
++    pts = [(r, c) for r, width in enumerate(widths) for c in range(width)]
++    pairs = [(r, c) for r, width in enumerate(widths) for c in range(width - 1)]
++    return pts, pairs
++
++
++def _random_color_counts(total, k):
++    """Distribute `total` items among `k` colors with positive counts."""
++    counts = [1] * k
++    remaining = total - k
++    while remaining:
++        open_idxs = [i for i, v in enumerate(counts) if v < MAX_COUNT_PER_COLOR]
++        i = random.choice(open_idxs)
++        add = random.randint(1, min(remaining, MAX_COUNT_PER_COLOR - counts[i]))
++        counts[i] += add
++        remaining -= add
++    random.shuffle(counts)
++    return counts
++
++
++def _assign_legend_colors(pts, anchor_pair, palette):
++    """
++    Color the legend so the ordered horizontal anchor pair is unique.
++
++    This preserves the original task's sparse-anchors feel while giving the
++    tiling solver a unique phase vote.
++    """
++    pos_set = set(pts)
++    first = anchor_pair
++    second = (anchor_pair[0], anchor_pair[1] + 1)
++    a, b = random.sample(palette, 2)
++    counts = dict(zip(palette, _random_color_counts(len(pts), len(palette))))
++    colors = {first: a, second: b}
++    counts[a] -= 1
++    counts[b] -= 1
++    if counts[a] < 0 or counts[b] < 0:
++        return None
++
++    anchor_colors = (a, b)
++    cells = [p for p in pts if p not in colors]
++
++    def allowed(pos, col):
++        r, c = pos
++        left = (r, c - 1)
++        if left in pos_set and left in colors:
++            if (colors[left], col) == anchor_colors and (left, pos) != (first, second):
++                return False
++        right = (r, c + 1)
++        if right in pos_set and right in colors:
++            if (col, colors[right]) == anchor_colors and (pos, right) != (first, second):
++                return False
++        return True
++
++    def search():
++        if not cells:
++            return all(v == 0 for v in counts.values())
++        best_i, best_opts = None, None
++        for i, pos in enumerate(cells):
++            opts = [col for col in palette if counts[col] > 0 and allowed(pos, col)]
++            if best_opts is None or len(opts) < len(best_opts):
++                best_i, best_opts = i, opts
++        if not best_opts:
++            return False
++        pos = cells.pop(best_i)
++        random.shuffle(best_opts)
++        for col in best_opts:
++            colors[pos] = col
++            counts[col] -= 1
++            if search():
++                return True
++            counts[col] += 1
++            del colors[pos]
++        cells.insert(best_i, pos)
++        return False
++
++    if not search():
++        return None
++    return colors
++
++
++def _render_tiling(canvas, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols):
++    """Paint every block in every macro-tile."""
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for (rr, cc), col in legend_colors.items():
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                canvas[br:br + block_size, bc:bc + block_size] = col
++
++
++def _gen_attempt():
++    size = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    block_size, gap = random.choice(_BLOCK_GAP_PAIRS)
++    step = block_size + gap
++    pts, pairs = _pick_staircase()
++    anchor_pair = random.choice(pairs)
++
++    bg = random.randrange(NUM_COLORS)
++    k_min = max(PALETTE_SIZE_MIN, (len(pts) + MAX_COUNT_PER_COLOR - 1) // MAX_COUNT_PER_COLOR)
++    k = random.randint(k_min, min(PALETTE_SIZE_MAX, len(pts)))
++    palette = random.sample([c for c in range(NUM_COLORS) if c != bg], k)
++    legend_colors = _assign_legend_colors(pts, anchor_pair, palette)
++    if legend_colors is None:
++        return None
++
++    tile_rows = max(r for r, _ in pts) + 1
++    tile_cols = max(c for _, c in pts) + 1
++    tile_span_r = (tile_rows - 1) * step + block_size
++    tile_span_c = (tile_cols - 1) * step + block_size
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++
++    layout_options = []
++    for reps_r in TILE_REPS_R:
++        total_h = tile_span_r + (reps_r - 1) * period_r
++        r_hi = size - total_h
++        r_max = min(period_r - 1, r_hi)
++        if r_max < BASE_R_MIN:
++            continue
++        for reps_c in TILE_REPS_C:
++            total_w = tile_span_c + (reps_c - 1) * period_c
++            c_hi = size - total_w
++            c_max = min(period_c - 1, c_hi)
++            if c_max < BASE_C_MIN:
++                continue
++            if reps_r * reps_c < 4:
++                continue
++            layout_options.append((reps_r, reps_c, r_max, c_max))
++    if not layout_options:
++        return None
++
++    reps_r, reps_c, r_max, c_max = random.choice(layout_options)
++    base_r = random.randint(BASE_R_MIN, r_max)
++    base_c = random.randint(BASE_C_MIN, c_max)
++
++    lr0, lc0 = LEGEND_ORIGIN
++    out = np.full((size, size), bg, dtype=int)
++    for (rr, cc), col in legend_colors.items():
++        out[lr0 + rr * LEGEND_STEP, lc0 + cc * LEGEND_STEP] = col
++    _render_tiling(out, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols)
++
++    inp = out.copy()
++    keep = {anchor_pair, (anchor_pair[0], anchor_pair[1] + 1)}
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for rr, cc in pts:
++                if tile_idx_r == 0 and tile_idx_c == 0 and (rr, cc) in keep:
++                    continue
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                inp[br:br + block_size, bc:bc + block_size] = bg
++
++    try:
++        solved = main(inp)
++    except Exception:
++        return None
++    if not np.array_equal(solved, out):
++        return None
++    return inp
++
++
++def generate_input():
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid tiled c4d067a0 input")
+
+ succeeded in 433ms:
+Success: 50/50, Time: 0.1s (3ms/call)
+
+codex
+稳定性已经通过。现在补一个“变体是否真的发生”的统计：我会量化 `输出块数 / 图例点数` 这个重复倍数，并顺手对比原 solver 在同一输入上是否还能给出相同结果。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util, numpy as np, collections
+from arc_utils import components_mask, get_bg, bbox_coords
+
+# load variant
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/c4d067a0/D3/1/code.py')
+variant = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(variant)
+
+# load original
+spec2 = importlib.util.spec_from_file_location('orig', '/home/lixinyu/snap/new/arc2_solver_select/c4d067a0.py')
+orig = importlib.util.module_from_spec(spec2)
+spec2.loader.exec_module(orig)
+
+multipliers = []
+layouts = collections.Counter()
+same_as_original = 0
+orig_ok = 0
+for _ in range(30):
+    inp = variant.generate_input()
+    out = variant.main(inp)
+    bg = get_bg(out)
+    comps = components_mask(out "'!= bg, connectivity=4)
+    singles = []
+    blocks = 0
+    for pts in comps:
+        if len(pts) == 1:
+            r, c = pts[0]
+            if r < min(out.shape[0], 12) and c < min(out.shape[1], 12):
+                singles.append((int(r), int(c)))
+            continue
+        r0, c0, r1, c1 = bbox_coords(pts)
+        sub = out[r0:r1+1, c0:c1+1]
+        if (r1-r0) == (c1-c0) and np.all(sub == sub[0,0]) and sub.size == len(pts):
+            blocks += 1
+    legend_count = len(singles)
+    multipliers.append(blocks / legend_count)
+
+    rs = sorted({r for r, _ in singles})
+    cs = sorted({c for _, c in singles})
+    stepL = 2
+    rmin, cmin = min(rs), min(cs)
+    coords = [((r-rmin)//stepL, (c-cmin)//stepL) for r,c in singles]
+    tile_rows = max(r for r,_ in coords) + 1
+    tile_cols = max(c for _,c in coords) + 1
+    layouts[(tile_rows, tile_cols, int(blocks / legend_count))] += 1
+
+    try:
+        o = orig.main(inp)
+        orig_ok += 1
+        if np.array_equal(o, out):
+            same_as_original += 1
+    except Exception:
+        pass
+
+print('"'Multiplier distribution:', collections.Counter(multipliers))
+print('Sampled layouts (tile_rows, tile_cols, multiplier):', layouts)
+print('Original solver produced an output on', orig_ok, 'of 30 inputs')
+print('Original solver matched variant output on', same_as_original, 'of 30 inputs')
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code/c4d067a0/D3/1/code.py b/ceshi/code/c4d067a0/D3/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e971ba1ec60d79a8f1bf26fdfe068595f4d341c
+--- /dev/null
++++ b/ceshi/code/c4d067a0/D3/1/code.py
+@@ -0,0 +1,410 @@
++# Variant of c4d067a0
++# Dimension: D3 — 目标位置：色块放置区域 (dst)
++# Change: 网格中通过缩放因子计算出的对应位置，每个图例像素映射为一个 NxN 的实心色块，色块之间以背景色分隔... → 铺贴到周期性网格的指定单元
++
++# Design analysis
++# ----------------
++# a) 具体化与行为追踪
++#    - 左上角图例仍然是 step=2 的单像素点阵，颜色和原题一致，表示一个小的“模板”。
++#    - 右侧主区域仍然由 NxN 实心色块组成，色块顶点落在步长为 step=block_size+gap 的块格点上。
++#    - 变体的核心改动：图例不再只映射到主区域中的一个单次形状，而是作为“一个宏瓦片内部的局部占位图”。
++#      设图例在格点坐标中的包围盒是 tile_rows x tile_cols，则主区域的宏瓦片周期就是
++#      period_r = tile_rows * step, period_c = tile_cols * step。每个瓦片里，图例中的每个点都映射为一个 NxN 色块。
++#    - 小例子：
++#      原题若图例局部坐标有 (0,0),(0,1),(1,0)，并从已有块反推出 base=(4,10), step=3，
++#      则只会在 (4,10),(4,13),(7,10) 放三块。
++#      本变体中，若图例包围盒是 2x2，则 period=(6,6)；除了 base 对应的那一组外，
++#      还会在 (4+6k,10+6m) 的每个瓦片里重复放置同样的三块，直到完整瓦片放不下为止。
++#
++# b) 复杂度校准
++#    - 仍保留原题的 2-4 种颜色、3-4 x 2-3 的小图例、2x2 以上实心色块，避免退化成过于规则的单色平铺。
++#    - 为了保证“周期性”肉眼可见，生成器强制至少 2x2 个宏瓦片，总块数严格大于单次图例块数。
++#    - 仍只保留两个输入锚块，但要求它们对应图例中唯一的水平相邻有序颜色对，这样既维持原题的稀疏提示，
++#      又能唯一锁定宏瓦片的相位。
++#
++# c) 隐式假设审查（相对原 main 的关键变化）
++#    - 原代码把 base_r + rr*step / base_c + cc*step 当成唯一绝对目标位置；本变体不成立，
++#      因为同一图例点会在多个瓦片中重复出现，所以 solver 必须改为推断“模周期的相位”而不是单次绝对偏移。
++#    - 原代码对同色 legend 点与 block 的投票是绝对坐标投票；本变体改为对
++#      ((br0 - rr*step) mod period_r, (bc0 - cc*step) mod period_c) 投票。
++#    - 原代码最后只绘制一轮 legend_pts；本变体必须在所有完整瓦片上循环绘制。
++#
++# d) 放置合法性
++#    - 生成器只接受完整瓦片可放置的布局：tile_span_r/tile_span_c 给出单个瓦片的实际占用范围，
++#      base 与 repetitions 的选择保证所有块都在画布内，且与左上角图例分离。
++#    - 输入只保留同一瓦片中的两个水平相邻锚块，因此它们既能给出 step，也不会与其他重复实例混淆。
++#
++# e) 视觉可观察性
++#    - 人类从样例能直接看到：左上角是一个小模板，右侧不是补一个局部缺块，而是整齐地在多块大瓦片中重复。
++#    - 重复次数固定至少 4 个瓦片，因此 D3 的差异不是边缘现象。
++#
++# f) 可视化整洁度
++#    - 宏瓦片之间只通过背景色间隔，没有额外标记线，视觉上会形成干净的重复阵列。
++#    - 图例保留在左上角，主区域从较右侧开始，避免与平铺区混在一起。
++#
++# g) 颜色变化可推断性
++#    - 颜色仍只表示“这个局部槽位要填什么色”，没有引入任何依赖颜色 id 的排序或运算。
++#    - 锚块的唯一性由“局部相邻颜色对”保证，而不是由颜色大小关系保证。
++
++import numpy as np
++from functools import reduce
++from math import gcd
++
++from arc_utils import bbox_coords, components_mask, get_bg
++import random
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Repeat a legend-defined block template across a periodic macro-tile grid.
++
++    Input structure:
++    - bg = most common color.
++    - Top-left corner: a sparse legend of singleton colored pixels on a regular lattice; these pixels describe one macro-tile's local block layout.
++    - Main area: a few uniformly colored square blocks (NxN) already placed on the same block lattice; they reveal block size, block step, and macro-tile phase.
++
++    Rule:
++    - Normalize the legend into lattice coordinates, and treat its bounding box as the row/column span of one repeating macro-tile.
++    - Infer the block lattice step from the existing blocks, then infer the macro-tile phase by matching block colors against legend colors modulo the macro-tile period.
++    - For every macro-tile that fully fits in the canvas, place an NxN block for every legend pixel at the corresponding local position inside that tile.
++
++    Key insight: The legend is no longer a one-off minimap of a single block cluster; it is a local template that repeats at a fixed 2D period across the destination lattice.
++    """
++    g = np.asarray(grid, dtype=int)
++    h, w = g.shape
++    out = g.copy()
++    bg = get_bg(g)
++
++    comps = components_mask(g != bg, connectivity=4)
++    singles: list[tuple[int, int, int]] = []
++    blocks: list[tuple[int, int, int, int]] = []  # (r0,c0,size,color)
++    for pts in comps:
++        if len(pts) == 1:
++            r, c = pts[0]
++            singles.append((int(r), int(c), int(g[r, c])))
++            continue
++        r0, c0, r1, c1 = bbox_coords(pts)
++        hh, ww = r1 - r0 + 1, c1 - c0 + 1
++        if hh != ww or hh < 2:
++            continue
++        sub = g[r0:r1 + 1, c0:c1 + 1]
++        col = int(sub[0, 0])
++        if col == bg:
++            continue
++        if np.all(sub == col) and sub.size == len(pts):
++            blocks.append((int(r0), int(c0), int(hh), col))
++
++    assert singles and blocks, "grid must contain legend pixels and main blocks"
++
++    win_r = min(h, 12)
++    win_c = min(w, 12)
++    legend = [(r, c, v) for (r, c, v) in singles if r < win_r and c < win_c]
++    assert legend, "top-left legend must contain singleton pixels"
++
++    rs = sorted({r for r, _, _ in legend})
++    cs = sorted({c for _, c, _ in legend})
++    drs = [rs[i + 1] - rs[i] for i in range(len(rs) - 1)]
++    dcs = [cs[i + 1] - cs[i] for i in range(len(cs) - 1)]
++    stepL = reduce(gcd, drs + dcs)
++    assert stepL > 0, "legend lattice step must be positive"
++    rmin = min(r for r, _, _ in legend)
++    cmin = min(c for _, c, _ in legend)
++
++    legend_pts: list[tuple[int, int, int]] = []
++    for r, c, v in legend:
++        rr = (r - rmin) // stepL
++        cc = (c - cmin) // stepL
++        legend_pts.append((int(rr), int(cc), int(v)))
++
++    tile_rows = max(rr for rr, _, _ in legend_pts) + 1
++    tile_cols = max(cc for _, cc, _ in legend_pts) + 1
++    max_rr = tile_rows - 1
++    max_cc = tile_cols - 1
++
++    sizes = [s for _, _, s, _ in blocks]
++    vals, cnts = np.unique(np.array(sizes, dtype=int), return_counts=True)
++    block_size = int(vals[cnts.argmax()])
++    blocks = [b for b in blocks if b[2] == block_size]
++    assert blocks, "must contain at least one block of the dominant block size"
++
++    tops = sorted({r0 for r0, _, _, _ in blocks})
++    lefts = sorted({c0 for _, c0, _, _ in blocks})
++    step_candidates = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
++    step_candidates += [lefts[i + 1] - lefts[i] for i in range(len(lefts) - 1)]
++    assert step_candidates, "existing blocks must reveal the block step"
++    step = reduce(gcd, step_candidates)
++    assert step > 0, "block step must be positive"
++
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    tile_span_r = max_rr * step + block_size
++    tile_span_c = max_cc * step + block_size
++
++    by_color: dict[int, list[tuple[int, int]]] = {}
++    for r0, c0, _, col in blocks:
++        by_color.setdefault(int(col), []).append((int(r0), int(c0)))
++
++    phases: dict[tuple[int, int], int] = {}
++    for rr, cc, col in legend_pts:
++        if col not in by_color:
++            continue
++        for br0, bc0 in by_color[col]:
++            phase_r = (br0 - rr * step) % period_r
++            phase_c = (bc0 - cc * step) % period_c
++            phases[(phase_r, phase_c)] = phases.get((phase_r, phase_c), 0) + 1
++    assert phases, "existing blocks must determine the macro-tile phase"
++    max_votes = max(phases.values())
++    best_phases = [phase for phase, votes in phases.items() if votes == max_votes]
++    assert len(best_phases) == 1, "macro-tile phase must be unique"
++    phase_r, phase_c = best_phases[0]
++
++    row_starts = range(phase_r, h - tile_span_r + 1, period_r)
++    col_starts = range(phase_c, w - tile_span_c + 1, period_c)
++    for tile_r in row_starts:
++        for tile_c in col_starts:
++            for rr, cc, col in legend_pts:
++                tr0 = tile_r + rr * step
++                tc0 = tile_c + cc * step
++                assert 0 <= tr0 <= h - block_size and 0 <= tc0 <= w - block_size, \
++                    "tiled legend block projection must fit in canvas"
++                out[tr0:tr0 + block_size, tc0:tc0 + block_size] = col
++    return out
++
++
++# --------------- generator (o5x -> D3 tiling) ---------------
++
++# === CFG: canvas ===
++GRID_SIZE_MIN, GRID_SIZE_MAX = 23, 27
++NUM_COLORS = 10
++
++# === CFG: legend lattice ===
++LEGEND_ORIGIN = (1, 1)
++LEGEND_STEP = 2
++LEGEND_ROWS = (3, 4)
++LEGEND_COLS = (2, 3)
++LEGEND_EMPTIES = (0, 1, 2)
++LEGEND_FILLED_MIN, LEGEND_FILLED_MAX = 6, 10
++PALETTE_SIZE_MIN, PALETTE_SIZE_MAX = 2, 4
++MAX_COUNT_PER_COLOR = 6
++
++# === CFG: block area ===
++BLOCK_SIZE_RANGE = range(2, 5)
++GAP_RANGE = range(1, 4)
++STEP_MIN, STEP_MAX = 3, 5
++BASE_C_MIN = 8
++BASE_R_MIN = 1
++TILE_REPS_R = (2, 3)
++TILE_REPS_C = (2, 3, 4)
++
++# === CFG: generation ===
++MAX_RETRIES = 400
++
++
++def _enumerate_staircase_shapes():
++    """Enumerate valid staircase width tuples."""
++    shapes = []
++    for rows in LEGEND_ROWS:
++        for cols in LEGEND_COLS:
++            total = rows * cols
++            for empties in LEGEND_EMPTIES:
++                count = total - empties
++                if not (LEGEND_FILLED_MIN <= count <= LEGEND_FILLED_MAX):
++                    continue
++
++                def rec(prefix, remaining, r):
++                    if r == rows:
++                        if remaining == 0 and max(prefix) == cols:
++                            shapes.append(tuple(prefix))
++                        return
++                    left = rows - r - 1
++                    lo = max(1, remaining - left * cols)
++                    hi = min(cols, remaining - left)
++                    for width in range(lo, hi + 1):
++                        rec(prefix + [width], remaining - width, r + 1)
++
++                rec([], count, 0)
++    return shapes
++
++
++_BLOCK_GAP_PAIRS = [
++    (n, g) for n in BLOCK_SIZE_RANGE for g in GAP_RANGE
++    if STEP_MIN <= n + g <= STEP_MAX
++]
++_STAIRCASE_SHAPES = _enumerate_staircase_shapes()
++
++
++def _pick_staircase():
++    """Pick a staircase legend shape; return filled points and horizontal adjacent pairs."""
++    widths = random.choice(_STAIRCASE_SHAPES)
++    pts = [(r, c) for r, width in enumerate(widths) for c in range(width)]
++    pairs = [(r, c) for r, width in enumerate(widths) for c in range(width - 1)]
++    return pts, pairs
++
++
++def _random_color_counts(total, k):
++    """Distribute `total` items among `k` colors with positive counts."""
++    counts = [1] * k
++    remaining = total - k
++    while remaining:
++        open_idxs = [i for i, v in enumerate(counts) if v < MAX_COUNT_PER_COLOR]
++        i = random.choice(open_idxs)
++        add = random.randint(1, min(remaining, MAX_COUNT_PER_COLOR - counts[i]))
++        counts[i] += add
++        remaining -= add
++    random.shuffle(counts)
++    return counts
++
++
++def _assign_legend_colors(pts, anchor_pair, palette):
++    """
++    Color the legend so the ordered horizontal anchor pair is unique.
++
++    This preserves the original task's sparse-anchors feel while giving the
++    tiling solver a unique phase vote.
++    """
++    pos_set = set(pts)
++    first = anchor_pair
++    second = (anchor_pair[0], anchor_pair[1] + 1)
++    a, b = random.sample(palette, 2)
++    counts = dict(zip(palette, _random_color_counts(len(pts), len(palette))))
++    colors = {first: a, second: b}
++    counts[a] -= 1
++    counts[b] -= 1
++    if counts[a] < 0 or counts[b] < 0:
++        return None
++
++    anchor_colors = (a, b)
++    cells = [p for p in pts if p not in colors]
++
++    def allowed(pos, col):
++        r, c = pos
++        left = (r, c - 1)
++        if left in pos_set and left in colors:
++            if (colors[left], col) == anchor_colors and (left, pos) != (first, second):
++                return False
++        right = (r, c + 1)
++        if right in pos_set and right in colors:
++            if (col, colors[right]) == anchor_colors and (pos, right) != (first, second):
++                return False
++        return True
++
++    def search():
++        if not cells:
++            return all(v == 0 for v in counts.values())
++        best_i, best_opts = None, None
++        for i, pos in enumerate(cells):
++            opts = [col for col in palette if counts[col] > 0 and allowed(pos, col)]
++            if best_opts is None or len(opts) < len(best_opts):
++                best_i, best_opts = i, opts
++        if not best_opts:
++            return False
++        pos = cells.pop(best_i)
++        random.shuffle(best_opts)
++        for col in best_opts:
++            colors[pos] = col
++            counts[col] -= 1
++            if search():
++                return True
++            counts[col] += 1
++            del colors[pos]
++        cells.insert(best_i, pos)
++        return False
++
++    if not search():
++        return None
++    return colors
++
++
++def _render_tiling(canvas, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols):
++    """Paint every block in every macro-tile."""
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for (rr, cc), col in legend_colors.items():
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                canvas[br:br + block_size, bc:bc + block_size] = col
++
++
++def _gen_attempt():
++    size = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    block_size, gap = random.choice(_BLOCK_GAP_PAIRS)
++    step = block_size + gap
++    pts, pairs = _pick_staircase()
++    anchor_pair = random.choice(pairs)
++
++    bg = random.randrange(NUM_COLORS)
++    k_min = max(PALETTE_SIZE_MIN, (len(pts) + MAX_COUNT_PER_COLOR - 1) // MAX_COUNT_PER_COLOR)
++    k = random.randint(k_min, min(PALETTE_SIZE_MAX, len(pts)))
++    palette = random.sample([c for c in range(NUM_COLORS) if c != bg], k)
++    legend_colors = _assign_legend_colors(pts, anchor_pair, palette)
++    if legend_colors is None:
++        return None
++
++    tile_rows = max(r for r, _ in pts) + 1
++    tile_cols = max(c for _, c in pts) + 1
++    tile_span_r = (tile_rows - 1) * step + block_size
++    tile_span_c = (tile_cols - 1) * step + block_size
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++
++    layout_options = []
++    for reps_r in TILE_REPS_R:
++        total_h = tile_span_r + (reps_r - 1) * period_r
++        r_hi = size - total_h
++        r_max = min(period_r - 1, r_hi)
++        if r_max < BASE_R_MIN:
++            continue
++        for reps_c in TILE_REPS_C:
++            total_w = tile_span_c + (reps_c - 1) * period_c
++            c_hi = size - total_w
++            c_max = min(period_c - 1, c_hi)
++            if c_max < BASE_C_MIN:
++                continue
++            if reps_r * reps_c < 4:
++                continue
++            layout_options.append((reps_r, reps_c, r_max, c_max))
++    if not layout_options:
++        return None
++
++    reps_r, reps_c, r_max, c_max = random.choice(layout_options)
++    base_r = random.randint(BASE_R_MIN, r_max)
++    base_c = random.randint(BASE_C_MIN, c_max)
++
++    lr0, lc0 = LEGEND_ORIGIN
++    out = np.full((size, size), bg, dtype=int)
++    for (rr, cc), col in legend_colors.items():
++        out[lr0 + rr * LEGEND_STEP, lc0 + cc * LEGEND_STEP] = col
++    _render_tiling(out, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols)
++
++    inp = out.copy()
++    keep = {anchor_pair, (anchor_pair[0], anchor_pair[1] + 1)}
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for rr, cc in pts:
++                if tile_idx_r == 0 and tile_idx_c == 0 and (rr, cc) in keep:
++                    continue
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                inp[br:br + block_size, bc:bc + block_size] = bg
++
++    try:
++        solved = main(inp)
++    except Exception:
++        return None
++    if not np.array_equal(solved, out):
++        return None
++    return inp
++
++
++def generate_input():
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid tiled c4d067a0 input")
+
+ succeeded in 502ms:
+Multiplier distribution: Counter({4.0: 26, 6.0: 4})
+Sampled layouts (tile_rows, tile_cols, multiplier): Counter({(3, 3, 4): 14, (4, 3, 4): 12, (3, 3, 6): 4})
+Original solver produced an output on 30 of 30 inputs
+Original solver matched variant output on 0 of 30 inputs
+
+Variant code is in place, passes the required 50-trial run, and the tiling multiplier/original-solver comparison confirms the D3 behavior is active rather than collapsing back to the base task.
+  ✓ Write variant code with design analysis comments, updated solver, and updated generator
+  ✓ Run 50-trial validation and fix any failures
+  ✓ Measure tiling-specific behavior to confirm non-degenerate variant
+diff --git a/ceshi/code/c4d067a0/D3/1/code.py b/ceshi/code/c4d067a0/D3/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e971ba1ec60d79a8f1bf26fdfe068595f4d341c
+--- /dev/null
++++ b/ceshi/code/c4d067a0/D3/1/code.py
+@@ -0,0 +1,410 @@
++# Variant of c4d067a0
++# Dimension: D3 — 目标位置：色块放置区域 (dst)
++# Change: 网格中通过缩放因子计算出的对应位置，每个图例像素映射为一个 NxN 的实心色块，色块之间以背景色分隔... → 铺贴到周期性网格的指定单元
++
++# Design analysis
++# ----------------
++# a) 具体化与行为追踪
++#    - 左上角图例仍然是 step=2 的单像素点阵，颜色和原题一致，表示一个小的“模板”。
++#    - 右侧主区域仍然由 NxN 实心色块组成，色块顶点落在步长为 step=block_size+gap 的块格点上。
++#    - 变体的核心改动：图例不再只映射到主区域中的一个单次形状，而是作为“一个宏瓦片内部的局部占位图”。
++#      设图例在格点坐标中的包围盒是 tile_rows x tile_cols，则主区域的宏瓦片周期就是
++#      period_r = tile_rows * step, period_c = tile_cols * step。每个瓦片里，图例中的每个点都映射为一个 NxN 色块。
++#    - 小例子：
++#      原题若图例局部坐标有 (0,0),(0,1),(1,0)，并从已有块反推出 base=(4,10), step=3，
++#      则只会在 (4,10),(4,13),(7,10) 放三块。
++#      本变体中，若图例包围盒是 2x2，则 period=(6,6)；除了 base 对应的那一组外，
++#      还会在 (4+6k,10+6m) 的每个瓦片里重复放置同样的三块，直到完整瓦片放不下为止。
++#
++# b) 复杂度校准
++#    - 仍保留原题的 2-4 种颜色、3-4 x 2-3 的小图例、2x2 以上实心色块，避免退化成过于规则的单色平铺。
++#    - 为了保证“周期性”肉眼可见，生成器强制至少 2x2 个宏瓦片，总块数严格大于单次图例块数。
++#    - 仍只保留两个输入锚块，但要求它们对应图例中唯一的水平相邻有序颜色对，这样既维持原题的稀疏提示，
++#      又能唯一锁定宏瓦片的相位。
++#
++# c) 隐式假设审查（相对原 main 的关键变化）
++#    - 原代码把 base_r + rr*step / base_c + cc*step 当成唯一绝对目标位置；本变体不成立，
++#      因为同一图例点会在多个瓦片中重复出现，所以 solver 必须改为推断“模周期的相位”而不是单次绝对偏移。
++#    - 原代码对同色 legend 点与 block 的投票是绝对坐标投票；本变体改为对
++#      ((br0 - rr*step) mod period_r, (bc0 - cc*step) mod period_c) 投票。
++#    - 原代码最后只绘制一轮 legend_pts；本变体必须在所有完整瓦片上循环绘制。
++#
++# d) 放置合法性
++#    - 生成器只接受完整瓦片可放置的布局：tile_span_r/tile_span_c 给出单个瓦片的实际占用范围，
++#      base 与 repetitions 的选择保证所有块都在画布内，且与左上角图例分离。
++#    - 输入只保留同一瓦片中的两个水平相邻锚块，因此它们既能给出 step，也不会与其他重复实例混淆。
++#
++# e) 视觉可观察性
++#    - 人类从样例能直接看到：左上角是一个小模板，右侧不是补一个局部缺块，而是整齐地在多块大瓦片中重复。
++#    - 重复次数固定至少 4 个瓦片，因此 D3 的差异不是边缘现象。
++#
++# f) 可视化整洁度
++#    - 宏瓦片之间只通过背景色间隔，没有额外标记线，视觉上会形成干净的重复阵列。
++#    - 图例保留在左上角，主区域从较右侧开始，避免与平铺区混在一起。
++#
++# g) 颜色变化可推断性
++#    - 颜色仍只表示“这个局部槽位要填什么色”，没有引入任何依赖颜色 id 的排序或运算。
++#    - 锚块的唯一性由“局部相邻颜色对”保证，而不是由颜色大小关系保证。
++
++import numpy as np
++from functools import reduce
++from math import gcd
++
++from arc_utils import bbox_coords, components_mask, get_bg
++import random
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Repeat a legend-defined block template across a periodic macro-tile grid.
++
++    Input structure:
++    - bg = most common color.
++    - Top-left corner: a sparse legend of singleton colored pixels on a regular lattice; these pixels describe one macro-tile's local block layout.
++    - Main area: a few uniformly colored square blocks (NxN) already placed on the same block lattice; they reveal block size, block step, and macro-tile phase.
++
++    Rule:
++    - Normalize the legend into lattice coordinates, and treat its bounding box as the row/column span of one repeating macro-tile.
++    - Infer the block lattice step from the existing blocks, then infer the macro-tile phase by matching block colors against legend colors modulo the macro-tile period.
++    - For every macro-tile that fully fits in the canvas, place an NxN block for every legend pixel at the corresponding local position inside that tile.
++
++    Key insight: The legend is no longer a one-off minimap of a single block cluster; it is a local template that repeats at a fixed 2D period across the destination lattice.
++    """
++    g = np.asarray(grid, dtype=int)
++    h, w = g.shape
++    out = g.copy()
++    bg = get_bg(g)
++
++    comps = components_mask(g != bg, connectivity=4)
++    singles: list[tuple[int, int, int]] = []
++    blocks: list[tuple[int, int, int, int]] = []  # (r0,c0,size,color)
++    for pts in comps:
++        if len(pts) == 1:
++            r, c = pts[0]
++            singles.append((int(r), int(c), int(g[r, c])))
++            continue
++        r0, c0, r1, c1 = bbox_coords(pts)
++        hh, ww = r1 - r0 + 1, c1 - c0 + 1
++        if hh != ww or hh < 2:
++            continue
++        sub = g[r0:r1 + 1, c0:c1 + 1]
++        col = int(sub[0, 0])
++        if col == bg:
++            continue
++        if np.all(sub == col) and sub.size == len(pts):
++            blocks.append((int(r0), int(c0), int(hh), col))
++
++    assert singles and blocks, "grid must contain legend pixels and main blocks"
++
++    win_r = min(h, 12)
++    win_c = min(w, 12)
++    legend = [(r, c, v) for (r, c, v) in singles if r < win_r and c < win_c]
++    assert legend, "top-left legend must contain singleton pixels"
++
++    rs = sorted({r for r, _, _ in legend})
++    cs = sorted({c for _, c, _ in legend})
++    drs = [rs[i + 1] - rs[i] for i in range(len(rs) - 1)]
++    dcs = [cs[i + 1] - cs[i] for i in range(len(cs) - 1)]
++    stepL = reduce(gcd, drs + dcs)
++    assert stepL > 0, "legend lattice step must be positive"
++    rmin = min(r for r, _, _ in legend)
++    cmin = min(c for _, c, _ in legend)
++
++    legend_pts: list[tuple[int, int, int]] = []
++    for r, c, v in legend:
++        rr = (r - rmin) // stepL
++        cc = (c - cmin) // stepL
++        legend_pts.append((int(rr), int(cc), int(v)))
++
++    tile_rows = max(rr for rr, _, _ in legend_pts) + 1
++    tile_cols = max(cc for _, cc, _ in legend_pts) + 1
++    max_rr = tile_rows - 1
++    max_cc = tile_cols - 1
++
++    sizes = [s for _, _, s, _ in blocks]
++    vals, cnts = np.unique(np.array(sizes, dtype=int), return_counts=True)
++    block_size = int(vals[cnts.argmax()])
++    blocks = [b for b in blocks if b[2] == block_size]
++    assert blocks, "must contain at least one block of the dominant block size"
++
++    tops = sorted({r0 for r0, _, _, _ in blocks})
++    lefts = sorted({c0 for _, c0, _, _ in blocks})
++    step_candidates = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
++    step_candidates += [lefts[i + 1] - lefts[i] for i in range(len(lefts) - 1)]
++    assert step_candidates, "existing blocks must reveal the block step"
++    step = reduce(gcd, step_candidates)
++    assert step > 0, "block step must be positive"
++
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    tile_span_r = max_rr * step + block_size
++    tile_span_c = max_cc * step + block_size
++
++    by_color: dict[int, list[tuple[int, int]]] = {}
++    for r0, c0, _, col in blocks:
++        by_color.setdefault(int(col), []).append((int(r0), int(c0)))
++
++    phases: dict[tuple[int, int], int] = {}
++    for rr, cc, col in legend_pts:
++        if col not in by_color:
++            continue
++        for br0, bc0 in by_color[col]:
++            phase_r = (br0 - rr * step) % period_r
++            phase_c = (bc0 - cc * step) % period_c
++            phases[(phase_r, phase_c)] = phases.get((phase_r, phase_c), 0) + 1
++    assert phases, "existing blocks must determine the macro-tile phase"
++    max_votes = max(phases.values())
++    best_phases = [phase for phase, votes in phases.items() if votes == max_votes]
++    assert len(best_phases) == 1, "macro-tile phase must be unique"
++    phase_r, phase_c = best_phases[0]
++
++    row_starts = range(phase_r, h - tile_span_r + 1, period_r)
++    col_starts = range(phase_c, w - tile_span_c + 1, period_c)
++    for tile_r in row_starts:
++        for tile_c in col_starts:
++            for rr, cc, col in legend_pts:
++                tr0 = tile_r + rr * step
++                tc0 = tile_c + cc * step
++                assert 0 <= tr0 <= h - block_size and 0 <= tc0 <= w - block_size, \
++                    "tiled legend block projection must fit in canvas"
++                out[tr0:tr0 + block_size, tc0:tc0 + block_size] = col
++    return out
++
++
++# --------------- generator (o5x -> D3 tiling) ---------------
++
++# === CFG: canvas ===
++GRID_SIZE_MIN, GRID_SIZE_MAX = 23, 27
++NUM_COLORS = 10
++
++# === CFG: legend lattice ===
++LEGEND_ORIGIN = (1, 1)
++LEGEND_STEP = 2
++LEGEND_ROWS = (3, 4)
++LEGEND_COLS = (2, 3)
++LEGEND_EMPTIES = (0, 1, 2)
++LEGEND_FILLED_MIN, LEGEND_FILLED_MAX = 6, 10
++PALETTE_SIZE_MIN, PALETTE_SIZE_MAX = 2, 4
++MAX_COUNT_PER_COLOR = 6
++
++# === CFG: block area ===
++BLOCK_SIZE_RANGE = range(2, 5)
++GAP_RANGE = range(1, 4)
++STEP_MIN, STEP_MAX = 3, 5
++BASE_C_MIN = 8
++BASE_R_MIN = 1
++TILE_REPS_R = (2, 3)
++TILE_REPS_C = (2, 3, 4)
++
++# === CFG: generation ===
++MAX_RETRIES = 400
++
++
++def _enumerate_staircase_shapes():
++    """Enumerate valid staircase width tuples."""
++    shapes = []
++    for rows in LEGEND_ROWS:
++        for cols in LEGEND_COLS:
++            total = rows * cols
++            for empties in LEGEND_EMPTIES:
++                count = total - empties
++                if not (LEGEND_FILLED_MIN <= count <= LEGEND_FILLED_MAX):
++                    continue
++
++                def rec(prefix, remaining, r):
++                    if r == rows:
++                        if remaining == 0 and max(prefix) == cols:
++                            shapes.append(tuple(prefix))
++                        return
++                    left = rows - r - 1
++                    lo = max(1, remaining - left * cols)
++                    hi = min(cols, remaining - left)
++                    for width in range(lo, hi + 1):
++                        rec(prefix + [width], remaining - width, r + 1)
++
++                rec([], count, 0)
++    return shapes
++
++
++_BLOCK_GAP_PAIRS = [
++    (n, g) for n in BLOCK_SIZE_RANGE for g in GAP_RANGE
++    if STEP_MIN <= n + g <= STEP_MAX
++]
++_STAIRCASE_SHAPES = _enumerate_staircase_shapes()
++
++
++def _pick_staircase():
++    """Pick a staircase legend shape; return filled points and horizontal adjacent pairs."""
++    widths = random.choice(_STAIRCASE_SHAPES)
++    pts = [(r, c) for r, width in enumerate(widths) for c in range(width)]
++    pairs = [(r, c) for r, width in enumerate(widths) for c in range(width - 1)]
++    return pts, pairs
++
++
++def _random_color_counts(total, k):
++    """Distribute `total` items among `k` colors with positive counts."""
++    counts = [1] * k
++    remaining = total - k
++    while remaining:
++        open_idxs = [i for i, v in enumerate(counts) if v < MAX_COUNT_PER_COLOR]
++        i = random.choice(open_idxs)
++        add = random.randint(1, min(remaining, MAX_COUNT_PER_COLOR - counts[i]))
++        counts[i] += add
++        remaining -= add
++    random.shuffle(counts)
++    return counts
++
++
++def _assign_legend_colors(pts, anchor_pair, palette):
++    """
++    Color the legend so the ordered horizontal anchor pair is unique.
++
++    This preserves the original task's sparse-anchors feel while giving the
++    tiling solver a unique phase vote.
++    """
++    pos_set = set(pts)
++    first = anchor_pair
++    second = (anchor_pair[0], anchor_pair[1] + 1)
++    a, b = random.sample(palette, 2)
++    counts = dict(zip(palette, _random_color_counts(len(pts), len(palette))))
++    colors = {first: a, second: b}
++    counts[a] -= 1
++    counts[b] -= 1
++    if counts[a] < 0 or counts[b] < 0:
++        return None
++
++    anchor_colors = (a, b)
++    cells = [p for p in pts if p not in colors]
++
++    def allowed(pos, col):
++        r, c = pos
++        left = (r, c - 1)
++        if left in pos_set and left in colors:
++            if (colors[left], col) == anchor_colors and (left, pos) != (first, second):
++                return False
++        right = (r, c + 1)
++        if right in pos_set and right in colors:
++            if (col, colors[right]) == anchor_colors and (pos, right) != (first, second):
++                return False
++        return True
++
++    def search():
++        if not cells:
++            return all(v == 0 for v in counts.values())
++        best_i, best_opts = None, None
++        for i, pos in enumerate(cells):
++            opts = [col for col in palette if counts[col] > 0 and allowed(pos, col)]
++            if best_opts is None or len(opts) < len(best_opts):
++                best_i, best_opts = i, opts
++        if not best_opts:
++            return False
++        pos = cells.pop(best_i)
++        random.shuffle(best_opts)
++        for col in best_opts:
++            colors[pos] = col
++            counts[col] -= 1
++            if search():
++                return True
++            counts[col] += 1
++            del colors[pos]
++        cells.insert(best_i, pos)
++        return False
++
++    if not search():
++        return None
++    return colors
++
++
++def _render_tiling(canvas, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols):
++    """Paint every block in every macro-tile."""
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for (rr, cc), col in legend_colors.items():
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                canvas[br:br + block_size, bc:bc + block_size] = col
++
++
++def _gen_attempt():
++    size = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    block_size, gap = random.choice(_BLOCK_GAP_PAIRS)
++    step = block_size + gap
++    pts, pairs = _pick_staircase()
++    anchor_pair = random.choice(pairs)
++
++    bg = random.randrange(NUM_COLORS)
++    k_min = max(PALETTE_SIZE_MIN, (len(pts) + MAX_COUNT_PER_COLOR - 1) // MAX_COUNT_PER_COLOR)
++    k = random.randint(k_min, min(PALETTE_SIZE_MAX, len(pts)))
++    palette = random.sample([c for c in range(NUM_COLORS) if c != bg], k)
++    legend_colors = _assign_legend_colors(pts, anchor_pair, palette)
++    if legend_colors is None:
++        return None
++
++    tile_rows = max(r for r, _ in pts) + 1
++    tile_cols = max(c for _, c in pts) + 1
++    tile_span_r = (tile_rows - 1) * step + block_size
++    tile_span_c = (tile_cols - 1) * step + block_size
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++
++    layout_options = []
++    for reps_r in TILE_REPS_R:
++        total_h = tile_span_r + (reps_r - 1) * period_r
++        r_hi = size - total_h
++        r_max = min(period_r - 1, r_hi)
++        if r_max < BASE_R_MIN:
++            continue
++        for reps_c in TILE_REPS_C:
++            total_w = tile_span_c + (reps_c - 1) * period_c
++            c_hi = size - total_w
++            c_max = min(period_c - 1, c_hi)
++            if c_max < BASE_C_MIN:
++                continue
++            if reps_r * reps_c < 4:
++                continue
++            layout_options.append((reps_r, reps_c, r_max, c_max))
++    if not layout_options:
++        return None
++
++    reps_r, reps_c, r_max, c_max = random.choice(layout_options)
++    base_r = random.randint(BASE_R_MIN, r_max)
++    base_c = random.randint(BASE_C_MIN, c_max)
++
++    lr0, lc0 = LEGEND_ORIGIN
++    out = np.full((size, size), bg, dtype=int)
++    for (rr, cc), col in legend_colors.items():
++        out[lr0 + rr * LEGEND_STEP, lc0 + cc * LEGEND_STEP] = col
++    _render_tiling(out, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols)
++
++    inp = out.copy()
++    keep = {anchor_pair, (anchor_pair[0], anchor_pair[1] + 1)}
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for rr, cc in pts:
++                if tile_idx_r == 0 and tile_idx_c == 0 and (rr, cc) in keep:
++                    continue
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                inp[br:br + block_size, bc:bc + block_size] = bg
++
++    try:
++        solved = main(inp)
++    except Exception:
++        return None
++    if not np.array_equal(solved, out):
++        return None
++    return inp
++
++
++def generate_input():
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid tiled c4d067a0 input")
+
+exec
+/bin/bash -lc "nl -ba /home/lixinyu/snap/new/ceshi/code/c4d067a0/D3/1/code.py | sed -n '1,260p'" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+     1	# Variant of c4d067a0
+     2	# Dimension: D3 — 目标位置：色块放置区域 (dst)
+     3	# Change: 网格中通过缩放因子计算出的对应位置，每个图例像素映射为一个 NxN 的实心色块，色块之间以背景色分隔... → 铺贴到周期性网格的指定单元
+     4	
+     5	# Design analysis
+     6	# ----------------
+     7	# a) 具体化与行为追踪
+     8	#    - 左上角图例仍然是 step=2 的单像素点阵，颜色和原题一致，表示一个小的“模板”。
+     9	#    - 右侧主区域仍然由 NxN 实心色块组成，色块顶点落在步长为 step=block_size+gap 的块格点上。
+    10	#    - 变体的核心改动：图例不再只映射到主区域中的一个单次形状，而是作为“一个宏瓦片内部的局部占位图”。
+    11	#      设图例在格点坐标中的包围盒是 tile_rows x tile_cols，则主区域的宏瓦片周期就是
+    12	#      period_r = tile_rows * step, period_c = tile_cols * step。每个瓦片里，图例中的每个点都映射为一个 NxN 色块。
+    13	#    - 小例子：
+    14	#      原题若图例局部坐标有 (0,0),(0,1),(1,0)，并从已有块反推出 base=(4,10), step=3，
+    15	#      则只会在 (4,10),(4,13),(7,10) 放三块。
+    16	#      本变体中，若图例包围盒是 2x2，则 period=(6,6)；除了 base 对应的那一组外，
+    17	#      还会在 (4+6k,10+6m) 的每个瓦片里重复放置同样的三块，直到完整瓦片放不下为止。
+    18	#
+    19	# b) 复杂度校准
+    20	#    - 仍保留原题的 2-4 种颜色、3-4 x 2-3 的小图例、2x2 以上实心色块，避免退化成过于规则的单色平铺。
+    21	#    - 为了保证“周期性”肉眼可见，生成器强制至少 2x2 个宏瓦片，总块数严格大于单次图例块数。
+    22	#    - 仍只保留两个输入锚块，但要求它们对应图例中唯一的水平相邻有序颜色对，这样既维持原题的稀疏提示，
+    23	#      又能唯一锁定宏瓦片的相位。
+    24	#
+    25	# c) 隐式假设审查（相对原 main 的关键变化）
+    26	#    - 原代码把 base_r + rr*step / base_c + cc*step 当成唯一绝对目标位置；本变体不成立，
+    27	#      因为同一图例点会在多个瓦片中重复出现，所以 solver 必须改为推断“模周期的相位”而不是单次绝对偏移。
+    28	#    - 原代码对同色 legend 点与 block 的投票是绝对坐标投票；本变体改为对
+    29	#      ((br0 - rr*step) mod period_r, (bc0 - cc*step) mod period_c) 投票。
+    30	#    - 原代码最后只绘制一轮 legend_pts；本变体必须在所有完整瓦片上循环绘制。
+    31	#
+    32	# d) 放置合法性
+    33	#    - 生成器只接受完整瓦片可放置的布局：tile_span_r/tile_span_c 给出单个瓦片的实际占用范围，
+    34	#      base 与 repetitions 的选择保证所有块都在画布内，且与左上角图例分离。
+    35	#    - 输入只保留同一瓦片中的两个水平相邻锚块，因此它们既能给出 step，也不会与其他重复实例混淆。
+    36	#
+    37	# e) 视觉可观察性
+    38	#    - 人类从样例能直接看到：左上角是一个小模板，右侧不是补一个局部缺块，而是整齐地在多块大瓦片中重复。
+    39	#    - 重复次数固定至少 4 个瓦片，因此 D3 的差异不是边缘现象。
+    40	#
+    41	# f) 可视化整洁度
+    42	#    - 宏瓦片之间只通过背景色间隔，没有额外标记线，视觉上会形成干净的重复阵列。
+    43	#    - 图例保留在左上角，主区域从较右侧开始，避免与平铺区混在一起。
+    44	#
+    45	# g) 颜色变化可推断性
+    46	#    - 颜色仍只表示“这个局部槽位要填什么色”，没有引入任何依赖颜色 id 的排序或运算。
+    47	#    - 锚块的唯一性由“局部相邻颜色对”保证，而不是由颜色大小关系保证。
+    48	
+    49	import numpy as np
+    50	from functools import reduce
+    51	from math import gcd
+    52	
+    53	from arc_utils import bbox_coords, components_mask, get_bg
+    54	import random
+    55	
+    56	
+    57	def main(grid: np.ndarray) -> np.ndarray:
+    58	    """
+    59	    Repeat a legend-defined block template across a periodic macro-tile grid.
+    60	
+    61	    Input structure:
+    62	    - bg = most common color.
+    63	    - Top-left corner: a sparse legend of singleton colored pixels on a regular lattice; these pixels describe one macro-tile's local block layout.
+    64	    - Main area: a few uniformly colored square blocks (NxN) already placed on the same block lattice; they reveal block size, block step, and macro-tile phase.
+    65	
+    66	    Rule:
+    67	    - Normalize the legend into lattice coordinates, and treat its bounding box as the row/column span of one repeating macro-tile.
+    68	    - Infer the block lattice step from the existing blocks, then infer the macro-tile phase by matching block colors against legend colors modulo the macro-tile period.
+    69	    - For every macro-tile that fully fits in the canvas, place an NxN block for every legend pixel at the corresponding local position inside that tile.
+    70	
+    71	    Key insight: The legend is no longer a one-off minimap of a single block cluster; it is a local template that repeats at a fixed 2D period across the destination lattice.
+    72	    """
+    73	    g = np.asarray(grid, dtype=int)
+    74	    h, w = g.shape
+    75	    out = g.copy()
+    76	    bg = get_bg(g)
+    77	
+    78	    comps = components_mask(g != bg, connectivity=4)
+    79	    singles: list[tuple[int, int, int]] = []
+    80	    blocks: list[tuple[int, int, int, int]] = []  # (r0,c0,size,color)
+    81	    for pts in comps:
+    82	        if len(pts) == 1:
+    83	            r, c = pts[0]
+    84	            singles.append((int(r), int(c), int(g[r, c])))
+    85	            continue
+    86	        r0, c0, r1, c1 = bbox_coords(pts)
+    87	        hh, ww = r1 - r0 + 1, c1 - c0 + 1
+    88	        if hh != ww or hh < 2:
+    89	            continue
+    90	        sub = g[r0:r1 + 1, c0:c1 + 1]
+    91	        col = int(sub[0, 0])
+    92	        if col == bg:
+    93	            continue
+    94	        if np.all(sub == col) and sub.size == len(pts):
+    95	            blocks.append((int(r0), int(c0), int(hh), col))
+    96	
+    97	    assert singles and blocks, "grid must contain legend pixels and main blocks"
+    98	
+    99	    win_r = min(h, 12)
+   100	    win_c = min(w, 12)
+   101	    legend = [(r, c, v) for (r, c, v) in singles if r < win_r and c < win_c]
+   102	    assert legend, "top-left legend must contain singleton pixels"
+   103	
+   104	    rs = sorted({r for r, _, _ in legend})
+   105	    cs = sorted({c for _, c, _ in legend})
+   106	    drs = [rs[i + 1] - rs[i] for i in range(len(rs) - 1)]
+   107	    dcs = [cs[i + 1] - cs[i] for i in range(len(cs) - 1)]
+   108	    stepL = reduce(gcd, drs + dcs)
+   109	    assert stepL > 0, "legend lattice step must be positive"
+   110	    rmin = min(r for r, _, _ in legend)
+   111	    cmin = min(c for _, c, _ in legend)
+   112	
+   113	    legend_pts: list[tuple[int, int, int]] = []
+   114	    for r, c, v in legend:
+   115	        rr = (r - rmin) // stepL
+   116	        cc = (c - cmin) // stepL
+   117	        legend_pts.append((int(rr), int(cc), int(v)))
+   118	
+   119	    tile_rows = max(rr for rr, _, _ in legend_pts) + 1
+   120	    tile_cols = max(cc for _, cc, _ in legend_pts) + 1
+   121	    max_rr = tile_rows - 1
+   122	    max_cc = tile_cols - 1
+   123	
+   124	    sizes = [s for _, _, s, _ in blocks]
+   125	    vals, cnts = np.unique(np.array(sizes, dtype=int), return_counts=True)
+   126	    block_size = int(vals[cnts.argmax()])
+   127	    blocks = [b for b in blocks if b[2] == block_size]
+   128	    assert blocks, "must contain at least one block of the dominant block size"
+   129	
+   130	    tops = sorted({r0 for r0, _, _, _ in blocks})
+   131	    lefts = sorted({c0 for _, c0, _, _ in blocks})
+   132	    step_candidates = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
+   133	    step_candidates += [lefts[i + 1] - lefts[i] for i in range(len(lefts) - 1)]
+   134	    assert step_candidates, "existing blocks must reveal the block step"
+   135	    step = reduce(gcd, step_candidates)
+   136	    assert step > 0, "block step must be positive"
+   137	
+   138	    period_r = tile_rows * step
+   139	    period_c = tile_cols * step
+   140	    tile_span_r = max_rr * step + block_size
+   141	    tile_span_c = max_cc * step + block_size
+   142	
+   143	    by_color: dict[int, list[tuple[int, int]]] = {}
+   144	    for r0, c0, _, col in blocks:
+   145	        by_color.setdefault(int(col), []).append((int(r0), int(c0)))
+   146	
+   147	    phases: dict[tuple[int, int], int] = {}
+   148	    for rr, cc, col in legend_pts:
+   149	        if col not in by_color:
+   150	            continue
+   151	        for br0, bc0 in by_color[col]:
+   152	            phase_r = (br0 - rr * step) % period_r
+   153	            phase_c = (bc0 - cc * step) % period_c
+   154	            phases[(phase_r, phase_c)] = phases.get((phase_r, phase_c), 0) + 1
+   155	    assert phases, "existing blocks must determine the macro-tile phase"
+   156	    max_votes = max(phases.values())
+   157	    best_phases = [phase for phase, votes in phases.items() if votes == max_votes]
+   158	    assert len(best_phases) == 1, "macro-tile phase must be unique"
+   159	    phase_r, phase_c = best_phases[0]
+   160	
+   161	    row_starts = range(phase_r, h - tile_span_r + 1, period_r)
+   162	    col_starts = range(phase_c, w - tile_span_c + 1, period_c)
+   163	    for tile_r in row_starts:
+   164	        for tile_c in col_starts:
+   165	            for rr, cc, col in legend_pts:
+   166	                tr0 = tile_r + rr * step
+   167	                tc0 = tile_c + cc * step
+   168	                assert 0 <= tr0 <= h - block_size and 0 <= tc0 <= w - block_size, \
+   169	                    "tiled legend block projection must fit in canvas"
+   170	                out[tr0:tr0 + block_size, tc0:tc0 + block_size] = col
+   171	    return out
+   172	
+   173	
+   174	# --------------- generator (o5x -> D3 tiling) ---------------
+   175	
+   176	# === CFG: canvas ===
+   177	GRID_SIZE_MIN, GRID_SIZE_MAX = 23, 27
+   178	NUM_COLORS = 10
+   179	
+   180	# === CFG: legend lattice ===
+   181	LEGEND_ORIGIN = (1, 1)
+   182	LEGEND_STEP = 2
+   183	LEGEND_ROWS = (3, 4)
+   184	LEGEND_COLS = (2, 3)
+   185	LEGEND_EMPTIES = (0, 1, 2)
+   186	LEGEND_FILLED_MIN, LEGEND_FILLED_MAX = 6, 10
+   187	PALETTE_SIZE_MIN, PALETTE_SIZE_MAX = 2, 4
+   188	MAX_COUNT_PER_COLOR = 6
+   189	
+   190	# === CFG: block area ===
+   191	BLOCK_SIZE_RANGE = range(2, 5)
+   192	GAP_RANGE = range(1, 4)
+   193	STEP_MIN, STEP_MAX = 3, 5
+   194	BASE_C_MIN = 8
+   195	BASE_R_MIN = 1
+   196	TILE_REPS_R = (2, 3)
+   197	TILE_REPS_C = (2, 3, 4)
+   198	
+   199	# === CFG: generation ===
+   200	MAX_RETRIES = 400
+   201	
+   202	
+   203	def _enumerate_staircase_shapes():
+   204	    """Enumerate valid staircase width tuples."""
+   205	    shapes = []
+   206	    for rows in LEGEND_ROWS:
+   207	        for cols in LEGEND_COLS:
+   208	            total = rows * cols
+   209	            for empties in LEGEND_EMPTIES:
+   210	                count = total - empties
+   211	                if not (LEGEND_FILLED_MIN <= count <= LEGEND_FILLED_MAX):
+   212	                    continue
+   213	
+   214	                def rec(prefix, remaining, r):
+   215	                    if r == rows:
+   216	                        if remaining == 0 and max(prefix) == cols:
+   217	                            shapes.append(tuple(prefix))
+   218	                        return
+   219	                    left = rows - r - 1
+   220	                    lo = max(1, remaining - left * cols)
+   221	                    hi = min(cols, remaining - left)
+   222	                    for width in range(lo, hi + 1):
+   223	                        rec(prefix + [width], remaining - width, r + 1)
+   224	
+   225	                rec([], count, 0)
+   226	    return shapes
+   227	
+   228	
+   229	_BLOCK_GAP_PAIRS = [
+   230	    (n, g) for n in BLOCK_SIZE_RANGE for g in GAP_RANGE
+   231	    if STEP_MIN <= n + g <= STEP_MAX
+   232	]
+   233	_STAIRCASE_SHAPES = _enumerate_staircase_shapes()
+   234	
+   235	
+   236	def _pick_staircase():
+   237	    """Pick a staircase legend shape; return filled points and horizontal adjacent pairs."""
+   238	    widths = random.choice(_STAIRCASE_SHAPES)
+   239	    pts = [(r, c) for r, width in enumerate(widths) for c in range(width)]
+   240	    pairs = [(r, c) for r, width in enumerate(widths) for c in range(width - 1)]
+   241	    return pts, pairs
+   242	
+   243	
+   244	def _random_color_counts(total, k):
+   245	    """Distribute `total` items among `k` colors with positive counts."""
+   246	    counts = [1] * k
+   247	    remaining = total - k
+   248	    while remaining:
+   249	        open_idxs = [i for i, v in enumerate(counts) if v < MAX_COUNT_PER_COLOR]
+   250	        i = random.choice(open_idxs)
+   251	        add = random.randint(1, min(remaining, MAX_COUNT_PER_COLOR - counts[i]))
+   252	        counts[i] += add
+   253	        remaining -= add
+   254	    random.shuffle(counts)
+   255	    return counts
+   256	
+   257	
+   258	def _assign_legend_colors(pts, anchor_pair, palette):
+   259	    """
+   260	    Color the legend so the ordered horizontal anchor pair is unique.
+
+diff --git a/ceshi/code/c4d067a0/D3/1/code.py b/ceshi/code/c4d067a0/D3/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e971ba1ec60d79a8f1bf26fdfe068595f4d341c
+--- /dev/null
++++ b/ceshi/code/c4d067a0/D3/1/code.py
+@@ -0,0 +1,410 @@
++# Variant of c4d067a0
++# Dimension: D3 — 目标位置：色块放置区域 (dst)
++# Change: 网格中通过缩放因子计算出的对应位置，每个图例像素映射为一个 NxN 的实心色块，色块之间以背景色分隔... → 铺贴到周期性网格的指定单元
++
++# Design analysis
++# ----------------
++# a) 具体化与行为追踪
++#    - 左上角图例仍然是 step=2 的单像素点阵，颜色和原题一致，表示一个小的“模板”。
++#    - 右侧主区域仍然由 NxN 实心色块组成，色块顶点落在步长为 step=block_size+gap 的块格点上。
++#    - 变体的核心改动：图例不再只映射到主区域中的一个单次形状，而是作为“一个宏瓦片内部的局部占位图”。
++#      设图例在格点坐标中的包围盒是 tile_rows x tile_cols，则主区域的宏瓦片周期就是
++#      period_r = tile_rows * step, period_c = tile_cols * step。每个瓦片里，图例中的每个点都映射为一个 NxN 色块。
++#    - 小例子：
++#      原题若图例局部坐标有 (0,0),(0,1),(1,0)，并从已有块反推出 base=(4,10), step=3，
++#      则只会在 (4,10),(4,13),(7,10) 放三块。
++#      本变体中，若图例包围盒是 2x2，则 period=(6,6)；除了 base 对应的那一组外，
++#      还会在 (4+6k,10+6m) 的每个瓦片里重复放置同样的三块，直到完整瓦片放不下为止。
++#
++# b) 复杂度校准
++#    - 仍保留原题的 2-4 种颜色、3-4 x 2-3 的小图例、2x2 以上实心色块，避免退化成过于规则的单色平铺。
++#    - 为了保证“周期性”肉眼可见，生成器强制至少 2x2 个宏瓦片，总块数严格大于单次图例块数。
++#    - 仍只保留两个输入锚块，但要求它们对应图例中唯一的水平相邻有序颜色对，这样既维持原题的稀疏提示，
++#      又能唯一锁定宏瓦片的相位。
++#
++# c) 隐式假设审查（相对原 main 的关键变化）
++#    - 原代码把 base_r + rr*step / base_c + cc*step 当成唯一绝对目标位置；本变体不成立，
++#      因为同一图例点会在多个瓦片中重复出现，所以 solver 必须改为推断“模周期的相位”而不是单次绝对偏移。
++#    - 原代码对同色 legend 点与 block 的投票是绝对坐标投票；本变体改为对
++#      ((br0 - rr*step) mod period_r, (bc0 - cc*step) mod period_c) 投票。
++#    - 原代码最后只绘制一轮 legend_pts；本变体必须在所有完整瓦片上循环绘制。
++#
++# d) 放置合法性
++#    - 生成器只接受完整瓦片可放置的布局：tile_span_r/tile_span_c 给出单个瓦片的实际占用范围，
++#      base 与 repetitions 的选择保证所有块都在画布内，且与左上角图例分离。
++#    - 输入只保留同一瓦片中的两个水平相邻锚块，因此它们既能给出 step，也不会与其他重复实例混淆。
++#
++# e) 视觉可观察性
++#    - 人类从样例能直接看到：左上角是一个小模板，右侧不是补一个局部缺块，而是整齐地在多块大瓦片中重复。
++#    - 重复次数固定至少 4 个瓦片，因此 D3 的差异不是边缘现象。
++#
++# f) 可视化整洁度
++#    - 宏瓦片之间只通过背景色间隔，没有额外标记线，视觉上会形成干净的重复阵列。
++#    - 图例保留在左上角，主区域从较右侧开始，避免与平铺区混在一起。
++#
++# g) 颜色变化可推断性
++#    - 颜色仍只表示“这个局部槽位要填什么色”，没有引入任何依赖颜色 id 的排序或运算。
++#    - 锚块的唯一性由“局部相邻颜色对”保证，而不是由颜色大小关系保证。
++
++import numpy as np
++from functools import reduce
++from math import gcd
++
++from arc_utils import bbox_coords, components_mask, get_bg
++import random
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Repeat a legend-defined block template across a periodic macro-tile grid.
++
++    Input structure:
++    - bg = most common color.
++    - Top-left corner: a sparse legend of singleton colored pixels on a regular lattice; these pixels describe one macro-tile's local block layout.
++    - Main area: a few uniformly colored square blocks (NxN) already placed on the same block lattice; they reveal block size, block step, and macro-tile phase.
++
++    Rule:
++    - Normalize the legend into lattice coordinates, and treat its bounding box as the row/column span of one repeating macro-tile.
++    - Infer the block lattice step from the existing blocks, then infer the macro-tile phase by matching block colors against legend colors modulo the macro-tile period.
++    - For every macro-tile that fully fits in the canvas, place an NxN block for every legend pixel at the corresponding local position inside that tile.
++
++    Key insight: The legend is no longer a one-off minimap of a single block cluster; it is a local template that repeats at a fixed 2D period across the destination lattice.
++    """
++    g = np.asarray(grid, dtype=int)
++    h, w = g.shape
++    out = g.copy()
++    bg = get_bg(g)
++
++    comps = components_mask(g != bg, connectivity=4)
++    singles: list[tuple[int, int, int]] = []
++    blocks: list[tuple[int, int, int, int]] = []  # (r0,c0,size,color)
++    for pts in comps:
++        if len(pts) == 1:
++            r, c = pts[0]
++            singles.append((int(r), int(c), int(g[r, c])))
++            continue
++        r0, c0, r1, c1 = bbox_coords(pts)
++        hh, ww = r1 - r0 + 1, c1 - c0 + 1
++        if hh != ww or hh < 2:
++            continue
++        sub = g[r0:r1 + 1, c0:c1 + 1]
++        col = int(sub[0, 0])
++        if col == bg:
++            continue
++        if np.all(sub == col) and sub.size == len(pts):
++            blocks.append((int(r0), int(c0), int(hh), col))
++
++    assert singles and blocks, "grid must contain legend pixels and main blocks"
++
++    win_r = min(h, 12)
++    win_c = min(w, 12)
++    legend = [(r, c, v) for (r, c, v) in singles if r < win_r and c < win_c]
++    assert legend, "top-left legend must contain singleton pixels"
++
++    rs = sorted({r for r, _, _ in legend})
++    cs = sorted({c for _, c, _ in legend})
++    drs = [rs[i + 1] - rs[i] for i in range(len(rs) - 1)]
++    dcs = [cs[i + 1] - cs[i] for i in range(len(cs) - 1)]
++    stepL = reduce(gcd, drs + dcs)
++    assert stepL > 0, "legend lattice step must be positive"
++    rmin = min(r for r, _, _ in legend)
++    cmin = min(c for _, c, _ in legend)
++
++    legend_pts: list[tuple[int, int, int]] = []
++    for r, c, v in legend:
++        rr = (r - rmin) // stepL
++        cc = (c - cmin) // stepL
++        legend_pts.append((int(rr), int(cc), int(v)))
++
++    tile_rows = max(rr for rr, _, _ in legend_pts) + 1
++    tile_cols = max(cc for _, cc, _ in legend_pts) + 1
++    max_rr = tile_rows - 1
++    max_cc = tile_cols - 1
++
++    sizes = [s for _, _, s, _ in blocks]
++    vals, cnts = np.unique(np.array(sizes, dtype=int), return_counts=True)
++    block_size = int(vals[cnts.argmax()])
++    blocks = [b for b in blocks if b[2] == block_size]
++    assert blocks, "must contain at least one block of the dominant block size"
++
++    tops = sorted({r0 for r0, _, _, _ in blocks})
++    lefts = sorted({c0 for _, c0, _, _ in blocks})
++    step_candidates = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
++    step_candidates += [lefts[i + 1] - lefts[i] for i in range(len(lefts) - 1)]
++    assert step_candidates, "existing blocks must reveal the block step"
++    step = reduce(gcd, step_candidates)
++    assert step > 0, "block step must be positive"
++
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    tile_span_r = max_rr * step + block_size
++    tile_span_c = max_cc * step + block_size
++
++    by_color: dict[int, list[tuple[int, int]]] = {}
++    for r0, c0, _, col in blocks:
++        by_color.setdefault(int(col), []).append((int(r0), int(c0)))
++
++    phases: dict[tuple[int, int], int] = {}
++    for rr, cc, col in legend_pts:
++        if col not in by_color:
++            continue
++        for br0, bc0 in by_color[col]:
++            phase_r = (br0 - rr * step) % period_r
++            phase_c = (bc0 - cc * step) % period_c
++            phases[(phase_r, phase_c)] = phases.get((phase_r, phase_c), 0) + 1
++    assert phases, "existing blocks must determine the macro-tile phase"
++    max_votes = max(phases.values())
++    best_phases = [phase for phase, votes in phases.items() if votes == max_votes]
++    assert len(best_phases) == 1, "macro-tile phase must be unique"
++    phase_r, phase_c = best_phases[0]
++
++    row_starts = range(phase_r, h - tile_span_r + 1, period_r)
++    col_starts = range(phase_c, w - tile_span_c + 1, period_c)
++    for tile_r in row_starts:
++        for tile_c in col_starts:
++            for rr, cc, col in legend_pts:
++                tr0 = tile_r + rr * step
++                tc0 = tile_c + cc * step
++                assert 0 <= tr0 <= h - block_size and 0 <= tc0 <= w - block_size, \
++                    "tiled legend block projection must fit in canvas"
++                out[tr0:tr0 + block_size, tc0:tc0 + block_size] = col
++    return out
++
++
++# --------------- generator (o5x -> D3 tiling) ---------------
++
++# === CFG: canvas ===
++GRID_SIZE_MIN, GRID_SIZE_MAX = 23, 27
++NUM_COLORS = 10
++
++# === CFG: legend lattice ===
++LEGEND_ORIGIN = (1, 1)
++LEGEND_STEP = 2
++LEGEND_ROWS = (3, 4)
++LEGEND_COLS = (2, 3)
++LEGEND_EMPTIES = (0, 1, 2)
++LEGEND_FILLED_MIN, LEGEND_FILLED_MAX = 6, 10
++PALETTE_SIZE_MIN, PALETTE_SIZE_MAX = 2, 4
++MAX_COUNT_PER_COLOR = 6
++
++# === CFG: block area ===
++BLOCK_SIZE_RANGE = range(2, 5)
++GAP_RANGE = range(1, 4)
++STEP_MIN, STEP_MAX = 3, 5
++BASE_C_MIN = 8
++BASE_R_MIN = 1
++TILE_REPS_R = (2, 3)
++TILE_REPS_C = (2, 3, 4)
++
++# === CFG: generation ===
++MAX_RETRIES = 400
++
++
++def _enumerate_staircase_shapes():
++    """Enumerate valid staircase width tuples."""
++    shapes = []
++    for rows in LEGEND_ROWS:
++        for cols in LEGEND_COLS:
++            total = rows * cols
++            for empties in LEGEND_EMPTIES:
++                count = total - empties
++                if not (LEGEND_FILLED_MIN <= count <= LEGEND_FILLED_MAX):
++                    continue
++
++                def rec(prefix, remaining, r):
++                    if r == rows:
++                        if remaining == 0 and max(prefix) == cols:
++                            shapes.append(tuple(prefix))
++                        return
++                    left = rows - r - 1
++                    lo = max(1, remaining - left * cols)
++                    hi = min(cols, remaining - left)
++                    for width in range(lo, hi + 1):
++                        rec(prefix + [width], remaining - width, r + 1)
++
++                rec([], count, 0)
++    return shapes
++
++
++_BLOCK_GAP_PAIRS = [
++    (n, g) for n in BLOCK_SIZE_RANGE for g in GAP_RANGE
++    if STEP_MIN <= n + g <= STEP_MAX
++]
++_STAIRCASE_SHAPES = _enumerate_staircase_shapes()
++
++
++def _pick_staircase():
++    """Pick a staircase legend shape; return filled points and horizontal adjacent pairs."""
++    widths = random.choice(_STAIRCASE_SHAPES)
++    pts = [(r, c) for r, width in enumerate(widths) for c in range(width)]
++    pairs = [(r, c) for r, width in enumerate(widths) for c in range(width - 1)]
++    return pts, pairs
++
++
++def _random_color_counts(total, k):
++    """Distribute `total` items among `k` colors with positive counts."""
++    counts = [1] * k
++    remaining = total - k
++    while remaining:
++        open_idxs = [i for i, v in enumerate(counts) if v < MAX_COUNT_PER_COLOR]
++        i = random.choice(open_idxs)
++        add = random.randint(1, min(remaining, MAX_COUNT_PER_COLOR - counts[i]))
++        counts[i] += add
++        remaining -= add
++    random.shuffle(counts)
++    return counts
++
++
++def _assign_legend_colors(pts, anchor_pair, palette):
++    """
++    Color the legend so the ordered horizontal anchor pair is unique.
++
++    This preserves the original task's sparse-anchors feel while giving the
++    tiling solver a unique phase vote.
++    """
++    pos_set = set(pts)
++    first = anchor_pair
++    second = (anchor_pair[0], anchor_pair[1] + 1)
++    a, b = random.sample(palette, 2)
++    counts = dict(zip(palette, _random_color_counts(len(pts), len(palette))))
++    colors = {first: a, second: b}
++    counts[a] -= 1
++    counts[b] -= 1
++    if counts[a] < 0 or counts[b] < 0:
++        return None
++
++    anchor_colors = (a, b)
++    cells = [p for p in pts if p not in colors]
++
++    def allowed(pos, col):
++        r, c = pos
++        left = (r, c - 1)
++        if left in pos_set and left in colors:
++            if (colors[left], col) == anchor_colors and (left, pos) != (first, second):
++                return False
++        right = (r, c + 1)
++        if right in pos_set and right in colors:
++            if (col, colors[right]) == anchor_colors and (pos, right) != (first, second):
++                return False
++        return True
++
++    def search():
++        if not cells:
++            return all(v == 0 for v in counts.values())
++        best_i, best_opts = None, None
++        for i, pos in enumerate(cells):
++            opts = [col for col in palette if counts[col] > 0 and allowed(pos, col)]
++            if best_opts is None or len(opts) < len(best_opts):
++                best_i, best_opts = i, opts
++        if not best_opts:
++            return False
++        pos = cells.pop(best_i)
++        random.shuffle(best_opts)
++        for col in best_opts:
++            colors[pos] = col
++            counts[col] -= 1
++            if search():
++                return True
++            counts[col] += 1
++            del colors[pos]
++        cells.insert(best_i, pos)
++        return False
++
++    if not search():
++        return None
++    return colors
++
++
++def _render_tiling(canvas, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols):
++    """Paint every block in every macro-tile."""
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for (rr, cc), col in legend_colors.items():
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                canvas[br:br + block_size, bc:bc + block_size] = col
++
++
++def _gen_attempt():
++    size = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    block_size, gap = random.choice(_BLOCK_GAP_PAIRS)
++    step = block_size + gap
++    pts, pairs = _pick_staircase()
++    anchor_pair = random.choice(pairs)
++
++    bg = random.randrange(NUM_COLORS)
++    k_min = max(PALETTE_SIZE_MIN, (len(pts) + MAX_COUNT_PER_COLOR - 1) // MAX_COUNT_PER_COLOR)
++    k = random.randint(k_min, min(PALETTE_SIZE_MAX, len(pts)))
++    palette = random.sample([c for c in range(NUM_COLORS) if c != bg], k)
++    legend_colors = _assign_legend_colors(pts, anchor_pair, palette)
++    if legend_colors is None:
++        return None
++
++    tile_rows = max(r for r, _ in pts) + 1
++    tile_cols = max(c for _, c in pts) + 1
++    tile_span_r = (tile_rows - 1) * step + block_size
++    tile_span_c = (tile_cols - 1) * step + block_size
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++
++    layout_options = []
++    for reps_r in TILE_REPS_R:
++        total_h = tile_span_r + (reps_r - 1) * period_r
++        r_hi = size - total_h
++        r_max = min(period_r - 1, r_hi)
++        if r_max < BASE_R_MIN:
++            continue
++        for reps_c in TILE_REPS_C:
++            total_w = tile_span_c + (reps_c - 1) * period_c
++            c_hi = size - total_w
++            c_max = min(period_c - 1, c_hi)
++            if c_max < BASE_C_MIN:
++                continue
++            if reps_r * reps_c < 4:
++                continue
++            layout_options.append((reps_r, reps_c, r_max, c_max))
++    if not layout_options:
++        return None
++
++    reps_r, reps_c, r_max, c_max = random.choice(layout_options)
++    base_r = random.randint(BASE_R_MIN, r_max)
++    base_c = random.randint(BASE_C_MIN, c_max)
++
++    lr0, lc0 = LEGEND_ORIGIN
++    out = np.full((size, size), bg, dtype=int)
++    for (rr, cc), col in legend_colors.items():
++        out[lr0 + rr * LEGEND_STEP, lc0 + cc * LEGEND_STEP] = col
++    _render_tiling(out, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols)
++
++    inp = out.copy()
++    keep = {anchor_pair, (anchor_pair[0], anchor_pair[1] + 1)}
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for rr, cc in pts:
++                if tile_idx_r == 0 and tile_idx_c == 0 and (rr, cc) in keep:
++                    continue
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                inp[br:br + block_size, bc:bc + block_size] = bg
++
++    try:
++        solved = main(inp)
++    except Exception:
++        return None
++    if not np.array_equal(solved, out):
++        return None
++    return inp
++
++
++def generate_input():
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid tiled c4d067a0 input")
+
+codex
+代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code/c4d067a0/D3/1/code.py)。
+
+`main()` 现在不再把图例投影成一次性的单个块簇，而是先从现有锚块推断 `step` 和“模宏瓦片周期”的相位，再把图例作为局部模板铺到所有完整瓦片上。`generate_input()` 相应改成 output-first 的平铺版本，强制生成至少 `2x2` 个宏瓦片，只保留首个瓦片中的两个水平相邻锚块，并在文件开头写入了完整的设计分析注释。
+
+验证结果：
+- 指定 50 次测试：`Success: 50/50, Time: 0.1s (3ms/call)`
+- 非退化统计（30 个样本）：输出块数 / 图例点数 的重复倍数分布为 `4x: 26`、`6x: 4`
+- 用原始 `c4d067a0` solver 对同一批输入对比：`0/30` 与变体输出一致，说明行为确实切换到了周期平铺，而不是退回原题逻辑
+
+新 solver 的关键假设也已由 generator 保证：两个输入锚块对应图例里唯一的有序水平相邻颜色对，且宏瓦片基相位落在首个周期内，因此相位投票和整瓦片遍历都是稳定的。
+diff --git a/ceshi/code/c4d067a0/D3/1/code.py b/ceshi/code/c4d067a0/D3/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e971ba1ec60d79a8f1bf26fdfe068595f4d341c
+--- /dev/null
++++ b/ceshi/code/c4d067a0/D3/1/code.py
+@@ -0,0 +1,410 @@
++# Variant of c4d067a0
++# Dimension: D3 — 目标位置：色块放置区域 (dst)
++# Change: 网格中通过缩放因子计算出的对应位置，每个图例像素映射为一个 NxN 的实心色块，色块之间以背景色分隔... → 铺贴到周期性网格的指定单元
++
++# Design analysis
++# ----------------
++# a) 具体化与行为追踪
++#    - 左上角图例仍然是 step=2 的单像素点阵，颜色和原题一致，表示一个小的“模板”。
++#    - 右侧主区域仍然由 NxN 实心色块组成，色块顶点落在步长为 step=block_size+gap 的块格点上。
++#    - 变体的核心改动：图例不再只映射到主区域中的一个单次形状，而是作为“一个宏瓦片内部的局部占位图”。
++#      设图例在格点坐标中的包围盒是 tile_rows x tile_cols，则主区域的宏瓦片周期就是
++#      period_r = tile_rows * step, period_c = tile_cols * step。每个瓦片里，图例中的每个点都映射为一个 NxN 色块。
++#    - 小例子：
++#      原题若图例局部坐标有 (0,0),(0,1),(1,0)，并从已有块反推出 base=(4,10), step=3，
++#      则只会在 (4,10),(4,13),(7,10) 放三块。
++#      本变体中，若图例包围盒是 2x2，则 period=(6,6)；除了 base 对应的那一组外，
++#      还会在 (4+6k,10+6m) 的每个瓦片里重复放置同样的三块，直到完整瓦片放不下为止。
++#
++# b) 复杂度校准
++#    - 仍保留原题的 2-4 种颜色、3-4 x 2-3 的小图例、2x2 以上实心色块，避免退化成过于规则的单色平铺。
++#    - 为了保证“周期性”肉眼可见，生成器强制至少 2x2 个宏瓦片，总块数严格大于单次图例块数。
++#    - 仍只保留两个输入锚块，但要求它们对应图例中唯一的水平相邻有序颜色对，这样既维持原题的稀疏提示，
++#      又能唯一锁定宏瓦片的相位。
++#
++# c) 隐式假设审查（相对原 main 的关键变化）
++#    - 原代码把 base_r + rr*step / base_c + cc*step 当成唯一绝对目标位置；本变体不成立，
++#      因为同一图例点会在多个瓦片中重复出现，所以 solver 必须改为推断“模周期的相位”而不是单次绝对偏移。
++#    - 原代码对同色 legend 点与 block 的投票是绝对坐标投票；本变体改为对
++#      ((br0 - rr*step) mod period_r, (bc0 - cc*step) mod period_c) 投票。
++#    - 原代码最后只绘制一轮 legend_pts；本变体必须在所有完整瓦片上循环绘制。
++#
++# d) 放置合法性
++#    - 生成器只接受完整瓦片可放置的布局：tile_span_r/tile_span_c 给出单个瓦片的实际占用范围，
++#      base 与 repetitions 的选择保证所有块都在画布内，且与左上角图例分离。
++#    - 输入只保留同一瓦片中的两个水平相邻锚块，因此它们既能给出 step，也不会与其他重复实例混淆。
++#
++# e) 视觉可观察性
++#    - 人类从样例能直接看到：左上角是一个小模板，右侧不是补一个局部缺块，而是整齐地在多块大瓦片中重复。
++#    - 重复次数固定至少 4 个瓦片，因此 D3 的差异不是边缘现象。
++#
++# f) 可视化整洁度
++#    - 宏瓦片之间只通过背景色间隔，没有额外标记线，视觉上会形成干净的重复阵列。
++#    - 图例保留在左上角，主区域从较右侧开始，避免与平铺区混在一起。
++#
++# g) 颜色变化可推断性
++#    - 颜色仍只表示“这个局部槽位要填什么色”，没有引入任何依赖颜色 id 的排序或运算。
++#    - 锚块的唯一性由“局部相邻颜色对”保证，而不是由颜色大小关系保证。
++
++import numpy as np
++from functools import reduce
++from math import gcd
++
++from arc_utils import bbox_coords, components_mask, get_bg
++import random
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Repeat a legend-defined block template across a periodic macro-tile grid.
++
++    Input structure:
++    - bg = most common color.
++    - Top-left corner: a sparse legend of singleton colored pixels on a regular lattice; these pixels describe one macro-tile's local block layout.
++    - Main area: a few uniformly colored square blocks (NxN) already placed on the same block lattice; they reveal block size, block step, and macro-tile phase.
++
++    Rule:
++    - Normalize the legend into lattice coordinates, and treat its bounding box as the row/column span of one repeating macro-tile.
++    - Infer the block lattice step from the existing blocks, then infer the macro-tile phase by matching block colors against legend colors modulo the macro-tile period.
++    - For every macro-tile that fully fits in the canvas, place an NxN block for every legend pixel at the corresponding local position inside that tile.
++
++    Key insight: The legend is no longer a one-off minimap of a single block cluster; it is a local template that repeats at a fixed 2D period across the destination lattice.
++    """
++    g = np.asarray(grid, dtype=int)
++    h, w = g.shape
++    out = g.copy()
++    bg = get_bg(g)
++
++    comps = components_mask(g != bg, connectivity=4)
++    singles: list[tuple[int, int, int]] = []
++    blocks: list[tuple[int, int, int, int]] = []  # (r0,c0,size,color)
++    for pts in comps:
++        if len(pts) == 1:
++            r, c = pts[0]
++            singles.append((int(r), int(c), int(g[r, c])))
++            continue
++        r0, c0, r1, c1 = bbox_coords(pts)
++        hh, ww = r1 - r0 + 1, c1 - c0 + 1
++        if hh != ww or hh < 2:
++            continue
++        sub = g[r0:r1 + 1, c0:c1 + 1]
++        col = int(sub[0, 0])
++        if col == bg:
++            continue
++        if np.all(sub == col) and sub.size == len(pts):
++            blocks.append((int(r0), int(c0), int(hh), col))
++
++    assert singles and blocks, "grid must contain legend pixels and main blocks"
++
++    win_r = min(h, 12)
++    win_c = min(w, 12)
++    legend = [(r, c, v) for (r, c, v) in singles if r < win_r and c < win_c]
++    assert legend, "top-left legend must contain singleton pixels"
++
++    rs = sorted({r for r, _, _ in legend})
++    cs = sorted({c for _, c, _ in legend})
++    drs = [rs[i + 1] - rs[i] for i in range(len(rs) - 1)]
++    dcs = [cs[i + 1] - cs[i] for i in range(len(cs) - 1)]
++    stepL = reduce(gcd, drs + dcs)
++    assert stepL > 0, "legend lattice step must be positive"
++    rmin = min(r for r, _, _ in legend)
++    cmin = min(c for _, c, _ in legend)
++
++    legend_pts: list[tuple[int, int, int]] = []
++    for r, c, v in legend:
++        rr = (r - rmin) // stepL
++        cc = (c - cmin) // stepL
++        legend_pts.append((int(rr), int(cc), int(v)))
++
++    tile_rows = max(rr for rr, _, _ in legend_pts) + 1
++    tile_cols = max(cc for _, cc, _ in legend_pts) + 1
++    max_rr = tile_rows - 1
++    max_cc = tile_cols - 1
++
++    sizes = [s for _, _, s, _ in blocks]
++    vals, cnts = np.unique(np.array(sizes, dtype=int), return_counts=True)
++    block_size = int(vals[cnts.argmax()])
++    blocks = [b for b in blocks if b[2] == block_size]
++    assert blocks, "must contain at least one block of the dominant block size"
++
++    tops = sorted({r0 for r0, _, _, _ in blocks})
++    lefts = sorted({c0 for _, c0, _, _ in blocks})
++    step_candidates = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]
++    step_candidates += [lefts[i + 1] - lefts[i] for i in range(len(lefts) - 1)]
++    assert step_candidates, "existing blocks must reveal the block step"
++    step = reduce(gcd, step_candidates)
++    assert step > 0, "block step must be positive"
++
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    tile_span_r = max_rr * step + block_size
++    tile_span_c = max_cc * step + block_size
++
++    by_color: dict[int, list[tuple[int, int]]] = {}
++    for r0, c0, _, col in blocks:
++        by_color.setdefault(int(col), []).append((int(r0), int(c0)))
++
++    phases: dict[tuple[int, int], int] = {}
++    for rr, cc, col in legend_pts:
++        if col not in by_color:
++            continue
++        for br0, bc0 in by_color[col]:
++            phase_r = (br0 - rr * step) % period_r
++            phase_c = (bc0 - cc * step) % period_c
++            phases[(phase_r, phase_c)] = phases.get((phase_r, phase_c), 0) + 1
++    assert phases, "existing blocks must determine the macro-tile phase"
++    max_votes = max(phases.values())
++    best_phases = [phase for phase, votes in phases.items() if votes == max_votes]
++    assert len(best_phases) == 1, "macro-tile phase must be unique"
++    phase_r, phase_c = best_phases[0]
++
++    row_starts = range(phase_r, h - tile_span_r + 1, period_r)
++    col_starts = range(phase_c, w - tile_span_c + 1, period_c)
++    for tile_r in row_starts:
++        for tile_c in col_starts:
++            for rr, cc, col in legend_pts:
++                tr0 = tile_r + rr * step
++                tc0 = tile_c + cc * step
++                assert 0 <= tr0 <= h - block_size and 0 <= tc0 <= w - block_size, \
++                    "tiled legend block projection must fit in canvas"
++                out[tr0:tr0 + block_size, tc0:tc0 + block_size] = col
++    return out
++
++
++# --------------- generator (o5x -> D3 tiling) ---------------
++
++# === CFG: canvas ===
++GRID_SIZE_MIN, GRID_SIZE_MAX = 23, 27
++NUM_COLORS = 10
++
++# === CFG: legend lattice ===
++LEGEND_ORIGIN = (1, 1)
++LEGEND_STEP = 2
++LEGEND_ROWS = (3, 4)
++LEGEND_COLS = (2, 3)
++LEGEND_EMPTIES = (0, 1, 2)
++LEGEND_FILLED_MIN, LEGEND_FILLED_MAX = 6, 10
++PALETTE_SIZE_MIN, PALETTE_SIZE_MAX = 2, 4
++MAX_COUNT_PER_COLOR = 6
++
++# === CFG: block area ===
++BLOCK_SIZE_RANGE = range(2, 5)
++GAP_RANGE = range(1, 4)
++STEP_MIN, STEP_MAX = 3, 5
++BASE_C_MIN = 8
++BASE_R_MIN = 1
++TILE_REPS_R = (2, 3)
++TILE_REPS_C = (2, 3, 4)
++
++# === CFG: generation ===
++MAX_RETRIES = 400
++
++
++def _enumerate_staircase_shapes():
++    """Enumerate valid staircase width tuples."""
++    shapes = []
++    for rows in LEGEND_ROWS:
++        for cols in LEGEND_COLS:
++            total = rows * cols
++            for empties in LEGEND_EMPTIES:
++                count = total - empties
++                if not (LEGEND_FILLED_MIN <= count <= LEGEND_FILLED_MAX):
++                    continue
++
++                def rec(prefix, remaining, r):
++                    if r == rows:
++                        if remaining == 0 and max(prefix) == cols:
++                            shapes.append(tuple(prefix))
++                        return
++                    left = rows - r - 1
++                    lo = max(1, remaining - left * cols)
++                    hi = min(cols, remaining - left)
++                    for width in range(lo, hi + 1):
++                        rec(prefix + [width], remaining - width, r + 1)
++
++                rec([], count, 0)
++    return shapes
++
++
++_BLOCK_GAP_PAIRS = [
++    (n, g) for n in BLOCK_SIZE_RANGE for g in GAP_RANGE
++    if STEP_MIN <= n + g <= STEP_MAX
++]
++_STAIRCASE_SHAPES = _enumerate_staircase_shapes()
++
++
++def _pick_staircase():
++    """Pick a staircase legend shape; return filled points and horizontal adjacent pairs."""
++    widths = random.choice(_STAIRCASE_SHAPES)
++    pts = [(r, c) for r, width in enumerate(widths) for c in range(width)]
++    pairs = [(r, c) for r, width in enumerate(widths) for c in range(width - 1)]
++    return pts, pairs
++
++
++def _random_color_counts(total, k):
++    """Distribute `total` items among `k` colors with positive counts."""
++    counts = [1] * k
++    remaining = total - k
++    while remaining:
++        open_idxs = [i for i, v in enumerate(counts) if v < MAX_COUNT_PER_COLOR]
++        i = random.choice(open_idxs)
++        add = random.randint(1, min(remaining, MAX_COUNT_PER_COLOR - counts[i]))
++        counts[i] += add
++        remaining -= add
++    random.shuffle(counts)
++    return counts
++
++
++def _assign_legend_colors(pts, anchor_pair, palette):
++    """
++    Color the legend so the ordered horizontal anchor pair is unique.
++
++    This preserves the original task's sparse-anchors feel while giving the
++    tiling solver a unique phase vote.
++    """
++    pos_set = set(pts)
++    first = anchor_pair
++    second = (anchor_pair[0], anchor_pair[1] + 1)
++    a, b = random.sample(palette, 2)
++    counts = dict(zip(palette, _random_color_counts(len(pts), len(palette))))
++    colors = {first: a, second: b}
++    counts[a] -= 1
++    counts[b] -= 1
++    if counts[a] < 0 or counts[b] < 0:
++        return None
++
++    anchor_colors = (a, b)
++    cells = [p for p in pts if p not in colors]
++
++    def allowed(pos, col):
++        r, c = pos
++        left = (r, c - 1)
++        if left in pos_set and left in colors:
++            if (colors[left], col) == anchor_colors and (left, pos) != (first, second):
++                return False
++        right = (r, c + 1)
++        if right in pos_set and right in colors:
++            if (col, colors[right]) == anchor_colors and (pos, right) != (first, second):
++                return False
++        return True
++
++    def search():
++        if not cells:
++            return all(v == 0 for v in counts.values())
++        best_i, best_opts = None, None
++        for i, pos in enumerate(cells):
++            opts = [col for col in palette if counts[col] > 0 and allowed(pos, col)]
++            if best_opts is None or len(opts) < len(best_opts):
++                best_i, best_opts = i, opts
++        if not best_opts:
++            return False
++        pos = cells.pop(best_i)
++        random.shuffle(best_opts)
++        for col in best_opts:
++            colors[pos] = col
++            counts[col] -= 1
++            if search():
++                return True
++            counts[col] += 1
++            del colors[pos]
++        cells.insert(best_i, pos)
++        return False
++
++    if not search():
++        return None
++    return colors
++
++
++def _render_tiling(canvas, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols):
++    """Paint every block in every macro-tile."""
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for (rr, cc), col in legend_colors.items():
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                canvas[br:br + block_size, bc:bc + block_size] = col
++
++
++def _gen_attempt():
++    size = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    block_size, gap = random.choice(_BLOCK_GAP_PAIRS)
++    step = block_size + gap
++    pts, pairs = _pick_staircase()
++    anchor_pair = random.choice(pairs)
++
++    bg = random.randrange(NUM_COLORS)
++    k_min = max(PALETTE_SIZE_MIN, (len(pts) + MAX_COUNT_PER_COLOR - 1) // MAX_COUNT_PER_COLOR)
++    k = random.randint(k_min, min(PALETTE_SIZE_MAX, len(pts)))
++    palette = random.sample([c for c in range(NUM_COLORS) if c != bg], k)
++    legend_colors = _assign_legend_colors(pts, anchor_pair, palette)
++    if legend_colors is None:
++        return None
++
++    tile_rows = max(r for r, _ in pts) + 1
++    tile_cols = max(c for _, c in pts) + 1
++    tile_span_r = (tile_rows - 1) * step + block_size
++    tile_span_c = (tile_cols - 1) * step + block_size
++    period_r = tile_rows * step
++    period_c = tile_cols * step
++
++    layout_options = []
++    for reps_r in TILE_REPS_R:
++        total_h = tile_span_r + (reps_r - 1) * period_r
++        r_hi = size - total_h
++        r_max = min(period_r - 1, r_hi)
++        if r_max < BASE_R_MIN:
++            continue
++        for reps_c in TILE_REPS_C:
++            total_w = tile_span_c + (reps_c - 1) * period_c
++            c_hi = size - total_w
++            c_max = min(period_c - 1, c_hi)
++            if c_max < BASE_C_MIN:
++                continue
++            if reps_r * reps_c < 4:
++                continue
++            layout_options.append((reps_r, reps_c, r_max, c_max))
++    if not layout_options:
++        return None
++
++    reps_r, reps_c, r_max, c_max = random.choice(layout_options)
++    base_r = random.randint(BASE_R_MIN, r_max)
++    base_c = random.randint(BASE_C_MIN, c_max)
++
++    lr0, lc0 = LEGEND_ORIGIN
++    out = np.full((size, size), bg, dtype=int)
++    for (rr, cc), col in legend_colors.items():
++        out[lr0 + rr * LEGEND_STEP, lc0 + cc * LEGEND_STEP] = col
++    _render_tiling(out, legend_colors, block_size, step, base_r, base_c, reps_r, reps_c, tile_rows, tile_cols)
++
++    inp = out.copy()
++    keep = {anchor_pair, (anchor_pair[0], anchor_pair[1] + 1)}
++    for tile_idx_r in range(reps_r):
++        tile_r = base_r + tile_idx_r * period_r
++        for tile_idx_c in range(reps_c):
++            tile_c = base_c + tile_idx_c * period_c
++            for rr, cc in pts:
++                if tile_idx_r == 0 and tile_idx_c == 0 and (rr, cc) in keep:
++                    continue
++                br = tile_r + rr * step
++                bc = tile_c + cc * step
++                inp[br:br + block_size, bc:bc + block_size] = bg
++
++    try:
++        solved = main(inp)
++    except Exception:
++        return None
++    if not np.array_equal(solved, out):
++        return None
++    return inp
++
++
++def generate_input():
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid tiled c4d067a0 input")
+
+tokens used
+90,553
+代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code/c4d067a0/D3/1/code.py)。
+
+`main()` 现在不再把图例投影成一次性的单个块簇，而是先从现有锚块推断 `step` 和“模宏瓦片周期”的相位，再把图例作为局部模板铺到所有完整瓦片上。`generate_input()` 相应改成 output-first 的平铺版本，强制生成至少 `2x2` 个宏瓦片，只保留首个瓦片中的两个水平相邻锚块，并在文件开头写入了完整的设计分析注释。
+
+验证结果：
+- 指定 50 次测试：`Success: 50/50, Time: 0.1s (3ms/call)`
+- 非退化统计（30 个样本）：输出块数 / 图例点数 的重复倍数分布为 `4x: 26`、`6x: 4`
+- 用原始 `c4d067a0` solver 对同一批输入对比：`0/30` 与变体输出一致，说明行为确实切换到了周期平铺，而不是退回原题逻辑
+
+新 solver 的关键假设也已由 generator 保证：两个输入锚块对应图例里唯一的有序水平相邻颜色对，且宏瓦片基相位落在首个周期内，因此相位投票和整瓦片遍历都是稳定的。

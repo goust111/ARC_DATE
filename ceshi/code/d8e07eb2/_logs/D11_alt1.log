@@ -1,0 +1,4369 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e25a7-ca40-7082-b675-b09e8cd91fe6
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个变体。
+
+    ## 原始任务: d8e07eb2
+    **摘要**: 30x22网格被两条水平分隔行（色6）分为三个带：顶部查询带含若干3x3彩色字形，中间参考表为4x4的5x5单元格阵列（每格内含3x3字形），底部判定带。将查询字形按颜色+形状匹配到参考表单元格，匹配的单元格用绿色(3)填充背景；若所有匹配恰好构成参考表的一整行或一整列，则查询带和判定带也填绿，否则仅判定带填红(2)。
+
+    ## 要实现的变体
+    - **维度**: D11 — 网格输出尺寸 (`grid_shape`)
+    - **当前值**: 输出网格与输入尺寸完全相同(30x22)，所有变换都在原位进行
+    - **改为**: 输出仅保留匹配的行或列 — 如果判定为绿色，输出仅包含被匹配的那一整行或整列的单元格（紧凑排列）；如果为红色，输出为单个红色像素或空网格。输出尺寸可变，增加了尺寸推理维度。
+    - **来源**: crop（参考任务: a251c730）
+
+    ## 修改原则 
+    以 D11 为核心变更，不要随意改动与该创新无关的部分。但如果其他维度需要做适配性调整才能让 D11 的变化在视觉上可观察、在逻辑上可行（例如：变换规则改为旋转/翻转，但原始对象是纯色对称的导致变换不可见，则应让对象带不对称内部结构），这种配合修改是允许且必要的。
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/d8e07eb2.py`
+
+    ```python
+    from __future__ import annotations
+
+import numpy as np
+
+from arc_utils import get_bg, paste
+import random
+
+
+def _constant_non_bg_rows(g: np.ndarray, bg: int) -> list[int]:
+    return [
+        int(r)
+        for r in range(g.shape[0])
+        if bool(np.all(g[r, :] == g[r, 0])) and int(g[r, 0]) != int(bg)
+    ]
+
+
+def _cell_signature(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> tuple[tuple[int, int, int], ...] | None:
+    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)]
+    mask = cell != int(bg)
+    if not bool(mask.any()):
+        return None
+    return tuple(
+        (int(r), int(c), int(cell[r, c]))
+        for r, c in zip(*np.where(mask), strict=False)
+    )
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Look up query glyphs in a reference table and mark whether they form a line.
+
+    Input structure:
+    - Teal background with two full-width pink separator rows.
+    - Above the first separator is a query row of 5x5 glyph cells.
+    - Between separators is a reference table of the same 5x5 cells; a glyph is
+      identified by both its color and its 3x3 shape.
+
+    Rule:
+    - Green-fill the background inside every table cell whose glyph exactly
+      appears in the query row.
+    - If the matched table cells form one complete row or one complete column,
+      also green-fill the query band and the bottom verdict band.
+    - Otherwise leave the query band unchanged and fill the bottom verdict band red.
+
+    Key insight: The bottom color is not a count; it is the yes/no answer to
+    whether the queried glyphs align as a full row or column in the table.
+    """
+    g = np.asarray(grid, dtype=int)
+    h, w = g.shape
+    bg = get_bg(g)
+    cell_size = 5
+
+    sep_rows = _constant_non_bg_rows(g, bg)
+    assert len(sep_rows) >= 2, "expected two full-width separator rows"
+    top_sep = sep_rows[0]
+    bottom_sep = sep_rows[-1]
+
+    table_region = g[top_sep + 1 : bottom_sep, :]
+    table_fg = np.argwhere(table_region != bg)
+    assert table_fg.size, "reference table must contain glyphs"
+
+    first_glyph_r = top_sep + 1 + int(table_fg[:, 0].min())
+    first_glyph_c = int(table_fg[:, 1].min())
+    row0 = first_glyph_r - 1
+    col0 = first_glyph_c - 1
+
+    row_starts = list(range(row0, bottom_sep, cell_size))
+    row_starts = [r for r in row_starts if r + cell_size <= bottom_sep]
+    col_starts = list(range(col0, w, cell_size))
+    col_starts = [c for c in col_starts if c + cell_size <= w]
+    assert row_starts and col_starts, "could not infer table cell grid"
+
+    query_sigs = [
+        sig
+        for c in col_starts
+        if (sig := _cell_signature(g, 0, c, cell_size, bg)) is not None
+    ]
+    query_set = set(query_sigs)
+    assert len(query_sigs) == len(query_set), "query glyphs should be distinct"
+
+    out = g.copy()
+    selected: list[tuple[int, int]] = []
+    for ri, r in enumerate(row_starts):
+        for ci, c in enumerate(col_starts):
+            if _cell_signature(g, r, c, cell_size, bg) not in query_set:
+                continue
+            selected.append((int(ri), int(ci)))
+            cell = out[r : r + cell_size, c : c + cell_size]
+            cell[cell == bg] = 3
+
+    complete_query = len(query_sigs) == len(col_starts)
+    same_row = len({r for r, _c in selected}) == 1
+    same_col = len({c for _r, c in selected}) == 1
+    success = complete_query and len(selected) == len(query_sigs) and (same_row or same_col)
+
+    if success:
+        query_band = out[:top_sep, :]
+        query_band[query_band == bg] = 3
+        out[bottom_sep + 1 :, :] = 3
+    else:
+        out[bottom_sep + 1 :, :] = 2
+
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# -- Grid layout --
+GRID_H, GRID_W = 30, 22       # fixed canvas size
+TOP_SEP_ROW = 5                # query-band separator row
+BOTTOM_SEP_ROW = 27            # table-bottom separator row
+QUERY_BAND_H = 5               # height of query band (rows 0..4)
+VERDICT_ROW = 28               # verdict band starts here
+
+# -- Colors --
+BG = 8                         # teal background
+GREEN = 3                      # success / match highlight
+RED = 2                        # fail verdict
+SEP = 6                        # separator row color
+GLYPH_COLORS = (0, 1, 2, 4, 5, 6, 7, 9)  # 8 available glyph colors
+
+# -- Table geometry --
+TABLE_DIM = 4                  # 4x4 grid of cells
+CELL = 5                       # each cell is 5x5
+ROWS = (7, 12, 17, 22)        # row offsets for 4 table rows
+COLS = (1, 6, 11, 16)         # col offsets for 4 table columns
+
+# -- Glyph shape --
+FILL_MIN, FILL_MAX = 5, 9     # filled-pixel range per 3x3 glyph
+SHAPE_BASE_COUNTS = {5: 2, 6: 2, 7: 2, 8: 2, 9: 1}  # min shapes per fill-count
+MAX_SHAPES_PER_FILL = 5       # cap during random top-up
+
+# -- Color distribution --
+COLOR_MIN, COLOR_MAX = 1, 3   # each color used 1-3 times across 16 cells
+
+# -- Outcome probabilities --
+P_SUCCESS = 0.4               # chance of success outcome
+P_QUERY_3 = 0.35              # chance of 3-query fail (vs 4-query fail)
+FAIL_MODES = ("rect", "bent_row", "bent_col", "scatter_rows", "scatter_cols")
+
+# -- Generation --
+MAX_RETRIES = 300
+
+
+def _has_full_bbox(mask: int) -> bool:
+    """True if the 3x3 bitmask spans all four edges (non-empty top/bottom/left/right rows)."""
+    bits = [(mask >> i) & 1 for i in range(9)]
+    return (
+        any(bits[0:3])
+        and any(bits[6:9])
+        and any(bits[i] for i in (0, 3, 6))
+        and any(bits[i] for i in (2, 5, 8))
+    )
+
+
+PATTERNS_BY_FILL = {
+    k: tuple(m for m in range(1 << 9) if m.bit_count() == k and _has_full_bbox(m))
+    for k in range(FILL_MIN, FILL_MAX + 1)
+}
+
+
+def _balanced_color_list() -> list[int]:
+    """Assign 16 colors (one per cell) so each of the 8 palette colors appears 1-3 times."""
+    counts = {c: COLOR_MIN for c in GLYPH_COLORS}
+    extras = TABLE_DIM * TABLE_DIM - len(GLYPH_COLORS) * COLOR_MIN  # 16 - 8 = 8
+    for _ in range(extras):
+        choices = [c for c in GLYPH_COLORS if counts[c] < COLOR_MAX]
+        counts[random.choice(choices)] += 1
+    colors = [c for c, n in counts.items() for _ in range(n)]
+    random.shuffle(colors)
+    return colors
+
+
+def _balanced_shape_masks() -> list[int]:
+    """Pick 16 distinct 3x3 shape masks with a balanced distribution of fill counts."""
+    counts = dict(SHAPE_BASE_COUNTS)
+    extras = TABLE_DIM * TABLE_DIM - sum(counts.values())  # 16 - 9 = 7
+    for _ in range(extras):
+        choices = [k for k in range(FILL_MIN, FILL_MAX) if counts[k] < MAX_SHAPES_PER_FILL]
+        counts[random.choice(choices)] += 1
+
+    masks: list[int] = []
+    for k, n in counts.items():
+        masks.extend(random.sample(PATTERNS_BY_FILL[k], n))
+    random.shuffle(masks)
+    return masks
+
+
+def _glyph(mask: int, color: int) -> np.ndarray:
+    """Render a 3x3 bitmask as a CELL x CELL array with 1-pixel border of BG."""
+    cell = np.full((CELL, CELL), BG, dtype=int)
+    bits = np.array([(mask >> i) & 1 for i in range(9)], dtype=bool).reshape(3, 3)
+    cell[1:4, 1:4][bits] = color
+    return cell
+
+
+def _line_cells() -> list[tuple[int, int]]:
+    """Pick a complete row or column of 4 cells (shuffled order)."""
+    if random.random() < 0.5:
+        r = random.randrange(TABLE_DIM)
+        cells = [(r, c) for c in range(TABLE_DIM)]
+    else:
+        c = random.randrange(TABLE_DIM)
+        cells = [(r, c) for r in range(TABLE_DIM)]
+    random.shuffle(cells)
+    return cells
+
+
+def _fail_cells(count: int) -> list[tuple[int, int]]:
+    """Pick `count` distinct cells that do NOT all share a single row or column."""
+    if count == 3:
+        rs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
+        cs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
+        cells = [(rs[0], cs[0]), (rs[1], cs[1])]
+        pool = [(r, c) for r in rs for c in cs if (r, c) not in cells]
+        cells.append(random.choice(pool))
+    else:
+        mode = random.choice(FAIL_MODES)
+        if mode == "rect":
+            rs = random.sample(range(TABLE_DIM), 2)
+            cs = random.sample(range(TABLE_DIM), 2)
+            cells = [(r, c) for r in rs for c in cs]
+        elif mode == "bent_row":
+            r = random.randrange(TABLE_DIM)
+            dropped_c = random.randrange(TABLE_DIM)
+            new_r = random.choice([rr for rr in range(TABLE_DIM) if rr != r])
+            cells = [(r, c) for c in range(TABLE_DIM) if c != dropped_c] + [(new_r, dropped_c)]
+        elif mode == "bent_col":
+            c = random.randrange(TABLE_DIM)
+            dropped_r = random.randrange(TABLE_DIM)
+            new_c = random.choice([cc for cc in range(TABLE_DIM) if cc != c])
+            cells = [(r, c) for r in range(TABLE_DIM) if r != dropped_r] + [(dropped_r, new_c)]
+        elif mode == "scatter_rows":
+            base_c = random.randrange(TABLE_DIM)
+            cols = [base_c] * TABLE_DIM
+            for r in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
+                cols[r] = random.choice([c for c in range(TABLE_DIM) if c != base_c])
+            cells = [(r, cols[r]) for r in range(TABLE_DIM)]
+        else:
+            base_r = random.randrange(TABLE_DIM)
+            rows = [base_r] * TABLE_DIM
+            for c in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
+                rows[c] = random.choice([r for r in range(TABLE_DIM) if r != base_r])
+            cells = [(rows[c], c) for c in range(TABLE_DIM)]
+
+    assert len(cells) == count and len(set(cells)) == count
+    assert len({r for r, _c in cells}) > 1 and len({c for _r, c in cells}) > 1
+    random.shuffle(cells)
+    return cells
+
+
+def _expected_output(grid: np.ndarray, cells: list[tuple[int, int]], success: bool) -> np.ndarray:
+    """Build the expected solver output by green-filling matched cells and verdict band."""
+    out = grid.copy()
+    for r_i, c_i in cells:
+        cell = out[ROWS[r_i] : ROWS[r_i] + CELL, COLS[c_i] : COLS[c_i] + CELL]
+        cell[cell == BG] = GREEN
+    if success:
+        query_band = out[:QUERY_BAND_H, :]
+        query_band[query_band == BG] = GREEN
+        out[VERDICT_ROW:, :] = GREEN
+    else:
+        out[VERDICT_ROW:, :] = RED
+    return out
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Try to generate one valid input grid; return None on oracle mismatch."""
+    grid = np.full((GRID_H, GRID_W), BG, dtype=int)
+    grid[TOP_SEP_ROW, :] = SEP
+    grid[BOTTOM_SEP_ROW, :] = SEP
+
+    masks = _balanced_shape_masks()
+    colors = _balanced_color_list()
+    glyphs: list[np.ndarray] = []
+    for i, (mask, color) in enumerate(zip(masks, colors, strict=True)):
+        glyph = _glyph(mask, color)
+        glyphs.append(glyph)
+        r_i, c_i = divmod(i, TABLE_DIM)
+        paste(grid, glyph, ROWS[r_i], COLS[c_i])
+
+    success = random.random() < P_SUCCESS
+    if success:
+        query_cells = _line_cells()
+    else:
+        count = 3 if random.random() < P_QUERY_3 else 4
+        query_cells = _fail_cells(count)
+
+    for slot, (r_i, c_i) in enumerate(query_cells):
+        paste(grid, glyphs[r_i * TABLE_DIM + c_i], 0, COLS[slot])
+
+    expected = _expected_output(grid, query_cells, success)
+    if not np.array_equal(main(grid), expected):
+        return None
+    return grid
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate a valid d8e07eb2 input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 30 rows x 22 cols (fixed)
+  background: 8 (teal)
+  layout: |
+    rows 0-4: query band (5 rows)
+    row 5: full-width separator (color 6)
+    row 6: empty bg row
+    rows 7-26: 4x4 table of 5x5 glyph cells (no gaps between cells)
+    row 27: full-width separator (color 6)
+    rows 28-29: verdict band (2 rows)
+    cols: 1 bg gap + 4*5 cells + 1 bg gap = 22
+  table:
+    size: 4x4 grid of 5x5 cells, each containing a 3x3 monochrome glyph centered in inner 3x3
+    colors: 8 available colors (0-9 minus 3 and 8), each used 1-3 times across 16 cells
+    shapes: all 16 cells have distinct 3x3 binary patterns; 5-9 filled pixels per glyph
+    uniqueness: every (color, shape) pair is unique across all 16 cells
+    fixed across examples: yes [observed] -- generator should create a new random table each call
+  query:
+    count: 3-4 glyphs placed in the same column slots as table columns
+    source: each query glyph is an exact copy (same color + shape) of a distinct table cell
+    empty_slots: 0-1 trailing slots may be empty (when count < 4)
+  outcome:
+    success: all 4 query slots filled AND matched table cells form one complete row or one complete column
+    fail: matched cells do NOT form a complete row or column, OR fewer than 4 queries
+  output_transform:
+    always: green-fill (3) the bg pixels inside each matched table cell
+    success: also green-fill all bg in query band + fill entire verdict band with green (3)
+    fail: query band unchanged + fill entire verdict band with red (2)
+
+generation_strategy:
+  approach: output-first
+  steps:
+    1. Generate a 4x4 table of 16 glyphs with unique (color, 3x3 shape) pairs; use 8 colors from {0,1,2,4,5,6,7,9}, each 5-9 filled pixels in inner 3x3, all shapes distinct
+    2. Decide outcome (success ~40%, fail ~60%)
+    3. If success, pick a random complete row or column (4 glyphs) as query set
+    4. If fail, pick 3-4 glyphs from distinct table cells that do NOT all share a single row or column; if 4, also ensure they don't form a complete row/col
+    5. Place query glyphs in column slots 0-3 (leave slot 3 empty if only 3 queries)
+    6. Assemble grid: query band (rows 0-4) + separator + gap row + table (rows 7-26) + separator + verdict band (rows 28-29, all bg)
+    7. Run solver to produce output (green-fill matched cells, verdict band)
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须保留这一结构，并根据**新的变体规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映变体后的输入结构、规则和关键洞察。
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考任务**（如有 source_task）: 变体描述中的 source_task 是该变体的灵感来源。**必须先阅读其 solver 代码**，理解参考任务中相关机制的实现方式和复杂度，作为你设计变体的基线。不存在就跳过。
+
+    3. **设计分析（写代码前必须完成，可仿照spec书写，尽可能的详细以供下面代码生成使用）**:
+
+       YAML 中的变体描述给出了变更的大致方向，但细节不够具体。你需要自行思考并确定完整的实现细节。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断变体改动的影响范围和实现方式。在写代码之前，完成以下分析：
+
+       a) **具体化与行为追踪**: 变体在 ARC 的像素网格中具体长什么样？变更的核心行为如何体现在输入/输出的结构上？不要停留在抽象概念上，要想清楚具体的形状、颜色、空间关系等细节。然后，确定变体的变化会影响整个流程（输入构造、solver 处理、输出生成等）中的哪个环节，在这个环节上用一个具体的小例子追踪：原始逻辑在这里是怎么执行的 → 变体要求的逻辑应该是怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 变体改变了原任务的某个属性。原始代码中哪些写法依赖了旧属性的不变性？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在变体中是否仍然成立？特别注意那些在原任务中"恰好无害"但在变体中会出错的模式（例如：原任务中某个值始终相同，所以无条件赋值不会产生覆盖问题——但变体让该值可变后，无条件赋值就会破坏已有的正确结果）。
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意（例如对象之间的空间关系、对齐方式、间距等应与任务规则一致）。同时要考虑放置后的网格是否能被 solver 正确处理并产生预期的输出。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。**禁止使用颜色id等不可见因素参与任何排序或者颜色变换（例如使用黑色=0参与排序等，禁用）**。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出变体的规则？如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。若规则本身允许多个合法分支或子情况，不要在生成器中长期固定成其中一种，除非题意本来就要求固定。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果变体后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **颜色变化可推断性**: 如果变体涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个变体设计就不合格。
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 基于第 3 步的设计分析实现变体的新规则。只改需要改的部分，其他逻辑保持不变。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发新规则。生成的输入必须能被新 `main()` 正确求解。
+    6. **保证 generator 的正确性**: 原 generator 采用 output-first 模式（先构造预期输出 → 反推输入 → 用 `main(input)` 验证一致）。修改变体时，你可以沿用或调整这个模式，但必须保证：生成的每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证变体行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了变体的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量变体核心行为（如交互深度、参与对象数等），统计生成样本中该指标和关键分支的分布。少量样本与原始行为相似不为退化；只有当关键控制变量不起作用，样本按照新的变体逻辑执行与原逻辑执行在相同输入网格上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/d8e07eb2.json` — 原任务的 I/O 样例
+
+    只参考上述文件和原始 solver 代码。不要查看其他变体的实现代码（如 variants/ 目录下的已有文件），避免引入其他维度的改动。
+    - `/home/lixinyu/snap/new/arc2_solver_select/a251c730.py` — **必读**：参考任务 a251c730 的 solver（变体灵感来源，用于校准实现复杂度）
+
+## 输出
+
+将完整的变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+`/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1/code.py`
+
+代码文件开头加一段注释说明这是什么变体:
+```python
+# Variant of d8e07eb2
+# Dimension: D11 — 网格输出尺寸 (grid_shape)
+# Change: 输出网格与输入尺寸完全相同(30x22)，所有变换都在原位进行... → 输出仅保留匹配的行或列
+```
+
+确保目录 `/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1` 存在（如不存在则创建）。
+
+codex
+先检查原题代码、参考任务 `a251c730` 的 solver，以及目标目录状态。我会据此先完成变体设计，再落到 `main()` 和 `generate_input()` 的改写。
+exec
+/bin/bash -lc "sed -n '1,220p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+
+exec
+/bin/bash -lc "sed -n '1,240p' /home/lixinyu/snap/new/arc2_solver_select/a251c730.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+from collections import Counter
+import numpy as np
+from arc_utils import bbox_coords, components_mask, paste, random_free_location
+import random
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Stamp source sprites into a destination frame via color-matched singleton markers.
+
+    Input structure:
+    - Two bordered rectangles: source (multi-cell sprites) and destination (singleton markers).
+    - Each sprite has an anchor pixel — its least-frequent color. Markers share these colors.
+
+    Rule:
+    - Match each destination marker to the source sprite with the same anchor color.
+    - Translate the sprite so its anchor overlaps the marker position.
+    - Output is the destination rectangle, interior cleared before stamping.
+
+    Key insight: The rarest color per sprite doubles as a template key and positioning anchor.
+    """
+    g = np.array(grid, dtype=int)
+    H, W = g.shape
+
+    # --- find all uniform-border rectangles (brute force, small grid) ---
+    def interior_bg(rect: tuple[int, int, int, int]) -> int:
+        r0, c0, r1, c1 = map(int, rect)
+        inner = g[int(r0) + 1 : int(r1), int(c0) + 1 : int(c1)]
+        return int(Counter(map(int, inner.flatten())).most_common(1)[0][0])
+
+    def rect_components(rect: tuple[int, int, int, int]) -> tuple[int, list[dict]]:
+        r0, c0, r1, c1 = map(int, rect)
+        inner = g[int(r0) + 1 : int(r1), int(c0) + 1 : int(c1)]
+        ibg = int(Counter(map(int, inner.flatten())).most_common(1)[0][0])
+        comps = []
+
+        for coords in components_mask(inner != int(ibg), connectivity=4):
+            if coords.size == 0:
+                continue
+            rr0, cc0, rr1, cc1 = bbox_coords(coords)
+            mask = np.zeros((int(rr1 - rr0 + 1), int(cc1 - cc0 + 1)), dtype=bool)
+            mask[coords[:, 0] - int(rr0), coords[:, 1] - int(cc0)] = True
+            patch = inner[int(rr0) : int(rr1) + 1, int(cc0) : int(cc1) + 1].copy()
+            patch[~mask] = 0
+
+            vals = [int(inner[int(r), int(c)]) for r, c in coords]
+            cols = Counter(vals)
+            comps.append(
+                {
+                    "size": int(coords.shape[0]),
+                    "colors": dict(cols),
+                    "bbox": (int(rr0), int(cc0), int(rr1), int(cc1)),
+                    "mask": mask,
+                    "patch": patch,
+                }
+            )
+
+        comps.sort(key=lambda d: -int(d["size"]))
+        return int(ibg), comps
+
+    rects: list[tuple[int, tuple[int, int, int, int], int, int]] = []
+    min_h = 6
+    min_w = 6
+    for r0 in range(int(H)):
+        for c0 in range(int(W)):
+            bc = int(g[int(r0), int(c0)])
+            for r1 in range(int(r0 + min_h - 1), int(H)):
+                for c1 in range(int(c0 + min_w - 1), int(W)):
+                    # corners
+                    if int(g[int(r0), int(c1)]) != int(bc) or int(g[int(r1), int(c0)]) != int(bc) or int(
+                        g[int(r1), int(c1)]
+                    ) != int(bc):
+                        continue
+                    # border uniformity
+                    if not bool((g[int(r0), int(c0) : int(c1) + 1] == int(bc)).all()):
+                        continue
+                    if not bool((g[int(r1), int(c0) : int(c1) + 1] == int(bc)).all()):
+                        continue
+                    if not bool((g[int(r0) : int(r1) + 1, int(c0)] == int(bc)).all()):
+                        continue
+                    if not bool((g[int(r0) : int(r1) + 1, int(c1)] == int(bc)).all()):
+                        continue
+                    # interior bg must differ from border
+                    ibg = interior_bg((int(r0), int(c0), int(r1), int(c1)))
+                    if int(ibg) == int(bc):
+                        continue
+                    area = int((int(r1) - int(r0) + 1) * (int(c1) - int(c0) + 1))
+                    rects.append((int(area), (int(r0), int(c0), int(r1), int(c1)), int(bc), int(ibg)))
+
+    assert not (not rects)
+
+    rects.sort(reverse=True, key=lambda x: int(x[0]))
+    rects = rects[:6]
+
+    src = None
+    dst = None
+    for _area, rect, bc, _ibg in rects:
+        ibg2, comps = rect_components(rect)
+        max_sz = max([int(c["size"]) for c in comps], default=0)
+        if max_sz > 1 and src is None:
+            src = (rect, bc, ibg2, comps)
+        if max_sz == 1 and len(comps) > 0 and dst is None:
+            dst = (rect, bc, ibg2, comps)
+
+    assert src is not None and dst is not None, 'must find both source (multi-cell) and destination (singleton) rectangles'
+
+    (sr, sc, sr1, sc1), _src_bc, src_bg, src_comps = src
+    (dr, dc, dr1, dc1), dst_bc, dst_bg, _dst_comps = dst
+
+    # --- build templates keyed by anchor color ---
+    templates: dict[int, tuple[np.ndarray, np.ndarray, tuple[int, int]]] = {}
+    for comp in src_comps:
+        cols = {k: int(v) for k, v in comp["colors"].items() if int(k) != 0}
+        if not cols:
+            continue
+        anchor_col = int(min(cols.items(), key=lambda kv: (int(kv[1]), int(kv[0])))[0])
+        patch = comp["patch"]
+        mask = comp["mask"]
+        anchors = np.argwhere((patch == int(anchor_col)) & mask)
+        if anchors.size == 0:
+            continue
+        ar, ac = map(int, anchors[0])
+        if int(anchor_col) not in templates or int(mask.sum()) > int(templates[int(anchor_col)][1].sum()):
+            templates[int(anchor_col)] = (patch.copy(), mask.copy(), (int(ar), int(ac)))
+
+    # --- create destination canvas and stamp ---
+    out_h = int(dr1 - dr + 1)
+    out_w = int(dc1 - dc + 1)
+    out = np.full((out_h, out_w), int(dst_bg), dtype=int)
+    out[0, :] = int(dst_bc)
+    out[-1, :] = int(dst_bc)
+    out[:, 0] = int(dst_bc)
+    out[:, -1] = int(dst_bc)
+
+    # Destination markers are singleton pixels (color != dst_bg) in the interior.
+    inner = g[int(dr) + 1 : int(dr1), int(dc) + 1 : int(dc1)]
+    for rr, cc in np.argwhere(inner != int(dst_bg)):
+        mr = int(dr + 1 + int(rr))
+        mc = int(dc + 1 + int(cc))
+        mcol = int(g[mr, mc])
+        if int(mcol) not in templates:
+            continue
+        patch, mask, (ar, ac) = templates[int(mcol)]
+        top = int((mr - dr) - int(ar))
+        left = int((mc - dc) - int(ac))
+        paste(out, patch, int(top), int(left), mask=mask, overwrite=True, clip=True)
+
+    return out
+
+# --------------- generator (O2) ---------------
+
+# === CFG: Canvas & layout ===
+GRID_SIZE = 30                     # fixed 30x30 canvas
+WALLPAPER_COLORS = (4, 5)         # number of wallpaper stripe colors (chosen per n_types)
+TOTAL_COLORS_TARGET = (7, 8, 9)   # total distinct color count targets
+GAP_RANGE = (1, 4)                # gap between rectangles during dimension selection
+
+# === CFG: Rectangle size bounds ===
+SRC_H_RANGE = (9, 19)             # source rect height (outer, inclusive)
+SRC_W_RANGE = (8, 18)             # source rect width (outer, inclusive)
+DST_H_RANGE = (9, 19)             # dest rect height (outer, inclusive)
+DST_W_RANGE = (8, 20)             # dest rect width (outer, inclusive)
+DST_W_SIDE_MAX = 20               # dest width cap for side-by-side layout
+
+# === CFG: Sprite & placement ===
+SPRITE_TYPE_CHOICES = (1, 2)      # number of distinct sprite types
+MARKER_COUNT_RANGE = (2, 3)       # markers in dest rect
+SOURCE_SPRITE_RANGE = (2, 4)      # total sprites in source rect
+MARKER_PLACE_RETRIES = 25         # retries per marker for non-overlapping placement
+SOURCE_SPRITE_PADDING = 1         # min gap between source sprites and edges
+
+# === CFG: Generation retries ===
+MAX_GEN_ATTEMPTS = 300            # outer retry limit
+
+SPRITE_SHAPES = [
+    (("AB.", "BBB"), (0, 0)),
+    (("ABB", "BBB"), (0, 0)),
+    ((".A.", "BBB", ".B."), (0, 1)),
+    (("AB.", "BBB", ".BB"), (0, 0)),
+    (("ABB", "BBB", "..B"), (0, 0)),
+    ((".AB", "BBB", "BB."), (0, 1)),
+    (("B.B", "BBB", ".A."), (2, 1)),
+    ((".B.", "BAB", ".B."), (1, 1)),
+    (("BBB", "BAB"), (1, 1)),
+    (("AB.", "BBB", ".B."), (0, 0)),
+    (("BAB", "BBB"), (0, 1)),
+]
+
+
+def _render_sprite(shape_rows: tuple[str, ...], body: int, anchor: int, bg: int) -> np.ndarray:
+    """Render a sprite template into a colored patch. 'A'=anchor, 'B'=body, '.'=bg."""
+    char_map = {'B': body, 'A': anchor}
+    rows = [[char_map.get(ch, bg) for ch in row] for row in shape_rows]
+    return np.array(rows, dtype=int)
+
+
+def _make_wallpaper(direction: str, palette: list[int]) -> np.ndarray:
+    """Create a 30x30 striped wallpaper (vertical or horizontal)."""
+    period = len(palette)
+    stripe = np.array(palette * ((GRID_SIZE + period - 1) // period), dtype=int)[:GRID_SIZE]
+    if direction == "vertical":
+        return np.tile(stripe, (GRID_SIZE, 1))
+    return np.tile(stripe.reshape(-1, 1), (1, GRID_SIZE))
+
+
+def _build_frame(h: int, w: int, border: int, bg: int) -> np.ndarray:
+    """Create an h x w rectangle with a 1-pixel border and interior filled with bg."""
+    rect = np.full((h, w), bg, dtype=int)
+    rect[0, :] = rect[-1, :] = border
+    rect[:, 0] = rect[:, -1] = border
+    return rect
+
+
+def _choose_counts(n_total: int, n_types: int) -> list[int]:
+    """Distribute n_total items across n_types bins, each bin >= 1."""
+    counts = [1] * n_types
+    for _ in range(n_total - n_types):
+        counts[random.randrange(n_types)] += 1
+    return counts
+
+
+def _choose_dimensions(layout: str) -> tuple[int, int, int, int]:
+    """Pick (src_h, src_w, dst_h, dst_w) that fit the 30x30 canvas for the given layout."""
+    gap = random.randint(*GAP_RANGE)
+    if layout == "side_by_side":
+        src_w = random.randint(*SRC_W_RANGE)
+        dst_w_max = min(DST_W_SIDE_MAX, GRID_SIZE - gap - src_w)
+        if dst_w_max < DST_W_RANGE[0]:
+            raise ValueError("no side-by-side width fit")
+        dst_w = random.randint(DST_W_RANGE[0], dst_w_max)
+        src_h = random.randint(*SRC_H_RANGE)
+        dst_h = random.randint(*DST_H_RANGE)
+    else:
+        src_h = random.randint(*SRC_H_RANGE)
+        dst_h_max = min(DST_H_RANGE[1], GRID_SIZE - gap - src_h)
+        if dst_h_max < DST_H_RANGE[0]:
+            raise ValueError("no stacked height fit")
+        dst_h = random.randint(DST_H_RANGE[0], dst_h_max)
+        src_w = random.randint(*SRC_W_RANGE)
+        dst_w = random.randint(*DST_W_RANGE)
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/d8e07eb2.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+
+import numpy as np
+
+from arc_utils import get_bg, paste
+import random
+
+
+def _constant_non_bg_rows(g: np.ndarray, bg: int) -> list[int]:
+    return [
+        int(r)
+        for r in range(g.shape[0])
+        if bool(np.all(g[r, :] == g[r, 0])) and int(g[r, 0]) != int(bg)
+    ]
+
+
+def _cell_signature(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> tuple[tuple[int, int, int], ...] | None:
+    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)]
+    mask = cell != int(bg)
+    if not bool(mask.any()):
+        return None
+    return tuple(
+        (int(r), int(c), int(cell[r, c]))
+        for r, c in zip(*np.where(mask), strict=False)
+    )
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Look up query glyphs in a reference table and mark whether they form a line.
+
+    Input structure:
+    - Teal background with two full-width pink separator rows.
+    - Above the first separator is a query row of 5x5 glyph cells.
+    - Between separators is a reference table of the same 5x5 cells; a glyph is
+      identified by both its color and its 3x3 shape.
+
+    Rule:
+    - Green-fill the background inside every table cell whose glyph exactly
+      appears in the query row.
+    - If the matched table cells form one complete row or one complete column,
+      also green-fill the query band and the bottom verdict band.
+    - Otherwise leave the query band unchanged and fill the bottom verdict band red.
+
+    Key insight: The bottom color is not a count; it is the yes/no answer to
+    whether the queried glyphs align as a full row or column in the table.
+    """
+    g = np.asarray(grid, dtype=int)
+    h, w = g.shape
+    bg = get_bg(g)
+    cell_size = 5
+
+    sep_rows = _constant_non_bg_rows(g, bg)
+    assert len(sep_rows) >= 2, "expected two full-width separator rows"
+    top_sep = sep_rows[0]
+    bottom_sep = sep_rows[-1]
+
+    table_region = g[top_sep + 1 : bottom_sep, :]
+    table_fg = np.argwhere(table_region != bg)
+    assert table_fg.size, "reference table must contain glyphs"
+
+    first_glyph_r = top_sep + 1 + int(table_fg[:, 0].min())
+    first_glyph_c = int(table_fg[:, 1].min())
+    row0 = first_glyph_r - 1
+    col0 = first_glyph_c - 1
+
+    row_starts = list(range(row0, bottom_sep, cell_size))
+    row_starts = [r for r in row_starts if r + cell_size <= bottom_sep]
+    col_starts = list(range(col0, w, cell_size))
+    col_starts = [c for c in col_starts if c + cell_size <= w]
+    assert row_starts and col_starts, "could not infer table cell grid"
+
+    query_sigs = [
+        sig
+        for c in col_starts
+        if (sig := _cell_signature(g, 0, c, cell_size, bg)) is not None
+    ]
+    query_set = set(query_sigs)
+    assert len(query_sigs) == len(query_set), "query glyphs should be distinct"
+
+    out = g.copy()
+    selected: list[tuple[int, int]] = []
+    for ri, r in enumerate(row_starts):
+        for ci, c in enumerate(col_starts):
+            if _cell_signature(g, r, c, cell_size, bg) not in query_set:
+                continue
+            selected.append((int(ri), int(ci)))
+            cell = out[r : r + cell_size, c : c + cell_size]
+            cell[cell == bg] = 3
+
+    complete_query = len(query_sigs) == len(col_starts)
+    same_row = len({r for r, _c in selected}) == 1
+    same_col = len({c for _r, c in selected}) == 1
+    success = complete_query and len(selected) == len(query_sigs) and (same_row or same_col)
+
+    if success:
+        query_band = out[:top_sep, :]
+        query_band[query_band == bg] = 3
+        out[bottom_sep + 1 :, :] = 3
+    else:
+        out[bottom_sep + 1 :, :] = 2
+
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# -- Grid layout --
+GRID_H, GRID_W = 30, 22       # fixed canvas size
+TOP_SEP_ROW = 5                # query-band separator row
+BOTTOM_SEP_ROW = 27            # table-bottom separator row
+QUERY_BAND_H = 5               # height of query band (rows 0..4)
+VERDICT_ROW = 28               # verdict band starts here
+
+# -- Colors --
+BG = 8                         # teal background
+GREEN = 3                      # success / match highlight
+RED = 2                        # fail verdict
+SEP = 6                        # separator row color
+GLYPH_COLORS = (0, 1, 2, 4, 5, 6, 7, 9)  # 8 available glyph colors
+
+# -- Table geometry --
+TABLE_DIM = 4                  # 4x4 grid of cells
+CELL = 5                       # each cell is 5x5
+ROWS = (7, 12, 17, 22)        # row offsets for 4 table rows
+COLS = (1, 6, 11, 16)         # col offsets for 4 table columns
+
+# -- Glyph shape --
+FILL_MIN, FILL_MAX = 5, 9     # filled-pixel range per 3x3 glyph
+SHAPE_BASE_COUNTS = {5: 2, 6: 2, 7: 2, 8: 2, 9: 1}  # min shapes per fill-count
+MAX_SHAPES_PER_FILL = 5       # cap during random top-up
+
+# -- Color distribution --
+COLOR_MIN, COLOR_MAX = 1, 3   # each color used 1-3 times across 16 cells
+
+# -- Outcome probabilities --
+P_SUCCESS = 0.4               # chance of success outcome
+P_QUERY_3 = 0.35              # chance of 3-query fail (vs 4-query fail)
+FAIL_MODES = ("rect", "bent_row", "bent_col", "scatter_rows", "scatter_cols")
+
+# -- Generation --
+MAX_RETRIES = 300
+
+
+def _has_full_bbox(mask: int) -> bool:
+    """True if the 3x3 bitmask spans all four edges (non-empty top/bottom/left/right rows)."""
+    bits = [(mask >> i) & 1 for i in range(9)]
+    return (
+        any(bits[0:3])
+        and any(bits[6:9])
+        and any(bits[i] for i in (0, 3, 6))
+        and any(bits[i] for i in (2, 5, 8))
+    )
+
+
+PATTERNS_BY_FILL = {
+    k: tuple(m for m in range(1 << 9) if m.bit_count() == k and _has_full_bbox(m))
+    for k in range(FILL_MIN, FILL_MAX + 1)
+}
+
+
+def _balanced_color_list() -> list[int]:
+    """Assign 16 colors (one per cell) so each of the 8 palette colors appears 1-3 times."""
+    counts = {c: COLOR_MIN for c in GLYPH_COLORS}
+    extras = TABLE_DIM * TABLE_DIM - len(GLYPH_COLORS) * COLOR_MIN  # 16 - 8 = 8
+    for _ in range(extras):
+        choices = [c for c in GLYPH_COLORS if counts[c] < COLOR_MAX]
+        counts[random.choice(choices)] += 1
+    colors = [c for c, n in counts.items() for _ in range(n)]
+    random.shuffle(colors)
+    return colors
+
+
+def _balanced_shape_masks() -> list[int]:
+    """Pick 16 distinct 3x3 shape masks with a balanced distribution of fill counts."""
+    counts = dict(SHAPE_BASE_COUNTS)
+    extras = TABLE_DIM * TABLE_DIM - sum(counts.values())  # 16 - 9 = 7
+    for _ in range(extras):
+        choices = [k for k in range(FILL_MIN, FILL_MAX) if counts[k] < MAX_SHAPES_PER_FILL]
+        counts[random.choice(choices)] += 1
+
+    masks: list[int] = []
+    for k, n in counts.items():
+        masks.extend(random.sample(PATTERNS_BY_FILL[k], n))
+    random.shuffle(masks)
+    return masks
+
+
+def _glyph(mask: int, color: int) -> np.ndarray:
+    """Render a 3x3 bitmask as a CELL x CELL array with 1-pixel border of BG."""
+    cell = np.full((CELL, CELL), BG, dtype=int)
+    bits = np.array([(mask >> i) & 1 for i in range(9)], dtype=bool).reshape(3, 3)
+    cell[1:4, 1:4][bits] = color
+    return cell
+
+
+def _line_cells() -> list[tuple[int, int]]:
+    """Pick a complete row or column of 4 cells (shuffled order)."""
+    if random.random() < 0.5:
+        r = random.randrange(TABLE_DIM)
+        cells = [(r, c) for c in range(TABLE_DIM)]
+    else:
+        c = random.randrange(TABLE_DIM)
+        cells = [(r, c) for r in range(TABLE_DIM)]
+    random.shuffle(cells)
+    return cells
+
+
+def _fail_cells(count: int) -> list[tuple[int, int]]:
+    """Pick `count` distinct cells that do NOT all share a single row or column."""
+    if count == 3:
+        rs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
+        cs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
+        cells = [(rs[0], cs[0]), (rs[1], cs[1])]
+        pool = [(r, c) for r in rs for c in cs if (r, c) not in cells]
+        cells.append(random.choice(pool))
+    else:
+        mode = random.choice(FAIL_MODES)
+        if mode == "rect":
+            rs = random.sample(range(TABLE_DIM), 2)
+            cs = random.sample(range(TABLE_DIM), 2)
+            cells = [(r, c) for r in rs for c in cs]
+        elif mode == "bent_row":
+            r = random.randrange(TABLE_DIM)
+            dropped_c = random.randrange(TABLE_DIM)
+            new_r = random.choice([rr for rr in range(TABLE_DIM) if rr != r])
+            cells = [(r, c) for c in range(TABLE_DIM) if c != dropped_c] + [(new_r, dropped_c)]
+        elif mode == "bent_col":
+            c = random.randrange(TABLE_DIM)
+            dropped_r = random.randrange(TABLE_DIM)
+            new_c = random.choice([cc for cc in range(TABLE_DIM) if cc != c])
+            cells = [(r, c) for r in range(TABLE_DIM) if r != dropped_r] + [(dropped_r, new_c)]
+        elif mode == "scatter_rows":
+            base_c = random.randrange(TABLE_DIM)
+            cols = [base_c] * TABLE_DIM
+            for r in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
+                cols[r] = random.choice([c for c in range(TABLE_DIM) if c != base_c])
+            cells = [(r, cols[r]) for r in range(TABLE_DIM)]
+        else:
+            base_r = random.randrange(TABLE_DIM)
+            rows = [base_r] * TABLE_DIM
+            for c in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
+                rows[c] = random.choice([r for r in range(TABLE_DIM) if r != base_r])
+            cells = [(rows[c], c) for c in range(TABLE_DIM)]
+
+    assert len(cells) == count and len(set(cells)) == count
+    assert len({r for r, _c in cells}) > 1 and len({c for _r, c in cells}) > 1
+    random.shuffle(cells)
+    return cells
+
+
+def _expected_output(grid: np.ndarray, cells: list[tuple[int, int]], success: bool) -> np.ndarray:
+    """Build the expected solver output by green-filling matched cells and verdict band."""
+    out = grid.copy()
+    for r_i, c_i in cells:
+        cell = out[ROWS[r_i] : ROWS[r_i] + CELL, COLS[c_i] : COLS[c_i] + CELL]
+        cell[cell == BG] = GREEN
+    if success:
+        query_band = out[:QUERY_BAND_H, :]
+        query_band[query_band == BG] = GREEN
+        out[VERDICT_ROW:, :] = GREEN
+
+exec
+/bin/bash -lc 'ls -ld /home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1 || true' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+ls: cannot access '/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1': No such file or directory
+
+codex
+原题和参考任务都很明确地指向“先按原规则识别，再把输出裁成目标区域”。接下来我会把变体设计具体化成一套可生成、可验证、且肉眼可见的输出尺寸规则，再开始写文件。
+exec
+/bin/bash -lc "rg -n \"def paste\\(\" -n /home/lixinyu/snap/new/solvers/arc_utils.py && sed -n '430,520p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+308:def paste(
+        colors_set = None
+        colors_iter = sorted(set(map(int, grid.flatten())) - {bg})
+    else:
+        colors_set = {int(c) for c in colors}
+        colors_iter = [int(c) for c in colors_set if int(c) != bg]
+
+    # Monochromatic = label per-color
+    if monochromatic:
+        if return_format == "dict":
+            out: list[dict] = []
+            for col in colors_iter:
+                mask = (grid == col)
+                if not mask.any():
+                    continue
+                comps = components_mask(mask, connectivity=connectivity)
+                for coords in comps:
+                    if int(coords.shape[0]) < int(min_area):
+                        continue
+                    out.append(
+                        {
+                            "color": int(col),
+                            "coords": coords,
+                            "bbox": bbox_coords(coords),
+                            "area": int(coords.shape[0]),
+                        }
+                    )
+            return out
+
+        objs: list[np.ndarray] = []
+        struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+        for col in colors_iter:
+            lab, n = label(grid == int(col), structure=struct)
+            for k in range(1, int(n) + 1):
+                m = (lab == k)
+                if int(m.sum()) < int(min_area):
+                    continue
+                obj = np.full_like(grid, bg)
+                obj[m] = int(col)
+                objs.append(obj)
+        return objs
+
+    # Multicolor components = label foreground as a whole
+    struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+    if colors_set is None:
+        fg_mask = (grid != bg)
+    else:
+        fg_mask = (grid != bg) & np.isin(grid, list(colors_set))
+
+    lab, n = label(fg_mask, structure=struct)
+    if return_format == "dict":
+        out: list[dict] = []
+        for k in range(1, int(n) + 1):
+            coords = np.argwhere(lab == k)
+            if coords.size == 0 or int(coords.shape[0]) < int(min_area):
+                continue
+            out.append(
+                {
+                    "color": None,
+                    "coords": coords,
+                    "bbox": bbox_coords(coords),
+                    "area": int(coords.shape[0]),
+                }
+            )
+        return out
+
+    objs: list[np.ndarray] = []
+    for k in range(1, int(n) + 1):
+        m = (lab == k)
+        if int(m.sum()) < int(min_area):
+            continue
+        obj = np.full_like(grid, bg)
+        obj[m] = grid[m]
+        objs.append(obj)
+    return objs
+
+
+# =============================================================================
+# Geometry
+# =============================================================================
+
+
+def flood_fill(grid: np.ndarray, r: int, c: int, color: int, *, connectivity: int = 4) -> None:
+    """Flood fill region containing (r,c) with `color` (in-place)."""
+    H, W = grid.shape
+    r0 = int(r)
+    c0 = int(c)
+    if not (0 <= r0 < H and 0 <= c0 < W):
+        return
+    new_col = int(color)
+    old_col = int(grid[r0, c0])
+    if old_col == new_col:
+
+exec
+/bin/bash -lc "sed -n '308,380p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def paste(
+    dst: np.ndarray,
+    patch: np.ndarray,
+    r0: int,
+    c0: int,
+    *,
+    transparent: int | None = None,
+    mask: np.ndarray | None = None,
+    overwrite: bool = True,
+    clip: bool = False,
+) -> np.ndarray:
+    """
+    Paste `patch` into `dst` at top-left (r0,c0).
+
+    This is the ONE placement primitive solver examples should use.
+
+    - Opaque paste: `paste(dst, patch, r0, c0)`
+    - Transparent overlay: `paste(dst, patch, r0, c0, transparent=bg)`
+    - Masked paste: `paste(dst, patch, r0, c0, mask=m)`
+    - Non-overwriting overlay: `paste(dst, patch, r0, c0, transparent=bg, overwrite=False)`
+    - Strict vs clip: default `clip=False` (fail fast); set `clip=True` to clip out-of-bounds.
+    """
+    H, W = dst.shape
+    r0 = int(r0)
+    c0 = int(c0)
+    h, w = map(int, patch.shape)
+
+    if not clip:
+        if r0 < 0 or c0 < 0 or r0 + h > H or c0 + w > W:
+            raise ValueError("paste: patch out of bounds (set clip=True to allow clipping)")
+        rr0, cc0 = r0, c0
+        rr1, cc1 = r0 + h, c0 + w
+        pr0, pc0 = 0, 0
+    else:
+        rr0 = max(0, r0)
+        cc0 = max(0, c0)
+        rr1 = min(H, r0 + h)
+        cc1 = min(W, c0 + w)
+        if rr0 >= rr1 or cc0 >= cc1:
+            return dst
+        pr0 = rr0 - r0
+        pc0 = cc0 - c0
+
+    pr1 = pr0 + (rr1 - rr0)
+    pc1 = pc0 + (cc1 - cc0)
+
+    dst_view = dst[rr0:rr1, cc0:cc1]
+    patch_view = patch[pr0:pr1, pc0:pc1]
+
+    m = np.ones(patch_view.shape, dtype=bool)
+    if mask is not None:
+        m &= mask[pr0:pr1, pc0:pc1].astype(bool)
+    if transparent is not None:
+        m &= (patch_view != int(transparent))
+        if not overwrite:
+            m &= (dst_view == int(transparent))
+    else:
+        if not overwrite:
+            raise ValueError("paste: overwrite=False requires transparent to be set")
+
+    dst_view[m] = patch_view[m]
+    return dst
+
+
+def paint_coords(out: np.ndarray, coords: Iterable[Coord], color: int) -> None:
+    """Set out[r,c]=color for each coord (in-bounds only)."""
+    H, W = out.shape
+    v = int(color)
+    for r, c in coords:
+        rr = int(r)
+        cc = int(c)
+        if 0 <= rr < H and 0 <= cc < W:
+            out[rr, cc] = v
+
+codex
+设计已经收敛：成功时只输出被命中的整行或整列的 `5x5` 单元拼接条，失败时输出 `1x1` 红点；输入布局和匹配逻辑保持原题。现在开始写代码，并把设计分析一并写进文件注释，避免实现和规格脱节。
+Implement D11 crop variant by preserving the original input construction and matching logic, then changing only the output representation and generator oracle accordingly.
+  ✓ Design the D11 variant behavior and audit original solver assumptions against it
+  → Write the new variant file with analysis comments, updated solver, and updated generator
+  • Run the required generation test, inspect failures if any, and iterate until pass
+  • Measure branch/output-size distribution to confirm the D11 behavior is actually expressed
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+codex
+现在开始落盘。实现上会把“识别命中集合”和“裁出整行/整列结果”拆开，这样 `main()` 和 generator 共享同一套成功输出逻辑，减少偏差。
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1/code.py
+diff --git a/ceshi/code/d8e07eb2/D11/1/code.py b/ceshi/code/d8e07eb2/D11/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..12b30860b7bef0ace673ee0bf247d5edc1ec3db9
+--- /dev/null
++++ b/ceshi/code/d8e07eb2/D11/1/code.py
+@@ -0,0 +1,368 @@
++# Variant of d8e07eb2
++# Dimension: D11 — 网格输出尺寸 (grid_shape)
++# Change: 输出网格与输入尺寸完全相同(30x22)，所有变换都在原位进行... → 输出仅保留匹配的行或列
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import get_bg, paste
++
++
++# Design analysis for the D11 crop variant
++# ========================================
++# a) Concrete behavior:
++# - Input stays identical to the original task: a 30x22 canvas with a 4x4 table
++#   of 5x5 cells, query cells above, and separator rows.
++# - The matching rule also stays identical: compare each query glyph to table
++#   glyphs by exact (shape + color) signature.
++# - The changed step is the output stage. In the original task, success painted
++#   the whole 30x22 canvas. Here, success discards the query band, separators,
++#   empty margins, and verdict band, keeping only the matched complete row or
++#   matched complete column from the reference table.
++# - Because each table cell is 5x5 and there are 4 cells per successful line,
++#   the success output is either 5x20 (row) or 20x5 (column). Each kept cell has
++#   its background recolored to green, preserving the original glyph pixels.
++# - Failure is concretized as a visible 1x1 red output instead of an empty grid.
++#   This keeps the D11 size change observable in every failing example.
++# - Small trace:
++#   Original success: 4 query glyphs match table row 2 -> highlight those 4
++#   table cells, paint query band green, paint bottom band green, return 30x22.
++#   Variant success: the same 4 matches are found, but the solver returns only
++#   the four highlighted row-2 cells concatenated into a 5x20 strip.
++#   Original failure: return 30x22 with red verdict band. Variant failure:
++#   return [[2]].
++#
++# b) Complexity calibration:
++# - The table/query construction is unchanged, so there are still 16 distinct
++#   (color, shape) pairs and 3-4 queries. This preserves the original matching
++#   difficulty and avoids simplifying the task into a trivial crop.
++# - Success keeps both orientations (row and column), so the new size reasoning
++#   is not a single fixed size.
++#
++# c) Implicit-assumption audit of the original main():
++# - Separator detection via uniform non-background rows still holds because the
++#   input layout is unchanged.
++# - Grid inference from the first glyph's centered 3x3 footprint still works
++#   because the generator keeps the same 5x5 cells with a 1-pixel border.
++# - Query signatures remain distinct; otherwise set membership would become
++#   ambiguous. The generator still guarantees unique (color, shape) pairs.
++# - The original success branch freely painted whole bands because output size
++#   was fixed. That assumption is invalid here; the new solver must avoid any
++#   whole-canvas write and instead crop from the matched table line only.
++#
++# d) Placement legality:
++# - Generator placement is unchanged for inputs, so cells never overlap and all
++#   objects fit the 30x22 canvas exactly as in the base task.
++# - Success output crops already-existing 5x5 cells, so it cannot create
++#   out-of-bounds artifacts.
++#
++# e) Visual observability:
++# - The D11 change is obvious across examples: outputs become either a horizontal
++#   green strip, a vertical green strip, or a single red pixel.
++# - The retained glyphs keep their original colors and shapes, so the user can
++#   still see which table line was selected.
++#
++# f) Visual cleanliness:
++# - The output contains exactly one object family: the cropped matched line.
++#   This removes the original overlapping highlights/query/verdict regions and
++#   makes the transformed result cleaner rather than noisier.
++#
++# g) Color-change inference:
++# - No new hidden color rule is introduced. Green still means "matched cell
++#   background" and red still means "failure", only the canvas is cropped.
++
++
++def _constant_non_bg_rows(g: np.ndarray, bg: int) -> list[int]:
++    return [
++        int(r)
++        for r in range(g.shape[0])
++        if bool(np.all(g[r, :] == g[r, 0])) and int(g[r, 0]) != int(bg)
++    ]
++
++
++def _cell_signature(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> tuple[tuple[int, int, int], ...] | None:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)]
++    mask = cell != int(bg)
++    if not bool(mask.any()):
++        return None
++    return tuple((int(r), int(c), int(cell[r, c])) for r, c in zip(*np.where(mask), strict=False))
++
++
++def _highlighted_cell(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> np.ndarray:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)].copy()
++    cell[cell == int(bg)] = 3
++    return cell
++
++
++def _cropped_success_output(
++    g: np.ndarray,
++    selected: list[tuple[int, int]],
++    row_starts: list[int],
++    col_starts: list[int],
++    cell_size: int,
++    bg: int,
++) -> np.ndarray:
++    rows = {int(r) for r, _c in selected}
++    cols = {int(c) for _r, c in selected}
++    if len(rows) == 1:
++        ri = next(iter(rows))
++        parts = [
++            _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++            for ci in range(len(col_starts))
++        ]
++        return np.concatenate(parts, axis=1)
++    assert len(cols) == 1, "success must be a full row or full column"
++    ci = next(iter(cols))
++    parts = [
++        _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++        for ri in range(len(row_starts))
++    ]
++    return np.concatenate(parts, axis=0)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Look up query glyphs in a reference table and keep only the successful line.
++
++    Input structure:
++    - A teal background contains two full-width pink separator rows.
++    - The top band holds up to four 5x5 query cells, each containing a centered
++      3x3 colored glyph.
++    - Between the separators sits a 4x4 table of the same 5x5 cells; identity is
++      determined by the exact glyph shape together with its color.
++
++    Rule:
++    - Find every table cell whose glyph exactly matches one of the query glyphs.
++    - If the queries fill all four slots and those matched cells are one complete
++      table row or one complete table column, recolor the matched cells'
++      background to green and output only that row/column as a tight crop.
++    - Otherwise output a single red pixel.
++
++    Key insight: The original line-detection criterion is unchanged; only the
++    representation of the answer changes from an in-place annotation to a crop.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    cell_size = 5
++
++    sep_rows = _constant_non_bg_rows(g, bg)
++    assert len(sep_rows) >= 2, "expected two full-width separator rows"
++    top_sep = sep_rows[0]
++    bottom_sep = sep_rows[-1]
++
++    table_region = g[top_sep + 1 : bottom_sep, :]
++    table_fg = np.argwhere(table_region != int(bg))
++    assert table_fg.size, "reference table must contain glyphs"
++
++    first_glyph_r = top_sep + 1 + int(table_fg[:, 0].min())
++    first_glyph_c = int(table_fg[:, 1].min())
++    row0 = first_glyph_r - 1
++    col0 = first_glyph_c - 1
++
++    row_starts = [r for r in range(row0, bottom_sep, cell_size) if r + cell_size <= bottom_sep]
++    col_starts = [c for c in range(col0, g.shape[1], cell_size) if c + cell_size <= g.shape[1]]
++    assert row_starts and col_starts, "could not infer table cell grid"
++
++    query_sigs = [sig for c in col_starts if (sig := _cell_signature(g, 0, c, cell_size, bg)) is not None]
++    query_set = set(query_sigs)
++    assert len(query_sigs) == len(query_set), "query glyphs should be distinct"
++
++    selected: list[tuple[int, int]] = []
++    for ri, r in enumerate(row_starts):
++        for ci, c in enumerate(col_starts):
++            if _cell_signature(g, r, c, cell_size, bg) in query_set:
++                selected.append((int(ri), int(ci)))
++
++    complete_query = len(query_sigs) == len(col_starts)
++    same_row = len({r for r, _c in selected}) == 1
++    same_col = len({c for _r, c in selected}) == 1
++    success = complete_query and len(selected) == len(query_sigs) and (same_row or same_col)
++
++    if not success:
++        return np.array([[2]], dtype=int)
++    return _cropped_success_output(g, selected, row_starts, col_starts, cell_size, bg)
++
++
++# --------------- generator (o5x -> D11 crop variant) ---------------
++
++# -- Grid layout --
++GRID_H, GRID_W = 30, 22
++TOP_SEP_ROW = 5
++BOTTOM_SEP_ROW = 27
++
++# -- Colors --
++BG = 8
++GREEN = 3
++RED = 2
++SEP = 6
++GLYPH_COLORS = (0, 1, 2, 4, 5, 6, 7, 9)
++
++# -- Table geometry --
++TABLE_DIM = 4
++CELL = 5
++ROWS = (7, 12, 17, 22)
++COLS = (1, 6, 11, 16)
++
++# -- Glyph shape --
++FILL_MIN, FILL_MAX = 5, 9
++SHAPE_BASE_COUNTS = {5: 2, 6: 2, 7: 2, 8: 2, 9: 1}
++MAX_SHAPES_PER_FILL = 5
++
++# -- Color distribution --
++COLOR_MIN, COLOR_MAX = 1, 3
++
++# -- Outcome probabilities --
++P_SUCCESS = 0.4
++P_QUERY_3 = 0.35
++FAIL_MODES = ("rect", "bent_row", "bent_col", "scatter_rows", "scatter_cols")
++
++# -- Generation --
++MAX_RETRIES = 300
++
++
++def _has_full_bbox(mask: int) -> bool:
++    bits = [(mask >> i) & 1 for i in range(9)]
++    return any(bits[0:3]) and any(bits[6:9]) and any(bits[i] for i in (0, 3, 6)) and any(
++        bits[i] for i in (2, 5, 8)
++    )
++
++
++PATTERNS_BY_FILL = {
++    k: tuple(m for m in range(1 << 9) if m.bit_count() == k and _has_full_bbox(m))
++    for k in range(FILL_MIN, FILL_MAX + 1)
++}
++
++
++def _balanced_color_list() -> list[int]:
++    counts = {c: COLOR_MIN for c in GLYPH_COLORS}
++    extras = TABLE_DIM * TABLE_DIM - len(GLYPH_COLORS) * COLOR_MIN
++    for _ in range(extras):
++        choices = [c for c in GLYPH_COLORS if counts[c] < COLOR_MAX]
++        counts[random.choice(choices)] += 1
++    colors = [c for c, n in counts.items() for _ in range(n)]
++    random.shuffle(colors)
++    return colors
++
++
++def _balanced_shape_masks() -> list[int]:
++    counts = dict(SHAPE_BASE_COUNTS)
++    extras = TABLE_DIM * TABLE_DIM - sum(counts.values())
++    for _ in range(extras):
++        choices = [k for k in range(FILL_MIN, FILL_MAX) if counts[k] < MAX_SHAPES_PER_FILL]
++        counts[random.choice(choices)] += 1
++
++    masks: list[int] = []
++    for k, n in counts.items():
++        masks.extend(random.sample(PATTERNS_BY_FILL[k], n))
++    random.shuffle(masks)
++    return masks
++
++
++def _glyph(mask: int, color: int) -> np.ndarray:
++    cell = np.full((CELL, CELL), BG, dtype=int)
++    bits = np.array([(mask >> i) & 1 for i in range(9)], dtype=bool).reshape(3, 3)
++    cell[1:4, 1:4][bits] = color
++    return cell
++
++
++def _line_cells() -> list[tuple[int, int]]:
++    if random.random() < 0.5:
++        r = random.randrange(TABLE_DIM)
++        cells = [(r, c) for c in range(TABLE_DIM)]
++    else:
++        c = random.randrange(TABLE_DIM)
++        cells = [(r, c) for r in range(TABLE_DIM)]
++    random.shuffle(cells)
++    return cells
++
++
++def _fail_cells(count: int) -> list[tuple[int, int]]:
++    if count == 3:
++        rs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cells = [(rs[0], cs[0]), (rs[1], cs[1])]
++        pool = [(r, c) for r in rs for c in cs if (r, c) not in cells]
++        cells.append(random.choice(pool))
++    else:
++        mode = random.choice(FAIL_MODES)
++        if mode == "rect":
++            rs = random.sample(range(TABLE_DIM), 2)
++            cs = random.sample(range(TABLE_DIM), 2)
++            cells = [(r, c) for r in rs for c in cs]
++        elif mode == "bent_row":
++            r = random.randrange(TABLE_DIM)
++            dropped_c = random.randrange(TABLE_DIM)
++            new_r = random.choice([rr for rr in range(TABLE_DIM) if rr != r])
++            cells = [(r, c) for c in range(TABLE_DIM) if c != dropped_c] + [(new_r, dropped_c)]
++        elif mode == "bent_col":
++            c = random.randrange(TABLE_DIM)
++            dropped_r = random.randrange(TABLE_DIM)
++            new_c = random.choice([cc for cc in range(TABLE_DIM) if cc != c])
++            cells = [(r, c) for r in range(TABLE_DIM) if r != dropped_r] + [(dropped_r, new_c)]
++        elif mode == "scatter_rows":
++            base_c = random.randrange(TABLE_DIM)
++            cols = [base_c] * TABLE_DIM
++            for r in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                cols[r] = random.choice([c for c in range(TABLE_DIM) if c != base_c])
++            cells = [(r, cols[r]) for r in range(TABLE_DIM)]
++        else:
++            base_r = random.randrange(TABLE_DIM)
++            rows = [base_r] * TABLE_DIM
++            for c in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                rows[c] = random.choice([r for r in range(TABLE_DIM) if r != base_r])
++            cells = [(rows[c], c) for c in range(TABLE_DIM)]
++
++    assert len(cells) == count and len(set(cells)) == count
++    assert len({r for r, _c in cells}) > 1 and len({c for _r, c in cells}) > 1
++    random.shuffle(cells)
++    return cells
++
++
++def _expected_output(grid: np.ndarray, cells: list[tuple[int, int]], success: bool) -> np.ndarray:
++    if not success:
++        return np.array([[RED]], dtype=int)
++
++    row_starts = list(ROWS)
++    col_starts = list(COLS)
++    return _cropped_success_output(grid, cells, row_starts, col_starts, CELL, BG)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    grid = np.full((GRID_H, GRID_W), BG, dtype=int)
++    grid[TOP_SEP_ROW, :] = SEP
++    grid[BOTTOM_SEP_ROW, :] = SEP
++
++    masks = _balanced_shape_masks()
++    colors = _balanced_color_list()
++    glyphs: list[np.ndarray] = []
++    for i, (mask, color) in enumerate(zip(masks, colors, strict=True)):
++        glyph = _glyph(mask, color)
++        glyphs.append(glyph)
++        r_i, c_i = divmod(i, TABLE_DIM)
++        paste(grid, glyph, ROWS[r_i], COLS[c_i])
++
++    success = random.random() < P_SUCCESS
++    if success:
++        query_cells = _line_cells()
++    else:
++        count = 3 if random.random() < P_QUERY_3 else 4
++        query_cells = _fail_cells(count)
++
++    for slot, (r_i, c_i) in enumerate(query_cells):
++        paste(grid, glyphs[r_i * TABLE_DIM + c_i], 0, COLS[slot])
++
++    expected = _expected_output(grid, query_cells, success)
++    if not np.array_equal(main(grid), expected):
++        return None
++    return grid
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid d8e07eb2 D11 input")
+
+diff --git a/ceshi/code/d8e07eb2/D11/1/code.py b/ceshi/code/d8e07eb2/D11/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..12b30860b7bef0ace673ee0bf247d5edc1ec3db9
+--- /dev/null
++++ b/ceshi/code/d8e07eb2/D11/1/code.py
+@@ -0,0 +1,368 @@
++# Variant of d8e07eb2
++# Dimension: D11 — 网格输出尺寸 (grid_shape)
++# Change: 输出网格与输入尺寸完全相同(30x22)，所有变换都在原位进行... → 输出仅保留匹配的行或列
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import get_bg, paste
++
++
++# Design analysis for the D11 crop variant
++# ========================================
++# a) Concrete behavior:
++# - Input stays identical to the original task: a 30x22 canvas with a 4x4 table
++#   of 5x5 cells, query cells above, and separator rows.
++# - The matching rule also stays identical: compare each query glyph to table
++#   glyphs by exact (shape + color) signature.
++# - The changed step is the output stage. In the original task, success painted
++#   the whole 30x22 canvas. Here, success discards the query band, separators,
++#   empty margins, and verdict band, keeping only the matched complete row or
++#   matched complete column from the reference table.
++# - Because each table cell is 5x5 and there are 4 cells per successful line,
++#   the success output is either 5x20 (row) or 20x5 (column). Each kept cell has
++#   its background recolored to green, preserving the original glyph pixels.
++# - Failure is concretized as a visible 1x1 red output instead of an empty grid.
++#   This keeps the D11 size change observable in every failing example.
++# - Small trace:
++#   Original success: 4 query glyphs match table row 2 -> highlight those 4
++#   table cells, paint query band green, paint bottom band green, return 30x22.
++#   Variant success: the same 4 matches are found, but the solver returns only
++#   the four highlighted row-2 cells concatenated into a 5x20 strip.
++#   Original failure: return 30x22 with red verdict band. Variant failure:
++#   return [[2]].
++#
++# b) Complexity calibration:
++# - The table/query construction is unchanged, so there are still 16 distinct
++#   (color, shape) pairs and 3-4 queries. This preserves the original matching
++#   difficulty and avoids simplifying the task into a trivial crop.
++# - Success keeps both orientations (row and column), so the new size reasoning
++#   is not a single fixed size.
++#
++# c) Implicit-assumption audit of the original main():
++# - Separator detection via uniform non-background rows still holds because the
++#   input layout is unchanged.
++# - Grid inference from the first glyph's centered 3x3 footprint still works
++#   because the generator keeps the same 5x5 cells with a 1-pixel border.
++# - Query signatures remain distinct; otherwise set membership would become
++#   ambiguous. The generator still guarantees unique (color, shape) pairs.
++# - The original success branch freely painted whole bands because output size
++#   was fixed. That assumption is invalid here; the new solver must avoid any
++#   whole-canvas write and instead crop from the matched table line only.
++#
++# d) Placement legality:
++# - Generator placement is unchanged for inputs, so cells never overlap and all
++#   objects fit the 30x22 canvas exactly as in the base task.
++# - Success output crops already-existing 5x5 cells, so it cannot create
++#   out-of-bounds artifacts.
++#
++# e) Visual observability:
++# - The D11 change is obvious across examples: outputs become either a horizontal
++#   green strip, a vertical green strip, or a single red pixel.
++# - The retained glyphs keep their original colors and shapes, so the user can
++#   still see which table line was selected.
++#
++# f) Visual cleanliness:
++# - The output contains exactly one object family: the cropped matched line.
++#   This removes the original overlapping highlights/query/verdict regions and
++#   makes the transformed result cleaner rather than noisier.
++#
++# g) Color-change inference:
++# - No new hidden color rule is introduced. Green still means "matched cell
++#   background" and red still means "failure", only the canvas is cropped.
++
++
++def _constant_non_bg_rows(g: np.ndarray, bg: int) -> list[int]:
++    return [
++        int(r)
++        for r in range(g.shape[0])
++        if bool(np.all(g[r, :] == g[r, 0])) and int(g[r, 0]) != int(bg)
++    ]
++
++
++def _cell_signature(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> tuple[tuple[int, int, int], ...] | None:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)]
++    mask = cell != int(bg)
++    if not bool(mask.any()):
++        return None
++    return tuple((int(r), int(c), int(cell[r, c])) for r, c in zip(*np.where(mask), strict=False))
++
++
++def _highlighted_cell(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> np.ndarray:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)].copy()
++    cell[cell == int(bg)] = 3
++    return cell
++
++
++def _cropped_success_output(
++    g: np.ndarray,
++    selected: list[tuple[int, int]],
++    row_starts: list[int],
++    col_starts: list[int],
++    cell_size: int,
++    bg: int,
++) -> np.ndarray:
++    rows = {int(r) for r, _c in selected}
++    cols = {int(c) for _r, c in selected}
++    if len(rows) == 1:
++        ri = next(iter(rows))
++        parts = [
++            _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++            for ci in range(len(col_starts))
++        ]
++        return np.concatenate(parts, axis=1)
++    assert len(cols) == 1, "success must be a full row or full column"
++    ci = next(iter(cols))
++    parts = [
++        _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++        for ri in range(len(row_starts))
++    ]
++    return np.concatenate(parts, axis=0)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Look up query glyphs in a reference table and keep only the successful line.
++
++    Input structure:
++    - A teal background contains two full-width pink separator rows.
++    - The top band holds up to four 5x5 query cells, each containing a centered
++      3x3 colored glyph.
++    - Between the separators sits a 4x4 table of the same 5x5 cells; identity is
++      determined by the exact glyph shape together with its color.
++
++    Rule:
++    - Find every table cell whose glyph exactly matches one of the query glyphs.
++    - If the queries fill all four slots and those matched cells are one complete
++      table row or one complete table column, recolor the matched cells'
++      background to green and output only that row/column as a tight crop.
++    - Otherwise output a single red pixel.
++
++    Key insight: The original line-detection criterion is unchanged; only the
++    representation of the answer changes from an in-place annotation to a crop.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    cell_size = 5
++
++    sep_rows = _constant_non_bg_rows(g, bg)
++    assert len(sep_rows) >= 2, "expected two full-width separator rows"
++    top_sep = sep_rows[0]
++    bottom_sep = sep_rows[-1]
++
++    table_region = g[top_sep + 1 : bottom_sep, :]
++    table_fg = np.argwhere(table_region != int(bg))
++    assert table_fg.size, "reference table must contain glyphs"
++
++    first_glyph_r = top_sep + 1 + int(table_fg[:, 0].min())
++    first_glyph_c = int(table_fg[:, 1].min())
++    row0 = first_glyph_r - 1
++    col0 = first_glyph_c - 1
++
++    row_starts = [r for r in range(row0, bottom_sep, cell_size) if r + cell_size <= bottom_sep]
++    col_starts = [c for c in range(col0, g.shape[1], cell_size) if c + cell_size <= g.shape[1]]
++    assert row_starts and col_starts, "could not infer table cell grid"
++
++    query_sigs = [sig for c in col_starts if (sig := _cell_signature(g, 0, c, cell_size, bg)) is not None]
++    query_set = set(query_sigs)
++    assert len(query_sigs) == len(query_set), "query glyphs should be distinct"
++
++    selected: list[tuple[int, int]] = []
++    for ri, r in enumerate(row_starts):
++        for ci, c in enumerate(col_starts):
++            if _cell_signature(g, r, c, cell_size, bg) in query_set:
++                selected.append((int(ri), int(ci)))
++
++    complete_query = len(query_sigs) == len(col_starts)
++    same_row = len({r for r, _c in selected}) == 1
++    same_col = len({c for _r, c in selected}) == 1
++    success = complete_query and len(selected) == len(query_sigs) and (same_row or same_col)
++
++    if not success:
++        return np.array([[2]], dtype=int)
++    return _cropped_success_output(g, selected, row_starts, col_starts, cell_size, bg)
++
++
++# --------------- generator (o5x -> D11 crop variant) ---------------
++
++# -- Grid layout --
++GRID_H, GRID_W = 30, 22
++TOP_SEP_ROW = 5
++BOTTOM_SEP_ROW = 27
++
++# -- Colors --
++BG = 8
++GREEN = 3
++RED = 2
++SEP = 6
++GLYPH_COLORS = (0, 1, 2, 4, 5, 6, 7, 9)
++
++# -- Table geometry --
++TABLE_DIM = 4
++CELL = 5
++ROWS = (7, 12, 17, 22)
++COLS = (1, 6, 11, 16)
++
++# -- Glyph shape --
++FILL_MIN, FILL_MAX = 5, 9
++SHAPE_BASE_COUNTS = {5: 2, 6: 2, 7: 2, 8: 2, 9: 1}
++MAX_SHAPES_PER_FILL = 5
++
++# -- Color distribution --
++COLOR_MIN, COLOR_MAX = 1, 3
++
++# -- Outcome probabilities --
++P_SUCCESS = 0.4
++P_QUERY_3 = 0.35
++FAIL_MODES = ("rect", "bent_row", "bent_col", "scatter_rows", "scatter_cols")
++
++# -- Generation --
++MAX_RETRIES = 300
++
++
++def _has_full_bbox(mask: int) -> bool:
++    bits = [(mask >> i) & 1 for i in range(9)]
++    return any(bits[0:3]) and any(bits[6:9]) and any(bits[i] for i in (0, 3, 6)) and any(
++        bits[i] for i in (2, 5, 8)
++    )
++
++
++PATTERNS_BY_FILL = {
++    k: tuple(m for m in range(1 << 9) if m.bit_count() == k and _has_full_bbox(m))
++    for k in range(FILL_MIN, FILL_MAX + 1)
++}
++
++
++def _balanced_color_list() -> list[int]:
++    counts = {c: COLOR_MIN for c in GLYPH_COLORS}
++    extras = TABLE_DIM * TABLE_DIM - len(GLYPH_COLORS) * COLOR_MIN
++    for _ in range(extras):
++        choices = [c for c in GLYPH_COLORS if counts[c] < COLOR_MAX]
++        counts[random.choice(choices)] += 1
++    colors = [c for c, n in counts.items() for _ in range(n)]
++    random.shuffle(colors)
++    return colors
++
++
++def _balanced_shape_masks() -> list[int]:
++    counts = dict(SHAPE_BASE_COUNTS)
++    extras = TABLE_DIM * TABLE_DIM - sum(counts.values())
++    for _ in range(extras):
++        choices = [k for k in range(FILL_MIN, FILL_MAX) if counts[k] < MAX_SHAPES_PER_FILL]
++        counts[random.choice(choices)] += 1
++
++    masks: list[int] = []
++    for k, n in counts.items():
++        masks.extend(random.sample(PATTERNS_BY_FILL[k], n))
++    random.shuffle(masks)
++    return masks
++
++
++def _glyph(mask: int, color: int) -> np.ndarray:
++    cell = np.full((CELL, CELL), BG, dtype=int)
++    bits = np.array([(mask >> i) & 1 for i in range(9)], dtype=bool).reshape(3, 3)
++    cell[1:4, 1:4][bits] = color
++    return cell
++
++
++def _line_cells() -> list[tuple[int, int]]:
++    if random.random() < 0.5:
++        r = random.randrange(TABLE_DIM)
++        cells = [(r, c) for c in range(TABLE_DIM)]
++    else:
++        c = random.randrange(TABLE_DIM)
++        cells = [(r, c) for r in range(TABLE_DIM)]
++    random.shuffle(cells)
++    return cells
++
++
++def _fail_cells(count: int) -> list[tuple[int, int]]:
++    if count == 3:
++        rs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cells = [(rs[0], cs[0]), (rs[1], cs[1])]
++        pool = [(r, c) for r in rs for c in cs if (r, c) not in cells]
++        cells.append(random.choice(pool))
++    else:
++        mode = random.choice(FAIL_MODES)
++        if mode == "rect":
++            rs = random.sample(range(TABLE_DIM), 2)
++            cs = random.sample(range(TABLE_DIM), 2)
++            cells = [(r, c) for r in rs for c in cs]
++        elif mode == "bent_row":
++            r = random.randrange(TABLE_DIM)
++            dropped_c = random.randrange(TABLE_DIM)
++            new_r = random.choice([rr for rr in range(TABLE_DIM) if rr != r])
++            cells = [(r, c) for c in range(TABLE_DIM) if c != dropped_c] + [(new_r, dropped_c)]
++        elif mode == "bent_col":
++            c = random.randrange(TABLE_DIM)
++            dropped_r = random.randrange(TABLE_DIM)
++            new_c = random.choice([cc for cc in range(TABLE_DIM) if cc != c])
++            cells = [(r, c) for r in range(TABLE_DIM) if r != dropped_r] + [(dropped_r, new_c)]
++        elif mode == "scatter_rows":
++            base_c = random.randrange(TABLE_DIM)
++            cols = [base_c] * TABLE_DIM
++            for r in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                cols[r] = random.choice([c for c in range(TABLE_DIM) if c != base_c])
++            cells = [(r, cols[r]) for r in range(TABLE_DIM)]
++        else:
++            base_r = random.randrange(TABLE_DIM)
++            rows = [base_r] * TABLE_DIM
++            for c in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                rows[c] = random.choice([r for r in range(TABLE_DIM) if r != base_r])
++            cells = [(rows[c], c) for c in range(TABLE_DIM)]
++
++    assert len(cells) == count and len(set(cells)) == count
++    assert len({r for r, _c in cells}) > 1 and len({c for _r, c in cells}) > 1
++    random.shuffle(cells)
++    return cells
++
++
++def _expected_output(grid: np.ndarray, cells: list[tuple[int, int]], success: bool) -> np.ndarray:
++    if not success:
++        return np.array([[RED]], dtype=int)
++
++    row_starts = list(ROWS)
++    col_starts = list(COLS)
++    return _cropped_success_output(grid, cells, row_starts, col_starts, CELL, BG)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    grid = np.full((GRID_H, GRID_W), BG, dtype=int)
++    grid[TOP_SEP_ROW, :] = SEP
++    grid[BOTTOM_SEP_ROW, :] = SEP
++
++    masks = _balanced_shape_masks()
++    colors = _balanced_color_list()
++    glyphs: list[np.ndarray] = []
++    for i, (mask, color) in enumerate(zip(masks, colors, strict=True)):
++        glyph = _glyph(mask, color)
++        glyphs.append(glyph)
++        r_i, c_i = divmod(i, TABLE_DIM)
++        paste(grid, glyph, ROWS[r_i], COLS[c_i])
++
++    success = random.random() < P_SUCCESS
++    if success:
++        query_cells = _line_cells()
++    else:
++        count = 3 if random.random() < P_QUERY_3 else 4
++        query_cells = _fail_cells(count)
++
++    for slot, (r_i, c_i) in enumerate(query_cells):
++        paste(grid, glyphs[r_i * TABLE_DIM + c_i], 0, COLS[slot])
++
++    expected = _expected_output(grid, query_cells, success)
++    if not np.array_equal(main(grid), expected):
++        return None
++    return grid
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid d8e07eb2 D11 input")
+
+codex
+代码已经写入。下一步先跑用户给定的 50 次生成测试；如果导入路径或逻辑有问题，会先修这些基础故障，再看生成正确率。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys; spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1/code.py'); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); ok, fail = 0, 0; t0 = time.time();
+for i in range(50):
+    try:
+        inp = mod.generate_input();
+        out = mod.main(inp);
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0; print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)');
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code/d8e07eb2/D11/1/code.py b/ceshi/code/d8e07eb2/D11/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..12b30860b7bef0ace673ee0bf247d5edc1ec3db9
+--- /dev/null
++++ b/ceshi/code/d8e07eb2/D11/1/code.py
+@@ -0,0 +1,368 @@
++# Variant of d8e07eb2
++# Dimension: D11 — 网格输出尺寸 (grid_shape)
++# Change: 输出网格与输入尺寸完全相同(30x22)，所有变换都在原位进行... → 输出仅保留匹配的行或列
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import get_bg, paste
++
++
++# Design analysis for the D11 crop variant
++# ========================================
++# a) Concrete behavior:
++# - Input stays identical to the original task: a 30x22 canvas with a 4x4 table
++#   of 5x5 cells, query cells above, and separator rows.
++# - The matching rule also stays identical: compare each query glyph to table
++#   glyphs by exact (shape + color) signature.
++# - The changed step is the output stage. In the original task, success painted
++#   the whole 30x22 canvas. Here, success discards the query band, separators,
++#   empty margins, and verdict band, keeping only the matched complete row or
++#   matched complete column from the reference table.
++# - Because each table cell is 5x5 and there are 4 cells per successful line,
++#   the success output is either 5x20 (row) or 20x5 (column). Each kept cell has
++#   its background recolored to green, preserving the original glyph pixels.
++# - Failure is concretized as a visible 1x1 red output instead of an empty grid.
++#   This keeps the D11 size change observable in every failing example.
++# - Small trace:
++#   Original success: 4 query glyphs match table row 2 -> highlight those 4
++#   table cells, paint query band green, paint bottom band green, return 30x22.
++#   Variant success: the same 4 matches are found, but the solver returns only
++#   the four highlighted row-2 cells concatenated into a 5x20 strip.
++#   Original failure: return 30x22 with red verdict band. Variant failure:
++#   return [[2]].
++#
++# b) Complexity calibration:
++# - The table/query construction is unchanged, so there are still 16 distinct
++#   (color, shape) pairs and 3-4 queries. This preserves the original matching
++#   difficulty and avoids simplifying the task into a trivial crop.
++# - Success keeps both orientations (row and column), so the new size reasoning
++#   is not a single fixed size.
++#
++# c) Implicit-assumption audit of the original main():
++# - Separator detection via uniform non-background rows still holds because the
++#   input layout is unchanged.
++# - Grid inference from the first glyph's centered 3x3 footprint still works
++#   because the generator keeps the same 5x5 cells with a 1-pixel border.
++# - Query signatures remain distinct; otherwise set membership would become
++#   ambiguous. The generator still guarantees unique (color, shape) pairs.
++# - The original success branch freely painted whole bands because output size
++#   was fixed. That assumption is invalid here; the new solver must avoid any
++#   whole-canvas write and instead crop from the matched table line only.
++#
++# d) Placement legality:
++# - Generator placement is unchanged for inputs, so cells never overlap and all
++#   objects fit the 30x22 canvas exactly as in the base task.
++# - Success output crops already-existing 5x5 cells, so it cannot create
++#   out-of-bounds artifacts.
++#
++# e) Visual observability:
++# - The D11 change is obvious across examples: outputs become either a horizontal
++#   green strip, a vertical green strip, or a single red pixel.
++# - The retained glyphs keep their original colors and shapes, so the user can
++#   still see which table line was selected.
++#
++# f) Visual cleanliness:
++# - The output contains exactly one object family: the cropped matched line.
++#   This removes the original overlapping highlights/query/verdict regions and
++#   makes the transformed result cleaner rather than noisier.
++#
++# g) Color-change inference:
++# - No new hidden color rule is introduced. Green still means "matched cell
++#   background" and red still means "failure", only the canvas is cropped.
++
++
++def _constant_non_bg_rows(g: np.ndarray, bg: int) -> list[int]:
++    return [
++        int(r)
++        for r in range(g.shape[0])
++        if bool(np.all(g[r, :] == g[r, 0])) and int(g[r, 0]) != int(bg)
++    ]
++
++
++def _cell_signature(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> tuple[tuple[int, int, int], ...] | None:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)]
++    mask = cell != int(bg)
++    if not bool(mask.any()):
++        return None
++    return tuple((int(r), int(c), int(cell[r, c])) for r, c in zip(*np.where(mask), strict=False))
++
++
++def _highlighted_cell(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> np.ndarray:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)].copy()
++    cell[cell == int(bg)] = 3
++    return cell
++
++
++def _cropped_success_output(
++    g: np.ndarray,
++    selected: list[tuple[int, int]],
++    row_starts: list[int],
++    col_starts: list[int],
++    cell_size: int,
++    bg: int,
++) -> np.ndarray:
++    rows = {int(r) for r, _c in selected}
++    cols = {int(c) for _r, c in selected}
++    if len(rows) == 1:
++        ri = next(iter(rows))
++        parts = [
++            _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++            for ci in range(len(col_starts))
++        ]
++        return np.concatenate(parts, axis=1)
++    assert len(cols) == 1, "success must be a full row or full column"
++    ci = next(iter(cols))
++    parts = [
++        _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++        for ri in range(len(row_starts))
++    ]
++    return np.concatenate(parts, axis=0)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Look up query glyphs in a reference table and keep only the successful line.
++
++    Input structure:
++    - A teal background contains two full-width pink separator rows.
++    - The top band holds up to four 5x5 query cells, each containing a centered
++      3x3 colored glyph.
++    - Between the separators sits a 4x4 table of the same 5x5 cells; identity is
++      determined by the exact glyph shape together with its color.
++
++    Rule:
++    - Find every table cell whose glyph exactly matches one of the query glyphs.
++    - If the queries fill all four slots and those matched cells are one complete
++      table row or one complete table column, recolor the matched cells'
++      background to green and output only that row/column as a tight crop.
++    - Otherwise output a single red pixel.
++
++    Key insight: The original line-detection criterion is unchanged; only the
++    representation of the answer changes from an in-place annotation to a crop.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    cell_size = 5
++
++    sep_rows = _constant_non_bg_rows(g, bg)
++    assert len(sep_rows) >= 2, "expected two full-width separator rows"
++    top_sep = sep_rows[0]
++    bottom_sep = sep_rows[-1]
++
++    table_region = g[top_sep + 1 : bottom_sep, :]
++    table_fg = np.argwhere(table_region != int(bg))
++    assert table_fg.size, "reference table must contain glyphs"
++
++    first_glyph_r = top_sep + 1 + int(table_fg[:, 0].min())
++    first_glyph_c = int(table_fg[:, 1].min())
++    row0 = first_glyph_r - 1
++    col0 = first_glyph_c - 1
++
++    row_starts = [r for r in range(row0, bottom_sep, cell_size) if r + cell_size <= bottom_sep]
++    col_starts = [c for c in range(col0, g.shape[1], cell_size) if c + cell_size <= g.shape[1]]
++    assert row_starts and col_starts, "could not infer table cell grid"
++
++    query_sigs = [sig for c in col_starts if (sig := _cell_signature(g, 0, c, cell_size, bg)) is not None]
++    query_set = set(query_sigs)
++    assert len(query_sigs) == len(query_set), "query glyphs should be distinct"
++
++    selected: list[tuple[int, int]] = []
++    for ri, r in enumerate(row_starts):
++        for ci, c in enumerate(col_starts):
++            if _cell_signature(g, r, c, cell_size, bg) in query_set:
++                selected.append((int(ri), int(ci)))
++
++    complete_query = len(query_sigs) == len(col_starts)
++    same_row = len({r for r, _c in selected}) == 1
++    same_col = len({c for _r, c in selected}) == 1
++    success = complete_query and len(selected) == len(query_sigs) and (same_row or same_col)
++
++    if not success:
++        return np.array([[2]], dtype=int)
++    return _cropped_success_output(g, selected, row_starts, col_starts, cell_size, bg)
++
++
++# --------------- generator (o5x -> D11 crop variant) ---------------
++
++# -- Grid layout --
++GRID_H, GRID_W = 30, 22
++TOP_SEP_ROW = 5
++BOTTOM_SEP_ROW = 27
++
++# -- Colors --
++BG = 8
++GREEN = 3
++RED = 2
++SEP = 6
++GLYPH_COLORS = (0, 1, 2, 4, 5, 6, 7, 9)
++
++# -- Table geometry --
++TABLE_DIM = 4
++CELL = 5
++ROWS = (7, 12, 17, 22)
++COLS = (1, 6, 11, 16)
++
++# -- Glyph shape --
++FILL_MIN, FILL_MAX = 5, 9
++SHAPE_BASE_COUNTS = {5: 2, 6: 2, 7: 2, 8: 2, 9: 1}
++MAX_SHAPES_PER_FILL = 5
++
++# -- Color distribution --
++COLOR_MIN, COLOR_MAX = 1, 3
++
++# -- Outcome probabilities --
++P_SUCCESS = 0.4
++P_QUERY_3 = 0.35
++FAIL_MODES = ("rect", "bent_row", "bent_col", "scatter_rows", "scatter_cols")
++
++# -- Generation --
++MAX_RETRIES = 300
++
++
++def _has_full_bbox(mask: int) -> bool:
++    bits = [(mask >> i) & 1 for i in range(9)]
++    return any(bits[0:3]) and any(bits[6:9]) and any(bits[i] for i in (0, 3, 6)) and any(
++        bits[i] for i in (2, 5, 8)
++    )
++
++
++PATTERNS_BY_FILL = {
++    k: tuple(m for m in range(1 << 9) if m.bit_count() == k and _has_full_bbox(m))
++    for k in range(FILL_MIN, FILL_MAX + 1)
++}
++
++
++def _balanced_color_list() -> list[int]:
++    counts = {c: COLOR_MIN for c in GLYPH_COLORS}
++    extras = TABLE_DIM * TABLE_DIM - len(GLYPH_COLORS) * COLOR_MIN
++    for _ in range(extras):
++        choices = [c for c in GLYPH_COLORS if counts[c] < COLOR_MAX]
++        counts[random.choice(choices)] += 1
++    colors = [c for c, n in counts.items() for _ in range(n)]
++    random.shuffle(colors)
++    return colors
++
++
++def _balanced_shape_masks() -> list[int]:
++    counts = dict(SHAPE_BASE_COUNTS)
++    extras = TABLE_DIM * TABLE_DIM - sum(counts.values())
++    for _ in range(extras):
++        choices = [k for k in range(FILL_MIN, FILL_MAX) if counts[k] < MAX_SHAPES_PER_FILL]
++        counts[random.choice(choices)] += 1
++
++    masks: list[int] = []
++    for k, n in counts.items():
++        masks.extend(random.sample(PATTERNS_BY_FILL[k], n))
++    random.shuffle(masks)
++    return masks
++
++
++def _glyph(mask: int, color: int) -> np.ndarray:
++    cell = np.full((CELL, CELL), BG, dtype=int)
++    bits = np.array([(mask >> i) & 1 for i in range(9)], dtype=bool).reshape(3, 3)
++    cell[1:4, 1:4][bits] = color
++    return cell
++
++
++def _line_cells() -> list[tuple[int, int]]:
++    if random.random() < 0.5:
++        r = random.randrange(TABLE_DIM)
++        cells = [(r, c) for c in range(TABLE_DIM)]
++    else:
++        c = random.randrange(TABLE_DIM)
++        cells = [(r, c) for r in range(TABLE_DIM)]
++    random.shuffle(cells)
++    return cells
++
++
++def _fail_cells(count: int) -> list[tuple[int, int]]:
++    if count == 3:
++        rs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cells = [(rs[0], cs[0]), (rs[1], cs[1])]
++        pool = [(r, c) for r in rs for c in cs if (r, c) not in cells]
++        cells.append(random.choice(pool))
++    else:
++        mode = random.choice(FAIL_MODES)
++        if mode == "rect":
++            rs = random.sample(range(TABLE_DIM), 2)
++            cs = random.sample(range(TABLE_DIM), 2)
++            cells = [(r, c) for r in rs for c in cs]
++        elif mode == "bent_row":
++            r = random.randrange(TABLE_DIM)
++            dropped_c = random.randrange(TABLE_DIM)
++            new_r = random.choice([rr for rr in range(TABLE_DIM) if rr != r])
++            cells = [(r, c) for c in range(TABLE_DIM) if c != dropped_c] + [(new_r, dropped_c)]
++        elif mode == "bent_col":
++            c = random.randrange(TABLE_DIM)
++            dropped_r = random.randrange(TABLE_DIM)
++            new_c = random.choice([cc for cc in range(TABLE_DIM) if cc != c])
++            cells = [(r, c) for r in range(TABLE_DIM) if r != dropped_r] + [(dropped_r, new_c)]
++        elif mode == "scatter_rows":
++            base_c = random.randrange(TABLE_DIM)
++            cols = [base_c] * TABLE_DIM
++            for r in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                cols[r] = random.choice([c for c in range(TABLE_DIM) if c != base_c])
++            cells = [(r, cols[r]) for r in range(TABLE_DIM)]
++        else:
++            base_r = random.randrange(TABLE_DIM)
++            rows = [base_r] * TABLE_DIM
++            for c in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                rows[c] = random.choice([r for r in range(TABLE_DIM) if r != base_r])
++            cells = [(rows[c], c) for c in range(TABLE_DIM)]
++
++    assert len(cells) == count and len(set(cells)) == count
++    assert len({r for r, _c in cells}) > 1 and len({c for _r, c in cells}) > 1
++    random.shuffle(cells)
++    return cells
++
++
++def _expected_output(grid: np.ndarray, cells: list[tuple[int, int]], success: bool) -> np.ndarray:
++    if not success:
++        return np.array([[RED]], dtype=int)
++
++    row_starts = list(ROWS)
++    col_starts = list(COLS)
++    return _cropped_success_output(grid, cells, row_starts, col_starts, CELL, BG)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    grid = np.full((GRID_H, GRID_W), BG, dtype=int)
++    grid[TOP_SEP_ROW, :] = SEP
++    grid[BOTTOM_SEP_ROW, :] = SEP
++
++    masks = _balanced_shape_masks()
++    colors = _balanced_color_list()
++    glyphs: list[np.ndarray] = []
++    for i, (mask, color) in enumerate(zip(masks, colors, strict=True)):
++        glyph = _glyph(mask, color)
++        glyphs.append(glyph)
++        r_i, c_i = divmod(i, TABLE_DIM)
++        paste(grid, glyph, ROWS[r_i], COLS[c_i])
++
++    success = random.random() < P_SUCCESS
++    if success:
++        query_cells = _line_cells()
++    else:
++        count = 3 if random.random() < P_QUERY_3 else 4
++        query_cells = _fail_cells(count)
++
++    for slot, (r_i, c_i) in enumerate(query_cells):
++        paste(grid, glyphs[r_i * TABLE_DIM + c_i], 0, COLS[slot])
++
++    expected = _expected_output(grid, query_cells, success)
++    if not np.array_equal(main(grid), expected):
++        return None
++    return grid
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid d8e07eb2 D11 input")
+
+ succeeded in 393ms:
+Success: 50/50, Time: 0.1s (2ms/call)
+
+codex
+求解器和生成器已经稳定通过。现在补做退化检查：统计成功/失败分支和输出尺寸分布，确认样本里确实出现了新的 D11 可变尺寸行为，而不是碰巧退回原题表现。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util
+from collections import Counter
+import numpy as np
+
+variant_spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1/code.py')
+variant = importlib.util.module_from_spec(variant_spec)
+variant_spec.loader.exec_module(variant)
+
+orig_spec = importlib.util.spec_from_file_location('orig', '/home/lixinyu/snap/new/arc2_solver_select/d8e07eb2.py')
+orig = importlib.util.module_from_spec(orig_spec)
+orig_spec.loader.exec_module(orig)
+
+shape_counts = Counter()
+branch_counts = Counter()
+diff_shape = 0
+same_array = 0
+for _ in range(200):
+    inp = variant.generate_input()
+    out = variant.main(inp)
+    shape_counts[out.shape] += 1
+    if out.shape == (5, 20):
+        branch_counts['success_row'] += 1
+    elif out.shape == (20, 5):
+        branch_counts['success_col'] += 1
+    elif out.shape == (1, 1) and int(out[0, 0]) == variant.RED:
+        branch_counts['fail_red'] += 1
+    else:
+        branch_counts['other'] += 1
+    old = orig.main(inp)
+    if out.shape "'!= old.shape:
+        diff_shape += 1
+    if out.shape == old.shape and np.array_equal(out, old):
+        same_array += 1
+
+print('"'Output shapes:', dict(shape_counts))
+print('Branches:', dict(branch_counts))
+print('Different shape from original on same input:', diff_shape, '/ 200')
+print('Exactly same as original output:', same_array, '/ 200')
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code/d8e07eb2/D11/1/code.py b/ceshi/code/d8e07eb2/D11/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..12b30860b7bef0ace673ee0bf247d5edc1ec3db9
+--- /dev/null
++++ b/ceshi/code/d8e07eb2/D11/1/code.py
+@@ -0,0 +1,368 @@
++# Variant of d8e07eb2
++# Dimension: D11 — 网格输出尺寸 (grid_shape)
++# Change: 输出网格与输入尺寸完全相同(30x22)，所有变换都在原位进行... → 输出仅保留匹配的行或列
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import get_bg, paste
++
++
++# Design analysis for the D11 crop variant
++# ========================================
++# a) Concrete behavior:
++# - Input stays identical to the original task: a 30x22 canvas with a 4x4 table
++#   of 5x5 cells, query cells above, and separator rows.
++# - The matching rule also stays identical: compare each query glyph to table
++#   glyphs by exact (shape + color) signature.
++# - The changed step is the output stage. In the original task, success painted
++#   the whole 30x22 canvas. Here, success discards the query band, separators,
++#   empty margins, and verdict band, keeping only the matched complete row or
++#   matched complete column from the reference table.
++# - Because each table cell is 5x5 and there are 4 cells per successful line,
++#   the success output is either 5x20 (row) or 20x5 (column). Each kept cell has
++#   its background recolored to green, preserving the original glyph pixels.
++# - Failure is concretized as a visible 1x1 red output instead of an empty grid.
++#   This keeps the D11 size change observable in every failing example.
++# - Small trace:
++#   Original success: 4 query glyphs match table row 2 -> highlight those 4
++#   table cells, paint query band green, paint bottom band green, return 30x22.
++#   Variant success: the same 4 matches are found, but the solver returns only
++#   the four highlighted row-2 cells concatenated into a 5x20 strip.
++#   Original failure: return 30x22 with red verdict band. Variant failure:
++#   return [[2]].
++#
++# b) Complexity calibration:
++# - The table/query construction is unchanged, so there are still 16 distinct
++#   (color, shape) pairs and 3-4 queries. This preserves the original matching
++#   difficulty and avoids simplifying the task into a trivial crop.
++# - Success keeps both orientations (row and column), so the new size reasoning
++#   is not a single fixed size.
++#
++# c) Implicit-assumption audit of the original main():
++# - Separator detection via uniform non-background rows still holds because the
++#   input layout is unchanged.
++# - Grid inference from the first glyph's centered 3x3 footprint still works
++#   because the generator keeps the same 5x5 cells with a 1-pixel border.
++# - Query signatures remain distinct; otherwise set membership would become
++#   ambiguous. The generator still guarantees unique (color, shape) pairs.
++# - The original success branch freely painted whole bands because output size
++#   was fixed. That assumption is invalid here; the new solver must avoid any
++#   whole-canvas write and instead crop from the matched table line only.
++#
++# d) Placement legality:
++# - Generator placement is unchanged for inputs, so cells never overlap and all
++#   objects fit the 30x22 canvas exactly as in the base task.
++# - Success output crops already-existing 5x5 cells, so it cannot create
++#   out-of-bounds artifacts.
++#
++# e) Visual observability:
++# - The D11 change is obvious across examples: outputs become either a horizontal
++#   green strip, a vertical green strip, or a single red pixel.
++# - The retained glyphs keep their original colors and shapes, so the user can
++#   still see which table line was selected.
++#
++# f) Visual cleanliness:
++# - The output contains exactly one object family: the cropped matched line.
++#   This removes the original overlapping highlights/query/verdict regions and
++#   makes the transformed result cleaner rather than noisier.
++#
++# g) Color-change inference:
++# - No new hidden color rule is introduced. Green still means "matched cell
++#   background" and red still means "failure", only the canvas is cropped.
++
++
++def _constant_non_bg_rows(g: np.ndarray, bg: int) -> list[int]:
++    return [
++        int(r)
++        for r in range(g.shape[0])
++        if bool(np.all(g[r, :] == g[r, 0])) and int(g[r, 0]) != int(bg)
++    ]
++
++
++def _cell_signature(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> tuple[tuple[int, int, int], ...] | None:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)]
++    mask = cell != int(bg)
++    if not bool(mask.any()):
++        return None
++    return tuple((int(r), int(c), int(cell[r, c])) for r, c in zip(*np.where(mask), strict=False))
++
++
++def _highlighted_cell(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> np.ndarray:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)].copy()
++    cell[cell == int(bg)] = 3
++    return cell
++
++
++def _cropped_success_output(
++    g: np.ndarray,
++    selected: list[tuple[int, int]],
++    row_starts: list[int],
++    col_starts: list[int],
++    cell_size: int,
++    bg: int,
++) -> np.ndarray:
++    rows = {int(r) for r, _c in selected}
++    cols = {int(c) for _r, c in selected}
++    if len(rows) == 1:
++        ri = next(iter(rows))
++        parts = [
++            _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++            for ci in range(len(col_starts))
++        ]
++        return np.concatenate(parts, axis=1)
++    assert len(cols) == 1, "success must be a full row or full column"
++    ci = next(iter(cols))
++    parts = [
++        _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++        for ri in range(len(row_starts))
++    ]
++    return np.concatenate(parts, axis=0)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Look up query glyphs in a reference table and keep only the successful line.
++
++    Input structure:
++    - A teal background contains two full-width pink separator rows.
++    - The top band holds up to four 5x5 query cells, each containing a centered
++      3x3 colored glyph.
++    - Between the separators sits a 4x4 table of the same 5x5 cells; identity is
++      determined by the exact glyph shape together with its color.
++
++    Rule:
++    - Find every table cell whose glyph exactly matches one of the query glyphs.
++    - If the queries fill all four slots and those matched cells are one complete
++      table row or one complete table column, recolor the matched cells'
++      background to green and output only that row/column as a tight crop.
++    - Otherwise output a single red pixel.
++
++    Key insight: The original line-detection criterion is unchanged; only the
++    representation of the answer changes from an in-place annotation to a crop.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    cell_size = 5
++
++    sep_rows = _constant_non_bg_rows(g, bg)
++    assert len(sep_rows) >= 2, "expected two full-width separator rows"
++    top_sep = sep_rows[0]
++    bottom_sep = sep_rows[-1]
++
++    table_region = g[top_sep + 1 : bottom_sep, :]
++    table_fg = np.argwhere(table_region != int(bg))
++    assert table_fg.size, "reference table must contain glyphs"
++
++    first_glyph_r = top_sep + 1 + int(table_fg[:, 0].min())
++    first_glyph_c = int(table_fg[:, 1].min())
++    row0 = first_glyph_r - 1
++    col0 = first_glyph_c - 1
++
++    row_starts = [r for r in range(row0, bottom_sep, cell_size) if r + cell_size <= bottom_sep]
++    col_starts = [c for c in range(col0, g.shape[1], cell_size) if c + cell_size <= g.shape[1]]
++    assert row_starts and col_starts, "could not infer table cell grid"
++
++    query_sigs = [sig for c in col_starts if (sig := _cell_signature(g, 0, c, cell_size, bg)) is not None]
++    query_set = set(query_sigs)
++    assert len(query_sigs) == len(query_set), "query glyphs should be distinct"
++
++    selected: list[tuple[int, int]] = []
++    for ri, r in enumerate(row_starts):
++        for ci, c in enumerate(col_starts):
++            if _cell_signature(g, r, c, cell_size, bg) in query_set:
++                selected.append((int(ri), int(ci)))
++
++    complete_query = len(query_sigs) == len(col_starts)
++    same_row = len({r for r, _c in selected}) == 1
++    same_col = len({c for _r, c in selected}) == 1
++    success = complete_query and len(selected) == len(query_sigs) and (same_row or same_col)
++
++    if not success:
++        return np.array([[2]], dtype=int)
++    return _cropped_success_output(g, selected, row_starts, col_starts, cell_size, bg)
++
++
++# --------------- generator (o5x -> D11 crop variant) ---------------
++
++# -- Grid layout --
++GRID_H, GRID_W = 30, 22
++TOP_SEP_ROW = 5
++BOTTOM_SEP_ROW = 27
++
++# -- Colors --
++BG = 8
++GREEN = 3
++RED = 2
++SEP = 6
++GLYPH_COLORS = (0, 1, 2, 4, 5, 6, 7, 9)
++
++# -- Table geometry --
++TABLE_DIM = 4
++CELL = 5
++ROWS = (7, 12, 17, 22)
++COLS = (1, 6, 11, 16)
++
++# -- Glyph shape --
++FILL_MIN, FILL_MAX = 5, 9
++SHAPE_BASE_COUNTS = {5: 2, 6: 2, 7: 2, 8: 2, 9: 1}
++MAX_SHAPES_PER_FILL = 5
++
++# -- Color distribution --
++COLOR_MIN, COLOR_MAX = 1, 3
++
++# -- Outcome probabilities --
++P_SUCCESS = 0.4
++P_QUERY_3 = 0.35
++FAIL_MODES = ("rect", "bent_row", "bent_col", "scatter_rows", "scatter_cols")
++
++# -- Generation --
++MAX_RETRIES = 300
++
++
++def _has_full_bbox(mask: int) -> bool:
++    bits = [(mask >> i) & 1 for i in range(9)]
++    return any(bits[0:3]) and any(bits[6:9]) and any(bits[i] for i in (0, 3, 6)) and any(
++        bits[i] for i in (2, 5, 8)
++    )
++
++
++PATTERNS_BY_FILL = {
++    k: tuple(m for m in range(1 << 9) if m.bit_count() == k and _has_full_bbox(m))
++    for k in range(FILL_MIN, FILL_MAX + 1)
++}
++
++
++def _balanced_color_list() -> list[int]:
++    counts = {c: COLOR_MIN for c in GLYPH_COLORS}
++    extras = TABLE_DIM * TABLE_DIM - len(GLYPH_COLORS) * COLOR_MIN
++    for _ in range(extras):
++        choices = [c for c in GLYPH_COLORS if counts[c] < COLOR_MAX]
++        counts[random.choice(choices)] += 1
++    colors = [c for c, n in counts.items() for _ in range(n)]
++    random.shuffle(colors)
++    return colors
++
++
++def _balanced_shape_masks() -> list[int]:
++    counts = dict(SHAPE_BASE_COUNTS)
++    extras = TABLE_DIM * TABLE_DIM - sum(counts.values())
++    for _ in range(extras):
++        choices = [k for k in range(FILL_MIN, FILL_MAX) if counts[k] < MAX_SHAPES_PER_FILL]
++        counts[random.choice(choices)] += 1
++
++    masks: list[int] = []
++    for k, n in counts.items():
++        masks.extend(random.sample(PATTERNS_BY_FILL[k], n))
++    random.shuffle(masks)
++    return masks
++
++
++def _glyph(mask: int, color: int) -> np.ndarray:
++    cell = np.full((CELL, CELL), BG, dtype=int)
++    bits = np.array([(mask >> i) & 1 for i in range(9)], dtype=bool).reshape(3, 3)
++    cell[1:4, 1:4][bits] = color
++    return cell
++
++
++def _line_cells() -> list[tuple[int, int]]:
++    if random.random() < 0.5:
++        r = random.randrange(TABLE_DIM)
++        cells = [(r, c) for c in range(TABLE_DIM)]
++    else:
++        c = random.randrange(TABLE_DIM)
++        cells = [(r, c) for r in range(TABLE_DIM)]
++    random.shuffle(cells)
++    return cells
++
++
++def _fail_cells(count: int) -> list[tuple[int, int]]:
++    if count == 3:
++        rs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cells = [(rs[0], cs[0]), (rs[1], cs[1])]
++        pool = [(r, c) for r in rs for c in cs if (r, c) not in cells]
++        cells.append(random.choice(pool))
++    else:
++        mode = random.choice(FAIL_MODES)
++        if mode == "rect":
++            rs = random.sample(range(TABLE_DIM), 2)
++            cs = random.sample(range(TABLE_DIM), 2)
++            cells = [(r, c) for r in rs for c in cs]
++        elif mode == "bent_row":
++            r = random.randrange(TABLE_DIM)
++            dropped_c = random.randrange(TABLE_DIM)
++            new_r = random.choice([rr for rr in range(TABLE_DIM) if rr != r])
++            cells = [(r, c) for c in range(TABLE_DIM) if c != dropped_c] + [(new_r, dropped_c)]
++        elif mode == "bent_col":
++            c = random.randrange(TABLE_DIM)
++            dropped_r = random.randrange(TABLE_DIM)
++            new_c = random.choice([cc for cc in range(TABLE_DIM) if cc != c])
++            cells = [(r, c) for r in range(TABLE_DIM) if r != dropped_r] + [(dropped_r, new_c)]
++        elif mode == "scatter_rows":
++            base_c = random.randrange(TABLE_DIM)
++            cols = [base_c] * TABLE_DIM
++            for r in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                cols[r] = random.choice([c for c in range(TABLE_DIM) if c != base_c])
++            cells = [(r, cols[r]) for r in range(TABLE_DIM)]
++        else:
++            base_r = random.randrange(TABLE_DIM)
++            rows = [base_r] * TABLE_DIM
++            for c in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                rows[c] = random.choice([r for r in range(TABLE_DIM) if r != base_r])
++            cells = [(rows[c], c) for c in range(TABLE_DIM)]
++
++    assert len(cells) == count and len(set(cells)) == count
++    assert len({r for r, _c in cells}) > 1 and len({c for _r, c in cells}) > 1
++    random.shuffle(cells)
++    return cells
++
++
++def _expected_output(grid: np.ndarray, cells: list[tuple[int, int]], success: bool) -> np.ndarray:
++    if not success:
++        return np.array([[RED]], dtype=int)
++
++    row_starts = list(ROWS)
++    col_starts = list(COLS)
++    return _cropped_success_output(grid, cells, row_starts, col_starts, CELL, BG)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    grid = np.full((GRID_H, GRID_W), BG, dtype=int)
++    grid[TOP_SEP_ROW, :] = SEP
++    grid[BOTTOM_SEP_ROW, :] = SEP
++
++    masks = _balanced_shape_masks()
++    colors = _balanced_color_list()
++    glyphs: list[np.ndarray] = []
++    for i, (mask, color) in enumerate(zip(masks, colors, strict=True)):
++        glyph = _glyph(mask, color)
++        glyphs.append(glyph)
++        r_i, c_i = divmod(i, TABLE_DIM)
++        paste(grid, glyph, ROWS[r_i], COLS[c_i])
++
++    success = random.random() < P_SUCCESS
++    if success:
++        query_cells = _line_cells()
++    else:
++        count = 3 if random.random() < P_QUERY_3 else 4
++        query_cells = _fail_cells(count)
++
++    for slot, (r_i, c_i) in enumerate(query_cells):
++        paste(grid, glyphs[r_i * TABLE_DIM + c_i], 0, COLS[slot])
++
++    expected = _expected_output(grid, query_cells, success)
++    if not np.array_equal(main(grid), expected):
++        return None
++    return grid
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid d8e07eb2 D11 input")
+
+ succeeded in 709ms:
+Output shapes: {(1, 1): 121, (20, 5): 36, (5, 20): 43}
+Branches: {'fail_red': 121, 'success_col': 36, 'success_row': 43}
+Different shape from original on same input: 200 / 200
+Exactly same as original output: 0 / 200
+
+codex
+退化检查结果很干净：`200/200` 个样本的输出尺寸都和原题不同，且三种分支都出现了。最后我再快速看一下行号，方便给你一个精确的变更定位。
+exec
+/bin/bash -lc "nl -ba /home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1/code.py | sed -n '1,260p'" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+     1	# Variant of d8e07eb2
+     2	# Dimension: D11 — 网格输出尺寸 (grid_shape)
+     3	# Change: 输出网格与输入尺寸完全相同(30x22)，所有变换都在原位进行... → 输出仅保留匹配的行或列
+     4	
+     5	from __future__ import annotations
+     6	
+     7	import random
+     8	
+     9	import numpy as np
+    10	
+    11	from arc_utils import get_bg, paste
+    12	
+    13	
+    14	# Design analysis for the D11 crop variant
+    15	# ========================================
+    16	# a) Concrete behavior:
+    17	# - Input stays identical to the original task: a 30x22 canvas with a 4x4 table
+    18	#   of 5x5 cells, query cells above, and separator rows.
+    19	# - The matching rule also stays identical: compare each query glyph to table
+    20	#   glyphs by exact (shape + color) signature.
+    21	# - The changed step is the output stage. In the original task, success painted
+    22	#   the whole 30x22 canvas. Here, success discards the query band, separators,
+    23	#   empty margins, and verdict band, keeping only the matched complete row or
+    24	#   matched complete column from the reference table.
+    25	# - Because each table cell is 5x5 and there are 4 cells per successful line,
+    26	#   the success output is either 5x20 (row) or 20x5 (column). Each kept cell has
+    27	#   its background recolored to green, preserving the original glyph pixels.
+    28	# - Failure is concretized as a visible 1x1 red output instead of an empty grid.
+    29	#   This keeps the D11 size change observable in every failing example.
+    30	# - Small trace:
+    31	#   Original success: 4 query glyphs match table row 2 -> highlight those 4
+    32	#   table cells, paint query band green, paint bottom band green, return 30x22.
+    33	#   Variant success: the same 4 matches are found, but the solver returns only
+    34	#   the four highlighted row-2 cells concatenated into a 5x20 strip.
+    35	#   Original failure: return 30x22 with red verdict band. Variant failure:
+    36	#   return [[2]].
+    37	#
+    38	# b) Complexity calibration:
+    39	# - The table/query construction is unchanged, so there are still 16 distinct
+    40	#   (color, shape) pairs and 3-4 queries. This preserves the original matching
+    41	#   difficulty and avoids simplifying the task into a trivial crop.
+    42	# - Success keeps both orientations (row and column), so the new size reasoning
+    43	#   is not a single fixed size.
+    44	#
+    45	# c) Implicit-assumption audit of the original main():
+    46	# - Separator detection via uniform non-background rows still holds because the
+    47	#   input layout is unchanged.
+    48	# - Grid inference from the first glyph's centered 3x3 footprint still works
+    49	#   because the generator keeps the same 5x5 cells with a 1-pixel border.
+    50	# - Query signatures remain distinct; otherwise set membership would become
+    51	#   ambiguous. The generator still guarantees unique (color, shape) pairs.
+    52	# - The original success branch freely painted whole bands because output size
+    53	#   was fixed. That assumption is invalid here; the new solver must avoid any
+    54	#   whole-canvas write and instead crop from the matched table line only.
+    55	#
+    56	# d) Placement legality:
+    57	# - Generator placement is unchanged for inputs, so cells never overlap and all
+    58	#   objects fit the 30x22 canvas exactly as in the base task.
+    59	# - Success output crops already-existing 5x5 cells, so it cannot create
+    60	#   out-of-bounds artifacts.
+    61	#
+    62	# e) Visual observability:
+    63	# - The D11 change is obvious across examples: outputs become either a horizontal
+    64	#   green strip, a vertical green strip, or a single red pixel.
+    65	# - The retained glyphs keep their original colors and shapes, so the user can
+    66	#   still see which table line was selected.
+    67	#
+    68	# f) Visual cleanliness:
+    69	# - The output contains exactly one object family: the cropped matched line.
+    70	#   This removes the original overlapping highlights/query/verdict regions and
+    71	#   makes the transformed result cleaner rather than noisier.
+    72	#
+    73	# g) Color-change inference:
+    74	# - No new hidden color rule is introduced. Green still means "matched cell
+    75	#   background" and red still means "failure", only the canvas is cropped.
+    76	
+    77	
+    78	def _constant_non_bg_rows(g: np.ndarray, bg: int) -> list[int]:
+    79	    return [
+    80	        int(r)
+    81	        for r in range(g.shape[0])
+    82	        if bool(np.all(g[r, :] == g[r, 0])) and int(g[r, 0]) != int(bg)
+    83	    ]
+    84	
+    85	
+    86	def _cell_signature(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> tuple[tuple[int, int, int], ...] | None:
+    87	    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)]
+    88	    mask = cell != int(bg)
+    89	    if not bool(mask.any()):
+    90	        return None
+    91	    return tuple((int(r), int(c), int(cell[r, c])) for r, c in zip(*np.where(mask), strict=False))
+    92	
+    93	
+    94	def _highlighted_cell(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> np.ndarray:
+    95	    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)].copy()
+    96	    cell[cell == int(bg)] = 3
+    97	    return cell
+    98	
+    99	
+   100	def _cropped_success_output(
+   101	    g: np.ndarray,
+   102	    selected: list[tuple[int, int]],
+   103	    row_starts: list[int],
+   104	    col_starts: list[int],
+   105	    cell_size: int,
+   106	    bg: int,
+   107	) -> np.ndarray:
+   108	    rows = {int(r) for r, _c in selected}
+   109	    cols = {int(c) for _r, c in selected}
+   110	    if len(rows) == 1:
+   111	        ri = next(iter(rows))
+   112	        parts = [
+   113	            _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
+   114	            for ci in range(len(col_starts))
+   115	        ]
+   116	        return np.concatenate(parts, axis=1)
+   117	    assert len(cols) == 1, "success must be a full row or full column"
+   118	    ci = next(iter(cols))
+   119	    parts = [
+   120	        _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
+   121	        for ri in range(len(row_starts))
+   122	    ]
+   123	    return np.concatenate(parts, axis=0)
+   124	
+   125	
+   126	def main(grid: np.ndarray) -> np.ndarray:
+   127	    """
+   128	    Look up query glyphs in a reference table and keep only the successful line.
+   129	
+   130	    Input structure:
+   131	    - A teal background contains two full-width pink separator rows.
+   132	    - The top band holds up to four 5x5 query cells, each containing a centered
+   133	      3x3 colored glyph.
+   134	    - Between the separators sits a 4x4 table of the same 5x5 cells; identity is
+   135	      determined by the exact glyph shape together with its color.
+   136	
+   137	    Rule:
+   138	    - Find every table cell whose glyph exactly matches one of the query glyphs.
+   139	    - If the queries fill all four slots and those matched cells are one complete
+   140	      table row or one complete table column, recolor the matched cells'
+   141	      background to green and output only that row/column as a tight crop.
+   142	    - Otherwise output a single red pixel.
+   143	
+   144	    Key insight: The original line-detection criterion is unchanged; only the
+   145	    representation of the answer changes from an in-place annotation to a crop.
+   146	    """
+   147	    g = np.asarray(grid, dtype=int)
+   148	    bg = get_bg(g)
+   149	    cell_size = 5
+   150	
+   151	    sep_rows = _constant_non_bg_rows(g, bg)
+   152	    assert len(sep_rows) >= 2, "expected two full-width separator rows"
+   153	    top_sep = sep_rows[0]
+   154	    bottom_sep = sep_rows[-1]
+   155	
+   156	    table_region = g[top_sep + 1 : bottom_sep, :]
+   157	    table_fg = np.argwhere(table_region != int(bg))
+   158	    assert table_fg.size, "reference table must contain glyphs"
+   159	
+   160	    first_glyph_r = top_sep + 1 + int(table_fg[:, 0].min())
+   161	    first_glyph_c = int(table_fg[:, 1].min())
+   162	    row0 = first_glyph_r - 1
+   163	    col0 = first_glyph_c - 1
+   164	
+   165	    row_starts = [r for r in range(row0, bottom_sep, cell_size) if r + cell_size <= bottom_sep]
+   166	    col_starts = [c for c in range(col0, g.shape[1], cell_size) if c + cell_size <= g.shape[1]]
+   167	    assert row_starts and col_starts, "could not infer table cell grid"
+   168	
+   169	    query_sigs = [sig for c in col_starts if (sig := _cell_signature(g, 0, c, cell_size, bg)) is not None]
+   170	    query_set = set(query_sigs)
+   171	    assert len(query_sigs) == len(query_set), "query glyphs should be distinct"
+   172	
+   173	    selected: list[tuple[int, int]] = []
+   174	    for ri, r in enumerate(row_starts):
+   175	        for ci, c in enumerate(col_starts):
+   176	            if _cell_signature(g, r, c, cell_size, bg) in query_set:
+   177	                selected.append((int(ri), int(ci)))
+   178	
+   179	    complete_query = len(query_sigs) == len(col_starts)
+   180	    same_row = len({r for r, _c in selected}) == 1
+   181	    same_col = len({c for _r, c in selected}) == 1
+   182	    success = complete_query and len(selected) == len(query_sigs) and (same_row or same_col)
+   183	
+   184	    if not success:
+   185	        return np.array([[2]], dtype=int)
+   186	    return _cropped_success_output(g, selected, row_starts, col_starts, cell_size, bg)
+   187	
+   188	
+   189	# --------------- generator (o5x -> D11 crop variant) ---------------
+   190	
+   191	# -- Grid layout --
+   192	GRID_H, GRID_W = 30, 22
+   193	TOP_SEP_ROW = 5
+   194	BOTTOM_SEP_ROW = 27
+   195	
+   196	# -- Colors --
+   197	BG = 8
+   198	GREEN = 3
+   199	RED = 2
+   200	SEP = 6
+   201	GLYPH_COLORS = (0, 1, 2, 4, 5, 6, 7, 9)
+   202	
+   203	# -- Table geometry --
+   204	TABLE_DIM = 4
+   205	CELL = 5
+   206	ROWS = (7, 12, 17, 22)
+   207	COLS = (1, 6, 11, 16)
+   208	
+   209	# -- Glyph shape --
+   210	FILL_MIN, FILL_MAX = 5, 9
+   211	SHAPE_BASE_COUNTS = {5: 2, 6: 2, 7: 2, 8: 2, 9: 1}
+   212	MAX_SHAPES_PER_FILL = 5
+   213	
+   214	# -- Color distribution --
+   215	COLOR_MIN, COLOR_MAX = 1, 3
+   216	
+   217	# -- Outcome probabilities --
+   218	P_SUCCESS = 0.4
+   219	P_QUERY_3 = 0.35
+   220	FAIL_MODES = ("rect", "bent_row", "bent_col", "scatter_rows", "scatter_cols")
+   221	
+   222	# -- Generation --
+   223	MAX_RETRIES = 300
+   224	
+   225	
+   226	def _has_full_bbox(mask: int) -> bool:
+   227	    bits = [(mask >> i) & 1 for i in range(9)]
+   228	    return any(bits[0:3]) and any(bits[6:9]) and any(bits[i] for i in (0, 3, 6)) and any(
+   229	        bits[i] for i in (2, 5, 8)
+   230	    )
+   231	
+   232	
+   233	PATTERNS_BY_FILL = {
+   234	    k: tuple(m for m in range(1 << 9) if m.bit_count() == k and _has_full_bbox(m))
+   235	    for k in range(FILL_MIN, FILL_MAX + 1)
+   236	}
+   237	
+   238	
+   239	def _balanced_color_list() -> list[int]:
+   240	    counts = {c: COLOR_MIN for c in GLYPH_COLORS}
+   241	    extras = TABLE_DIM * TABLE_DIM - len(GLYPH_COLORS) * COLOR_MIN
+   242	    for _ in range(extras):
+   243	        choices = [c for c in GLYPH_COLORS if counts[c] < COLOR_MAX]
+   244	        counts[random.choice(choices)] += 1
+   245	    colors = [c for c, n in counts.items() for _ in range(n)]
+   246	    random.shuffle(colors)
+   247	    return colors
+   248	
+   249	
+   250	def _balanced_shape_masks() -> list[int]:
+   251	    counts = dict(SHAPE_BASE_COUNTS)
+   252	    extras = TABLE_DIM * TABLE_DIM - sum(counts.values())
+   253	    for _ in range(extras):
+   254	        choices = [k for k in range(FILL_MIN, FILL_MAX) if counts[k] < MAX_SHAPES_PER_FILL]
+   255	        counts[random.choice(choices)] += 1
+   256	
+   257	    masks: list[int] = []
+   258	    for k, n in counts.items():
+   259	        masks.extend(random.sample(PATTERNS_BY_FILL[k], n))
+   260	    random.shuffle(masks)
+
+diff --git a/ceshi/code/d8e07eb2/D11/1/code.py b/ceshi/code/d8e07eb2/D11/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..12b30860b7bef0ace673ee0bf247d5edc1ec3db9
+--- /dev/null
++++ b/ceshi/code/d8e07eb2/D11/1/code.py
+@@ -0,0 +1,368 @@
++# Variant of d8e07eb2
++# Dimension: D11 — 网格输出尺寸 (grid_shape)
++# Change: 输出网格与输入尺寸完全相同(30x22)，所有变换都在原位进行... → 输出仅保留匹配的行或列
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import get_bg, paste
++
++
++# Design analysis for the D11 crop variant
++# ========================================
++# a) Concrete behavior:
++# - Input stays identical to the original task: a 30x22 canvas with a 4x4 table
++#   of 5x5 cells, query cells above, and separator rows.
++# - The matching rule also stays identical: compare each query glyph to table
++#   glyphs by exact (shape + color) signature.
++# - The changed step is the output stage. In the original task, success painted
++#   the whole 30x22 canvas. Here, success discards the query band, separators,
++#   empty margins, and verdict band, keeping only the matched complete row or
++#   matched complete column from the reference table.
++# - Because each table cell is 5x5 and there are 4 cells per successful line,
++#   the success output is either 5x20 (row) or 20x5 (column). Each kept cell has
++#   its background recolored to green, preserving the original glyph pixels.
++# - Failure is concretized as a visible 1x1 red output instead of an empty grid.
++#   This keeps the D11 size change observable in every failing example.
++# - Small trace:
++#   Original success: 4 query glyphs match table row 2 -> highlight those 4
++#   table cells, paint query band green, paint bottom band green, return 30x22.
++#   Variant success: the same 4 matches are found, but the solver returns only
++#   the four highlighted row-2 cells concatenated into a 5x20 strip.
++#   Original failure: return 30x22 with red verdict band. Variant failure:
++#   return [[2]].
++#
++# b) Complexity calibration:
++# - The table/query construction is unchanged, so there are still 16 distinct
++#   (color, shape) pairs and 3-4 queries. This preserves the original matching
++#   difficulty and avoids simplifying the task into a trivial crop.
++# - Success keeps both orientations (row and column), so the new size reasoning
++#   is not a single fixed size.
++#
++# c) Implicit-assumption audit of the original main():
++# - Separator detection via uniform non-background rows still holds because the
++#   input layout is unchanged.
++# - Grid inference from the first glyph's centered 3x3 footprint still works
++#   because the generator keeps the same 5x5 cells with a 1-pixel border.
++# - Query signatures remain distinct; otherwise set membership would become
++#   ambiguous. The generator still guarantees unique (color, shape) pairs.
++# - The original success branch freely painted whole bands because output size
++#   was fixed. That assumption is invalid here; the new solver must avoid any
++#   whole-canvas write and instead crop from the matched table line only.
++#
++# d) Placement legality:
++# - Generator placement is unchanged for inputs, so cells never overlap and all
++#   objects fit the 30x22 canvas exactly as in the base task.
++# - Success output crops already-existing 5x5 cells, so it cannot create
++#   out-of-bounds artifacts.
++#
++# e) Visual observability:
++# - The D11 change is obvious across examples: outputs become either a horizontal
++#   green strip, a vertical green strip, or a single red pixel.
++# - The retained glyphs keep their original colors and shapes, so the user can
++#   still see which table line was selected.
++#
++# f) Visual cleanliness:
++# - The output contains exactly one object family: the cropped matched line.
++#   This removes the original overlapping highlights/query/verdict regions and
++#   makes the transformed result cleaner rather than noisier.
++#
++# g) Color-change inference:
++# - No new hidden color rule is introduced. Green still means "matched cell
++#   background" and red still means "failure", only the canvas is cropped.
++
++
++def _constant_non_bg_rows(g: np.ndarray, bg: int) -> list[int]:
++    return [
++        int(r)
++        for r in range(g.shape[0])
++        if bool(np.all(g[r, :] == g[r, 0])) and int(g[r, 0]) != int(bg)
++    ]
++
++
++def _cell_signature(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> tuple[tuple[int, int, int], ...] | None:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)]
++    mask = cell != int(bg)
++    if not bool(mask.any()):
++        return None
++    return tuple((int(r), int(c), int(cell[r, c])) for r, c in zip(*np.where(mask), strict=False))
++
++
++def _highlighted_cell(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> np.ndarray:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)].copy()
++    cell[cell == int(bg)] = 3
++    return cell
++
++
++def _cropped_success_output(
++    g: np.ndarray,
++    selected: list[tuple[int, int]],
++    row_starts: list[int],
++    col_starts: list[int],
++    cell_size: int,
++    bg: int,
++) -> np.ndarray:
++    rows = {int(r) for r, _c in selected}
++    cols = {int(c) for _r, c in selected}
++    if len(rows) == 1:
++        ri = next(iter(rows))
++        parts = [
++            _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++            for ci in range(len(col_starts))
++        ]
++        return np.concatenate(parts, axis=1)
++    assert len(cols) == 1, "success must be a full row or full column"
++    ci = next(iter(cols))
++    parts = [
++        _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++        for ri in range(len(row_starts))
++    ]
++    return np.concatenate(parts, axis=0)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Look up query glyphs in a reference table and keep only the successful line.
++
++    Input structure:
++    - A teal background contains two full-width pink separator rows.
++    - The top band holds up to four 5x5 query cells, each containing a centered
++      3x3 colored glyph.
++    - Between the separators sits a 4x4 table of the same 5x5 cells; identity is
++      determined by the exact glyph shape together with its color.
++
++    Rule:
++    - Find every table cell whose glyph exactly matches one of the query glyphs.
++    - If the queries fill all four slots and those matched cells are one complete
++      table row or one complete table column, recolor the matched cells'
++      background to green and output only that row/column as a tight crop.
++    - Otherwise output a single red pixel.
++
++    Key insight: The original line-detection criterion is unchanged; only the
++    representation of the answer changes from an in-place annotation to a crop.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    cell_size = 5
++
++    sep_rows = _constant_non_bg_rows(g, bg)
++    assert len(sep_rows) >= 2, "expected two full-width separator rows"
++    top_sep = sep_rows[0]
++    bottom_sep = sep_rows[-1]
++
++    table_region = g[top_sep + 1 : bottom_sep, :]
++    table_fg = np.argwhere(table_region != int(bg))
++    assert table_fg.size, "reference table must contain glyphs"
++
++    first_glyph_r = top_sep + 1 + int(table_fg[:, 0].min())
++    first_glyph_c = int(table_fg[:, 1].min())
++    row0 = first_glyph_r - 1
++    col0 = first_glyph_c - 1
++
++    row_starts = [r for r in range(row0, bottom_sep, cell_size) if r + cell_size <= bottom_sep]
++    col_starts = [c for c in range(col0, g.shape[1], cell_size) if c + cell_size <= g.shape[1]]
++    assert row_starts and col_starts, "could not infer table cell grid"
++
++    query_sigs = [sig for c in col_starts if (sig := _cell_signature(g, 0, c, cell_size, bg)) is not None]
++    query_set = set(query_sigs)
++    assert len(query_sigs) == len(query_set), "query glyphs should be distinct"
++
++    selected: list[tuple[int, int]] = []
++    for ri, r in enumerate(row_starts):
++        for ci, c in enumerate(col_starts):
++            if _cell_signature(g, r, c, cell_size, bg) in query_set:
++                selected.append((int(ri), int(ci)))
++
++    complete_query = len(query_sigs) == len(col_starts)
++    same_row = len({r for r, _c in selected}) == 1
++    same_col = len({c for _r, c in selected}) == 1
++    success = complete_query and len(selected) == len(query_sigs) and (same_row or same_col)
++
++    if not success:
++        return np.array([[2]], dtype=int)
++    return _cropped_success_output(g, selected, row_starts, col_starts, cell_size, bg)
++
++
++# --------------- generator (o5x -> D11 crop variant) ---------------
++
++# -- Grid layout --
++GRID_H, GRID_W = 30, 22
++TOP_SEP_ROW = 5
++BOTTOM_SEP_ROW = 27
++
++# -- Colors --
++BG = 8
++GREEN = 3
++RED = 2
++SEP = 6
++GLYPH_COLORS = (0, 1, 2, 4, 5, 6, 7, 9)
++
++# -- Table geometry --
++TABLE_DIM = 4
++CELL = 5
++ROWS = (7, 12, 17, 22)
++COLS = (1, 6, 11, 16)
++
++# -- Glyph shape --
++FILL_MIN, FILL_MAX = 5, 9
++SHAPE_BASE_COUNTS = {5: 2, 6: 2, 7: 2, 8: 2, 9: 1}
++MAX_SHAPES_PER_FILL = 5
++
++# -- Color distribution --
++COLOR_MIN, COLOR_MAX = 1, 3
++
++# -- Outcome probabilities --
++P_SUCCESS = 0.4
++P_QUERY_3 = 0.35
++FAIL_MODES = ("rect", "bent_row", "bent_col", "scatter_rows", "scatter_cols")
++
++# -- Generation --
++MAX_RETRIES = 300
++
++
++def _has_full_bbox(mask: int) -> bool:
++    bits = [(mask >> i) & 1 for i in range(9)]
++    return any(bits[0:3]) and any(bits[6:9]) and any(bits[i] for i in (0, 3, 6)) and any(
++        bits[i] for i in (2, 5, 8)
++    )
++
++
++PATTERNS_BY_FILL = {
++    k: tuple(m for m in range(1 << 9) if m.bit_count() == k and _has_full_bbox(m))
++    for k in range(FILL_MIN, FILL_MAX + 1)
++}
++
++
++def _balanced_color_list() -> list[int]:
++    counts = {c: COLOR_MIN for c in GLYPH_COLORS}
++    extras = TABLE_DIM * TABLE_DIM - len(GLYPH_COLORS) * COLOR_MIN
++    for _ in range(extras):
++        choices = [c for c in GLYPH_COLORS if counts[c] < COLOR_MAX]
++        counts[random.choice(choices)] += 1
++    colors = [c for c, n in counts.items() for _ in range(n)]
++    random.shuffle(colors)
++    return colors
++
++
++def _balanced_shape_masks() -> list[int]:
++    counts = dict(SHAPE_BASE_COUNTS)
++    extras = TABLE_DIM * TABLE_DIM - sum(counts.values())
++    for _ in range(extras):
++        choices = [k for k in range(FILL_MIN, FILL_MAX) if counts[k] < MAX_SHAPES_PER_FILL]
++        counts[random.choice(choices)] += 1
++
++    masks: list[int] = []
++    for k, n in counts.items():
++        masks.extend(random.sample(PATTERNS_BY_FILL[k], n))
++    random.shuffle(masks)
++    return masks
++
++
++def _glyph(mask: int, color: int) -> np.ndarray:
++    cell = np.full((CELL, CELL), BG, dtype=int)
++    bits = np.array([(mask >> i) & 1 for i in range(9)], dtype=bool).reshape(3, 3)
++    cell[1:4, 1:4][bits] = color
++    return cell
++
++
++def _line_cells() -> list[tuple[int, int]]:
++    if random.random() < 0.5:
++        r = random.randrange(TABLE_DIM)
++        cells = [(r, c) for c in range(TABLE_DIM)]
++    else:
++        c = random.randrange(TABLE_DIM)
++        cells = [(r, c) for r in range(TABLE_DIM)]
++    random.shuffle(cells)
++    return cells
++
++
++def _fail_cells(count: int) -> list[tuple[int, int]]:
++    if count == 3:
++        rs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cells = [(rs[0], cs[0]), (rs[1], cs[1])]
++        pool = [(r, c) for r in rs for c in cs if (r, c) not in cells]
++        cells.append(random.choice(pool))
++    else:
++        mode = random.choice(FAIL_MODES)
++        if mode == "rect":
++            rs = random.sample(range(TABLE_DIM), 2)
++            cs = random.sample(range(TABLE_DIM), 2)
++            cells = [(r, c) for r in rs for c in cs]
++        elif mode == "bent_row":
++            r = random.randrange(TABLE_DIM)
++            dropped_c = random.randrange(TABLE_DIM)
++            new_r = random.choice([rr for rr in range(TABLE_DIM) if rr != r])
++            cells = [(r, c) for c in range(TABLE_DIM) if c != dropped_c] + [(new_r, dropped_c)]
++        elif mode == "bent_col":
++            c = random.randrange(TABLE_DIM)
++            dropped_r = random.randrange(TABLE_DIM)
++            new_c = random.choice([cc for cc in range(TABLE_DIM) if cc != c])
++            cells = [(r, c) for r in range(TABLE_DIM) if r != dropped_r] + [(dropped_r, new_c)]
++        elif mode == "scatter_rows":
++            base_c = random.randrange(TABLE_DIM)
++            cols = [base_c] * TABLE_DIM
++            for r in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                cols[r] = random.choice([c for c in range(TABLE_DIM) if c != base_c])
++            cells = [(r, cols[r]) for r in range(TABLE_DIM)]
++        else:
++            base_r = random.randrange(TABLE_DIM)
++            rows = [base_r] * TABLE_DIM
++            for c in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                rows[c] = random.choice([r for r in range(TABLE_DIM) if r != base_r])
++            cells = [(rows[c], c) for c in range(TABLE_DIM)]
++
++    assert len(cells) == count and len(set(cells)) == count
++    assert len({r for r, _c in cells}) > 1 and len({c for _r, c in cells}) > 1
++    random.shuffle(cells)
++    return cells
++
++
++def _expected_output(grid: np.ndarray, cells: list[tuple[int, int]], success: bool) -> np.ndarray:
++    if not success:
++        return np.array([[RED]], dtype=int)
++
++    row_starts = list(ROWS)
++    col_starts = list(COLS)
++    return _cropped_success_output(grid, cells, row_starts, col_starts, CELL, BG)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    grid = np.full((GRID_H, GRID_W), BG, dtype=int)
++    grid[TOP_SEP_ROW, :] = SEP
++    grid[BOTTOM_SEP_ROW, :] = SEP
++
++    masks = _balanced_shape_masks()
++    colors = _balanced_color_list()
++    glyphs: list[np.ndarray] = []
++    for i, (mask, color) in enumerate(zip(masks, colors, strict=True)):
++        glyph = _glyph(mask, color)
++        glyphs.append(glyph)
++        r_i, c_i = divmod(i, TABLE_DIM)
++        paste(grid, glyph, ROWS[r_i], COLS[c_i])
++
++    success = random.random() < P_SUCCESS
++    if success:
++        query_cells = _line_cells()
++    else:
++        count = 3 if random.random() < P_QUERY_3 else 4
++        query_cells = _fail_cells(count)
++
++    for slot, (r_i, c_i) in enumerate(query_cells):
++        paste(grid, glyphs[r_i * TABLE_DIM + c_i], 0, COLS[slot])
++
++    expected = _expected_output(grid, query_cells, success)
++    if not np.array_equal(main(grid), expected):
++        return None
++    return grid
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid d8e07eb2 D11 input")
+
+Variant file passes the required generator test and the post-test distribution check confirms variable output shapes across success/failure branches.
+  ✓ Design the D11 variant behavior and audit original solver assumptions against it
+  ✓ Write the new variant file with analysis comments, updated solver, and updated generator
+  ✓ Run the required generation test, inspect failures if any, and iterate until pass
+  ✓ Measure branch/output-size distribution to confirm the D11 behavior is actually expressed
+diff --git a/ceshi/code/d8e07eb2/D11/1/code.py b/ceshi/code/d8e07eb2/D11/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..12b30860b7bef0ace673ee0bf247d5edc1ec3db9
+--- /dev/null
++++ b/ceshi/code/d8e07eb2/D11/1/code.py
+@@ -0,0 +1,368 @@
++# Variant of d8e07eb2
++# Dimension: D11 — 网格输出尺寸 (grid_shape)
++# Change: 输出网格与输入尺寸完全相同(30x22)，所有变换都在原位进行... → 输出仅保留匹配的行或列
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import get_bg, paste
++
++
++# Design analysis for the D11 crop variant
++# ========================================
++# a) Concrete behavior:
++# - Input stays identical to the original task: a 30x22 canvas with a 4x4 table
++#   of 5x5 cells, query cells above, and separator rows.
++# - The matching rule also stays identical: compare each query glyph to table
++#   glyphs by exact (shape + color) signature.
++# - The changed step is the output stage. In the original task, success painted
++#   the whole 30x22 canvas. Here, success discards the query band, separators,
++#   empty margins, and verdict band, keeping only the matched complete row or
++#   matched complete column from the reference table.
++# - Because each table cell is 5x5 and there are 4 cells per successful line,
++#   the success output is either 5x20 (row) or 20x5 (column). Each kept cell has
++#   its background recolored to green, preserving the original glyph pixels.
++# - Failure is concretized as a visible 1x1 red output instead of an empty grid.
++#   This keeps the D11 size change observable in every failing example.
++# - Small trace:
++#   Original success: 4 query glyphs match table row 2 -> highlight those 4
++#   table cells, paint query band green, paint bottom band green, return 30x22.
++#   Variant success: the same 4 matches are found, but the solver returns only
++#   the four highlighted row-2 cells concatenated into a 5x20 strip.
++#   Original failure: return 30x22 with red verdict band. Variant failure:
++#   return [[2]].
++#
++# b) Complexity calibration:
++# - The table/query construction is unchanged, so there are still 16 distinct
++#   (color, shape) pairs and 3-4 queries. This preserves the original matching
++#   difficulty and avoids simplifying the task into a trivial crop.
++# - Success keeps both orientations (row and column), so the new size reasoning
++#   is not a single fixed size.
++#
++# c) Implicit-assumption audit of the original main():
++# - Separator detection via uniform non-background rows still holds because the
++#   input layout is unchanged.
++# - Grid inference from the first glyph's centered 3x3 footprint still works
++#   because the generator keeps the same 5x5 cells with a 1-pixel border.
++# - Query signatures remain distinct; otherwise set membership would become
++#   ambiguous. The generator still guarantees unique (color, shape) pairs.
++# - The original success branch freely painted whole bands because output size
++#   was fixed. That assumption is invalid here; the new solver must avoid any
++#   whole-canvas write and instead crop from the matched table line only.
++#
++# d) Placement legality:
++# - Generator placement is unchanged for inputs, so cells never overlap and all
++#   objects fit the 30x22 canvas exactly as in the base task.
++# - Success output crops already-existing 5x5 cells, so it cannot create
++#   out-of-bounds artifacts.
++#
++# e) Visual observability:
++# - The D11 change is obvious across examples: outputs become either a horizontal
++#   green strip, a vertical green strip, or a single red pixel.
++# - The retained glyphs keep their original colors and shapes, so the user can
++#   still see which table line was selected.
++#
++# f) Visual cleanliness:
++# - The output contains exactly one object family: the cropped matched line.
++#   This removes the original overlapping highlights/query/verdict regions and
++#   makes the transformed result cleaner rather than noisier.
++#
++# g) Color-change inference:
++# - No new hidden color rule is introduced. Green still means "matched cell
++#   background" and red still means "failure", only the canvas is cropped.
++
++
++def _constant_non_bg_rows(g: np.ndarray, bg: int) -> list[int]:
++    return [
++        int(r)
++        for r in range(g.shape[0])
++        if bool(np.all(g[r, :] == g[r, 0])) and int(g[r, 0]) != int(bg)
++    ]
++
++
++def _cell_signature(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> tuple[tuple[int, int, int], ...] | None:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)]
++    mask = cell != int(bg)
++    if not bool(mask.any()):
++        return None
++    return tuple((int(r), int(c), int(cell[r, c])) for r, c in zip(*np.where(mask), strict=False))
++
++
++def _highlighted_cell(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> np.ndarray:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)].copy()
++    cell[cell == int(bg)] = 3
++    return cell
++
++
++def _cropped_success_output(
++    g: np.ndarray,
++    selected: list[tuple[int, int]],
++    row_starts: list[int],
++    col_starts: list[int],
++    cell_size: int,
++    bg: int,
++) -> np.ndarray:
++    rows = {int(r) for r, _c in selected}
++    cols = {int(c) for _r, c in selected}
++    if len(rows) == 1:
++        ri = next(iter(rows))
++        parts = [
++            _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++            for ci in range(len(col_starts))
++        ]
++        return np.concatenate(parts, axis=1)
++    assert len(cols) == 1, "success must be a full row or full column"
++    ci = next(iter(cols))
++    parts = [
++        _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++        for ri in range(len(row_starts))
++    ]
++    return np.concatenate(parts, axis=0)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Look up query glyphs in a reference table and keep only the successful line.
++
++    Input structure:
++    - A teal background contains two full-width pink separator rows.
++    - The top band holds up to four 5x5 query cells, each containing a centered
++      3x3 colored glyph.
++    - Between the separators sits a 4x4 table of the same 5x5 cells; identity is
++      determined by the exact glyph shape together with its color.
++
++    Rule:
++    - Find every table cell whose glyph exactly matches one of the query glyphs.
++    - If the queries fill all four slots and those matched cells are one complete
++      table row or one complete table column, recolor the matched cells'
++      background to green and output only that row/column as a tight crop.
++    - Otherwise output a single red pixel.
++
++    Key insight: The original line-detection criterion is unchanged; only the
++    representation of the answer changes from an in-place annotation to a crop.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    cell_size = 5
++
++    sep_rows = _constant_non_bg_rows(g, bg)
++    assert len(sep_rows) >= 2, "expected two full-width separator rows"
++    top_sep = sep_rows[0]
++    bottom_sep = sep_rows[-1]
++
++    table_region = g[top_sep + 1 : bottom_sep, :]
++    table_fg = np.argwhere(table_region != int(bg))
++    assert table_fg.size, "reference table must contain glyphs"
++
++    first_glyph_r = top_sep + 1 + int(table_fg[:, 0].min())
++    first_glyph_c = int(table_fg[:, 1].min())
++    row0 = first_glyph_r - 1
++    col0 = first_glyph_c - 1
++
++    row_starts = [r for r in range(row0, bottom_sep, cell_size) if r + cell_size <= bottom_sep]
++    col_starts = [c for c in range(col0, g.shape[1], cell_size) if c + cell_size <= g.shape[1]]
++    assert row_starts and col_starts, "could not infer table cell grid"
++
++    query_sigs = [sig for c in col_starts if (sig := _cell_signature(g, 0, c, cell_size, bg)) is not None]
++    query_set = set(query_sigs)
++    assert len(query_sigs) == len(query_set), "query glyphs should be distinct"
++
++    selected: list[tuple[int, int]] = []
++    for ri, r in enumerate(row_starts):
++        for ci, c in enumerate(col_starts):
++            if _cell_signature(g, r, c, cell_size, bg) in query_set:
++                selected.append((int(ri), int(ci)))
++
++    complete_query = len(query_sigs) == len(col_starts)
++    same_row = len({r for r, _c in selected}) == 1
++    same_col = len({c for _r, c in selected}) == 1
++    success = complete_query and len(selected) == len(query_sigs) and (same_row or same_col)
++
++    if not success:
++        return np.array([[2]], dtype=int)
++    return _cropped_success_output(g, selected, row_starts, col_starts, cell_size, bg)
++
++
++# --------------- generator (o5x -> D11 crop variant) ---------------
++
++# -- Grid layout --
++GRID_H, GRID_W = 30, 22
++TOP_SEP_ROW = 5
++BOTTOM_SEP_ROW = 27
++
++# -- Colors --
++BG = 8
++GREEN = 3
++RED = 2
++SEP = 6
++GLYPH_COLORS = (0, 1, 2, 4, 5, 6, 7, 9)
++
++# -- Table geometry --
++TABLE_DIM = 4
++CELL = 5
++ROWS = (7, 12, 17, 22)
++COLS = (1, 6, 11, 16)
++
++# -- Glyph shape --
++FILL_MIN, FILL_MAX = 5, 9
++SHAPE_BASE_COUNTS = {5: 2, 6: 2, 7: 2, 8: 2, 9: 1}
++MAX_SHAPES_PER_FILL = 5
++
++# -- Color distribution --
++COLOR_MIN, COLOR_MAX = 1, 3
++
++# -- Outcome probabilities --
++P_SUCCESS = 0.4
++P_QUERY_3 = 0.35
++FAIL_MODES = ("rect", "bent_row", "bent_col", "scatter_rows", "scatter_cols")
++
++# -- Generation --
++MAX_RETRIES = 300
++
++
++def _has_full_bbox(mask: int) -> bool:
++    bits = [(mask >> i) & 1 for i in range(9)]
++    return any(bits[0:3]) and any(bits[6:9]) and any(bits[i] for i in (0, 3, 6)) and any(
++        bits[i] for i in (2, 5, 8)
++    )
++
++
++PATTERNS_BY_FILL = {
++    k: tuple(m for m in range(1 << 9) if m.bit_count() == k and _has_full_bbox(m))
++    for k in range(FILL_MIN, FILL_MAX + 1)
++}
++
++
++def _balanced_color_list() -> list[int]:
++    counts = {c: COLOR_MIN for c in GLYPH_COLORS}
++    extras = TABLE_DIM * TABLE_DIM - len(GLYPH_COLORS) * COLOR_MIN
++    for _ in range(extras):
++        choices = [c for c in GLYPH_COLORS if counts[c] < COLOR_MAX]
++        counts[random.choice(choices)] += 1
++    colors = [c for c, n in counts.items() for _ in range(n)]
++    random.shuffle(colors)
++    return colors
++
++
++def _balanced_shape_masks() -> list[int]:
++    counts = dict(SHAPE_BASE_COUNTS)
++    extras = TABLE_DIM * TABLE_DIM - sum(counts.values())
++    for _ in range(extras):
++        choices = [k for k in range(FILL_MIN, FILL_MAX) if counts[k] < MAX_SHAPES_PER_FILL]
++        counts[random.choice(choices)] += 1
++
++    masks: list[int] = []
++    for k, n in counts.items():
++        masks.extend(random.sample(PATTERNS_BY_FILL[k], n))
++    random.shuffle(masks)
++    return masks
++
++
++def _glyph(mask: int, color: int) -> np.ndarray:
++    cell = np.full((CELL, CELL), BG, dtype=int)
++    bits = np.array([(mask >> i) & 1 for i in range(9)], dtype=bool).reshape(3, 3)
++    cell[1:4, 1:4][bits] = color
++    return cell
++
++
++def _line_cells() -> list[tuple[int, int]]:
++    if random.random() < 0.5:
++        r = random.randrange(TABLE_DIM)
++        cells = [(r, c) for c in range(TABLE_DIM)]
++    else:
++        c = random.randrange(TABLE_DIM)
++        cells = [(r, c) for r in range(TABLE_DIM)]
++    random.shuffle(cells)
++    return cells
++
++
++def _fail_cells(count: int) -> list[tuple[int, int]]:
++    if count == 3:
++        rs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cells = [(rs[0], cs[0]), (rs[1], cs[1])]
++        pool = [(r, c) for r in rs for c in cs if (r, c) not in cells]
++        cells.append(random.choice(pool))
++    else:
++        mode = random.choice(FAIL_MODES)
++        if mode == "rect":
++            rs = random.sample(range(TABLE_DIM), 2)
++            cs = random.sample(range(TABLE_DIM), 2)
++            cells = [(r, c) for r in rs for c in cs]
++        elif mode == "bent_row":
++            r = random.randrange(TABLE_DIM)
++            dropped_c = random.randrange(TABLE_DIM)
++            new_r = random.choice([rr for rr in range(TABLE_DIM) if rr != r])
++            cells = [(r, c) for c in range(TABLE_DIM) if c != dropped_c] + [(new_r, dropped_c)]
++        elif mode == "bent_col":
++            c = random.randrange(TABLE_DIM)
++            dropped_r = random.randrange(TABLE_DIM)
++            new_c = random.choice([cc for cc in range(TABLE_DIM) if cc != c])
++            cells = [(r, c) for r in range(TABLE_DIM) if r != dropped_r] + [(dropped_r, new_c)]
++        elif mode == "scatter_rows":
++            base_c = random.randrange(TABLE_DIM)
++            cols = [base_c] * TABLE_DIM
++            for r in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                cols[r] = random.choice([c for c in range(TABLE_DIM) if c != base_c])
++            cells = [(r, cols[r]) for r in range(TABLE_DIM)]
++        else:
++            base_r = random.randrange(TABLE_DIM)
++            rows = [base_r] * TABLE_DIM
++            for c in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                rows[c] = random.choice([r for r in range(TABLE_DIM) if r != base_r])
++            cells = [(rows[c], c) for c in range(TABLE_DIM)]
++
++    assert len(cells) == count and len(set(cells)) == count
++    assert len({r for r, _c in cells}) > 1 and len({c for _r, c in cells}) > 1
++    random.shuffle(cells)
++    return cells
++
++
++def _expected_output(grid: np.ndarray, cells: list[tuple[int, int]], success: bool) -> np.ndarray:
++    if not success:
++        return np.array([[RED]], dtype=int)
++
++    row_starts = list(ROWS)
++    col_starts = list(COLS)
++    return _cropped_success_output(grid, cells, row_starts, col_starts, CELL, BG)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    grid = np.full((GRID_H, GRID_W), BG, dtype=int)
++    grid[TOP_SEP_ROW, :] = SEP
++    grid[BOTTOM_SEP_ROW, :] = SEP
++
++    masks = _balanced_shape_masks()
++    colors = _balanced_color_list()
++    glyphs: list[np.ndarray] = []
++    for i, (mask, color) in enumerate(zip(masks, colors, strict=True)):
++        glyph = _glyph(mask, color)
++        glyphs.append(glyph)
++        r_i, c_i = divmod(i, TABLE_DIM)
++        paste(grid, glyph, ROWS[r_i], COLS[c_i])
++
++    success = random.random() < P_SUCCESS
++    if success:
++        query_cells = _line_cells()
++    else:
++        count = 3 if random.random() < P_QUERY_3 else 4
++        query_cells = _fail_cells(count)
++
++    for slot, (r_i, c_i) in enumerate(query_cells):
++        paste(grid, glyphs[r_i * TABLE_DIM + c_i], 0, COLS[slot])
++
++    expected = _expected_output(grid, query_cells, success)
++    if not np.array_equal(main(grid), expected):
++        return None
++    return grid
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid d8e07eb2 D11 input")
+
+codex
+变体代码已写入 [code.py](/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1/code.py)。`main()` 保留了原题的匹配与整行/整列判定逻辑，但把成功输出改成只裁出命中的整行或整列单元块：横向成功输出 `5x20`，纵向成功输出 `20x5`；失败输出固定为 `1x1` 红点。设计分析、隐式假设审查和新的四段式 `main()` 文档字符串也都写进了文件，核心实现在 [code.py](/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1/code.py:100) 和 [code.py](/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1/code.py:126)。
+
+测试已通过。按你给的 50 次脚本，结果是 `Success: 50/50, Time: 0.1s (2ms/call)`。另外做了 200 个样本的退化检查，输出分布为 `1x1` 失败 121 次、`20x5` 列成功 36 次、`5x20` 行成功 43 次；并且这 200 个样本里新输出与原题在同一输入上的输出尺寸 `200/200` 都不同，说明 D11 的可变输出尺寸行为确实生效，没有退回原始 30x22 原位标注逻辑。
+diff --git a/ceshi/code/d8e07eb2/D11/1/code.py b/ceshi/code/d8e07eb2/D11/1/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..12b30860b7bef0ace673ee0bf247d5edc1ec3db9
+--- /dev/null
++++ b/ceshi/code/d8e07eb2/D11/1/code.py
+@@ -0,0 +1,368 @@
++# Variant of d8e07eb2
++# Dimension: D11 — 网格输出尺寸 (grid_shape)
++# Change: 输出网格与输入尺寸完全相同(30x22)，所有变换都在原位进行... → 输出仅保留匹配的行或列
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from arc_utils import get_bg, paste
++
++
++# Design analysis for the D11 crop variant
++# ========================================
++# a) Concrete behavior:
++# - Input stays identical to the original task: a 30x22 canvas with a 4x4 table
++#   of 5x5 cells, query cells above, and separator rows.
++# - The matching rule also stays identical: compare each query glyph to table
++#   glyphs by exact (shape + color) signature.
++# - The changed step is the output stage. In the original task, success painted
++#   the whole 30x22 canvas. Here, success discards the query band, separators,
++#   empty margins, and verdict band, keeping only the matched complete row or
++#   matched complete column from the reference table.
++# - Because each table cell is 5x5 and there are 4 cells per successful line,
++#   the success output is either 5x20 (row) or 20x5 (column). Each kept cell has
++#   its background recolored to green, preserving the original glyph pixels.
++# - Failure is concretized as a visible 1x1 red output instead of an empty grid.
++#   This keeps the D11 size change observable in every failing example.
++# - Small trace:
++#   Original success: 4 query glyphs match table row 2 -> highlight those 4
++#   table cells, paint query band green, paint bottom band green, return 30x22.
++#   Variant success: the same 4 matches are found, but the solver returns only
++#   the four highlighted row-2 cells concatenated into a 5x20 strip.
++#   Original failure: return 30x22 with red verdict band. Variant failure:
++#   return [[2]].
++#
++# b) Complexity calibration:
++# - The table/query construction is unchanged, so there are still 16 distinct
++#   (color, shape) pairs and 3-4 queries. This preserves the original matching
++#   difficulty and avoids simplifying the task into a trivial crop.
++# - Success keeps both orientations (row and column), so the new size reasoning
++#   is not a single fixed size.
++#
++# c) Implicit-assumption audit of the original main():
++# - Separator detection via uniform non-background rows still holds because the
++#   input layout is unchanged.
++# - Grid inference from the first glyph's centered 3x3 footprint still works
++#   because the generator keeps the same 5x5 cells with a 1-pixel border.
++# - Query signatures remain distinct; otherwise set membership would become
++#   ambiguous. The generator still guarantees unique (color, shape) pairs.
++# - The original success branch freely painted whole bands because output size
++#   was fixed. That assumption is invalid here; the new solver must avoid any
++#   whole-canvas write and instead crop from the matched table line only.
++#
++# d) Placement legality:
++# - Generator placement is unchanged for inputs, so cells never overlap and all
++#   objects fit the 30x22 canvas exactly as in the base task.
++# - Success output crops already-existing 5x5 cells, so it cannot create
++#   out-of-bounds artifacts.
++#
++# e) Visual observability:
++# - The D11 change is obvious across examples: outputs become either a horizontal
++#   green strip, a vertical green strip, or a single red pixel.
++# - The retained glyphs keep their original colors and shapes, so the user can
++#   still see which table line was selected.
++#
++# f) Visual cleanliness:
++# - The output contains exactly one object family: the cropped matched line.
++#   This removes the original overlapping highlights/query/verdict regions and
++#   makes the transformed result cleaner rather than noisier.
++#
++# g) Color-change inference:
++# - No new hidden color rule is introduced. Green still means "matched cell
++#   background" and red still means "failure", only the canvas is cropped.
++
++
++def _constant_non_bg_rows(g: np.ndarray, bg: int) -> list[int]:
++    return [
++        int(r)
++        for r in range(g.shape[0])
++        if bool(np.all(g[r, :] == g[r, 0])) and int(g[r, 0]) != int(bg)
++    ]
++
++
++def _cell_signature(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> tuple[tuple[int, int, int], ...] | None:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)]
++    mask = cell != int(bg)
++    if not bool(mask.any()):
++        return None
++    return tuple((int(r), int(c), int(cell[r, c])) for r, c in zip(*np.where(mask), strict=False))
++
++
++def _highlighted_cell(g: np.ndarray, r0: int, c0: int, size: int, bg: int) -> np.ndarray:
++    cell = g[int(r0) : int(r0) + int(size), int(c0) : int(c0) + int(size)].copy()
++    cell[cell == int(bg)] = 3
++    return cell
++
++
++def _cropped_success_output(
++    g: np.ndarray,
++    selected: list[tuple[int, int]],
++    row_starts: list[int],
++    col_starts: list[int],
++    cell_size: int,
++    bg: int,
++) -> np.ndarray:
++    rows = {int(r) for r, _c in selected}
++    cols = {int(c) for _r, c in selected}
++    if len(rows) == 1:
++        ri = next(iter(rows))
++        parts = [
++            _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++            for ci in range(len(col_starts))
++        ]
++        return np.concatenate(parts, axis=1)
++    assert len(cols) == 1, "success must be a full row or full column"
++    ci = next(iter(cols))
++    parts = [
++        _highlighted_cell(g, row_starts[ri], col_starts[ci], cell_size, bg)
++        for ri in range(len(row_starts))
++    ]
++    return np.concatenate(parts, axis=0)
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Look up query glyphs in a reference table and keep only the successful line.
++
++    Input structure:
++    - A teal background contains two full-width pink separator rows.
++    - The top band holds up to four 5x5 query cells, each containing a centered
++      3x3 colored glyph.
++    - Between the separators sits a 4x4 table of the same 5x5 cells; identity is
++      determined by the exact glyph shape together with its color.
++
++    Rule:
++    - Find every table cell whose glyph exactly matches one of the query glyphs.
++    - If the queries fill all four slots and those matched cells are one complete
++      table row or one complete table column, recolor the matched cells'
++      background to green and output only that row/column as a tight crop.
++    - Otherwise output a single red pixel.
++
++    Key insight: The original line-detection criterion is unchanged; only the
++    representation of the answer changes from an in-place annotation to a crop.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    cell_size = 5
++
++    sep_rows = _constant_non_bg_rows(g, bg)
++    assert len(sep_rows) >= 2, "expected two full-width separator rows"
++    top_sep = sep_rows[0]
++    bottom_sep = sep_rows[-1]
++
++    table_region = g[top_sep + 1 : bottom_sep, :]
++    table_fg = np.argwhere(table_region != int(bg))
++    assert table_fg.size, "reference table must contain glyphs"
++
++    first_glyph_r = top_sep + 1 + int(table_fg[:, 0].min())
++    first_glyph_c = int(table_fg[:, 1].min())
++    row0 = first_glyph_r - 1
++    col0 = first_glyph_c - 1
++
++    row_starts = [r for r in range(row0, bottom_sep, cell_size) if r + cell_size <= bottom_sep]
++    col_starts = [c for c in range(col0, g.shape[1], cell_size) if c + cell_size <= g.shape[1]]
++    assert row_starts and col_starts, "could not infer table cell grid"
++
++    query_sigs = [sig for c in col_starts if (sig := _cell_signature(g, 0, c, cell_size, bg)) is not None]
++    query_set = set(query_sigs)
++    assert len(query_sigs) == len(query_set), "query glyphs should be distinct"
++
++    selected: list[tuple[int, int]] = []
++    for ri, r in enumerate(row_starts):
++        for ci, c in enumerate(col_starts):
++            if _cell_signature(g, r, c, cell_size, bg) in query_set:
++                selected.append((int(ri), int(ci)))
++
++    complete_query = len(query_sigs) == len(col_starts)
++    same_row = len({r for r, _c in selected}) == 1
++    same_col = len({c for _r, c in selected}) == 1
++    success = complete_query and len(selected) == len(query_sigs) and (same_row or same_col)
++
++    if not success:
++        return np.array([[2]], dtype=int)
++    return _cropped_success_output(g, selected, row_starts, col_starts, cell_size, bg)
++
++
++# --------------- generator (o5x -> D11 crop variant) ---------------
++
++# -- Grid layout --
++GRID_H, GRID_W = 30, 22
++TOP_SEP_ROW = 5
++BOTTOM_SEP_ROW = 27
++
++# -- Colors --
++BG = 8
++GREEN = 3
++RED = 2
++SEP = 6
++GLYPH_COLORS = (0, 1, 2, 4, 5, 6, 7, 9)
++
++# -- Table geometry --
++TABLE_DIM = 4
++CELL = 5
++ROWS = (7, 12, 17, 22)
++COLS = (1, 6, 11, 16)
++
++# -- Glyph shape --
++FILL_MIN, FILL_MAX = 5, 9
++SHAPE_BASE_COUNTS = {5: 2, 6: 2, 7: 2, 8: 2, 9: 1}
++MAX_SHAPES_PER_FILL = 5
++
++# -- Color distribution --
++COLOR_MIN, COLOR_MAX = 1, 3
++
++# -- Outcome probabilities --
++P_SUCCESS = 0.4
++P_QUERY_3 = 0.35
++FAIL_MODES = ("rect", "bent_row", "bent_col", "scatter_rows", "scatter_cols")
++
++# -- Generation --
++MAX_RETRIES = 300
++
++
++def _has_full_bbox(mask: int) -> bool:
++    bits = [(mask >> i) & 1 for i in range(9)]
++    return any(bits[0:3]) and any(bits[6:9]) and any(bits[i] for i in (0, 3, 6)) and any(
++        bits[i] for i in (2, 5, 8)
++    )
++
++
++PATTERNS_BY_FILL = {
++    k: tuple(m for m in range(1 << 9) if m.bit_count() == k and _has_full_bbox(m))
++    for k in range(FILL_MIN, FILL_MAX + 1)
++}
++
++
++def _balanced_color_list() -> list[int]:
++    counts = {c: COLOR_MIN for c in GLYPH_COLORS}
++    extras = TABLE_DIM * TABLE_DIM - len(GLYPH_COLORS) * COLOR_MIN
++    for _ in range(extras):
++        choices = [c for c in GLYPH_COLORS if counts[c] < COLOR_MAX]
++        counts[random.choice(choices)] += 1
++    colors = [c for c, n in counts.items() for _ in range(n)]
++    random.shuffle(colors)
++    return colors
++
++
++def _balanced_shape_masks() -> list[int]:
++    counts = dict(SHAPE_BASE_COUNTS)
++    extras = TABLE_DIM * TABLE_DIM - sum(counts.values())
++    for _ in range(extras):
++        choices = [k for k in range(FILL_MIN, FILL_MAX) if counts[k] < MAX_SHAPES_PER_FILL]
++        counts[random.choice(choices)] += 1
++
++    masks: list[int] = []
++    for k, n in counts.items():
++        masks.extend(random.sample(PATTERNS_BY_FILL[k], n))
++    random.shuffle(masks)
++    return masks
++
++
++def _glyph(mask: int, color: int) -> np.ndarray:
++    cell = np.full((CELL, CELL), BG, dtype=int)
++    bits = np.array([(mask >> i) & 1 for i in range(9)], dtype=bool).reshape(3, 3)
++    cell[1:4, 1:4][bits] = color
++    return cell
++
++
++def _line_cells() -> list[tuple[int, int]]:
++    if random.random() < 0.5:
++        r = random.randrange(TABLE_DIM)
++        cells = [(r, c) for c in range(TABLE_DIM)]
++    else:
++        c = random.randrange(TABLE_DIM)
++        cells = [(r, c) for r in range(TABLE_DIM)]
++    random.shuffle(cells)
++    return cells
++
++
++def _fail_cells(count: int) -> list[tuple[int, int]]:
++    if count == 3:
++        rs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cs = random.sample(range(TABLE_DIM), random.choice((2, 3)))
++        cells = [(rs[0], cs[0]), (rs[1], cs[1])]
++        pool = [(r, c) for r in rs for c in cs if (r, c) not in cells]
++        cells.append(random.choice(pool))
++    else:
++        mode = random.choice(FAIL_MODES)
++        if mode == "rect":
++            rs = random.sample(range(TABLE_DIM), 2)
++            cs = random.sample(range(TABLE_DIM), 2)
++            cells = [(r, c) for r in rs for c in cs]
++        elif mode == "bent_row":
++            r = random.randrange(TABLE_DIM)
++            dropped_c = random.randrange(TABLE_DIM)
++            new_r = random.choice([rr for rr in range(TABLE_DIM) if rr != r])
++            cells = [(r, c) for c in range(TABLE_DIM) if c != dropped_c] + [(new_r, dropped_c)]
++        elif mode == "bent_col":
++            c = random.randrange(TABLE_DIM)
++            dropped_r = random.randrange(TABLE_DIM)
++            new_c = random.choice([cc for cc in range(TABLE_DIM) if cc != c])
++            cells = [(r, c) for r in range(TABLE_DIM) if r != dropped_r] + [(dropped_r, new_c)]
++        elif mode == "scatter_rows":
++            base_c = random.randrange(TABLE_DIM)
++            cols = [base_c] * TABLE_DIM
++            for r in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                cols[r] = random.choice([c for c in range(TABLE_DIM) if c != base_c])
++            cells = [(r, cols[r]) for r in range(TABLE_DIM)]
++        else:
++            base_r = random.randrange(TABLE_DIM)
++            rows = [base_r] * TABLE_DIM
++            for c in random.sample(range(TABLE_DIM), random.choice((1, 2, 3))):
++                rows[c] = random.choice([r for r in range(TABLE_DIM) if r != base_r])
++            cells = [(rows[c], c) for c in range(TABLE_DIM)]
++
++    assert len(cells) == count and len(set(cells)) == count
++    assert len({r for r, _c in cells}) > 1 and len({c for _r, c in cells}) > 1
++    random.shuffle(cells)
++    return cells
++
++
++def _expected_output(grid: np.ndarray, cells: list[tuple[int, int]], success: bool) -> np.ndarray:
++    if not success:
++        return np.array([[RED]], dtype=int)
++
++    row_starts = list(ROWS)
++    col_starts = list(COLS)
++    return _cropped_success_output(grid, cells, row_starts, col_starts, CELL, BG)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    grid = np.full((GRID_H, GRID_W), BG, dtype=int)
++    grid[TOP_SEP_ROW, :] = SEP
++    grid[BOTTOM_SEP_ROW, :] = SEP
++
++    masks = _balanced_shape_masks()
++    colors = _balanced_color_list()
++    glyphs: list[np.ndarray] = []
++    for i, (mask, color) in enumerate(zip(masks, colors, strict=True)):
++        glyph = _glyph(mask, color)
++        glyphs.append(glyph)
++        r_i, c_i = divmod(i, TABLE_DIM)
++        paste(grid, glyph, ROWS[r_i], COLS[c_i])
++
++    success = random.random() < P_SUCCESS
++    if success:
++        query_cells = _line_cells()
++    else:
++        count = 3 if random.random() < P_QUERY_3 else 4
++        query_cells = _fail_cells(count)
++
++    for slot, (r_i, c_i) in enumerate(query_cells):
++        paste(grid, glyphs[r_i * TABLE_DIM + c_i], 0, COLS[slot])
++
++    expected = _expected_output(grid, query_cells, success)
++    if not np.array_equal(main(grid), expected):
++        return None
++    return grid
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid d8e07eb2 D11 input")
+
+tokens used
+68,466
+变体代码已写入 [code.py](/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1/code.py)。`main()` 保留了原题的匹配与整行/整列判定逻辑，但把成功输出改成只裁出命中的整行或整列单元块：横向成功输出 `5x20`，纵向成功输出 `20x5`；失败输出固定为 `1x1` 红点。设计分析、隐式假设审查和新的四段式 `main()` 文档字符串也都写进了文件，核心实现在 [code.py](/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1/code.py:100) 和 [code.py](/home/lixinyu/snap/new/ceshi/code/d8e07eb2/D11/1/code.py:126)。
+
+测试已通过。按你给的 50 次脚本，结果是 `Success: 50/50, Time: 0.1s (2ms/call)`。另外做了 200 个样本的退化检查，输出分布为 `1x1` 失败 121 次、`20x5` 列成功 36 次、`5x20` 行成功 43 次；并且这 200 个样本里新输出与原题在同一输入上的输出尺寸 `200/200` 都不同，说明 D11 的可变输出尺寸行为确实生效，没有退回原始 30x22 原位标注逻辑。

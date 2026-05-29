@@ -1,0 +1,1397 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: high
+reasoning summaries: none
+session id: 019e254d-8d1b-75c3-8201-b684b9ee42dd
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个变体。
+
+    ## 原始任务: cb2d8a2c
+    **摘要**: 绿色像素从网格边缘出发，沿直角转弯路径绕过红色障碍条，每条红色条的最小回避距离由其上蓝色像素数量决定，蓝色像素最终变为红色
+
+    ## 要实现的变体
+    - **维度**: D4 — 轨迹涂色模式 (`trajectory`)
+    - **当前值**: 连续涂色——绿色路径经过的每个背景格子都被涂为绿色，形成连续的绿色线条
+    - **改为**: 仅在转弯处涂色 — 路径的直线段保持背景色不变，只在直角转弯的拐角区域涂色（如转弯前后各1-2格）。这将连续轨迹变为离散的转弯标记，视觉上完全不同，解题者需要理解路径但只标记关键点。
+    - **来源**: inversion（参考任务: None）
+
+    ## 修改原则 
+    以 D4 为核心变更，不要随意改动与该创新无关的部分。但如果其他维度需要做适配性调整才能让 D4 的变化在视觉上可观察、在逻辑上可行（例如：变换规则改为旋转/翻转，但原始对象是纯色对称的导致变换不可见，则应让对象带不对称内部结构），这种配合修改是允许且必要的。
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/cb2d8a2c.py`
+
+    ```python
+    import heapq
+from collections import deque
+
+import numpy as np
+
+from arc_utils import components_mask, neighbors4
+import itertools
+import random
+
+_DIRS_URDL = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Extend a green path from one grid edge to the opposite, routing around red bars at a distance dictated by their blue pixel count.
+
+    Input structure:
+    - bg = azure (8). Red/blue bars (color 2/1) act as obstacles.
+    - A single green (3) pixel sits on a grid border — the path start.
+
+    Rule:
+    - Each bar's keep-out radius equals its number of blue pixels; the path must stay farther than that from every bar cell.
+    - The green pixel extends inward toward the opposite edge, turning at right angles to navigate around forbidden zones.
+    - After the path is drawn, all blue pixels become red.
+
+    Key insight: Blue pixels on a bar encode its danger radius — more blue means a wider no-go zone the path must respect.
+    """
+    g = np.array(grid, copy=True)
+    h, w = g.shape
+
+    BG = 8
+    GREEN = 3
+    BLUE = 1
+    RED = 2
+
+    dirs = _DIRS_URDL  # U, R, D, L
+
+    # --- find the unique green start pixel on the border ---
+    start_pts = np.argwhere(g == GREEN)
+    assert start_pts.shape[0] == 1, "grid must contain exactly one green start pixel"
+    sr, sc = map(int, start_pts[0])
+
+    # Inward initial direction + opposite-edge target.
+    if sr == 0:
+        init_dir = 2  # down
+        goal_kind, goal_val = "row", h - 1
+    elif sr == h - 1:
+        init_dir = 0  # up
+        goal_kind, goal_val = "row", 0
+    elif sc == 0:
+        init_dir = 1  # right
+        goal_kind, goal_val = "col", w - 1
+    elif sc == w - 1:
+        init_dir = 3  # left
+        goal_kind, goal_val = "col", 0
+    else:
+        raise AssertionError("green start must be on a border edge")
+
+    def is_goal(r: int, c: int) -> bool:
+        return (r == goal_val) if goal_kind == "row" else (c == goal_val)
+
+    # --- find bar components (colors {1,2}) ---
+    bar_mask = (g == BLUE) | (g == RED)
+    bar_comps = components_mask(bar_mask, connectivity=4)
+
+    # --- build forbidden region: for each bar, forbid cells within Manhattan distance <= blue_count ---
+    forbidden = np.zeros((h, w), dtype=bool)
+    for comp in bar_comps:
+        blue_count = sum(1 for r, c in comp if g[r, c] == BLUE)
+        radius = int(blue_count)
+
+        dist = np.full((h, w), -1, dtype=np.int16)
+        q = deque()
+        for r, c in comp:
+            dist[r, c] = 0
+            q.append((r, c))
+
+        while q:
+            r, c = q.popleft()
+            d = int(dist[r, c])
+            forbidden[r, c] = True
+            if d == radius:
+                continue
+            for rr, cc in neighbors4(r, c):
+                if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == -1:
+                    dist[rr, cc] = d + 1
+                    q.append((rr, cc))
+
+    blocked = bar_mask | forbidden
+    blocked[sr, sc] = False
+
+    # --- Dijkstra: minimize (steps, turns) ---
+    INF = (10**9, 10**9)
+    best_cost: dict[tuple[int, int, int], tuple[int, int]] = {(sr, sc, init_dir): (0, 0)}
+    prev: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    heap: list[tuple[tuple[int, int], int, int, int]] = [((0, 0), sr, sc, init_dir)]
+
+    goal_state: tuple[int, int, int] | None = None
+    while heap:
+        (steps, turns), r, c, dprev = heapq.heappop(heap)
+        if (steps, turns) != best_cost.get((r, c, dprev), INF):
+            continue
+        if is_goal(r, c) and (r, c) != (sr, sc):
+            goal_state = (r, c, dprev)
+            break
+        for nd, (dr, dc) in enumerate(dirs):
+            rr, cc = r + dr, c + dc
+            if not (0 <= rr < h and 0 <= cc < w):
+                continue
+            if blocked[rr, cc]:
+                continue
+            ncost = (steps + 1, turns + (0 if nd == dprev else 1))
+            key = (rr, cc, nd)
+            if ncost < best_cost.get(key, INF):
+                best_cost[key] = ncost
+                prev[key] = (r, c, dprev)
+                heapq.heappush(heap, (ncost, rr, cc, nd))
+
+    # --- paint path + convert blue -> red ---
+    out = g.copy()
+    assert goal_state is not None, "a valid path to the opposite edge must exist"
+    path: list[tuple[int, int]] = []
+    st = goal_state
+    while True:
+        r, c, _ = st
+        path.append((r, c))
+        if (r, c) == (sr, sc):
+            break
+        st = prev[st]
+    path.reverse()
+    for r, c in path:
+        if out[r, c] == BG:
+            out[r, c] = GREEN
+
+    out[out == BLUE] = RED
+    return out
+
+# --------------- generator (o5x) ---------------
+
+BG = 8
+BLUE = 1
+RED = 2
+GREEN = 3
+
+# --- Tunable parameters (CFG) ---
+# Grid size bounds (rows x cols from spec: 12-29 x 13-26)
+ROWS_LO, ROWS_HI = 12, 29
+COLS_LO, COLS_HI = 13, 26
+# Bar counts and blue-per-bar range
+BAR_COUNT_LO, BAR_COUNT_HI = 1, 4
+BLUE_PER_BAR_LO, BLUE_PER_BAR_HI = 1, 4  # keepout radius encoded per bar
+# Bar length bounds: absolute min/max and cross-axis percentage bounds
+BAR_LEN_MIN, BAR_LEN_MAX = 6, 15
+BAR_CROSS_PCT_LO, BAR_CROSS_PCT_HI = 32, 79  # bar spans 32-79% of cross-axis
+# Generation retry limit
+MAX_GEN_RETRIES = 300
+
+
+def _min_main_len(blues: tuple[int, ...]) -> int:
+    """Minimum main-axis size to fit all bars with required spacing."""
+    last_bar = blues[0] + 2
+    for a, b in zip(blues, blues[1:]):
+        last_bar += a + b + 2
+    return last_bar + 2
+
+
+def _random_composition(total: int, parts: int) -> list[int]:
+    """Distribute `total` into `parts` non-negative integers uniformly (stars-and-bars)."""
+    if parts == 1:
+        return [total]
+    cuts = sorted(random.sample(range(total + parts - 1), parts - 1))
+    out = []
+    prev = -1
+    for cut in cuts + [total + parts - 1]:
+        out.append(cut - prev - 1)
+        prev = cut
+    return out
+
+
+def _choose_blues(count: int, main_hi: int) -> tuple[int, ...]:
+    """Pick blue counts per bar such that they fit within main_hi."""
+    choices = [
+        combo
+        for combo in itertools.product(range(BLUE_PER_BAR_LO, BLUE_PER_BAR_HI + 1), repeat=count)
+        if _min_main_len(combo) <= main_hi
+    ]
+    return random.choice(choices)
+
+
+def _length_bounds(cross_size: int, blue_count: int) -> tuple[int, int] | None:
+    """Valid bar length range given cross-axis size and blue count."""
+    lo = max(BAR_LEN_MIN, 2 * blue_count - 1, (BAR_CROSS_PCT_LO * cross_size + 99) // 100)
+    hi = min(BAR_LEN_MAX, cross_size - blue_count - 1, (BAR_CROSS_PCT_HI * cross_size) // 100)
+    if lo > hi:
+        return None
+    return lo, hi
+
+
+def _paint_bar(grid: np.ndarray, row: int, side: int, length: int, blue_count: int) -> None:
+    """Paint a single bar on `row` starting from the given wall side."""
+    w = grid.shape[1]
+    colors = np.full(length, RED, dtype=int)
+    colors[:2 * blue_count - 1:2] = BLUE  # alternating B at even positions
+    if side == 0:
+        grid[row, :length] = colors
+    else:
+        grid[row, w - length:] = colors[::-1]
+
+
+def _canonical_grid(
+    main_size: int,
+    cross_size: int,
+    blues: tuple[int, ...],
+    first_side: int,
+) -> np.ndarray | None:
+    """Build the grid in canonical orientation (start edge = top, path goes down)."""
+    count = len(blues)
+    slack = main_size - _min_main_len(blues)
+    if slack < 0:
+        return None
+
+    # Distribute slack spacing among gaps (before first bar, between bars)
+    extras = _random_composition(slack, count + 1)
+    row = blues[0] + 2 + extras[0]
+    rows = [row]
+    for i in range(1, count):
+        row += blues[i - 1] + blues[i] + 2 + extras[i]
+        rows.append(row)
+
+    grid = np.full((main_size, cross_size), BG, dtype=int)
+    lengths = []
+    for row, blue_count, side in zip(rows, blues, ((first_side + i) % 2 for i in range(count))):
+        bounds = _length_bounds(cross_size, blue_count)
+        if bounds is None:
+            return None
+        length = random.randint(*bounds)
+        lengths.append(length)
+        _paint_bar(grid, row, side, length, blue_count)
+
+    # Place green start pixel within first bar's cross-axis coverage
+    first_len = lengths[0]
+    if first_side == 0:
+        start_col = random.randint(1, first_len - 1)
+    else:
+        start_col = random.randint(cross_size - first_len, cross_size - 2)
+    grid[0, start_col] = GREEN
+    return grid
+
+
+def _orient_grid(grid: np.ndarray, edge: str) -> np.ndarray:
+    """Rotate canonical (top-start) grid so the start edge matches `edge`."""
+    if edge == "top":
+        return grid.copy()
+    if edge == "bottom":
+        return np.flipud(grid).copy()
+    if edge == "left":
+        return grid.T.copy()
+    return np.fliplr(grid.T).copy()  # edge == "right"
+
+
+def _reaches_opposite_edge(out: np.ndarray, edge: str) -> bool:
+    """Check whether the solved output has green on the edge opposite to `edge`."""
+    if edge == "top":
+        return bool(np.any(out[-1, :] == GREEN))
+    if edge == "bottom":
+        return bool(np.any(out[0, :] == GREEN))
+    if edge == "left":
+        return bool(np.any(out[:, -1] == GREEN))
+    return bool(np.any(out[:, 0] == GREEN))
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Single generation attempt: pick parameters, build grid, validate via solver."""
+    edge = random.choice(("top", "bottom", "left", "right"))
+    if edge in ("top", "bottom"):
+        main_lo, main_hi = ROWS_LO, ROWS_HI
+        cross_lo, cross_hi = COLS_LO, COLS_HI
+    else:
+        main_lo, main_hi = COLS_LO, COLS_HI
+        cross_lo, cross_hi = ROWS_LO, ROWS_HI
+
+    count = random.randint(BAR_COUNT_LO, BAR_COUNT_HI)
+    blues = _choose_blues(count, main_hi)
+    main_size = random.randint(max(main_lo, _min_main_len(blues)), main_hi)
+    cross_size = random.randint(cross_lo, cross_hi)
+    first_side = random.randrange(2)
+
+    canonical = _canonical_grid(main_size, cross_size, blues, first_side)
+    if canonical is None:
+        return None
+    inp = _orient_grid(canonical, edge)
+
+    try:
+        out = main(inp)
+        if not _reaches_opposite_edge(out, edge):
+            return None
+        if not np.array_equal(main(inp), out):
+            return None
+    except Exception:
+        return None
+    return inp
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_GEN_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate a valid cb2d8a2c input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 12-29 rows x 13-26 cols; bg=azure(8)
+  green_start: single green(3) pixel on one border edge (any of 4 edges)
+  bars:
+    count: 1-4 obstacle bars, each a 1-cell-wide line perpendicular to the path direction
+    orientation: horizontal bars for vertical path, vertical bars for horizontal path
+    wall_attachment: each bar touches one side-wall and leaves a gap on the other; consecutive bars alternate walls (left/right or top/bottom)
+    length: 6-15 cells; spans 32-79% of cross-axis
+    color_pattern: from wall-attached end toward open end, alternating B-R-B-R...B (length 2*blue_count-1), then solid R for the remainder
+    blue_count: 1-4 per bar; encodes keepout radius (path must stay Manhattan distance > blue_count from every bar cell)
+    cross_gap: cross-axis uncovered cells = cross_size - bar_length >= blue_count + 1
+  layout:
+    bars sorted along main axis from start edge; inter-bar gap >= blue_A + blue_B + 1
+    start-to-first-bar gap >= first_bar_blue + 1
+    last-bar-to-end gap >= 1
+    start cross-axis position falls within first bar's covered range [observed]
+  output:
+    green path from start edge to opposite edge, right-angle turns around bar keepout zones (2 turns per bar)
+    blue pixels all become red; path painted green on bg cells
+
+generation_strategy:
+  approach: path-first
+  steps:
+    1. Pick grid size, main axis direction (vert/horiz), start edge, and bar count N (1-4)
+    2. Assign blue counts b_1..b_N (each 1-4) and choose alternating wall sides for bars
+    3. Place bars along main axis with sufficient spacing; inter-bar gap >= b_i + b_{i+1} + 1; start gap >= b_1 + 1; end gap >= 1
+    4. For each bar, pick length so cross-gap >= b_i + 1; fill color pattern B-R alternating from wall end
+    5. Run the solver (Dijkstra pathfinding) to get the green path; verify it reaches the opposite edge
+    6. Place green start pixel on the start edge within the first bar's cross-axis coverage
+    7. Output = input + green path painted + blue->red; input = grid with bars + green start only
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须保留这一结构，并根据**新的变体规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映变体后的输入结构、规则和关键洞察。
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考任务**（如有 source_task）: 变体描述中的 source_task 是该变体的灵感来源。**必须先阅读其 solver 代码**，理解参考任务中相关机制的实现方式和复杂度，作为你设计变体的基线。不存在就跳过。
+
+    3. **设计分析（写代码前必须完成，可仿照spec书写，尽可能的详细以供下面代码生成使用）**:
+
+       YAML 中的变体描述给出了变更的大致方向，但细节不够具体。你需要自行思考并确定完整的实现细节。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断变体改动的影响范围和实现方式。在写代码之前，完成以下分析：
+
+       a) **具体化与行为追踪**: 变体在 ARC 的像素网格中具体长什么样？变更的核心行为如何体现在输入/输出的结构上？不要停留在抽象概念上，要想清楚具体的形状、颜色、空间关系等细节。然后，确定变体的变化会影响整个流程（输入构造、solver 处理、输出生成等）中的哪个环节，在这个环节上用一个具体的小例子追踪：原始逻辑在这里是怎么执行的 → 变体要求的逻辑应该是怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 变体改变了原任务的某个属性。原始代码中哪些写法依赖了旧属性的不变性？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在变体中是否仍然成立？特别注意那些在原任务中"恰好无害"但在变体中会出错的模式（例如：原任务中某个值始终相同，所以无条件赋值不会产生覆盖问题——但变体让该值可变后，无条件赋值就会破坏已有的正确结果）。
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意（例如对象之间的空间关系、对齐方式、间距等应与任务规则一致）。同时要考虑放置后的网格是否能被 solver 正确处理并产生预期的输出。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。**禁止使用颜色id等不可见因素参与任何排序或者颜色变换（例如使用黑色=0参与排序等，禁用）**。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出变体的规则？如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。若规则本身允许多个合法分支或子情况，不要在生成器中长期固定成其中一种，除非题意本来就要求固定。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果变体后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **颜色变化可推断性**: 如果变体涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个变体设计就不合格。
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 基于第 3 步的设计分析实现变体的新规则。只改需要改的部分，其他逻辑保持不变。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发新规则。生成的输入必须能被新 `main()` 正确求解。
+    6. **保证 generator 的正确性**: 原 generator 采用 output-first 模式（先构造预期输出 → 反推输入 → 用 `main(input)` 验证一致）。修改变体时，你可以沿用或调整这个模式，但必须保证：生成的每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/cb2d8a2c/D4/3/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证变体行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了变体的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量变体核心行为（如交互深度、参与对象数等），统计生成样本中该指标和关键分支的分布。少量样本与原始行为相似不为退化；只有当关键控制变量不起作用，样本按照新的变体逻辑执行与原逻辑执行在相同输入网格上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/cb2d8a2c.json` — 原任务的 I/O 样例
+
+    只参考上述文件和原始 solver 代码。不要查看其他变体的实现代码（如 variants/ 目录下的已有文件），避免引入其他维度的改动。
+
+## 输出
+
+将完整的变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+`/home/lixinyu/snap/new/ceshi/code/cb2d8a2c/D4/3/code.py`
+
+代码文件开头加一段注释说明这是什么变体:
+```python
+# Variant of cb2d8a2c
+# Dimension: D4 — 轨迹涂色模式 (trajectory)
+# Change: 连续涂色——绿色路径经过的每个背景格子都被涂为绿色，形成连续的绿色线条... → 仅在转弯处涂色
+```
+
+确保目录 `/home/lixinyu/snap/new/ceshi/code/cb2d8a2c/D4/3` 存在（如不存在则创建）。
+codex
+先检查原始 solver、`arc_utils` 和样例输入输出，确认原任务的路径构造与生成约束，然后基于 D4 变体确定只改“如何涂路径”这一层，不动障碍和寻路逻辑。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/cb2d8a2c.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+import heapq
+from collections import deque
+
+import numpy as np
+
+from arc_utils import components_mask, neighbors4
+import itertools
+import random
+
+_DIRS_URDL = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Extend a green path from one grid edge to the opposite, routing around red bars at a distance dictated by their blue pixel count.
+
+    Input structure:
+    - bg = azure (8). Red/blue bars (color 2/1) act as obstacles.
+    - A single green (3) pixel sits on a grid border — the path start.
+
+    Rule:
+    - Each bar's keep-out radius equals its number of blue pixels; the path must stay farther than that from every bar cell.
+    - The green pixel extends inward toward the opposite edge, turning at right angles to navigate around forbidden zones.
+    - After the path is drawn, all blue pixels become red.
+
+    Key insight: Blue pixels on a bar encode its danger radius — more blue means a wider no-go zone the path must respect.
+    """
+    g = np.array(grid, copy=True)
+    h, w = g.shape
+
+    BG = 8
+    GREEN = 3
+    BLUE = 1
+    RED = 2
+
+    dirs = _DIRS_URDL  # U, R, D, L
+
+    # --- find the unique green start pixel on the border ---
+    start_pts = np.argwhere(g == GREEN)
+    assert start_pts.shape[0] == 1, "grid must contain exactly one green start pixel"
+    sr, sc = map(int, start_pts[0])
+
+    # Inward initial direction + opposite-edge target.
+    if sr == 0:
+        init_dir = 2  # down
+        goal_kind, goal_val = "row", h - 1
+    elif sr == h - 1:
+        init_dir = 0  # up
+        goal_kind, goal_val = "row", 0
+    elif sc == 0:
+        init_dir = 1  # right
+        goal_kind, goal_val = "col", w - 1
+    elif sc == w - 1:
+        init_dir = 3  # left
+        goal_kind, goal_val = "col", 0
+    else:
+        raise AssertionError("green start must be on a border edge")
+
+    def is_goal(r: int, c: int) -> bool:
+        return (r == goal_val) if goal_kind == "row" else (c == goal_val)
+
+    # --- find bar components (colors {1,2}) ---
+    bar_mask = (g == BLUE) | (g == RED)
+    bar_comps = components_mask(bar_mask, connectivity=4)
+
+    # --- build forbidden region: for each bar, forbid cells within Manhattan distance <= blue_count ---
+    forbidden = np.zeros((h, w), dtype=bool)
+    for comp in bar_comps:
+        blue_count = sum(1 for r, c in comp if g[r, c] == BLUE)
+        radius = int(blue_count)
+
+        dist = np.full((h, w), -1, dtype=np.int16)
+        q = deque()
+        for r, c in comp:
+            dist[r, c] = 0
+            q.append((r, c))
+
+        while q:
+            r, c = q.popleft()
+            d = int(dist[r, c])
+            forbidden[r, c] = True
+            if d == radius:
+                continue
+            for rr, cc in neighbors4(r, c):
+                if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == -1:
+                    dist[rr, cc] = d + 1
+                    q.append((rr, cc))
+
+    blocked = bar_mask | forbidden
+    blocked[sr, sc] = False
+
+    # --- Dijkstra: minimize (steps, turns) ---
+    INF = (10**9, 10**9)
+    best_cost: dict[tuple[int, int, int], tuple[int, int]] = {(sr, sc, init_dir): (0, 0)}
+    prev: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    heap: list[tuple[tuple[int, int], int, int, int]] = [((0, 0), sr, sc, init_dir)]
+
+    goal_state: tuple[int, int, int] | None = None
+    while heap:
+        (steps, turns), r, c, dprev = heapq.heappop(heap)
+        if (steps, turns) != best_cost.get((r, c, dprev), INF):
+            continue
+        if is_goal(r, c) and (r, c) != (sr, sc):
+            goal_state = (r, c, dprev)
+            break
+        for nd, (dr, dc) in enumerate(dirs):
+            rr, cc = r + dr, c + dc
+            if not (0 <= rr < h and 0 <= cc < w):
+                continue
+            if blocked[rr, cc]:
+                continue
+            ncost = (steps + 1, turns + (0 if nd == dprev else 1))
+            key = (rr, cc, nd)
+            if ncost < best_cost.get(key, INF):
+                best_cost[key] = ncost
+                prev[key] = (r, c, dprev)
+                heapq.heappush(heap, (ncost, rr, cc, nd))
+
+    # --- paint path + convert blue -> red ---
+    out = g.copy()
+    assert goal_state is not None, "a valid path to the opposite edge must exist"
+    path: list[tuple[int, int]] = []
+    st = goal_state
+    while True:
+        r, c, _ = st
+        path.append((r, c))
+        if (r, c) == (sr, sc):
+            break
+        st = prev[st]
+    path.reverse()
+    for r, c in path:
+        if out[r, c] == BG:
+            out[r, c] = GREEN
+
+    out[out == BLUE] = RED
+    return out
+
+# --------------- generator (o5x) ---------------
+
+BG = 8
+BLUE = 1
+RED = 2
+GREEN = 3
+
+# --- Tunable parameters (CFG) ---
+# Grid size bounds (rows x cols from spec: 12-29 x 13-26)
+ROWS_LO, ROWS_HI = 12, 29
+COLS_LO, COLS_HI = 13, 26
+# Bar counts and blue-per-bar range
+BAR_COUNT_LO, BAR_COUNT_HI = 1, 4
+BLUE_PER_BAR_LO, BLUE_PER_BAR_HI = 1, 4  # keepout radius encoded per bar
+# Bar length bounds: absolute min/max and cross-axis percentage bounds
+BAR_LEN_MIN, BAR_LEN_MAX = 6, 15
+BAR_CROSS_PCT_LO, BAR_CROSS_PCT_HI = 32, 79  # bar spans 32-79% of cross-axis
+# Generation retry limit
+MAX_GEN_RETRIES = 300
+
+
+def _min_main_len(blues: tuple[int, ...]) -> int:
+    """Minimum main-axis size to fit all bars with required spacing."""
+    last_bar = blues[0] + 2
+    for a, b in zip(blues, blues[1:]):
+        last_bar += a + b + 2
+    return last_bar + 2
+
+
+def _random_composition(total: int, parts: int) -> list[int]:
+    """Distribute `total` into `parts` non-negative integers uniformly (stars-and-bars)."""
+    if parts == 1:
+        return [total]
+    cuts = sorted(random.sample(range(total + parts - 1), parts - 1))
+    out = []
+    prev = -1
+    for cut in cuts + [total + parts - 1]:
+        out.append(cut - prev - 1)
+        prev = cut
+    return out
+
+
+def _choose_blues(count: int, main_hi: int) -> tuple[int, ...]:
+    """Pick blue counts per bar such that they fit within main_hi."""
+    choices = [
+        combo
+        for combo in itertools.product(range(BLUE_PER_BAR_LO, BLUE_PER_BAR_HI + 1), repeat=count)
+        if _min_main_len(combo) <= main_hi
+    ]
+    return random.choice(choices)
+
+
+def _length_bounds(cross_size: int, blue_count: int) -> tuple[int, int] | None:
+    """Valid bar length range given cross-axis size and blue count."""
+    lo = max(BAR_LEN_MIN, 2 * blue_count - 1, (BAR_CROSS_PCT_LO * cross_size + 99) // 100)
+    hi = min(BAR_LEN_MAX, cross_size - blue_count - 1, (BAR_CROSS_PCT_HI * cross_size) // 100)
+    if lo > hi:
+        return None
+    return lo, hi
+
+
+def _paint_bar(grid: np.ndarray, row: int, side: int, length: int, blue_count: int) -> None:
+    """Paint a single bar on `row` starting from the given wall side."""
+    w = grid.shape[1]
+    colors = np.full(length, RED, dtype=int)
+    colors[:2 * blue_count - 1:2] = BLUE  # alternating B at even positions
+    if side == 0:
+        grid[row, :length] = colors
+    else:
+        grid[row, w - length:] = colors[::-1]
+
+
+def _canonical_grid(
+    main_size: int,
+    cross_size: int,
+    blues: tuple[int, ...],
+    first_side: int,
+) -> np.ndarray | None:
+    """Build the grid in canonical orientation (start edge = top, path goes down)."""
+    count = len(blues)
+    slack = main_size - _min_main_len(blues)
+    if slack < 0:
+        return None
+
+    # Distribute slack spacing among gaps (before first bar, between bars)
+    extras = _random_composition(slack, count + 1)
+    row = blues[0] + 2 + extras[0]
+    rows = [row]
+    for i in range(1, count):
+        row += blues[i - 1] + blues[i] + 2 + extras[i]
+        rows.append(row)
+
+    grid = np.full((main_size, cross_size), BG, dtype=int)
+    lengths = []
+    for row, blue_count, side in zip(rows, blues, ((first_side + i) % 2 for i in range(count))):
+        bounds = _length_bounds(cross_size, blue_count)
+        if bounds is None:
+            return None
+        length = random.randint(*bounds)
+        lengths.append(length)
+        _paint_bar(grid, row, side, length, blue_count)
+
+    # Place green start pixel within first bar's cross-axis coverage
+    first_len = lengths[0]
+    if first_side == 0:
+        start_col = random.randint(1, first_len - 1)
+    else:
+        start_col = random.randint(cross_size - first_len, cross_size - 2)
+    grid[0, start_col] = GREEN
+    return grid
+
+
+def _orient_grid(grid: np.ndarray, edge: str) -> np.ndarray:
+    """Rotate canonical (top-start) grid so the start edge matches `edge`."""
+    if edge == "top":
+        return grid.copy()
+    if edge == "bottom":
+        return np.flipud(grid).copy()
+    if edge == "left":
+        return grid.T.copy()
+    return np.fliplr(grid.T).copy()  # edge == "right"
+
+
+def _reaches_opposite_edge(out: np.ndarray, edge: str) -> bool:
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+    r0 = min(b[0] for b in bbs)
+    c0 = min(b[1] for b in bbs)
+    r1 = max(b[2] for b in bbs)
+    c1 = max(b[3] for b in bbs)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox_h(b: BBox) -> int:
+    r0, _c0, r1, _c1 = b
+    return int(r1 - r0 + 1)
+
+
+def bbox_w(b: BBox) -> int:
+    _r0, c0, _r1, c1 = b
+    return int(c1 - c0 + 1)
+
+
+def bbox_anchor(b: BBox, *, anchor: str = "upper left") -> Coord:
+    """
+    Return an anchor point (r,c) for a bbox.
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json, pprint
+path='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/cb2d8a2c.json'
+with open(path) as f:
+    data=json.load(f)
+print('train', len(data.get('train',[])), 'test', len(data.get('test',[])))
+for split in ('train','test'):
+    for i,pair in enumerate(data.get(split,[])[:4]):
+        inp=pair['input']; out=pair['output']
+        print(f'--- {split} {i} input {len(inp)}x{len(inp[0])} output {len(out)}x{len(out[0])}')
+        print('input colors', sorted({c for row in inp for c in row}))
+        print('output colors', sorted({c for row in out for c in row}))
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+train 4 test 2
+--- train 0 input 19x13 output 19x13
+input colors [1, 2, 3, 8]
+output colors [2, 3, 8]
+--- train 1 input 17x19 output 17x19
+input colors [1, 2, 3, 8]
+output colors [2, 3, 8]
+--- train 2 input 19x19 output 19x19
+input colors [1, 2, 3, 8]
+output colors [2, 3, 8]
+--- train 3 input 12x19 output 12x19
+input colors [1, 2, 3, 8]
+output colors [2, 3, 8]
+--- test 0 input 14x26 output 14x26
+input colors [1, 2, 3, 8]
+output colors [2, 3, 8]
+--- test 1 input 29x16 output 29x16
+input colors [1, 2, 3, 8]
+output colors [2, 3, 8]
+
+codex
+原题生成器是“先放条形障碍，再让求解器找一条最短且少转弯的通路”，所以 D4 变体可以直接复用寻路与障碍半径编码，只替换输出阶段对路径的可视化方式。接下来我把样例和路径转折模式看清楚，再决定转角标记的具体形状与生成约束。
+exec
+/bin/bash -lc 'rg -n "def components_mask" -n /home/lixinyu/snap/new/solvers/arc_utils.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+398:def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+path='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/cb2d8a2c.json'
+with open(path) as f:
+    data=json.load(f)
+for split in ('train',):
+    for i,pair in enumerate(data[split][:2]):
+        print('===', split, i, 'input')
+        for row in pair['input']:
+            print(''.join(str(x) for x in row))
+        print('===', split, i, 'output')
+        for row in pair['output']:
+            print(''.join(str(x) for x in row))
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+=== train 0 input
+8888888838888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888881212121
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+=== train 0 output
+8888888838888
+8888888838888
+8333333338888
+8388888888888
+8388888888888
+8388888888888
+8388888888888
+8388882222222
+8388888888888
+8388888888888
+8388888888888
+8388888888888
+8388888888888
+8388888888888
+8388888888888
+8388888888888
+8388888888888
+8388888888888
+8388888888888
+=== train 1 input
+8888881888888888888
+8888882888888888888
+8888882888888888888
+3888882888888888888
+8888882888888888888
+8888882888888888888
+8888882888888888888
+8888888888888888288
+8888888888888888288
+8888888888888888288
+8888888888888888288
+8888888888888888288
+8888888888888888188
+8888888888888888288
+8888888888888888188
+8888888888888888288
+8888888888888888188
+=== train 1 output
+8888882888888888888
+8888882888888888888
+8888882888888888888
+3333382888883333333
+8888382888883888888
+8888382888883888888
+8888382888883888888
+8888388888883888288
+8888333333333888288
+8888888888888888288
+8888888888888888288
+8888888888888888288
+8888888888888888288
+8888888888888888288
+8888888888888888288
+8888888888888888288
+8888888888888888288
+
+exec
+/bin/bash -lc "sed -n '398,450p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+    """List of components from a boolean mask, each as an (N,2) coords array."""
+    lab, n = label_mask(mask, connectivity=connectivity)
+    return [np.argwhere(lab == k) for k in range(1, n + 1)]
+
+
+def find_components(
+    grid: np.ndarray,
+    *,
+    bg: int | None = None,
+    connectivity: int = 4,
+    monochromatic: bool = True,
+    colors: Sequence[int] | None = None,
+    min_area: int = 1,
+    return_format: str = "dict",
+) -> list[dict] | list[np.ndarray]:
+    """
+    Find connected components in a grid (unified API for ARC-2 + migrated seeds).
+
+    return_format:
+      - \"dict\": list of dicts {color, coords, bbox, area}
+      - \"objects\": list of full-grid arrays containing exactly one component
+    """
+    if bg is None:
+        bg = get_bg(grid)
+    bg = int(bg)
+
+    return_format = str(return_format).lower().strip()
+    if return_format not in {"dict", "objects"}:
+        raise ValueError("find_components: return_format must be 'dict' or 'objects'")
+
+    if colors is None:
+        colors_set = None
+        colors_iter = sorted(set(map(int, grid.flatten())) - {bg})
+    else:
+        colors_set = {int(c) for c in colors}
+        colors_iter = [int(c) for c in colors_set if int(c) != bg]
+
+    # Monochromatic = label per-color
+    if monochromatic:
+        if return_format == "dict":
+            out: list[dict] = []
+            for col in colors_iter:
+                mask = (grid == col)
+                if not mask.any():
+                    continue
+                comps = components_mask(mask, connectivity=connectivity)
+                for coords in comps:
+                    if int(coords.shape[0]) < int(min_area):
+                        continue
+                    out.append(
+                        {
+                            "color": int(col),
+
+codex
+设计已经收敛到一个小改动面：仍然求完整最短少拐弯路径，但输出只保留每次方向变化附近的绿色“L”形标记。下面我会先用几个具体路径例子验证这种标记不会退化成连续线，再落到代码和生成校验上。
+Implement D4 by preserving pathfinding and changing only the path rendering plus generator validation/metrics.
+  ✓ Inspect original task behavior and confirm how turns appear in solved paths
+  → Design precise corner-marking rule and generator-side validity checks for visible discrete turn markers
+  • Write variant code with analysis comments and updated solver/generator
+  • Run success-rate and behavior-distribution tests, iterate until stable
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util, numpy as np
+spec=importlib.util.spec_from_file_location('orig','/home/lixinyu/snap/new/arc2_solver_select/cb2d8a2c.py')
+mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+DIRS=[(-1,0),(0,1),(1,0),(0,-1)]
+
+def path_and_turns(grid):
+    g=np.array(grid,copy=True)
+    h,w=g.shape
+    BG=8; GREEN=3; BLUE=1; RED=2
+    pts=np.argwhere(g==GREEN); sr,sc=map(int,pts[0])
+    if sr==0: init_dir=2; goal_kind='row'; goal_val=h-1
+    elif sr==h-1: init_dir=0; goal_kind='row'; goal_val=0
+    elif sc==0: init_dir=1; goal_kind='col'; goal_val=w-1
+    else: init_dir=3; goal_kind='col'; goal_val=0
+    def is_goal(r,c): return (r==goal_val) if goal_kind=='row' else (c==goal_val)
+    from arc_utils import components_mask, neighbors4
+    import heapq
+    from collections import deque
+    bar_mask=(g==BLUE)|(g==RED)
+    comps=components_mask(bar_mask, connectivity=4)
+    forbidden=np.zeros((h,w),dtype=bool)
+    for comp in comps:
+        radius=sum(1 for r,c in comp if g[r,c]==BLUE)
+        dist=np.full((h,w),-1,dtype=np.int16)
+        q=deque()
+        for r,c in comp:
+            dist[r,c]=0;q.append((r,c))
+        while q:
+            r,c=q.popleft(); d=int(dist[r,c]); forbidden[r,c]=True
+            if d==radius: continue
+            for rr,cc in neighbors4(r,c):
+                if 0<=rr<h and 0<=cc<w and dist[rr,cc]==-1:
+                    dist[rr,cc]=d+1;q.append((rr,cc))
+    blocked=bar_mask|forbidden; blocked[sr,sc]=False
+    INF=(10**9,10**9)
+    best={(sr,sc,init_dir):(0,0)}; prev={}; heap=[((0,0),sr,sc,init_dir)]
+    goal=None
+    while heap:
+        (steps,turns),r,c,dprev=heapq.heappop(heap)
+        if (steps,turns)"'!=best.get((r,c,dprev),INF): continue
+        if is_goal(r,c) and (r,c)!=(sr,sc): goal=(r,c,dprev); break
+        for nd,(dr,dc) in enumerate(DIRS):
+            rr,cc=r+dr,c+dc
+            if not (0<=rr<h and 0<=cc<w): continue
+            if blocked[rr,cc]: continue
+            ncost=(steps+1, turns+(nd!=dprev))
+            key=(rr,cc,nd)
+            if ncost<best.get(key,INF):
+                best[key]=ncost; prev[key]=(r,c,dprev); heapq.heappush(heap,(ncost,rr,cc,nd))
+    path=[]; st=goal
+    while True:
+        r,c,_=st; path.append((r,c))
+        if (r,c)==(sr,sc): break
+        st=prev[st]
+    path.reverse()
+    turns=[]
+    dirs=[]
+    for (r0,c0),(r1,c1) in zip(path,path[1:]):
+        dirs.append((r1-r0,c1-c0))
+    for i in range(1,len(path)-1):
+        if dirs[i-1]!=dirs[i]:
+            turns.append(path[i])
+    return path,turns
+
+stats=[]
+for i in range(100):
+    inp=mod.generate_input()
+    path,turns=path_and_turns(inp)
+    stats.append((len(path), len(turns)))
+print('"'samples', len(stats))
+print('turn counts', sorted(set(t for _,t in stats)))
+from collections import Counter
+print('turn freq', Counter(t for _,t in stats))
+print('min path', min(l for l,_ in stats), 'max path', max(l for l,_ in stats))
+print('example few', stats[:10])
+PY" in /home/lixinyu/snap/new
+ succeeded in 1167ms:
+samples 100
+turn counts [2, 4, 6, 8]
+turn freq Counter({4: 32, 2: 29, 6: 24, 8: 15})
+min path 19 max path 62
+example few [(46, 4), (23, 4), (48, 8), (37, 8), (26, 2), (30, 4), (50, 6), (51, 6), (59, 8), (45, 6)]
+
+codex
+我在批量抽样原生成器，统计真实路径的长度和转弯数。这个结果会直接决定转角标记应该画多长，以及生成器是否需要额外避开“两个转角标记粘连”的情况。
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util, numpy as np
+from collections import Counter
+spec=importlib.util.spec_from_file_location('orig','/home/lixinyu/snap/new/arc2_solver_select/cb2d8a2c.py')
+mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+from arc_utils import components_mask, neighbors4
+from collections import deque
+import heapq
+DIRS=[(-1,0),(0,1),(1,0),(0,-1)]
+
+def path_and_turn_indices(grid):
+    g=np.array(grid,copy=True)
+    h,w=g.shape
+    BG=8; GREEN=3; BLUE=1; RED=2
+    pts=np.argwhere(g==GREEN); sr,sc=map(int,pts[0])
+    if sr==0: init_dir=2; goal_kind='row'; goal_val=h-1
+    elif sr==h-1: init_dir=0; goal_kind='row'; goal_val=0
+    elif sc==0: init_dir=1; goal_kind='col'; goal_val=w-1
+    else: init_dir=3; goal_kind='col'; goal_val=0
+    def is_goal(r,c): return (r==goal_val) if goal_kind=='row' else (c==goal_val)
+    bar_mask=(g==BLUE)|(g==RED)
+    comps=components_mask(bar_mask, connectivity=4)
+    forbidden=np.zeros((h,w),dtype=bool)
+    for comp in comps:
+        radius=sum(1 for r,c in comp if g[r,c]==BLUE)
+        dist=np.full((h,w),-1,dtype=np.int16)
+        q=deque(comp.tolist())
+        for r,c in comp: dist[r,c]=0
+        while q:
+            r,c=q.popleft(); d=int(dist[r,c]); forbidden[r,c]=True
+            if d==radius: continue
+            for rr,cc in neighbors4(r,c):
+                if 0<=rr<h and 0<=cc<w and dist[rr,cc]==-1:
+                    dist[rr,cc]=d+1; q.append((rr,cc))
+    blocked=bar_mask|forbidden; blocked[sr,sc]=False
+    INF=(10**9,10**9)
+    best={(sr,sc,init_dir):(0,0)}; prev={}; heap=[((0,0),sr,sc,init_dir)]
+    goal=None
+    while heap:
+        (steps,turns),r,c,dprev=heapq.heappop(heap)
+        if (steps,turns)"'!=best.get((r,c,dprev),INF): continue
+        if is_goal(r,c) and (r,c)!=(sr,sc): goal=(r,c,dprev); break
+        for nd,(dr,dc) in enumerate(DIRS):
+            rr,cc=r+dr,c+dc
+            if 0<=rr<h and 0<=cc<w and not blocked[rr,cc]:
+                ncost=(steps+1,turns+(nd!=dprev)); key=(rr,cc,nd)
+                if ncost<best.get(key,INF):
+                    best[key]=ncost; prev[key]=(r,c,dprev); heapq.heappush(heap,(ncost,rr,cc,nd))
+    path=[]; st=goal
+    while True:
+        r,c,_=st; path.append((r,c))
+        if (r,c)==(sr,sc): break
+        st=prev[st]
+    path.reverse()
+    step_dirs=[(path[i+1][0]-path[i][0], path[i+1][1]-path[i][1]) for i in range(len(path)-1)]
+    turn_idx=[]
+    for i in range(1,len(path)-1):
+        if step_dirs[i-1]!=step_dirs[i]: turn_idx.append(i)
+    return path,turn_idx
+
+min_sep=999
+freq=Counter()
+for _ in range(200):
+    inp=mod.generate_input(); path,idxs=path_and_turn_indices(inp)
+    if len(idxs)>=2:
+        seps=[b-a for a,b in zip(idxs,idxs[1:])]
+        min_sep=min(min_sep,min(seps))
+        freq.update(seps)
+print('"'min turn-index separation', min_sep)
+print('small separations', {k:v for k,v in sorted(freq.items()) if k<=8})
+PY" in /home/lixinyu/snap/new
+ succeeded in 1961ms:
+min turn-index separation 1
+small separations {1: 12, 2: 16, 3: 27, 4: 72, 5: 54, 6: 91, 7: 77, 8: 109}
+
+codex
+实现前还有一个实际问题要确认：目标文件从 `ceshi/code/...` 被单独加载时，`arc_utils` 的导入路径可能和原文件不同。我先验证导入环境，避免写完后在测试里因为路径问题直接失败。
+exec
+/bin/bash -lc 'ls /home/lixinyu/snap/new | head' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+''
+ARC-data
+Visualization.ipynb
+__pycache__
+arc-agi-2-eval-annotations-merge.json
+arc2_mechanism_tags_raw.json
+arc2_solver_select
+arc_utils.py
+ceshi
+combo_prompt_builder.py
+
+exec
+/bin/bash -lc 'find /home/lixinyu/snap/new -maxdepth 2 -name arc_utils.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+/home/lixinyu/snap/new/solvers/arc_utils.py
+/home/lixinyu/snap/new/arc_utils.py
+/home/lixinyu/snap/new/arc2_solver_select/arc_utils.py
+
+exec
+/bin/bash -lc "python - <<'PY'
+import sys
+print(sys.path[:5])
+try:
+    import arc_utils
+    print('arc_utils import ok from', arc_utils.__file__)
+except Exception as e:
+    print('arc_utils import failed:', e)
+PY" in /home/lixinyu/snap/new
+ succeeded in 239ms:
+['', '/home/xd/miniconda3/lib/python310.zip', '/home/xd/miniconda3/lib/python3.10', '/home/xd/miniconda3/lib/python3.10/lib-dynload', '/home/lixinyu/.local/lib/python3.10/site-packages']
+arc_utils import ok from /home/lixinyu/snap/new/arc_utils.py
+
+codex
+准备开始落代码。改动会集中在三处：抽出完整路径用于识别转角、把连续涂路径改成只涂转角附近 3 格的 L 标记、把生成器验证从“到达对边”改成“确实存在被隐藏的直线段”。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code/cb2d8a2c/D4/3' in /home/lixinyu/snap/new
+ succeeded in 0ms:

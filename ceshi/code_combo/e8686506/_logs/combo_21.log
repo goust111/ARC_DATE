@@ -1,0 +1,3907 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e2fc1-3230-7a33-9106-b1e8f614162e
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: e8686506
+    **摘要**: 将散落在背景上的彩色像素碎片（拼图块）通过边缘对齐拼装成一个完整的矩形复合图案，输出具有严格的左右镜像对称性，同色碎片不可4-连通相邻
+
+    ## 要实现的融合组合
+    - **组合名称**: 连接器标记匹配+碎片带锚点
+    - **combo_spec**: D1/1+D2/1
+
+    ### 融合描述（实现规格）
+
+    每个碎片边上有特殊颜色的连接器突出像素，同时每个碎片有一个锚点像素。 连接器决定哪些碎片边可以相邻（颜色和位置匹配），锚点需对齐到目标位置的标记。 解题者需同时处理两种标记系统：连接器用于确定碎片间关系，锚点用于确定绝对位置。 两种标记协同定位，推理从纯几何变为'标记识别+配对+定位'。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D1/1** — 匹配条件：边缘对齐拼合 vs 其他匹配逻辑 (`match_cond`)
+  - 当前值: s.edge.position aligns with d.adjacent_piece.edge — 碎片的边缘位置与相邻碎片对齐，形成连续矩形
+  - 改为: 连接器标记匹配 — 每个碎片的某条边上有一个特殊颜色的突出像素（连接器），只有连接器颜色和位置匹配的碎片边才能相邻。增加了局部特征识别的推理层
+  - 来源: connector_match（参考任务: 20270e3b）
+- **D2/1** — 源对象：碎片的类型与结构 (`src`)
+  - 当前值: 散落的单色非背景像素碎片和精灵片段，每个碎片为单一颜色的连通区域
+  - 改为: 碎片带锚点标记 — 每个碎片有一个特殊颜色的锚点像素，拼合时锚点必须对齐到目标位置的对应标记。增加了点对点的精确对位要求
+  - 来源: anchor_points（参考任务: 4c416de3）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/e8686506.py`
+
+    ```python
+    import numpy as np
+
+from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
+import random
+
+
+def _piece_sig(pts: np.ndarray) -> tuple[int, int, tuple[tuple[int, int], ...]]:
+    r0, c0, r1, c1 = bbox_coords(pts)
+    coords = tuple(sorted((int(r) - r0, int(c) - c0) for r, c in pts))
+    return (r1 - r0 + 1), (c1 - c0 + 1), coords
+
+
+def _factors(n: int) -> list[tuple[int, int]]:
+    out = []
+    for w in range(1, n + 1):
+        if n % w == 0:
+            h = n // w
+            out.append((h, w))
+    return out
+
+
+def _build_requirements(
+    H: int,
+    W: int,
+    comps_by_color: dict[int, list[list[tuple[int, int]]]],
+) -> np.ndarray:
+    """
+    Build per-cell required color constraints (req[r,c] == -1 means unconstrained).
+
+    Heuristics supported by training examples:
+      - If there is a color with exactly 4 singleton components, those are the four corners.
+      - If there are full horizontal bars of length W-2 in the input, use them as the top/bottom edges
+        between the corners (ordered by their vertical position in the input).
+      - If there is a color with exactly two full vertical line components (width=1) in the input,
+        place them on the left/right edges centered vertically.
+    """
+    req = np.full((H, W), -1, dtype=int)
+
+    # 4 singleton components -> corners
+    corner_colors = [
+        col
+        for col, comps in comps_by_color.items()
+        if len(comps) == 4 and all(len(p) == 1 for p in comps)
+    ]
+    assert len(corner_colors) <= 1, "corner singleton color must be unique when present"
+    corner_color = corner_colors[0] if corner_colors else None
+    if corner_color is not None:
+        req[0, 0] = corner_color
+        req[0, W - 1] = corner_color
+        req[H - 1, 0] = corner_color
+        req[H - 1, W - 1] = corner_color
+
+    # Horizontal bar(s) of length W-2 (filled, height 1)
+    bar_colors: list[tuple[int, int]] = []  # (min_input_row, color)
+    if W >= 3 and corner_color is not None:
+        for col, comps in comps_by_color.items():
+            for pts in comps:
+                r0, c0, r1, c1 = bbox_coords(pts)
+                hh, ww = r1 - r0 + 1, c1 - c0 + 1
+                if hh == 1 and ww == (W - 2) and len(pts) == ww:
+                    bar_colors.append((r0, col))
+                    break
+        if bar_colors:
+            assert len(bar_colors) <= 2, "horizontal edge bar colors must be top/bottom only"
+            bar_colors.sort()
+            top_col = bar_colors[0][1]
+            bot_col = bar_colors[-1][1]
+            req[0, 1 : W - 1] = top_col
+            req[H - 1, 1 : W - 1] = bot_col
+
+    # Two full vertical line components -> left/right edges, centered vertically
+    vertical_line_candidates = []
+    for col, comps in comps_by_color.items():
+        if len(comps) != 2:
+            continue
+        sigs = [_piece_sig(pts) for pts in comps]
+        (h0, w0, coords0), (h1, w1, coords1) = sigs[0], sigs[1]
+        if w0 == 1 and w1 == 1 and h0 == h1 and coords0 == coords1 and h0 > 1:
+            vertical_line_candidates.append((col, h0))
+    assert len(vertical_line_candidates) <= 1, "paired vertical edge-line color must be unique when present"
+    if vertical_line_candidates:
+        col, L = vertical_line_candidates[0]
+        top = (H - L) // 2
+        assert 0 <= top and top + L <= H, "paired vertical edge lines must fit in the output height"
+        req[top : top + L, 0] = col
+        req[top : top + L, W - 1] = col
+
+    return req
+
+
+def _assemble(
+    types: list[dict],
+    H: int,
+    W: int,
+    req: np.ndarray,
+    disallow_touch: set[int] | None = None,
+) -> np.ndarray:
+    board = np.full((H, W), -1, dtype=int)
+    counts = [int(t["cnt"]) for t in types]
+
+    def mirror_ok(r: int, c: int, col: int) -> bool:
+        mc = W - 1 - c
+        v = board[r, mc]
+        return (v == -1) or (v == col)
+
+    def can_place(ti: int, r0: int, c0: int) -> bool:
+        t = types[ti]
+        col = int(t["col"])
+        is_singleton = len(t["coords"]) == 1
+        for dr, dc in t["coords"]:
+            r, c = r0 + dr, c0 + dc
+            if board[r, c] != -1:
+                return False
+            if req[r, c] != -1 and int(req[r, c]) != col:
+                return False
+            if not mirror_ok(r, c, col):
+                return False
+            if is_singleton and not (r == 0 or r == H - 1 or c == 0 or c == W - 1):
+                return False
+            if disallow_touch and col in disallow_touch:
+                for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                    if 0 <= rr < H and 0 <= cc < W and board[rr, cc] == col:
+                        return False
+        return True
+
+    def place(ti: int, r0: int, c0: int) -> list[tuple[int, int]]:
+        t = types[ti]
+        col = int(t["col"])
+        changed = []
+        for dr, dc in t["coords"]:
+            r, c = r0 + dr, c0 + dc
+            board[r, c] = col
+            changed.append((r, c))
+        return changed
+
+    def unplace(changed: list[tuple[int, int]]) -> None:
+        for r, c in changed:
+            board[r, c] = -1
+
+    def placements_for(ti: int) -> list[tuple[int, int]]:
+        t = types[ti]
+        return [(r0, c0)
+                for r0 in range(H - int(t["h"]) + 1)
+                for c0 in range(W - int(t["w"]) + 1)
+                if can_place(ti, r0, c0)]
+
+    # Pure constraint propagation: each step, every type must be forced (1 position)
+    # or batch-forced (positions == cnt). No backtracking. Asserts if stuck.
+    changed = True
+    while changed:
+        changed = False
+        for ti in range(len(types)):
+            if counts[ti] <= 0:
+                continue
+            places = placements_for(ti)
+            assert len(places) > 0, "assembly dead end: a piece has no valid placement"
+            if len(places) == 1:
+                counts[ti] -= 1
+                place(ti, places[0][0], places[0][1])
+                changed = True
+            elif len(places) == counts[ti]:
+                for r0, c0 in places:
+                    counts[ti] -= 1
+                    place(ti, r0, c0)
+                changed = True
+    assert all(c == 0 for c in counts), "assembly not purely propagation-solvable"
+    assert np.array_equal(board, board[:, ::-1]), "assembled board must be LR-symmetric"
+    return board
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Assemble scattered colored fragments into a left-right symmetric rectangle, jigsaw-style.
+
+    Input structure:
+    - bg = most common color; remaining colors form small sprite fragments.
+    - Optional roles: 4 singleton pixels of one color mark corners; horizontal bars mark top/bottom edges; paired vertical lines mark left/right edges.
+
+    Rule:
+    - Collect all non-bg connected components as jigsaw pieces.
+    - Determine output rectangle dimensions from total piece area.
+    - Pack pieces into the rectangle so it is exactly mirror-symmetric (left-right) and same-color pieces never 4-touch.
+
+    Key insight: Left-right symmetry plus the no-same-color-touching constraint make the assembly unique; corner/edge markers anchor it when present.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+
+    # Extract pieces (connected components per color)
+    comps_by_color: dict[int, list[list[tuple[int, int]]]] = {}
+    pieces = []
+    color_piece_count: dict[int, int] = {}
+
+    for col in sorted(set(map(int, np.unique(g)))):
+        if col == bg:
+            continue
+        comps = components_mask(g == col, connectivity=4)
+        comps_by_color[col] = comps
+        color_piece_count[col] = len(comps)
+        for pts in comps:
+            _, _, coords = _piece_sig(pts)
+            pieces.append((col, coords))
+
+    # Group identical pieces into types
+    from collections import Counter
+
+    ctr = Counter(pieces)
+    types = []
+    for (col, coords), cnt in sorted(ctr.items(), key=lambda kv: (-len(kv[0][1]), kv[0][0], kv[0][1])):
+        arr = np.array(coords, dtype=int)
+        h = int(arr[:, 0].max() + 1)
+        w = int(arr[:, 1].max() + 1)
+        types.append({"col": int(col), "coords": coords, "h": h, "w": w, "cnt": int(cnt)})
+
+    total_area = sum(int(t["cnt"]) * len(t["coords"]) for t in types)
+    assert total_area > 0, "total_area must be positive: grid must contain non-background pieces"
+
+    # Disallow 4-neigh touching between different pieces of same color (preserve component counts)
+    # Eval inputs use the unique closest-to-square portrait factor pair as the output shape.
+    dims = [(h, w) for (h, w) in _factors(total_area) if h >= w]
+    assert dims, "at least one portrait factor pair must exist for the total piece area"
+    best_gap = min(abs(h - w) for h, w in dims)
+    best_dims = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+    assert len(best_dims) == 1, "closest-to-square portrait output shape must be unique"
+    H, W = best_dims[0]
+
+    # Frame constraint: under 8-connectivity, 1-2 pieces must exist whose union bbox
+    # equals the output rectangle (H x W). Their relative positions are fixed in output.
+    comps8_all = []
+    for col in sorted(set(map(int, np.unique(g))) - {bg}):
+        for pts in components_mask(g == col, connectivity=8):
+            comps8_all.append((int(col), pts))
+    def _is_lr_symmetric(parts, h, w):
+        """Check if the union of frame parts forms an LR-symmetric bitmap."""
+        all_pts = np.concatenate([p for _, p in parts])
+        r0, c0 = int(all_pts[:, 0].min()), int(all_pts[:, 1].min())
+        bmp = np.zeros((h, w), dtype=bool)
+        for _, pts in parts:
+            for r, c in pts:
+                bmp[int(r) - r0, int(c) - c0] = True
+        return np.array_equal(bmp, bmp[:, ::-1])
+
+    frame_parts: list[tuple[int, np.ndarray]] = []
+    for i, (c1, p1) in enumerate(comps8_all):
+        r0, c0, r1, c1b = bbox_coords(p1)
+        if r1 - r0 + 1 == H and c1b - c0 + 1 == W:
+            if _is_lr_symmetric([(c1, p1)], H, W):
+                frame_parts = [(c1, p1)]
+                break
+        for j in range(i + 1, len(comps8_all)):
+            c2, p2 = comps8_all[j]
+            union = np.concatenate([p1, p2])
+            ur0, uc0, ur1, uc1 = bbox_coords(union)
+            if ur1 - ur0 + 1 == H and uc1 - uc0 + 1 == W:
+                if _is_lr_symmetric([(c1, p1), (c2, p2)], H, W):
+                    frame_parts = [(c1, p1), (c2, p2)]
+                    break
+        if frame_parts:
+            break
+    assert frame_parts, "input must contain 1-2 LR-symmetric pieces (8-conn) whose union bbox equals output dims"
+
+    req = _build_requirements(H, W, comps_by_color)
+
+    # Lock frame cells into req: their output positions are determined by input-relative positions.
+    all_frame_pts = np.concatenate([p for _, p in frame_parts])
+    fr0, fc0 = int(all_frame_pts[:, 0].min()), int(all_frame_pts[:, 1].min())
+    for col, pts in frame_parts:
+        for r, c in pts:
+            or_, oc = int(r) - fr0, int(c) - fc0
+            if 0 <= or_ < H and 0 <= oc < W:
+                req[or_, oc] = col
+
+    disallow_touch = {col for col, n in color_piece_count.items() if n > 1}
+    sol = _assemble(types, H, W, req, disallow_touch)
+    return sol.astype(int)
+
+# --------------- generator (o5x) ---------------
+
+# === CFG: Output dimensions ===
+_AREA_MIN = 25               # minimum total piece area
+_AREA_MAX = 50               # maximum total piece area (exclusive upper in range)
+_WIDTH_REQUIRED = 5           # all valid outputs have width 5
+_HEIGHT_MAX = 10              # maximum output height
+
+# === CFG: Color and palette ===
+_N_COLORS_MIN = 4             # min distinct colors in abstract output
+_N_COLORS_MAX = 6             # max distinct colors in abstract output
+_TWO_FRAME_MIN_H = 6          # min height to allow 2-color frame
+_TWO_FRAME_MIN_COLORS = 5     # min palette size to allow 2-color frame
+_TWO_FRAME_PROB = 0.35         # probability of splitting frame into 2 colors
+_CENTER_CAP_PROB = 0.5         # probability of capping center col at top/bottom
+
+# === CFG: Piece constraints ===
+_MAX_PIECE_AREA = 6           # maximum area of any single 4-conn piece
+_MAX_CHUNK_SIZE = 6           # max cells per hole chunk when splitting large holes
+_PIECE_COUNT_MIN = 9          # min total 4-conn components in output
+_PIECE_COUNT_MAX = 17         # max total 4-conn components in output
+
+# === CFG: Canvas / scatter ===
+_CANVAS_MIN = 13              # min canvas dimension (rows and cols)
+_CANVAS_MAX = 15              # max canvas dimension (rows and cols)
+_SCATTER_PADDING = 1          # Chebyshev padding between scattered pieces
+
+# === CFG: Retry ===
+_GEN_MAX_RETRIES = 300        # max attempts in generate_input()
+
+
+def _valid_dims():
+    """Precompute valid (H, W) pairs: unique closest-to-square portrait factorization with W=5."""
+    results = []
+    for area in range(_AREA_MIN, _AREA_MAX + 1):
+        dims = [(area // w, w) for w in range(1, area + 1) if area % w == 0 and area // w >= w]
+        best_gap = min(abs(h - w) for h, w in dims)
+        best = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+        if len(best) == 1:
+            h, w = best[0]
+            if w == _WIDTH_REQUIRED and h <= _HEIGHT_MAX:
+                results.append((h, w))
+    return results
+
+
+_VALID_DIMS = _valid_dims()
+_DIM_WEIGHTS = [h * w for h, w in _VALID_DIMS]
+
+
+def _zigzag_frame(H):
+    """Generate frame bitmap (Hx2 left-half) via zigzag path from top to bottom.
+    Returns (cells, start_c, end_c) where start_c/end_c are the column at top/bottom."""
+    cells = set()
+    start_c = random.randint(0, 1)
+    c = start_c
+    for r in range(H):
+        cells.add((r, c))
+        if r == H - 1:
+            break
+        move = random.choice(['down', 'horiz', 'diag'])
+        if move == 'down':
+            pass
+        elif move == 'horiz':
+            cells.add((r, 1 - c))
+            c = 1 - c
+        else:
+            c = 1 - c
+    return cells, start_c, c
+
+
+def _fill_holes(grid, H, W, half, frame1, frame2, split, fill_pool):
+    """Fill non-frame cells by assigning colors to 4-conn hole regions.
+    Large holes are split into chunks of <= _MAX_CHUNK_SIZE cells."""
+    holes = components_mask(grid == -1, connectivity=4)
+    prev_col = None
+    for hole in holes:
+        cells = sorted((int(r), int(c)) for r, c in hole)
+        # Split into chunks of bounded size
+        chunks = [cells[i:i + _MAX_CHUNK_SIZE] for i in range(0, len(cells), _MAX_CHUNK_SIZE)]
+        for chunk in chunks:
+            # Determine which frame colors are adjacent to this chunk
+            fc_set = {frame1 if r < split else frame2 for r, _ in chunk}
+            # Pick a fill color avoiding frame and previous neighbor
+            avoid = fc_set | ({prev_col} if prev_col else set())
+            opts = [f for f in fill_pool if f not in avoid]
+            if not opts:
+                opts = [f for f in fill_pool if f not in fc_set] or fill_pool
+            col = random.choice(opts)
+            for r, c in chunk:
+                grid[r, c] = col
+                grid[r, W - 1 - c] = col
+            prev_col = col
+
+
+def _build_output(H, W):
+    """Build an abstract LR-symmetric output grid with zigzag frame and filled holes.
+    Returns (grid, frame_colors_set) or (None, set()) on failure."""
+    half = W // 2
+    n_colors = random.randint(_N_COLORS_MIN, _N_COLORS_MAX)
+    palette = list(range(n_colors))
+    random.shuffle(palette)
+
+    use_two_frames = (H >= _TWO_FRAME_MIN_H and n_colors >= _TWO_FRAME_MIN_COLORS
+                      and random.random() < _TWO_FRAME_PROB)
+    ci = 0
+    frame1 = palette[ci]; ci += 1
+    frame2 = frame1
+    if use_two_frames:
+        frame2 = palette[ci]; ci += 1
+    fill_pool = palette[ci:]
+    if not fill_pool:
+        return None, set()
+
+    frame_half, start_c, end_c = _zigzag_frame(H)
+    split = H // 2 if frame1 != frame2 else H
+
+    grid = np.full((H, W), -1, dtype=int)
+
+    # Paint frame cells (mirror left half to right)
+    for r, c in frame_half:
+        fc = frame1 if r < split else frame2
+        grid[r, c] = fc
+        grid[r, W - 1 - c] = fc
+
+    # Cap center column at top/bottom when zigzag endpoint is adjacent
+    if start_c == 1 and random.random() < _CENTER_CAP_PROB:
+        grid[0, half] = frame1
+    if end_c == 1 and random.random() < _CENTER_CAP_PROB:
+        grid[H - 1, half] = frame2
+
+    _fill_holes(grid, H, W, half, frame1, frame2, split, fill_pool)
+
+    if np.any(grid < 0):
+        return None, set()
+    frame_set = {frame1}
+    if frame2 != frame1:
+        frame_set.add(frame2)
+    return grid, frame_set
+
+
+def _make_output() -> tuple[np.ndarray | None, int, set[int]]:
+    """Select dims, build abstract output, then remap to real ARC colors."""
+    H, W = random.choices(_VALID_DIMS, weights=_DIM_WEIGHTS, k=1)[0]
+    out, abstract_fcs = _build_output(H, W)
+    if out is None:
+        return None, 0, set()
+    bg = random.randint(0, 9)
+    abstract = sorted(np.unique(out))
+    available = [c for c in range(10) if c != bg]
+    random.shuffle(available)
+    if len(available) < len(abstract):
+        return None, 0, set()
+    cmap = {int(a): available[i] for i, a in enumerate(abstract)}
+    real_fcs = {cmap[a] for a in abstract_fcs}
+    return np.vectorize(lambda x: cmap[int(x)])(out), bg, real_fcs
+
+
+def _extract_non_frame_patches(out, bg, fcs):
+    """Extract non-frame piece patches from the output grid, sorted largest-first."""
+    patches = []
+    for col in sorted(map(int, np.unique(out))):
+        if col in fcs:
+            continue
+        for pts in components_mask(out == col, connectivity=4):
+            r0, c0, r1, c1 = bbox_coords(pts)
+            patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
+            for r, c in pts:
+                patch[int(r) - r0, int(c) - c0] = col
+            patches.append(patch)
+    random.shuffle(patches)
+    patches.sort(key=lambda p: (-(p != bg).sum(), random.random()))
+    return patches
+
+
+def _scatter(out: np.ndarray, bg: int, fcs: set[int]) -> np.ndarray:
+    """Place pieces onto a canvas: frame as a group, non-frame scattered with padding."""
+    rows = random.randint(_CANVAS_MIN, _CANVAS_MAX)
+    cols = random.randint(_CANVAS_MIN, _CANVAS_MAX)
+    canvas = np.full((rows, cols), bg, dtype=int)
+    oh, ow = out.shape
+
+    max_r = rows - oh - 2
+    max_c = cols - ow - 2
+    if max_r < 1 or max_c < 1:
+        raise ValueError
+    off_r = random.randint(1, max_r)
+    off_c = random.randint(1, max_c)
+
+    # Block the entire frame bbox so fill pieces stay outside the outline
+    canvas[off_r:off_r + oh, off_c:off_c + ow] = -1
+
+    # Scatter non-frame pieces into the area OUTSIDE the blocked bbox
+    for patch in _extract_non_frame_patches(out, bg, fcs):
+        r, c = random_free_location(canvas, patch, transparent=bg,
+                                    padding=_SCATTER_PADDING, padding_connectivity=8)
+        paste(canvas, patch, r, c, transparent=bg)
+
+    # Replace blocked bbox with frame cells (non-frame positions revert to bg)
+    frame_mask = np.zeros((oh, ow), dtype=bool)
+    for col in fcs:
+        frame_mask |= (out == col)
+    bbox_region = canvas[off_r:off_r + oh, off_c:off_c + ow]
+    bbox_region[:] = bg
+    bbox_region[frame_mask] = out[frame_mask]
+    return canvas
+
+
+def _piece_count(out: np.ndarray) -> int:
+    return sum(len(components_mask(out == col, connectivity=4)) for col in np.unique(out))
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Single generation attempt: build output, validate constraints, scatter, oracle check."""
+    out, bg, fcs = _make_output()
+    if out is None:
+        return None
+    if not np.array_equal(out, out[:, ::-1]):
+        return None
+    if not (_N_COLORS_MIN <= len(np.unique(out)) <= _N_COLORS_MAX):
+        return None
+    pc = _piece_count(out)
+    if not (_PIECE_COUNT_MIN <= pc <= _PIECE_COUNT_MAX):
+        return None
+    if any(len(pts) > _MAX_PIECE_AREA for col in np.unique(out)
+           for pts in components_mask(out == col, connectivity=4)):
+        return None
+    try:
+        inp = _scatter(out, bg, fcs)
+        got = main(inp)
+    except Exception:
+        return None
+    if np.array_equal(got, out):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(_GEN_MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate a valid e8686506 input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  task: assemble scattered jigsaw pieces into a LR-symmetric dense rectangle
+  input_grid: 13-15 rows x 13-15 cols, single bg color fills most cells
+  output_grid: H x W dense rectangle, H >= W (portrait), dims = closest-to-square factor pair of total piece area
+  output_dims_observed: 5x5 (area=25) or 8x5 (area=40)
+  output_symmetry: exact left-right mirror; UD symmetry NOT required
+  pieces:
+    connectivity: each piece is a single-color 8-connected component (NOT 4-connected)
+    total_count: 9-17
+    distinct_colors: 4-6
+    area_per_piece: 1-6
+    total_area: 25-40 [observed]; must have unique closest-to-square portrait factor pair
+    shapes: rectangles, L/C/zigzag fragments; no rotation applied
+    mirror_pairing: asymmetric pieces come in LR-mirror pairs (same color); self-symmetric pieces may appear alone or in matched counts
+  frame_constraint: |
+    REQUIRED: 1-2 pieces (8-connected) whose union bounding box = output rectangle dims (H x W)
+    and whose union bitmap is LR-symmetric. These "frame" pieces outline the assembled
+    rectangle via a zigzag contour. In the input, frame pieces are placed as a group
+    preserving their relative positions from the output, so the rectangular outline is
+    visually recognizable. Non-frame pieces are scattered freely.
+  uniqueness: REQUIRED — the assembly must be solvable by pure constraint propagation
+    (each step, every remaining piece has exactly one valid placement, or a batch
+    where positions = copies). No backtracking needed. Frame locks most cells;
+    irregular hole shapes force remaining pieces into unique positions.
+  singletons_on_border: 1x1 pieces only appear on the output rectangle border [observed 100%]
+  optional_anchors:
+    corner_markers: 0-1 colors with exactly 4 singleton pixels -> placed at 4 output corners [observed in 2/3]
+    h_bar_edges: 0-2 horizontal bars of width W-2 -> top/bottom edges between corners, ordered by input row [observed in 2/3]
+    v_line_pairs: 0-1 colors with 2 identical vertical lines -> left/right edges centered vertically [observed in 2/3]
+  input_scatter: pieces placed on bg grid with min Chebyshev distance 1 between any two pieces; no overlaps
+
+generation_strategy:
+  approach: output-first
+  steps:
+    1. Choose output dims H x W (H >= W, W odd so center column exists, area has unique closest-to-square portrait factorization).
+    2. Generate frame via zigzag path on the Hx2 left-half grid (top-to-bottom,
+       3 moves: down/horiz+down/diag). Mirror to right half. Optionally cap
+       top/bottom center col if endpoint is at col 1. Optionally split frame
+       into 2 colors (top/bottom halves) for visual variety.
+    3. Frame divides the rectangle into hole regions (4-conn components of
+       non-frame cells). Fill each hole with one color (split if >6 cells).
+       This produces irregular pieces whose shapes match the hole contours.
+    4. Mirror left half to right half for LR symmetry.
+    5. Extract each 4-conn component as a piece. Validate: 9-17 pieces,
+       area 1-6 each, 4-6 distinct colors, 1x1 pieces on border only.
+    6. Scatter pieces onto 13-15 x 13-15 input grid. Frame pieces placed as
+       a group at output-relative positions (bbox blocked to keep interior clean).
+       Non-frame pieces scattered in remaining space.
+    7. Validate: solver recovers output via pure constraint propagation.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+## 已有单变体参考代码
+
+以下组成项已有单变体实现，可作为融合时的参考：
+
+            ### 参考代码: D1/1
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/e8686506/D1/1/code.py`
+
+            ```python
+            # Variant of e8686506
+# Dimension: D1 — 匹配条件：边缘对齐拼合 vs 其他匹配逻辑 (match_cond)
+# Change: s.edge.position aligns with d.adjacent_piece.edge — 碎片的边缘位置与... → 连接器标记匹配
+
+import random
+from collections import defaultdict
+
+import numpy as np
+
+from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
+
+
+# ---------------------------------------------------------------------------
+# Design analysis for the D1 variant
+# ---------------------------------------------------------------------------
+# variant_spec:
+#   core_change:
+#     old: pieces were effectively positioned by output-frame locks plus shape fitting.
+#     new: each piece is now a multicolor 8-connected sprite; special connector pixels
+#       on piece boundaries must meet an equal-colored connector on a neighboring piece.
+#       Two pieces may touch in the final rectangle only when their shared boundary
+#       contains at least one connector-to-connector contact.
+#   concrete_visualization:
+#     input:
+#       - one anchored frame piece still appears as a grouped outline with its original
+#         output-relative geometry preserved.
+#       - the other pieces are scattered, but they are no longer monochrome; small
+#         accent pixels of fixed connector colors sit on their edges.
+#     output:
+#       - the dense rectangle remains exact LR-symmetric.
+#       - connector pixels remain visible in the assembled rectangle as small equal-
+#         colored pairs straddling seams between neighboring pieces.
+#   behavior_trace:
+#     original_local_step:
+#       - choose a piece placement because its outline is the only way to fit a hole
+#         while respecting border/color heuristics.
+#     variant_local_step:
+#       - choose a piece placement because, once translated into the rectangle, one or
+#         more of its connector pixels land directly beside equal-colored connector
+#         pixels on already anchored pieces.
+#       - mere edge contact is insufficient; touching a neighbor without a connector
+#         match is rejected.
+#   complexity_calibration:
+#     - the frame anchor and LR symmetry are preserved so the task does not become an
+#       unconstrained global search.
+#     - connector colors are fixed and visually repeated across multiple seams so the
+#       new rule is observable from a few examples.
+#     - width stays 5 and height stays 8; this is an intentional adaptation so pieces
+#       have enough interior contact structure for connector matching to be visible.
+#   implicit_assumption_audit:
+#     - original solver extracted pieces per color; that breaks once pieces are
+#       multicolor, so the new solver extracts 8-connected non-bg components.
+#     - original same-color-touch prohibition is no longer a reliable piece-boundary
+#       cue, so it is removed from legality checks.
+#     - original per-cell req-color anchors based on singleton/bar colors are tied to
+#       monochrome pieces and are dropped; the frame piece now provides the main anchor.
+#     - mirror checks remain valid, but now they apply to exact cell colors, including
+#       connector colors.
+#   placement_legality:
+#     - generator keeps pieces non-overlapping when scattered and keeps the frame bbox
+#       reserved, so input components stay separable.
+#     - solver placements must fit in bounds, avoid overlap, preserve LR symmetry, and
+#       touch the existing assembly through at least one connector-matched interface.
+#   observability_and_cleanliness:
+#     - connector colors are fixed, sparse, and only used for connectors, so the new
+#       matching cue is visually isolated from ordinary body colors.
+#     - the frame remains a single anchored outline, preventing the scene from looking
+#       like arbitrary colored noise.
+
+
+CONNECTOR_COLORS = (6, 7, 8)
+
+
+def _piece_sig(pts: np.ndarray) -> tuple[int, int, tuple[tuple[int, int], ...]]:
+    r0, c0, r1, c1 = bbox_coords(pts)
+    coords = tuple(sorted((int(r) - r0, int(c) - c0) for r, c in pts))
+    return (r1 - r0 + 1), (c1 - c0 + 1), coords
+
+
+def _factors(n: int) -> list[tuple[int, int]]:
+    out = []
+    for w in range(1, n + 1):
+        if n % w == 0:
+            h = n // w
+            out.append((h, w))
+    return out
+
+
+def _normalize_piece(pts: np.ndarray, grid: np.ndarray) -> dict:
+    r0, c0, r1, c1 = bbox_coords(pts)
+    cells = []
+    for r, c in pts:
+        dr = int(r) - int(r0)
+        dc = int(c) - int(c0)
+        cells.append((dr, dc, int(grid[int(r), int(c)])))
+    cells.sort()
+    coords = {(dr, dc) for dr, dc, _col in cells}
+    connectors = {(dr, dc) for dr, dc, col in cells if col in CONNECTOR_COLORS}
+    return {
+        "cells": tuple(cells),
+        "coords": coords,
+        "connectors": connectors,
+        "h": int(r1 - r0 + 1),
+        "w": int(c1 - c0 + 1),
+        "area": int(len(cells)),
+        "src_bbox": (int(r0), int(c0), int(r1), int(c1)),
+    }
+
+
+def _is_lr_symmetric_mask(coords: set[tuple[int, int]], H: int, W: int) -> bool:
+    bmp = np.zeros((H, W), dtype=bool)
+    for r, c in coords:
+        bmp[int(r), int(c)] = True
+    return np.array_equal(bmp, bmp[:, ::-1])
+
+
+def _find_frame_group(pieces: list[dict], H: int, W: int) -> list[tuple[int, int, int]]:
+    def group_ok(idxs: list[int]) -> list[tuple[int, int, int]] | None:
+        boxes = [pieces[i]["src_bbox"] for i in idxs]
+        gr0 = min(int(b[0]) for b in boxes)
+        gc0 = min(int(b[1]) for b in boxes)
+        gr1 = max(int(b[2]) for b in boxes)
+        gc1 = max(int(b[3]) for b in boxes)
+        if int(gr1 - gr0 + 1) != H or int(gc1 - gc0 + 1) != W:
+            return None
+        coords = set()
+        anchors = []
+        for i in idxs:
+            pr0, pc0, _pr1, _pc1 = pieces[i]["src_bbox"]
+            anchors.append((int(i), int(pr0 - gr0), int(pc0 - gc0)))
+            for dr, dc, _col in pieces[i]["cells"]:
+                coords.add((int(pr0 - gr0 + dr), int(pc0 - gc0 + dc)))
+        if not _is_lr_symmetric_mask(coords, H, W):
+            return None
+        return anchors
+
+    found: list[tuple[int, list[tuple[int, int, int]]]] = []
+    for i in range(len(pieces)):
+        got = group_ok([i])
+        if got is not None:
+            area = sum(int(pieces[idx]["area"]) for idx in [i])
+            found.append((area, got))
+    for i in range(len(pieces)):
+        for j in range(i + 1, len(pieces)):
+            got = group_ok([i, j])
+            if got is not None:
+                area = int(pieces[i]["area"]) + int(pieces[j]["area"])
+                found.append((area, got))
+    assert found, "expected at least one 1-2 piece LR-symmetric frame group"
+    best_area = min(area for area, _got in found)
+    best = [got for area, got in found if area == best_area]
+    assert len(best) == 1, "expected a unique minimum-area frame group"
+    return best[0]
+
+
+def _assemble(pieces: list[dict], H: int, W: int, frame_group: list[tuple[int, int, int]]) -> np.ndarray:
+    board = np.full((H, W), -1, dtype=int)
+    owner = np.full((H, W), -1, dtype=int)
+    is_connector = np.zeros((H, W), dtype=bool)
+    placed: dict[int, tuple[int, int]] = {}
+
+    def can_place(pi: int, r0: int, c0: int, require_touch: bool) -> bool:
+        piece = pieces[pi]
+        local_cells = {}
+        touched_neighbors: set[int] = set()
+        matched_any = False
+        connector_touch_ok: dict[tuple[int, int], bool] = {}
+        connector_has_occupied_neighbor: dict[tuple[int, int], bool] = {}
+
+        for dr, dc, col in piece["cells"]:
+            r, c = int(r0 + dr), int(c0 + dc)
+            if not (0 <= r < H and 0 <= c < W):
+                return False
+            if owner[r, c] != -1:
+                return False
+            local_cells[(r, c)] = int(col)
+
+        for (r, c), col in local_cells.items():
+            mc = W - 1 - int(c)
+            if (r, mc) in local_cells and int(local_cells[(r, mc)]) != int(col):
+                return False
+            if owner[r, mc] != -1 and int(board[r, mc]) != int(col):
+                return False
+
+        for dr, dc, col in piece["cells"]:
+            r, c = int(r0 + dr), int(c0 + dc)
+            here_is_connector = (int(dr), int(dc)) in piece["connectors"]
+            if here_is_connector:
+                connector_touch_ok[(r, c)] = False
+                connector_has_occupied_neighbor[(r, c)] = False
+            for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                if not (0 <= rr < H and 0 <= cc < W):
+                    continue
+                if (rr, cc) in local_cells:
+                    continue
+                if owner[rr, cc] == -1:
+                    continue
+                nid = int(owner[rr, cc])
+                touched_neighbors.add(nid)
+                if here_is_connector:
+                    connector_has_occupied_neighbor[(r, c)] = True
+                if here_is_connector and bool(is_connector[rr, cc]) and int(board[rr, cc]) == int(col):
+                    matched_any = True
+                    connector_touch_ok[(r, c)] = True
+
+        if require_touch and not touched_neighbors:
+            return False
+        if touched_neighbors and not matched_any:
+            return False
+        for pos, had_occ in connector_has_occupied_neighbor.items():
+            if had_occ and not connector_touch_ok[pos]:
+                return False
+        return True
+
+    def place(pi: int, r0: int, c0: int) -> list[tuple[int, int]]:
+        piece = pieces[pi]
+        changed = []
+        for dr, dc, col in piece["cells"]:
+            r, c = int(r0 + dr), int(c0 + dc)
+            board[r, c] = int(col)
+            owner[r, c] = int(pi)
+            is_connector[r, c] = (int(dr), int(dc)) in piece["connectors"]
+            changed.append((r, c))
+        placed[int(pi)] = (int(r0), int(c0))
+        return changed
+
+    def unplace(pi: int, changed: list[tuple[int, int]]) -> None:
+        for r, c in changed:
+            board[r, c] = -1
+            owner[r, c] = -1
+            is_connector[r, c] = False
+        placed.pop(int(pi), None)
+
+    def placements_for(pi: int) -> list[tuple[int, int]]:
+        piece = pieces[pi]
+        require_touch = bool(placed)
+        out = []
+        for r0 in range(H - int(piece["h"]) + 1):
+            for c0 in range(W - int(piece["w"]) + 1):
+                if can_place(pi, r0, c0, require_touch):
+                    out.append((int(r0), int(c0)))
+        return out
+
+    def final_ok() -> bool:
+        if np.any(owner == -1):
+            return False
+        if not np.array_equal(board, board[:, ::-1]):
+            return False
+        for pi, (r0, c0) in placed.items():
+            piece = pieces[pi]
+            for dr, dc in piece["connectors"]:
+                r, c = int(r0 + dr), int(c0 + dc)
+                ok = False
+                for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                    if 0 <= rr < H and 0 <= cc < W and owner[rr, cc] != pi:
+                        if bool(is_connector[rr, cc]) and int(board[rr, cc]) == int(board[r, c]):
+                            ok = True
+                            break
+                if not ok:
+                    return False
+        return True
+
+    for pi, r0, c0 in frame_group:
+        place(pi, r0, c0)
+
+    def search() -> bool:
+        remaining = [pi for pi in range(len(pieces)) if pi not in placed]
+        if not remaining:
+            return final_ok()
+
+        while True:
+            forced = None
+            best_pi = None
+            best_places = None
+            for pi in remaining:
+                places = placements_for(pi)
+                if not places:
+                    return False
+                if len(places) == 1:
+                    forced = (pi, places[0])
+                    break
+                if best_places is None or len(places) < len(best_places):
+                    best_pi = pi
+                    best_places = places
+            if forced is None:
+                break
+            pi, (r0, c0) = forced
+            place(pi, r0, c0)
+            remaining = [idx for idx in remaining if idx != pi]
+            if not remaining:
+                return final_ok()
+
+        assert best_pi is not None and best_places is not None
+        for r0, c0 in best_places:
+            changed = place(best_pi, r0, c0)
+            if search():
+                return True
+            unplace(best_pi, changed)
+        return False
+
+    ok = search()
+    assert ok, "connector assembly failed"
+    return board.astype(int)
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Assemble scattered multicolor fragments into a left-right symmetric rectangle using connector pixels.
+
+    Input structure:
+    - The background is the most common color; each foreground piece is an 8-connected multicolor sprite.
+    - One sprite is a pre-aligned LR-symmetric frame whose bbox already matches the output rectangle.
+    - Small pixels of fixed connector colors appear on piece boundaries and act as docking markers.
+
+    Rule:
+    - Collect each non-background 8-connected component as one piece, preserving its full color pattern.
+    - Infer the output rectangle size from total foreground area.
+    - Place the frame at the output anchor, then pack the remaining pieces so the rectangle is exactly LR-symmetric and every inter-piece contact contains a matched connector pair.
+
+    Key insight: shape fitting alone is no longer enough; the decisive cue is that adjacent pieces must meet through equal-colored connector pixels at the seam.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+
+    comps = components_mask(g != bg, connectivity=8)
+    assert comps, "grid must contain foreground pieces"
+    pieces = [_normalize_piece(pts, g) for pts in comps]
+
+    total_area = int(sum(piece["area"] for piece in pieces))
+    assert total_area > 0, "total area must be positive"
+    dims = [(h, w) for h, w in _factors(total_area) if h >= w]
+    assert dims, "at least one portrait factorization must exist"
+    best_gap = min(abs(h - w) for h, w in dims)
+    best_dims = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+    assert len(best_dims) == 1, "closest-to-square portrait output shape must be unique"
+    H, W = best_dims[0]
+
+    frame_group = _find_frame_group(pieces, H, W)
+    sol = _assemble(pieces, H, W, frame_group)
+    return sol.astype(int)
+
+
+# ---------------------------------------------------------------------------
+# Generator
+# ---------------------------------------------------------------------------
+
+_OUT_H = 10
+_OUT_W = 5
+
+_BODY_COLORS_MIN = 4
+_BODY_COLORS_MAX = 5
+_PIECE_COUNT_MIN = 7
+_PIECE_COUNT_MAX = 14
+_MAX_PIECE_AREA = 6
+
+_CANVAS_MIN = 13
+_CANVAS_MAX = 15
+_SCATTER_PADDING = 1
+_GEN_MAX_RETRIES = 400
+
+
+def _zigzag_frame(H: int) -> tuple[set[tuple[int, int]], int, int]:
+    cells = set()
+    start_c = random.randint(0, 1)
+    c = start_c
+    for r in range(H):
+        cells.add((r, c))
+        if r == H - 1:
+            break
+        move = random.choice(["down", "horiz", "diag"])
+        if move == "down":
+            pass
+        elif move == "horiz":
+            cells.add((r, 1 - c))
+            c = 1 - c
+        else:
+            c = 1 - c
+    return cells, start_c, c
+
+
+def _paint_chunk(grid: np.ndarray, chunk: list[tuple[int, int]], color: int) -> None:
+    W = grid.shape[1]
+    for r, c in chunk:
+        grid[int(r), int(c)] = int(color)
+        grid[int(r), W - 1 - int(c)] = int(color)
+
+
+def _adjacent_colors(grid: np.ndarray, chunk: list[tuple[int, int]], bg_marker: int = -1) -> set[int]:
+    H, W = grid.shape
+    colors = set()
+    full = set()
+    for r, c in chunk:
+        full.add((int(r), int(c)))
+        full.add((int(r), int(W - 1 - int(c))))
+    for r, c in full:
+        for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+            if 0 <= rr < H and 0 <= cc < W:
+                val = int(grid[rr, cc])
+                if val != bg_marker and (rr, cc) not in full:
+                    colors.add(val)
+    return colors
+
+
+def _fill_interior(grid: np.ndarray, fill_pool: list[int]) -> None:
+    half_cells = {(r, c) for r in range(1, _OUT_H - 1) for c in range(1, _OUT_W // 2 + 1)}
+    previous_color = None
+
+    while half_cells:
+        target = random.randint(1, min(3, len(half_cells)))
+        start = random.choice(sorted(half_cells))
+        chunk = [start]
+        half_cells.remove(start)
+        frontier = [start]
+        while len(chunk) < target and frontier:
+            cr, cc = random.choice(frontier)
+            nbrs = []
+            for nr, nc in ((cr - 1, cc), (cr + 1, cc), (cr, cc - 1), (cr, cc + 1)):
+                if (nr, nc) in half_cells:
+                    nbrs.append((nr, nc))
+            if not nbrs:
+                frontier.remove((cr, cc))
+                continue
+            nxt = random.choice(nbrs)
+            half_cells.remove(nxt)
+            chunk.append(nxt)
+            frontier.append(nxt)
+
+        avoid = _adjacent_colors(grid, chunk)
+        if previous_color is not None:
+            avoid.add(int(previous_color))
+        opts = [col for col in fill_pool if col not in avoid]
+        if not opts:
+            opts = [col for col in fill_pool if col != previous_color] or fill_pool
+        col = random.choice(opts)
+        _paint_chunk(grid, chunk, int(col))
+        previous_color = int(col)
+
+
+def _build_body_output() -> tuple[np.ndarray, int] | tuple[None, None]:
+    H, W = _OUT_H, _OUT_W
+    n_body = random.randint(_BODY_COLORS_MIN, _BODY_COLORS_MAX)
+    bg = random.choice([c for c in range(10) if c not in CONNECTOR_COLORS])
+    pool = [c for c in range(10) if c not in CONNECTOR_COLORS and c != bg]
+    random.shuffle(pool)
+    if len(pool) < n_body:
+        return None, None
+    body_palette = pool[:n_body]
+    frame_color = int(body_palette[0])
+    fill_pool = [int(c) for c in body_palette[1:]]
+    if not fill_pool:
+        return None, None
+
+    grid = np.full((H, W), -1, dtype=int)
+    grid[0, :] = frame_color
+    grid[H - 1, :] = frame_color
+    grid[:, 0] = frame_color
+    grid[:, W - 1] = frame_color
+    _fill_interior(grid, fill_pool)
+    if np.any(grid < 0):
+        return None, None
+    return grid.astype(int), int(bg)
+
+
+def _build_structured_output() -> tuple[np.ndarray, int, np.ndarray, set[int]]:
+    H, W = _OUT_H, _OUT_W
+    bg = random.choice([c for c in range(10) if c not in CONNECTOR_COLORS])
+    frame_color = random.choice([c for c in range(10) if c not in CONNECTOR_COLORS and c != bg])
+    out = np.full((H, W), int(frame_color), dtype=int)
+    pid_grid = np.zeros((H, W), dtype=int)
+
+    # Border ring + two inner frame bars.
+    bar_rows = {3, 6}
+    for r in range(H):
+        for c in range(W):
+            if r in (0, H - 1) or c in (0, W - 1) or r in bar_rows:
+                pid_grid[r, c] = 0
+            else:
+                out[r, c] = -1
+                pid_grid[r, c] = -1
+
+    chamber_starts = [1, 4, 7]
+    palette = list(CONNECTOR_COLORS)
+    random.shuffle(palette)
+    next_pid = 1
+    for i, r0 in enumerate(chamber_starts):
+        top_col = int(palette[i % len(palette)])
+        bot_col = int(palette[(i + 1) % len(palette)])
+
+        out[r0 - 1, 1:4] = top_col
+        out[r0 + 2, 1:4] = bot_col
+        out[r0, 0] = top_col
+        out[r0 + 1, 0] = bot_col
+        out[r0, W - 1] = top_col
+        out[r0 + 1, W - 1] = bot_col
+
+        for c in range(1, 4):
+            out[r0, c] = top_col
+            out[r0 + 1, c] = bot_col
+            pid_grid[r0, c] = int(next_pid)
+            pid_grid[r0 + 1, c] = int(next_pid)
+            next_pid += 1
+
+    assert np.all(out >= 0)
+    return out.astype(int), int(bg), pid_grid.astype(int), {0}
+
+
+def _piece_partition(body_out: np.ndarray) -> tuple[list[dict], np.ndarray]:
+    H, W = body_out.shape
+    pid_grid = np.full((H, W), -1, dtype=int)
+    pieces = []
+    for col in sorted(set(map(int, np.unique(body_out)))):
+        for pts in components_mask(body_out == int(col), connectivity=8):
+            r0, c0, r1, c1 = bbox_coords(pts)
+            coords = [(int(r), int(c)) for r, c in pts]
+            pid = len(pieces)
+            for r, c in coords:
+                pid_grid[int(r), int(c)] = int(pid)
+            pieces.append(
+                {
+                    "pid": int(pid),
+                    "color": int(col),
+                    "coords": coords,
+                    "bbox": (int(r0), int(c0), int(r1), int(c1)),
+                    "area": int(len(coords)),
+                }
+            )
+    assert np.all(pid_grid >= 0)
+    return pieces, pid_grid
+
+
+def _find_frame_pids(pieces: list[dict], pid_grid: np.ndarray) -> list[int]:
+    H, W = pid_grid.shape
+    def group_ok(idxs: list[int]) -> bool:
+        boxes = [pieces[i]["bbox"] for i in idxs]
+        gr0 = min(int(b[0]) for b in boxes)
+        gc0 = min(int(b[1]) for b in boxes)
+        gr1 = max(int(b[2]) for b in boxes)
+        gc1 = max(int(b[3]) for b in boxes)
+        if int(gr1 - gr0 + 1) != H or int(gc1 - gc0 + 1) != W:
+            return False
+        coords = set()
+        for i in idxs:
+            for r, c in pieces[i]["coords"]:
+                coords.add((int(r - gr0), int(c - gc0)))
+        return _is_lr_symmetric_mask(coords, H, W)
+
+    found: list[tuple[int, list[int]]] = []
+    for i in range(len(pieces)):
+        if group_ok([i]):
+            found.append((int(pieces[i]["area"]), [int(i)]))
+    for i in range(len(pieces)):
+        for j in range(i + 1, len(pieces)):
+            if group_ok([i, j]):
+                area = int(pieces[i]["area"]) + int(pieces[j]["area"])
+                found.append((area, [int(i), int(j)]))
+    assert found, "generator expected at least one 1-2 piece frame group"
+    best_area = min(area for area, _idxs in found)
+    best = [idxs for area, idxs in found if area == best_area]
+    assert len(best) == 1, "generator expected a unique minimum-area frame group"
+    return best[0]
+
+
+def _adjacency_map(pid_grid: np.ndarray) -> dict[tuple[int, int], list[tuple[tuple[int, int], tuple[int, int]]]]:
+    H, W = pid_grid.shape
+    adj: dict[tuple[int, int], list[tuple[tuple[int, int], tuple[int, int]]]] = defaultdict(list)
+    for r in range(H):
+        for c in range(W):
+            p = int(pid_grid[r, c])
+            if r + 1 < H and int(pid_grid[r + 1, c]) != p:
+                q = int(pid_grid[r + 1, c])
+                key = (min(p, q), max(p, q))
+                a = (r, c) if p <= q else (r + 1, c)
+                b = (r + 1, c) if p <= q else (r, c)
+                adj[key].append((a, b))
+            if c + 1 < W and int(pid_grid[r, c + 1]) != p:
+                q = int(pid_grid[r, c + 1])
+                key = (min(p, q), max(p, q))
+                a = (r, c) if p <= q else (r, c + 1)
+                b = (r, c + 1) if p <= q else (r, c)
+                adj[key].append((a, b))
+    return adj
+
+
+def _mirror_coord(W: int, rc: tuple[int, int]) -> tuple[int, int]:
+    r, c = rc
+    return int(r), int(W - 1 - c)
+
+
+def _apply_connectors(body_out: np.ndarray, pieces: list[dict], pid_grid: np.ndarray) -> tuple[np.ndarray | None, int]:
+    H, W = body_out.shape
+    out = np.array(body_out, copy=True)
+    adj = _adjacency_map(pid_grid)
+    used: set[tuple[int, int]] = set()
+    visited: set[tuple[int, int]] = set()
+    orbit_idx = 0
+
+    for key in sorted(adj):
+        if key in visited:
+            continue
+        pair = adj[key][0]
+        mk = tuple(sorted((int(pid_grid[_mirror_coord(W, pair[0])]), int(pid_grid[_mirror_coord(W, pair[1])] ))))
+        visited.add(key)
+        visited.add(mk)
+
+        candidates = []
+        for a, b in adj[key]:
+            leftness = min(int(a[1]), int(b[1]))
+            candidates.append((leftness, int(a[0] + b[0]), a, b))
+        candidates.sort()
+        chosen = None
+        for _leftness, _row_sum, a, b in candidates:
+            if a not in used and b not in used:
+                chosen = (a, b)
+                break
+        if chosen is None:
+            chosen = (candidates[0][2], candidates[0][3])
+        color = int(CONNECTOR_COLORS[orbit_idx % len(CONNECTOR_COLORS)])
+        orbit_idx += 1
+
+        coords_to_paint = [chosen[0], chosen[1]]
+        ma = _mirror_coord(W, chosen[0])
+        mb = _mirror_coord(W, chosen[1])
+        coords_to_paint.extend([ma, mb])
+
+        for r, c in coords_to_paint:
+            out[int(r), int(c)] = color
+            used.add((int(r), int(c)))
+
+    # Every non-frame piece should have at least one connector; otherwise the connector
+    # rule is visually weak and the sample is too close to the original task.
+    frame_pids = set(_find_frame_pids(pieces, pid_grid))
+    connector_counts = defaultdict(int)
+    for piece in pieces:
+        pid = int(piece["pid"])
+        for r, c in piece["coords"]:
+            if int(out[int(r), int(c)]) in CONNECTOR_COLORS:
+                connector_counts[pid] += 1
+    for piece in pieces:
+        pid = int(piece["pid"])
+        if pid in frame_pids:
+            continue
+        if connector_counts[pid] == 0:
+            return None, 0
+    return out.astype(int), int(len(adj))
+
+
+def _build_patches(out: np.ndarray, pid_grid: np.ndarray, bg: int, frame_pids: set[int]) -> tuple[np.ndarray, list[np.ndarray]]:
+    H, W = out.shape
+    frame_mask = np.isin(pid_grid, sorted(frame_pids))
+    frame_pts = np.argwhere(frame_mask)
+    fr0, fc0, fr1, fc1 = bbox_coords(frame_pts)
+    frame_patch = np.full((int(fr1 - fr0 + 1), int(fc1 - fc0 + 1)), int(bg), dtype=int)
+    for r, c in frame_pts:
+        frame_patch[int(r) - int(fr0), int(c) - int(fc0)] = int(out[int(r), int(c)])
+
+    patches = []
+    for pid in sorted(set(map(int, pid_grid.flatten()))):
+        if pid in frame_pids:
+            continue
+        pts = np.argwhere(pid_grid == int(pid))
+        r0, c0, r1, c1 = bbox_coords(pts)
+        patch = np.full((int(r1 - r0 + 1), int(c1 - c0 + 1)), int(bg), dtype=int)
+        for r, c in pts:
+            patch[int(r) - int(r0), int(c) - int(c0)] = int(out[int(r), int(c)])
+        patches.append(patch)
+    random.shuffle(patches)
+    patches.sort(key=lambda p: (-(p != bg).sum(), random.random()))
+    return frame_patch, patches
+
+
+def _scatter(out: np.ndarray, pid_grid: np.ndarray, bg: int, frame_pids: set[int]) -> np.ndarray:
+    rows = random.randint(_CANVAS_MIN, _CANVAS_MAX)
+    cols = random.randint(_CANVAS_MIN, _CANVAS_MAX)
+    canvas = np.full((rows, cols), int(bg), dtype=int)
+    oh, ow = out.shape
+
+    max_r = rows - oh - 2
+    max_c = cols - ow - 2
+    if max_r < 1 or max_c < 1:
+        raise ValueError("frame cannot fit on canvas")
+    off_r = random.randint(1, max_r)
+    off_c = random.randint(1, max_c)
+
+    frame_patch, patches = _build_patches(out, pid_grid, bg, frame_pids)
+    canvas[off_r : off_r + oh, off_c : off_c + ow] = -1
+    for patch in patches:
+        r, c = random_free_location(
+            canvas,
+            patch,
+            transparent=bg,
+            padding=_SCATTER_PADDING,
+            padding_connectivity=8,
+        )
+        paste(canvas, patch, r, c, transparent=bg)
+    canvas[off_r : off_r + oh, off_c : off_c + ow] = frame_patch
+    return canvas.astype(int)
+
+
+def _piece_count(body_out: np.ndarray) -> int:
+    return sum(len(components_mask(body_out == int(col), connectivity=4)) for col in np.unique(body_out))
+
+
+def _gen_attempt(return_meta: bool = False):
+    out, bg, pid_grid, frame_pids = _build_structured_output()
+    pieces = sorted(set(map(int, pid_grid.flatten())))
+    pc = len([pid for pid in pieces if pid >= 0])
+    if not (_PIECE_COUNT_MIN <= pc <= _PIECE_COUNT_MAX):
+        return None
+    if not np.array_equal(out, out[:, ::-1]):
+        return None
+
+    non_frame = [pid for pid in pieces if pid not in frame_pids and pid >= 0]
+    if any(int((pid_grid == pid).sum()) > _MAX_PIECE_AREA for pid in non_frame):
+        return None
+
+    connector_cells = int(np.isin(out, CONNECTOR_COLORS).sum())
+    pieces_with_connectors = len(non_frame)
+    seam_count = len(non_frame) + 6
+
+    try:
+        inp = _scatter(out, pid_grid, bg, frame_pids)
+        got = main(inp)
+    except Exception:
+        return None
+    if not np.array_equal(got, out):
+        return None
+
+    if return_meta:
+        return {
+            "input": inp.astype(int),
+            "output": out.astype(int),
+            "connector_cells": connector_cells,
+            "seam_count": int(seam_count),
+            "piece_count": int(pc),
+            "pieces_with_connectors": int(pieces_with_connectors),
+        }
+    return inp.astype(int)
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(_GEN_MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate a valid connector-matching e8686506 input")
+
+            ```
+
+            ### 参考代码: D2/1
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/e8686506/D2/1/code.py`
+
+            ```python
+            # Variant of e8686506
+# Dimension: D2 — 源对象：碎片的类型与结构 (src)
+# Change: 散落的单色非背景像素碎片和精灵片段，每个碎片为单一颜色的连通区域... → 碎片带锚点标记
+
+import random
+from collections import Counter
+
+import numpy as np
+
+from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
+
+
+# Design analysis for the D2 anchor-point variant
+# -----------------------------------------------
+# spec:
+#   visual_concretization:
+#     - Every real jigsaw piece is now a 4-connected non-background component with exactly
+#       one anchor pixel of a dedicated anchor color and >=2 body pixels of a single body color.
+#     - The output remains a dense LR-symmetric rectangle, but each assembled piece keeps its
+#       anchor pixel visible inside the rectangle.
+#     - In the input, frame piece(s) stay in-place as before; scattered non-frame pieces keep
+#       their embedded anchors; the target rectangle also shows one isolated single-pixel
+#       anchor marker for every scattered piece, at that piece's final anchor location.
+#   behavior_trace:
+#     - Original: collect monochrome components by color -> infer HxW from total area ->
+#       use frame + symmetry + same-color non-touch to place each pure-color fragment.
+#     - Variant: collect actual pieces by binary connectivity (color alone no longer defines
+#       a piece) -> treat singleton components as target anchor marks, not pieces ->
+#       infer HxW from only multi-cell components -> place each anchored piece so its unique
+#       anchor pixel lands on a same-colored target mark inside the frame.
+#     - Difference: precise point-to-point alignment is now explicit. A shape that could fit
+#       several symmetric holes is rejected unless its anchor lands on the matching marker.
+#   complexity_calibration:
+#     - Anchor colors come from a small dedicated palette reused across multiple pieces.
+#       This keeps the rule visible across 2-3 examples without exploding the color count.
+#     - Real pieces are forced to have area >= 3, so any singleton component in the input
+#       is unambiguously a target anchor marker rather than a fragment.
+#   implicit_assumptions_replaced:
+#     - Old `components_mask(g == col, ...)` assumed every piece was monochrome. Invalid now.
+#       New solver uses `components_mask(g != bg, connectivity=4)` and parses per-piece colors.
+#     - Old edge/corner heuristics in `_build_requirements()` assumed special roles were encoded
+#       by whole-color components. Multi-color anchored pieces would contaminate those signals,
+#       so the variant uses only the fixed frame geometry plus isolated anchor targets.
+#     - Old total-area logic counted every non-bg cell. Here singleton anchor markers must be
+#       excluded before factorizing the output shape.
+#   placement_legality_and_generator_guarantees:
+#     - Non-frame anchor markers are chosen so they are 4-disconnected from the fixed frame and
+#       from each other after non-frame bodies are removed from the template.
+#     - Anchor colors are never used as body colors, so the marker role is visually legible.
+#     - Frame generation avoids diagonal-only links so frame pieces remain 4-connected.
+#   observability:
+#     - Human-visible cue: every scattered patch contains one odd-colored pixel, and the target
+#       rectangle contains a matching constellation of isolated odd-colored dots.
+#     - These dots are not decorative: generator validation compares against the new solver on
+#       anchored instances, and the old monochrome-component interpretation no longer applies.
+
+
+def _factors(n: int) -> list[tuple[int, int]]:
+    out = []
+    for w in range(1, n + 1):
+        if n % w == 0:
+            h = n // w
+            out.append((h, w))
+    return out
+
+
+def _piece_sig(cells: list[tuple[int, int, int]]) -> tuple[int, int, tuple[tuple[int, int, int], ...]]:
+    arr = np.array([(r, c) for r, c, _ in cells], dtype=int)
+    r0, c0, r1, c1 = bbox_coords(arr)
+    norm = tuple(sorted((int(r) - r0, int(c) - c0, int(v)) for r, c, v in cells))
+    return (r1 - r0 + 1), (c1 - c0 + 1), norm
+
+
+def _sprite_from_component(g: np.ndarray, pts: np.ndarray, bg: int) -> dict:
+    r0, c0, r1, c1 = bbox_coords(pts)
+    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
+    cells: list[tuple[int, int, int]] = []
+    counts: Counter[int] = Counter()
+    for r, c in pts:
+        rr = int(r) - r0
+        cc = int(c) - c0
+        v = int(g[int(r), int(c)])
+        patch[rr, cc] = v
+        cells.append((rr, cc, v))
+        counts[v] += 1
+    anchor_colors = [col for col, n in counts.items() if n == 1]
+    assert len(counts) == 2 and len(anchor_colors) == 1, "each piece must contain one unique anchor color"
+    anchor_color = int(anchor_colors[0])
+    body_color = next(col for col, n in counts.items() if col != anchor_color and n >= 2)
+    anchor = next((rr, cc) for rr, cc, v in cells if v == anchor_color)
+    return {
+        "bbox": (int(r0), int(c0), int(r1), int(c1)),
+        "patch": patch,
+        "cells": tuple(sorted(cells)),
+        "anchor": (int(anchor[0]), int(anchor[1])),
+        "anchor_color": int(anchor_color),
+        "body_color": int(body_color),
+        "area": len(cells),
+    }
+
+
+def _is_lr_symmetric_union(parts: list[np.ndarray]) -> bool:
+    all_pts = np.concatenate(parts)
+    r0, c0, r1, c1 = bbox_coords(all_pts)
+    h = r1 - r0 + 1
+    w = c1 - c0 + 1
+    bmp = np.zeros((h, w), dtype=bool)
+    for pts in parts:
+        for r, c in pts:
+            bmp[int(r) - r0, int(c) - c0] = True
+    return np.array_equal(bmp, bmp[:, ::-1])
+
+
+def _find_frame_parts(piece_comps: list[np.ndarray], H: int, W: int) -> list[np.ndarray]:
+    candidates: list[list[np.ndarray]] = []
+    for i, p1 in enumerate(piece_comps):
+        r0, c0, r1, c1 = bbox_coords(p1)
+        if r1 - r0 + 1 == H and c1 - c0 + 1 == W and _is_lr_symmetric_union([p1]):
+            candidates.append([p1])
+        for j in range(i + 1, len(piece_comps)):
+            p2 = piece_comps[j]
+            union = np.concatenate([p1, p2])
+            ur0, uc0, ur1, uc1 = bbox_coords(union)
+            if ur1 - ur0 + 1 == H and uc1 - uc0 + 1 == W and _is_lr_symmetric_union([p1, p2]):
+                candidates.append([p1, p2])
+    assert len(candidates) == 1, "frame pieces must be uniquely identifiable by their LR-symmetric bbox"
+    return candidates[0]
+
+
+def _coords_key(pts: np.ndarray) -> frozenset[tuple[int, int]]:
+    return frozenset((int(r), int(c)) for r, c in pts)
+
+
+def _assemble(
+    pieces: list[dict],
+    H: int,
+    W: int,
+    req: np.ndarray,
+    fixed: list[tuple[int, int, dict]],
+    anchor_targets: dict[int, set[tuple[int, int]]],
+    disallow_touch: set[int],
+) -> np.ndarray:
+    board = np.full((H, W), -1, dtype=int)
+
+    def mirror_ok(proposed: dict[tuple[int, int], int], r: int, c: int, col: int) -> bool:
+        mc = W - 1 - c
+        if (r, mc) in proposed and proposed[(r, mc)] != col:
+            return False
+        v = board[r, mc]
+        if v != -1 and v != col:
+            return False
+        rv = int(req[r, mc])
+        if rv != -1 and rv != col:
+            return False
+        return True
+
+    def can_place(piece: dict, r0: int, c0: int) -> bool:
+        ar = r0 + int(piece["anchor"][0])
+        ac = c0 + int(piece["anchor"][1])
+        if (ar, ac) not in anchor_targets.get(int(piece["anchor_color"]), set()):
+            return False
+        proposed = {(r0 + dr, c0 + dc): int(col) for dr, dc, col in piece["cells"]}
+        for (r, c), col in proposed.items():
+            if not (0 <= r < H and 0 <= c < W):
+                return False
+            if board[r, c] != -1:
+                return False
+            rv = int(req[r, c])
+            if rv != -1 and rv != col:
+                return False
+            if not mirror_ok(proposed, r, c, col):
+                return False
+            if col == int(piece["body_color"]) and col in disallow_touch:
+                for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                    if 0 <= rr < H and 0 <= cc < W and board[rr, cc] == col:
+                        return False
+        return True
+
+    def placements_for(piece: dict) -> list[tuple[int, int]]:
+        h = int(piece["patch"].shape[0])
+        w = int(piece["patch"].shape[1])
+        out = []
+        for r0 in range(H - h + 1):
+            for c0 in range(W - w + 1):
+                if can_place(piece, r0, c0):
+                    out.append((r0, c0))
+        return out
+
+    def place(piece: dict, r0: int, c0: int) -> list[tuple[int, int]]:
+        changed = []
+        for dr, dc, col in piece["cells"]:
+            r = r0 + dr
+            c = c0 + dc
+            board[r, c] = int(col)
+            changed.append((r, c))
+        if not piece.get("fixed"):
+            ar = r0 + int(piece["anchor"][0])
+            ac = c0 + int(piece["anchor"][1])
+            anchor_targets[int(piece["anchor_color"])].remove((ar, ac))
+        return changed
+
+    def unplace(piece: dict, r0: int, c0: int, changed: list[tuple[int, int]]) -> None:
+        for r, c in changed:
+            board[r, c] = -1
+        if not piece.get("fixed"):
+            ar = r0 + int(piece["anchor"][0])
+            ac = c0 + int(piece["anchor"][1])
+            anchor_targets[int(piece["anchor_color"])].add((ar, ac))
+
+    for r0, c0, piece in fixed:
+        changed = place(piece, r0, c0)
+        assert len(changed) == int(piece["area"])
+
+    remaining = [piece for piece in pieces if not piece.get("fixed")]
+
+    def dfs(rem: list[dict]) -> bool:
+        placed_now: list[tuple[dict, int, int, list[tuple[int, int]]]] = []
+        cur = list(rem)
+        while True:
+            forced = None
+            best_piece = None
+            best_places = None
+            for piece in cur:
+                places = placements_for(piece)
+                if not places:
+                    for p, rr, cc, changed in reversed(placed_now):
+                        unplace(p, rr, cc, changed)
+                    return False
+                places.sort()
+                if best_places is None or len(places) < len(best_places):
+                    best_piece = piece
+                    best_places = places
+                if len(places) == 1:
+                    forced = (piece, places[0][0], places[0][1])
+                    break
+            if forced is None:
+                break
+            piece, r0, c0 = forced
+            changed = place(piece, r0, c0)
+            placed_now.append((piece, r0, c0, changed))
+            cur.remove(piece)
+
+        if not cur:
+            ok = not any(v == -1 for v in board.ravel())
+            ok = ok and all(len(v) == 0 for v in anchor_targets.values())
+            ok = ok and np.array_equal(board, board[:, ::-1])
+            if ok:
+                return True
+            for p, rr, cc, changed in reversed(placed_now):
+                unplace(p, rr, cc, changed)
+            return False
+
+        assert best_piece is not None and best_places is not None
+        cur.remove(best_piece)
+        for r0, c0 in best_places:
+            changed = place(best_piece, r0, c0)
+            if dfs(cur):
+                return True
+            unplace(best_piece, r0, c0, changed)
+
+        for p, rr, cc, changed in reversed(placed_now):
+            unplace(p, rr, cc, changed)
+        return False
+
+    ok = dfs(remaining)
+    assert ok, "assembly failed"
+    assert np.array_equal(board, board[:, ::-1]), "assembled board must be LR-symmetric"
+    return board
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Reassemble anchored fragments into a left-right symmetric rectangle.
+
+    Input structure:
+    - bg is the most common color; every real fragment is a 4-connected non-bg component
+      with one special anchor pixel and a larger single-color body.
+    - One or two frame fragments already sit in their final rectangle positions.
+    - Every scattered non-frame fragment has a matching isolated anchor marker inside the frame.
+
+    Rule:
+    - Ignore singleton non-bg components as target markers, and infer the output size from the
+      multi-cell anchored fragments only.
+    - Detect the in-place LR-symmetric frame, then place the remaining anchored fragments into
+      the rectangle so the whole output is exactly mirror-symmetric.
+    - A placement is legal only if the fragment's unique anchor pixel lands on a same-colored
+      target marker and same-body-color fragments do not 4-touch.
+
+    Key insight: the odd-colored pixel inside each fragment is not decorative; it is a precise
+    alignment key. Shape and symmetry narrow the options, and the anchor markers finish the match.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = int(get_bg(g))
+
+    comps = components_mask(g != bg, connectivity=4)
+    markers = [pts for pts in comps if len(pts) == 1]
+    piece_comps = [pts for pts in comps if len(pts) > 1]
+    assert piece_comps, "input must contain real anchored pieces"
+
+    total_area = sum(len(pts) for pts in piece_comps)
+    dims = [(h, w) for (h, w) in _factors(total_area) if h >= w]
+    assert dims, "at least one portrait factor pair must exist for the total piece area"
+    best_gap = min(abs(h - w) for h, w in dims)
+    best_dims = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+    assert len(best_dims) == 1, "closest-to-square portrait output shape must be unique"
+    H, W = best_dims[0]
+
+    frame_parts = _find_frame_parts(piece_comps, H, W)
+    frame_keys = {_coords_key(pts) for pts in frame_parts}
+    frame_union = np.concatenate(frame_parts)
+    fr0, fc0, _, _ = bbox_coords(frame_union)
+
+    req = np.full((H, W), -1, dtype=int)
+    pieces: list[dict] = []
+    body_counts: Counter[int] = Counter()
+    fixed: list[tuple[int, int, dict]] = []
+    anchor_targets: dict[int, set[tuple[int, int]]] = {}
+
+    for pts in piece_comps:
+        piece = _sprite_from_component(g, pts, bg)
+        body_counts[int(piece["body_color"])] += 1
+        key = _coords_key(pts)
+        if key in frame_keys:
+            r0, c0, _, _ = piece["bbox"]
+            or0 = int(r0) - fr0
+            oc0 = int(c0) - fc0
+            piece["fixed"] = True
+            fixed.append((or0, oc0, piece))
+            for dr, dc, col in piece["cells"]:
+                req[or0 + dr, oc0 + dc] = int(col)
+        pieces.append(piece)
+
+    for pts in markers:
+        r = int(pts[0, 0])
+        c = int(pts[0, 1])
+        or0 = r - fr0
+        oc0 = c - fc0
+        assert 0 <= or0 < H and 0 <= oc0 < W, "anchor marker must lie inside the frame bbox"
+        col = int(g[r, c])
+        rv = int(req[or0, oc0])
+        assert rv == -1 or rv == col, "marker must not conflict with fixed frame"
+        req[or0, oc0] = col
+        anchor_targets.setdefault(col, set()).add((or0, oc0))
+
+    for piece in pieces:
+        if piece.get("fixed"):
+            continue
+        col = int(piece["anchor_color"])
+        assert col in anchor_targets, "every scattered piece must have a target anchor marker"
+
+    assert sum(len(v) for v in anchor_targets.values()) == sum(1 for p in pieces if not p.get("fixed"))
+    disallow_touch = {col for col, n in body_counts.items() if n > 1}
+    sol = _assemble(pieces, H, W, req, fixed, anchor_targets, disallow_touch)
+    return sol.astype(int)
+
+
+# --------------- generator (output-first anchored assembly variant) ---------------
+
+# Output dimensions
+_AREA_MIN = 25
+_AREA_MAX = 50
+_WIDTH_REQUIRED = 5
+_HEIGHT_MAX = 10
+
+# Colors
+_BODY_COLORS_MIN = 3
+_BODY_COLORS_MAX = 4
+_ANCHOR_COLORS_MIN = 2
+_ANCHOR_COLORS_MAX = 3
+_CENTER_CAP_PROB = 0.5
+
+# Piece constraints
+_MIN_PIECE_AREA = 3
+_MAX_PIECE_AREA = 10
+_PIECE_COUNT_MIN = 5
+_PIECE_COUNT_MAX = 9
+_MAX_CHUNK_SIZE = 6
+
+# Canvas / scatter
+_CANVAS_MIN = 13
+_CANVAS_MAX = 15
+_SCATTER_PADDING = 1
+
+# Retry
+_GEN_MAX_RETRIES = 400
+
+
+def _valid_dims() -> list[tuple[int, int]]:
+    results = []
+    for area in range(_AREA_MIN, _AREA_MAX + 1):
+        dims = [(area // w, w) for w in range(1, area + 1) if area % w == 0 and area // w >= w]
+        best_gap = min(abs(h - w) for h, w in dims)
+        best = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+        if len(best) == 1:
+            h, w = best[0]
+            if w == _WIDTH_REQUIRED and h <= _HEIGHT_MAX:
+                results.append((h, w))
+    return results
+
+
+_VALID_DIMS = [dims for dims in _valid_dims() if dims[0] % 2 == 0 and dims[0] >= 6]
+_DIM_WEIGHTS = [h * w for h, w in _VALID_DIMS]
+
+
+def _zigzag_frame(H: int) -> tuple[set[tuple[int, int]], int, int]:
+    cells = set()
+    start_c = random.randint(0, 1)
+    c = start_c
+    for r in range(H):
+        cells.add((r, c))
+        if r == H - 1:
+            break
+        move = random.choice(["down", "horiz"])
+        if move == "horiz":
+            cells.add((r, 1 - c))
+            c = 1 - c
+    return cells, start_c, c
+
+
+def _build_base_output(H: int, W: int) -> tuple[np.ndarray | None, int]:
+    n_body = random.randint(_BODY_COLORS_MIN, _BODY_COLORS_MAX)
+    palette = list(range(n_body))
+    random.shuffle(palette)
+    frame_color = palette[0]
+    fill_pool = palette[1:]
+    if not fill_pool:
+        return None, -1
+
+    grid = np.full((H, W), frame_color, dtype=int)
+    prev_col = None
+    for r0 in range(0, H, 2):
+        opts = [f for f in fill_pool if f != prev_col] or fill_pool
+        col = random.choice(opts)
+        grid[r0 : r0 + 2, 1 : W - 1] = col
+        prev_col = col
+    return grid, frame_color
+
+
+def _extract_base_pieces(out: np.ndarray, frame_color: int) -> tuple[list[dict], list[int]]:
+    pieces = []
+    frame_ids = []
+    for col in sorted(map(int, np.unique(out))):
+        for pts in components_mask(out == col, connectivity=4):
+            coords = [(int(r), int(c)) for r, c in pts]
+            piece = {
+                "color": int(col),
+                "coords": coords,
+                "coord_set": frozenset(coords),
+                "area": len(coords),
+            }
+            if col == frame_color:
+                frame_ids.append(len(pieces))
+            pieces.append(piece)
+    return pieces, frame_ids
+
+
+def _mirror_groups(pieces: list[dict], W: int) -> list[list[int]]:
+    lookup = {(piece["color"], piece["coord_set"]): i for i, piece in enumerate(pieces)}
+    groups = []
+    seen = set()
+    for i, piece in enumerate(pieces):
+        if i in seen:
+            continue
+        mirrored = frozenset((r, W - 1 - c) for r, c in piece["coords"])
+        j = lookup[(piece["color"], mirrored)]
+        if j == i:
+            groups.append([i])
+            seen.add(i)
+        else:
+            groups.append(sorted([i, j]))
+            seen.add(i)
+            seen.add(j)
+    return groups
+
+
+def _frame_mask(shape: tuple[int, int], pieces: list[dict], frame_ids: list[int]) -> np.ndarray:
+    H, W = shape
+    mask = np.zeros((H, W), dtype=bool)
+    for idx in frame_ids:
+        for r, c in pieces[idx]["coords"]:
+            mask[r, c] = True
+    return mask
+
+
+def _choose_anchor_positions(
+    out: np.ndarray,
+    pieces: list[dict],
+    frame_ids: list[int],
+    anchor_palette: list[int],
+) -> tuple[np.ndarray | None, list[dict] | None, set[int]]:
+    H, W = out.shape
+    frame_set = set(frame_ids)
+    frame_mask = _frame_mask((H, W), pieces, frame_ids)
+    groups = _mirror_groups(pieces, W)
+    random.shuffle(groups)
+
+    anchored = out.copy()
+    markers: list[dict] = []
+    chosen_markers: set[tuple[int, int]] = set()
+    real_frame_colors: set[int] = set()
+
+    def touches_frame(r: int, c: int) -> bool:
+        for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+            if 0 <= rr < H and 0 <= cc < W and frame_mask[rr, cc]:
+                return True
+        return False
+
+    def touches_marker(r: int, c: int) -> bool:
+        return any((rr, cc) in chosen_markers for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)))
+
+    for group in groups:
+        a_col = random.choice(anchor_palette)
+        if len(group) == 1:
+            idx = group[0]
+            cells = list(pieces[idx]["coords"])
+            if idx in frame_set:
+                candidates = [(r, c) for r, c in cells if c == W // 2]
+                if not candidates:
+                    return None, None, set()
+                r, c = random.choice(candidates)
+                anchored[r, c] = a_col
+                real_frame_colors.add(a_col)
+            else:
+                candidates = [
+                    (r, c)
+                    for r, c in cells
+                    if c == W // 2 and not touches_frame(r, c) and not touches_marker(r, c)
+                ]
+                if not candidates:
+                    return None, None, set()
+                r, c = random.choice(candidates)
+                anchored[r, c] = a_col
+                markers.append({"pos": (r, c), "color": int(a_col)})
+                chosen_markers.add((r, c))
+        else:
+            i, j = group
+            left = i if np.mean([c for _, c in pieces[i]["coords"]]) <= np.mean([c for _, c in pieces[j]["coords"]]) else j
+            right = j if left == i else i
+            candidates = []
+            for r, c in pieces[left]["coords"]:
+                mr = r
+                mc = W - 1 - c
+                if (mr, mc) not in pieces[right]["coord_set"]:
+                    continue
+                if left not in frame_set:
+                    if touches_frame(r, c) or touches_frame(mr, mc):
+                        continue
+                    if touches_marker(r, c) or touches_marker(mr, mc):
+                        continue
+                candidates.append((r, c, mr, mc))
+            if not candidates:
+                return None, None, set()
+            r, c, mr, mc = random.choice(candidates)
+            anchored[r, c] = a_col
+            anchored[mr, mc] = a_col
+            if left in frame_set:
+                real_frame_colors.add(a_col)
+            else:
+                markers.append({"pos": (r, c), "color": int(a_col)})
+                markers.append({"pos": (mr, mc), "color": int(a_col)})
+                chosen_markers.add((r, c))
+                chosen_markers.add((mr, mc))
+
+    return anchored, markers, real_frame_colors
+
+
+def _extract_piece_patch(out: np.ndarray, coords: list[tuple[int, int]], bg: int) -> np.ndarray:
+    arr = np.array(coords, dtype=int)
+    r0, c0, r1, c1 = bbox_coords(arr)
+    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
+    for r, c in coords:
+        patch[r - r0, c - c0] = int(out[r, c])
+    return patch
+
+
+def _make_output() -> tuple[np.ndarray | None, int, list[dict] | None, list[int] | None, list[dict] | None]:
+    H, W = random.choices(_VALID_DIMS, weights=_DIM_WEIGHTS, k=1)[0]
+    base_out, frame_color = _build_base_output(H, W)
+    if base_out is None:
+        return None, 0, None, None, None
+    if not np.array_equal(base_out, base_out[:, ::-1]):
+        return None, 0, None, None, None
+
+    base_pieces, frame_ids = _extract_base_pieces(base_out, frame_color)
+    piece_areas = [int(piece["area"]) for piece in base_pieces]
+    if any(a < _MIN_PIECE_AREA or a > _MAX_PIECE_AREA for a in piece_areas):
+        return None, 0, None, None, None
+    if not (_PIECE_COUNT_MIN <= len(base_pieces) <= _PIECE_COUNT_MAX):
+        return None, 0, None, None, None
+    if any(idx not in frame_ids for idx in range(len(base_pieces))) is False:
+        return None, 0, None, None, None
+
+    bg = random.randint(0, 9)
+    body_colors = sorted(map(int, np.unique(base_out)))
+    available = [c for c in range(10) if c != bg]
+    random.shuffle(available)
+    if len(available) < len(body_colors) + _ANCHOR_COLORS_MIN:
+        return None, 0, None, None, None
+
+    body_cmap = {int(a): available[i] for i, a in enumerate(body_colors)}
+    body_used = set(body_cmap.values())
+    anchor_available = [c for c in available if c not in body_used]
+    if len(anchor_available) < _ANCHOR_COLORS_MIN:
+        return None, 0, None, None, None
+    n_anchor = random.randint(_ANCHOR_COLORS_MIN, min(_ANCHOR_COLORS_MAX, len(anchor_available)))
+    anchor_palette = anchor_available[:n_anchor]
+
+    recolored = np.vectorize(lambda x: body_cmap[int(x)])(base_out)
+    recolored_pieces, recolored_frame_ids = _extract_base_pieces(recolored, body_cmap[frame_color])
+    anchored_out, markers, _ = _choose_anchor_positions(recolored, recolored_pieces, recolored_frame_ids, anchor_palette)
+    if anchored_out is None or markers is None:
+        return None, 0, None, None, None
+    if len(markers) != len(recolored_pieces) - len(recolored_frame_ids):
+        return None, 0, None, None, None
+    return anchored_out.astype(int), bg, markers, recolored_frame_ids, recolored_pieces
+
+
+def _scatter(
+    out: np.ndarray,
+    bg: int,
+    markers: list[dict],
+    frame_ids: list[int],
+    pieces: list[dict],
+) -> np.ndarray:
+    rows = random.randint(_CANVAS_MIN, _CANVAS_MAX)
+    cols = random.randint(_CANVAS_MIN, _CANVAS_MAX)
+    canvas = np.full((rows, cols), bg, dtype=int)
+    oh, ow = out.shape
+
+    max_r = rows - oh - 2
+    max_c = cols - ow - 2
+    if max_r < 1 or max_c < 1:
+        raise ValueError
+    off_r = random.randint(1, max_r)
+    off_c = random.randint(1, max_c)
+    canvas[off_r:off_r + oh, off_c:off_c + ow] = -1
+
+    frame_set = set(frame_ids)
+    patches = []
+    frame_mask = np.zeros((oh, ow), dtype=bool)
+    for idx, piece in enumerate(pieces):
+        if idx in frame_set:
+            for r, c in piece["coords"]:
+                frame_mask[r, c] = True
+            continue
+        patch = _extract_piece_patch(out, piece["coords"], bg)
+        patches.append(patch)
+
+    random.shuffle(patches)
+    patches.sort(key=lambda p: (-(p != bg).sum(), random.random()))
+    for patch in patches:
+        r, c = random_free_location(
+            canvas,
+            patch,
+            transparent=bg,
+            padding=_SCATTER_PADDING,
+            padding_connectivity=8,
+        )
+        paste(canvas, patch, r, c, transparent=bg)
+
+    bbox_region = canvas[off_r:off_r + oh, off_c:off_c + ow]
+    bbox_region[:] = bg
+    bbox_region[frame_mask] = out[frame_mask]
+    for marker in markers:
+        mr, mc = marker["pos"]
+        bbox_region[int(mr), int(mc)] = int(marker["color"])
+    return canvas
+
+
+def _gen_attempt() -> np.ndarray | None:
+    out, bg, markers, frame_ids, pieces = _make_output()
+    if out is None or markers is None or frame_ids is None or pieces is None:
+        return None
+    if not np.array_equal(out, out[:, ::-1]):
+        return None
+    if not (_BODY_COLORS_MIN + _ANCHOR_COLORS_MIN <= len(np.unique(out)) <= _BODY_COLORS_MAX + _ANCHOR_COLORS_MAX):
+        return None
+    try:
+        inp = _scatter(out, bg, markers, frame_ids, pieces)
+        got = main(inp)
+    except Exception:
+        return None
+    if np.array_equal(got, out):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(_GEN_MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate a valid anchored e8686506 input")
+
+            ```
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/e8686506/21/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/e8686506.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/e8686506/21/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of e8686506 (index 21)
+    # combo_spec: D1/1+D2/1
+    # Name: 连接器标记匹配+碎片带锚点
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/e8686506/21` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/20270e3b.py` — 参考任务 20270e3b 的 solver（D1/1 的灵感来源）
+    - `/home/lixinyu/snap/new/arc2_solver_select/4c416de3.py` — 参考任务 4c416de3 的 solver（D2/1 的灵感来源）
+codex
+需要把 `e8686506` 做成 `D1/1 + D2/1` 的融合版，并落到新的 solver/generator 文件里。先读原题、两个单变体实现和目标目录现状，确认哪些隐式假设必须一起改。
+exec
+/bin/bash -lc "rg --files /home/lixinyu/snap/new/ceshi/code_combo/e8686506/21 /home/lixinyu/snap/new/arc2_solver_select /home/lixinyu/snap/new/ceshi/code/e8686506/D1/1 /home/lixinyu/snap/new/ceshi/code/e8686506/D2/1 /home/lixinyu/snap/new/solvers | rg '(/e8686506\\.py|/code\\.py|arc_utils\\.py)"'$'"'" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/e8686506.py" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '1,320p' /home/lixinyu/snap/new/ceshi/code/e8686506/D1/1/code.py" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '1,340p' /home/lixinyu/snap/new/ceshi/code/e8686506/D2/1/code.py" in /home/lixinyu/snap/new
+ succeeded in 231ms:
+# Variant of e8686506
+# Dimension: D1 — 匹配条件：边缘对齐拼合 vs 其他匹配逻辑 (match_cond)
+# Change: s.edge.position aligns with d.adjacent_piece.edge — 碎片的边缘位置与... → 连接器标记匹配
+
+import random
+from collections import defaultdict
+
+import numpy as np
+
+from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
+
+
+# ---------------------------------------------------------------------------
+# Design analysis for the D1 variant
+# ---------------------------------------------------------------------------
+# variant_spec:
+#   core_change:
+#     old: pieces were effectively positioned by output-frame locks plus shape fitting.
+#     new: each piece is now a multicolor 8-connected sprite; special connector pixels
+#       on piece boundaries must meet an equal-colored connector on a neighboring piece.
+#       Two pieces may touch in the final rectangle only when their shared boundary
+#       contains at least one connector-to-connector contact.
+#   concrete_visualization:
+#     input:
+#       - one anchored frame piece still appears as a grouped outline with its original
+#         output-relative geometry preserved.
+#       - the other pieces are scattered, but they are no longer monochrome; small
+#         accent pixels of fixed connector colors sit on their edges.
+#     output:
+#       - the dense rectangle remains exact LR-symmetric.
+#       - connector pixels remain visible in the assembled rectangle as small equal-
+#         colored pairs straddling seams between neighboring pieces.
+#   behavior_trace:
+#     original_local_step:
+#       - choose a piece placement because its outline is the only way to fit a hole
+#         while respecting border/color heuristics.
+#     variant_local_step:
+#       - choose a piece placement because, once translated into the rectangle, one or
+#         more of its connector pixels land directly beside equal-colored connector
+#         pixels on already anchored pieces.
+#       - mere edge contact is insufficient; touching a neighbor without a connector
+#         match is rejected.
+#   complexity_calibration:
+#     - the frame anchor and LR symmetry are preserved so the task does not become an
+#       unconstrained global search.
+#     - connector colors are fixed and visually repeated across multiple seams so the
+#       new rule is observable from a few examples.
+#     - width stays 5 and height stays 8; this is an intentional adaptation so pieces
+#       have enough interior contact structure for connector matching to be visible.
+#   implicit_assumption_audit:
+#     - original solver extracted pieces per color; that breaks once pieces are
+#       multicolor, so the new solver extracts 8-connected non-bg components.
+#     - original same-color-touch prohibition is no longer a reliable piece-boundary
+#       cue, so it is removed from legality checks.
+#     - original per-cell req-color anchors based on singleton/bar colors are tied to
+#       monochrome pieces and are dropped; the frame piece now provides the main anchor.
+#     - mirror checks remain valid, but now they apply to exact cell colors, including
+#       connector colors.
+#   placement_legality:
+#     - generator keeps pieces non-overlapping when scattered and keeps the frame bbox
+#       reserved, so input components stay separable.
+#     - solver placements must fit in bounds, avoid overlap, preserve LR symmetry, and
+#       touch the existing assembly through at least one connector-matched interface.
+#   observability_and_cleanliness:
+#     - connector colors are fixed, sparse, and only used for connectors, so the new
+#       matching cue is visually isolated from ordinary body colors.
+#     - the frame remains a single anchored outline, preventing the scene from looking
+#       like arbitrary colored noise.
+
+
+CONNECTOR_COLORS = (6, 7, 8)
+
+
+def _piece_sig(pts: np.ndarray) -> tuple[int, int, tuple[tuple[int, int], ...]]:
+    r0, c0, r1, c1 = bbox_coords(pts)
+    coords = tuple(sorted((int(r) - r0, int(c) - c0) for r, c in pts))
+    return (r1 - r0 + 1), (c1 - c0 + 1), coords
+
+
+def _factors(n: int) -> list[tuple[int, int]]:
+    out = []
+    for w in range(1, n + 1):
+        if n % w == 0:
+            h = n // w
+            out.append((h, w))
+    return out
+
+
+def _normalize_piece(pts: np.ndarray, grid: np.ndarray) -> dict:
+    r0, c0, r1, c1 = bbox_coords(pts)
+    cells = []
+    for r, c in pts:
+        dr = int(r) - int(r0)
+        dc = int(c) - int(c0)
+        cells.append((dr, dc, int(grid[int(r), int(c)])))
+    cells.sort()
+    coords = {(dr, dc) for dr, dc, _col in cells}
+    connectors = {(dr, dc) for dr, dc, col in cells if col in CONNECTOR_COLORS}
+    return {
+        "cells": tuple(cells),
+        "coords": coords,
+        "connectors": connectors,
+        "h": int(r1 - r0 + 1),
+        "w": int(c1 - c0 + 1),
+        "area": int(len(cells)),
+        "src_bbox": (int(r0), int(c0), int(r1), int(c1)),
+    }
+
+
+def _is_lr_symmetric_mask(coords: set[tuple[int, int]], H: int, W: int) -> bool:
+    bmp = np.zeros((H, W), dtype=bool)
+    for r, c in coords:
+        bmp[int(r), int(c)] = True
+    return np.array_equal(bmp, bmp[:, ::-1])
+
+
+def _find_frame_group(pieces: list[dict], H: int, W: int) -> list[tuple[int, int, int]]:
+    def group_ok(idxs: list[int]) -> list[tuple[int, int, int]] | None:
+        boxes = [pieces[i]["src_bbox"] for i in idxs]
+        gr0 = min(int(b[0]) for b in boxes)
+        gc0 = min(int(b[1]) for b in boxes)
+        gr1 = max(int(b[2]) for b in boxes)
+        gc1 = max(int(b[3]) for b in boxes)
+        if int(gr1 - gr0 + 1) != H or int(gc1 - gc0 + 1) != W:
+            return None
+        coords = set()
+        anchors = []
+        for i in idxs:
+            pr0, pc0, _pr1, _pc1 = pieces[i]["src_bbox"]
+            anchors.append((int(i), int(pr0 - gr0), int(pc0 - gc0)))
+            for dr, dc, _col in pieces[i]["cells"]:
+                coords.add((int(pr0 - gr0 + dr), int(pc0 - gc0 + dc)))
+        if not _is_lr_symmetric_mask(coords, H, W):
+            return None
+        return anchors
+
+    found: list[tuple[int, list[tuple[int, int, int]]]] = []
+    for i in range(len(pieces)):
+        got = group_ok([i])
+        if got is not None:
+            area = sum(int(pieces[idx]["area"]) for idx in [i])
+            found.append((area, got))
+    for i in range(len(pieces)):
+        for j in range(i + 1, len(pieces)):
+            got = group_ok([i, j])
+            if got is not None:
+                area = int(pieces[i]["area"]) + int(pieces[j]["area"])
+                found.append((area, got))
+    assert found, "expected at least one 1-2 piece LR-symmetric frame group"
+    best_area = min(area for area, _got in found)
+    best = [got for area, got in found if area == best_area]
+    assert len(best) == 1, "expected a unique minimum-area frame group"
+    return best[0]
+
+
+def _assemble(pieces: list[dict], H: int, W: int, frame_group: list[tuple[int, int, int]]) -> np.ndarray:
+    board = np.full((H, W), -1, dtype=int)
+    owner = np.full((H, W), -1, dtype=int)
+    is_connector = np.zeros((H, W), dtype=bool)
+    placed: dict[int, tuple[int, int]] = {}
+
+    def can_place(pi: int, r0: int, c0: int, require_touch: bool) -> bool:
+        piece = pieces[pi]
+        local_cells = {}
+        touched_neighbors: set[int] = set()
+        matched_any = False
+        connector_touch_ok: dict[tuple[int, int], bool] = {}
+        connector_has_occupied_neighbor: dict[tuple[int, int], bool] = {}
+
+        for dr, dc, col in piece["cells"]:
+            r, c = int(r0 + dr), int(c0 + dc)
+            if not (0 <= r < H and 0 <= c < W):
+                return False
+            if owner[r, c] != -1:
+                return False
+            local_cells[(r, c)] = int(col)
+
+        for (r, c), col in local_cells.items():
+            mc = W - 1 - int(c)
+            if (r, mc) in local_cells and int(local_cells[(r, mc)]) != int(col):
+                return False
+            if owner[r, mc] != -1 and int(board[r, mc]) != int(col):
+                return False
+
+        for dr, dc, col in piece["cells"]:
+            r, c = int(r0 + dr), int(c0 + dc)
+            here_is_connector = (int(dr), int(dc)) in piece["connectors"]
+            if here_is_connector:
+                connector_touch_ok[(r, c)] = False
+                connector_has_occupied_neighbor[(r, c)] = False
+            for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                if not (0 <= rr < H and 0 <= cc < W):
+                    continue
+                if (rr, cc) in local_cells:
+                    continue
+                if owner[rr, cc] == -1:
+                    continue
+                nid = int(owner[rr, cc])
+                touched_neighbors.add(nid)
+                if here_is_connector:
+                    connector_has_occupied_neighbor[(r, c)] = True
+                if here_is_connector and bool(is_connector[rr, cc]) and int(board[rr, cc]) == int(col):
+                    matched_any = True
+                    connector_touch_ok[(r, c)] = True
+
+        if require_touch and not touched_neighbors:
+            return False
+        if touched_neighbors and not matched_any:
+            return False
+        for pos, had_occ in connector_has_occupied_neighbor.items():
+            if had_occ and not connector_touch_ok[pos]:
+                return False
+        return True
+
+    def place(pi: int, r0: int, c0: int) -> list[tuple[int, int]]:
+        piece = pieces[pi]
+        changed = []
+        for dr, dc, col in piece["cells"]:
+            r, c = int(r0 + dr), int(c0 + dc)
+            board[r, c] = int(col)
+            owner[r, c] = int(pi)
+            is_connector[r, c] = (int(dr), int(dc)) in piece["connectors"]
+            changed.append((r, c))
+        placed[int(pi)] = (int(r0), int(c0))
+        return changed
+
+    def unplace(pi: int, changed: list[tuple[int, int]]) -> None:
+        for r, c in changed:
+            board[r, c] = -1
+            owner[r, c] = -1
+            is_connector[r, c] = False
+        placed.pop(int(pi), None)
+
+    def placements_for(pi: int) -> list[tuple[int, int]]:
+        piece = pieces[pi]
+        require_touch = bool(placed)
+        out = []
+        for r0 in range(H - int(piece["h"]) + 1):
+            for c0 in range(W - int(piece["w"]) + 1):
+                if can_place(pi, r0, c0, require_touch):
+                    out.append((int(r0), int(c0)))
+        return out
+
+    def final_ok() -> bool:
+        if np.any(owner == -1):
+            return False
+        if not np.array_equal(board, board[:, ::-1]):
+            return False
+        for pi, (r0, c0) in placed.items():
+            piece = pieces[pi]
+            for dr, dc in piece["connectors"]:
+                r, c = int(r0 + dr), int(c0 + dc)
+                ok = False
+                for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                    if 0 <= rr < H and 0 <= cc < W and owner[rr, cc] != pi:
+                        if bool(is_connector[rr, cc]) and int(board[rr, cc]) == int(board[r, c]):
+                            ok = True
+                            break
+                if not ok:
+                    return False
+        return True
+
+    for pi, r0, c0 in frame_group:
+        place(pi, r0, c0)
+
+    def search() -> bool:
+        remaining = [pi for pi in range(len(pieces)) if pi not in placed]
+        if not remaining:
+            return final_ok()
+
+        while True:
+            forced = None
+            best_pi = None
+            best_places = None
+            for pi in remaining:
+                places = placements_for(pi)
+                if not places:
+                    return False
+                if len(places) == 1:
+                    forced = (pi, places[0])
+                    break
+                if best_places is None or len(places) < len(best_places):
+                    best_pi = pi
+                    best_places = places
+            if forced is None:
+                break
+            pi, (r0, c0) = forced
+            place(pi, r0, c0)
+            remaining = [idx for idx in remaining if idx != pi]
+            if not remaining:
+                return final_ok()
+
+        assert best_pi is not None and best_places is not None
+        for r0, c0 in best_places:
+            changed = place(best_pi, r0, c0)
+            if search():
+                return True
+            unplace(best_pi, changed)
+        return False
+
+    ok = search()
+    assert ok, "connector assembly failed"
+    return board.astype(int)
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Assemble scattered multicolor fragments into a left-right symmetric rectangle using connector pixels.
+
+    Input structure:
+    - The background is the most common color; each foreground piece is an 8-connected multicolor sprite.
+    - One sprite is a pre-aligned LR-symmetric frame whose bbox already matches the output rectangle.
+    - Small pixels of fixed connector colors appear on piece boundaries and act as docking markers.
+
+    Rule:
+    - Collect each non-background 8-connected component as one piece, preserving its full color pattern.
+    - Infer the output rectangle size from total foreground area.
+    - Place the frame at the output anchor, then pack the remaining pieces so the rectangle is exactly LR-symmetric and every inter-piece contact contains a matched connector pair.
+
+    Key insight: shape fitting alone is no longer enough; the decisive cue is that adjacent pieces must meet through equal-colored connector pixels at the seam.
+
+ succeeded in 239ms:
+# Variant of e8686506
+# Dimension: D2 — 源对象：碎片的类型与结构 (src)
+# Change: 散落的单色非背景像素碎片和精灵片段，每个碎片为单一颜色的连通区域... → 碎片带锚点标记
+
+import random
+from collections import Counter
+
+import numpy as np
+
+from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
+
+
+# Design analysis for the D2 anchor-point variant
+# -----------------------------------------------
+# spec:
+#   visual_concretization:
+#     - Every real jigsaw piece is now a 4-connected non-background component with exactly
+#       one anchor pixel of a dedicated anchor color and >=2 body pixels of a single body color.
+#     - The output remains a dense LR-symmetric rectangle, but each assembled piece keeps its
+#       anchor pixel visible inside the rectangle.
+#     - In the input, frame piece(s) stay in-place as before; scattered non-frame pieces keep
+#       their embedded anchors; the target rectangle also shows one isolated single-pixel
+#       anchor marker for every scattered piece, at that piece's final anchor location.
+#   behavior_trace:
+#     - Original: collect monochrome components by color -> infer HxW from total area ->
+#       use frame + symmetry + same-color non-touch to place each pure-color fragment.
+#     - Variant: collect actual pieces by binary connectivity (color alone no longer defines
+#       a piece) -> treat singleton components as target anchor marks, not pieces ->
+#       infer HxW from only multi-cell components -> place each anchored piece so its unique
+#       anchor pixel lands on a same-colored target mark inside the frame.
+#     - Difference: precise point-to-point alignment is now explicit. A shape that could fit
+#       several symmetric holes is rejected unless its anchor lands on the matching marker.
+#   complexity_calibration:
+#     - Anchor colors come from a small dedicated palette reused across multiple pieces.
+#       This keeps the rule visible across 2-3 examples without exploding the color count.
+#     - Real pieces are forced to have area >= 3, so any singleton component in the input
+#       is unambiguously a target anchor marker rather than a fragment.
+#   implicit_assumptions_replaced:
+#     - Old `components_mask(g == col, ...)` assumed every piece was monochrome. Invalid now.
+#       New solver uses `components_mask(g != bg, connectivity=4)` and parses per-piece colors.
+#     - Old edge/corner heuristics in `_build_requirements()` assumed special roles were encoded
+#       by whole-color components. Multi-color anchored pieces would contaminate those signals,
+#       so the variant uses only the fixed frame geometry plus isolated anchor targets.
+#     - Old total-area logic counted every non-bg cell. Here singleton anchor markers must be
+#       excluded before factorizing the output shape.
+#   placement_legality_and_generator_guarantees:
+#     - Non-frame anchor markers are chosen so they are 4-disconnected from the fixed frame and
+#       from each other after non-frame bodies are removed from the template.
+#     - Anchor colors are never used as body colors, so the marker role is visually legible.
+#     - Frame generation avoids diagonal-only links so frame pieces remain 4-connected.
+#   observability:
+#     - Human-visible cue: every scattered patch contains one odd-colored pixel, and the target
+#       rectangle contains a matching constellation of isolated odd-colored dots.
+#     - These dots are not decorative: generator validation compares against the new solver on
+#       anchored instances, and the old monochrome-component interpretation no longer applies.
+
+
+def _factors(n: int) -> list[tuple[int, int]]:
+    out = []
+    for w in range(1, n + 1):
+        if n % w == 0:
+            h = n // w
+            out.append((h, w))
+    return out
+
+
+def _piece_sig(cells: list[tuple[int, int, int]]) -> tuple[int, int, tuple[tuple[int, int, int], ...]]:
+    arr = np.array([(r, c) for r, c, _ in cells], dtype=int)
+    r0, c0, r1, c1 = bbox_coords(arr)
+    norm = tuple(sorted((int(r) - r0, int(c) - c0, int(v)) for r, c, v in cells))
+    return (r1 - r0 + 1), (c1 - c0 + 1), norm
+
+
+def _sprite_from_component(g: np.ndarray, pts: np.ndarray, bg: int) -> dict:
+    r0, c0, r1, c1 = bbox_coords(pts)
+    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
+    cells: list[tuple[int, int, int]] = []
+    counts: Counter[int] = Counter()
+    for r, c in pts:
+        rr = int(r) - r0
+        cc = int(c) - c0
+        v = int(g[int(r), int(c)])
+        patch[rr, cc] = v
+        cells.append((rr, cc, v))
+        counts[v] += 1
+    anchor_colors = [col for col, n in counts.items() if n == 1]
+    assert len(counts) == 2 and len(anchor_colors) == 1, "each piece must contain one unique anchor color"
+    anchor_color = int(anchor_colors[0])
+    body_color = next(col for col, n in counts.items() if col != anchor_color and n >= 2)
+    anchor = next((rr, cc) for rr, cc, v in cells if v == anchor_color)
+    return {
+        "bbox": (int(r0), int(c0), int(r1), int(c1)),
+        "patch": patch,
+        "cells": tuple(sorted(cells)),
+        "anchor": (int(anchor[0]), int(anchor[1])),
+        "anchor_color": int(anchor_color),
+        "body_color": int(body_color),
+        "area": len(cells),
+    }
+
+
+def _is_lr_symmetric_union(parts: list[np.ndarray]) -> bool:
+    all_pts = np.concatenate(parts)
+    r0, c0, r1, c1 = bbox_coords(all_pts)
+    h = r1 - r0 + 1
+    w = c1 - c0 + 1
+    bmp = np.zeros((h, w), dtype=bool)
+    for pts in parts:
+        for r, c in pts:
+            bmp[int(r) - r0, int(c) - c0] = True
+    return np.array_equal(bmp, bmp[:, ::-1])
+
+
+def _find_frame_parts(piece_comps: list[np.ndarray], H: int, W: int) -> list[np.ndarray]:
+    candidates: list[list[np.ndarray]] = []
+    for i, p1 in enumerate(piece_comps):
+        r0, c0, r1, c1 = bbox_coords(p1)
+        if r1 - r0 + 1 == H and c1 - c0 + 1 == W and _is_lr_symmetric_union([p1]):
+            candidates.append([p1])
+        for j in range(i + 1, len(piece_comps)):
+            p2 = piece_comps[j]
+            union = np.concatenate([p1, p2])
+            ur0, uc0, ur1, uc1 = bbox_coords(union)
+            if ur1 - ur0 + 1 == H and uc1 - uc0 + 1 == W and _is_lr_symmetric_union([p1, p2]):
+                candidates.append([p1, p2])
+    assert len(candidates) == 1, "frame pieces must be uniquely identifiable by their LR-symmetric bbox"
+    return candidates[0]
+
+
+def _coords_key(pts: np.ndarray) -> frozenset[tuple[int, int]]:
+    return frozenset((int(r), int(c)) for r, c in pts)
+
+
+def _assemble(
+    pieces: list[dict],
+    H: int,
+    W: int,
+    req: np.ndarray,
+    fixed: list[tuple[int, int, dict]],
+    anchor_targets: dict[int, set[tuple[int, int]]],
+    disallow_touch: set[int],
+) -> np.ndarray:
+    board = np.full((H, W), -1, dtype=int)
+
+    def mirror_ok(proposed: dict[tuple[int, int], int], r: int, c: int, col: int) -> bool:
+        mc = W - 1 - c
+        if (r, mc) in proposed and proposed[(r, mc)] != col:
+            return False
+        v = board[r, mc]
+        if v != -1 and v != col:
+            return False
+        rv = int(req[r, mc])
+        if rv != -1 and rv != col:
+            return False
+        return True
+
+    def can_place(piece: dict, r0: int, c0: int) -> bool:
+        ar = r0 + int(piece["anchor"][0])
+        ac = c0 + int(piece["anchor"][1])
+        if (ar, ac) not in anchor_targets.get(int(piece["anchor_color"]), set()):
+            return False
+        proposed = {(r0 + dr, c0 + dc): int(col) for dr, dc, col in piece["cells"]}
+        for (r, c), col in proposed.items():
+            if not (0 <= r < H and 0 <= c < W):
+                return False
+            if board[r, c] != -1:
+                return False
+            rv = int(req[r, c])
+            if rv != -1 and rv != col:
+                return False
+            if not mirror_ok(proposed, r, c, col):
+                return False
+            if col == int(piece["body_color"]) and col in disallow_touch:
+                for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                    if 0 <= rr < H and 0 <= cc < W and board[rr, cc] == col:
+                        return False
+        return True
+
+    def placements_for(piece: dict) -> list[tuple[int, int]]:
+        h = int(piece["patch"].shape[0])
+        w = int(piece["patch"].shape[1])
+        out = []
+        for r0 in range(H - h + 1):
+            for c0 in range(W - w + 1):
+                if can_place(piece, r0, c0):
+                    out.append((r0, c0))
+        return out
+
+    def place(piece: dict, r0: int, c0: int) -> list[tuple[int, int]]:
+        changed = []
+        for dr, dc, col in piece["cells"]:
+            r = r0 + dr
+            c = c0 + dc
+            board[r, c] = int(col)
+            changed.append((r, c))
+        if not piece.get("fixed"):
+            ar = r0 + int(piece["anchor"][0])
+            ac = c0 + int(piece["anchor"][1])
+            anchor_targets[int(piece["anchor_color"])].remove((ar, ac))
+        return changed
+
+    def unplace(piece: dict, r0: int, c0: int, changed: list[tuple[int, int]]) -> None:
+        for r, c in changed:
+            board[r, c] = -1
+        if not piece.get("fixed"):
+            ar = r0 + int(piece["anchor"][0])
+            ac = c0 + int(piece["anchor"][1])
+            anchor_targets[int(piece["anchor_color"])].add((ar, ac))
+
+    for r0, c0, piece in fixed:
+        changed = place(piece, r0, c0)
+        assert len(changed) == int(piece["area"])
+
+    remaining = [piece for piece in pieces if not piece.get("fixed")]
+
+    def dfs(rem: list[dict]) -> bool:
+        placed_now: list[tuple[dict, int, int, list[tuple[int, int]]]] = []
+        cur = list(rem)
+        while True:
+            forced = None
+            best_piece = None
+            best_places = None
+            for piece in cur:
+                places = placements_for(piece)
+                if not places:
+                    for p, rr, cc, changed in reversed(placed_now):
+                        unplace(p, rr, cc, changed)
+                    return False
+                places.sort()
+                if best_places is None or len(places) < len(best_places):
+                    best_piece = piece
+                    best_places = places
+                if len(places) == 1:
+                    forced = (piece, places[0][0], places[0][1])
+                    break
+            if forced is None:
+                break
+            piece, r0, c0 = forced
+            changed = place(piece, r0, c0)
+            placed_now.append((piece, r0, c0, changed))
+            cur.remove(piece)
+
+        if not cur:
+            ok = not any(v == -1 for v in board.ravel())
+            ok = ok and all(len(v) == 0 for v in anchor_targets.values())
+            ok = ok and np.array_equal(board, board[:, ::-1])
+            if ok:
+                return True
+            for p, rr, cc, changed in reversed(placed_now):
+                unplace(p, rr, cc, changed)
+            return False
+
+        assert best_piece is not None and best_places is not None
+        cur.remove(best_piece)
+        for r0, c0 in best_places:
+            changed = place(best_piece, r0, c0)
+            if dfs(cur):
+                return True
+            unplace(best_piece, r0, c0, changed)
+
+        for p, rr, cc, changed in reversed(placed_now):
+            unplace(p, rr, cc, changed)
+        return False
+
+    ok = dfs(remaining)
+    assert ok, "assembly failed"
+    assert np.array_equal(board, board[:, ::-1]), "assembled board must be LR-symmetric"
+    return board
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Reassemble anchored fragments into a left-right symmetric rectangle.
+
+    Input structure:
+    - bg is the most common color; every real fragment is a 4-connected non-bg component
+      with one special anchor pixel and a larger single-color body.
+    - One or two frame fragments already sit in their final rectangle positions.
+    - Every scattered non-frame fragment has a matching isolated anchor marker inside the frame.
+
+    Rule:
+    - Ignore singleton non-bg components as target markers, and infer the output size from the
+      multi-cell anchored fragments only.
+    - Detect the in-place LR-symmetric frame, then place the remaining anchored fragments into
+      the rectangle so the whole output is exactly mirror-symmetric.
+    - A placement is legal only if the fragment's unique anchor pixel lands on a same-colored
+      target marker and same-body-color fragments do not 4-touch.
+
+    Key insight: the odd-colored pixel inside each fragment is not decorative; it is a precise
+    alignment key. Shape and symmetry narrow the options, and the anchor markers finish the match.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = int(get_bg(g))
+
+    comps = components_mask(g != bg, connectivity=4)
+    markers = [pts for pts in comps if len(pts) == 1]
+    piece_comps = [pts for pts in comps if len(pts) > 1]
+    assert piece_comps, "input must contain real anchored pieces"
+
+    total_area = sum(len(pts) for pts in piece_comps)
+    dims = [(h, w) for (h, w) in _factors(total_area) if h >= w]
+    assert dims, "at least one portrait factor pair must exist for the total piece area"
+    best_gap = min(abs(h - w) for h, w in dims)
+    best_dims = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+    assert len(best_dims) == 1, "closest-to-square portrait output shape must be unique"
+    H, W = best_dims[0]
+
+    frame_parts = _find_frame_parts(piece_comps, H, W)
+    frame_keys = {_coords_key(pts) for pts in frame_parts}
+    frame_union = np.concatenate(frame_parts)
+    fr0, fc0, _, _ = bbox_coords(frame_union)
+
+    req = np.full((H, W), -1, dtype=int)
+    pieces: list[dict] = []
+    body_counts: Counter[int] = Counter()
+    fixed: list[tuple[int, int, dict]] = []
+    anchor_targets: dict[int, set[tuple[int, int]]] = {}
+
+    for pts in piece_comps:
+        piece = _sprite_from_component(g, pts, bg)
+        body_counts[int(piece["body_color"])] += 1
+        key = _coords_key(pts)
+        if key in frame_keys:
+            r0, c0, _, _ = piece["bbox"]
+            or0 = int(r0) - fr0
+            oc0 = int(c0) - fc0
+            piece["fixed"] = True
+            fixed.append((or0, oc0, piece))
+            for dr, dc, col in piece["cells"]:
+                req[or0 + dr, oc0 + dc] = int(col)
+        pieces.append(piece)
+
+    for pts in markers:
+        r = int(pts[0, 0])
+        c = int(pts[0, 1])
+        or0 = r - fr0
+        oc0 = c - fc0
+        assert 0 <= or0 < H and 0 <= oc0 < W, "anchor marker must lie inside the frame bbox"
+        col = int(g[r, c])
+        rv = int(req[or0, oc0])
+
+ succeeded in 272ms:
+rg: /home/lixinyu/snap/new/ceshi/code_combo/e8686506/21: No such file or directory (os error 2)
+/home/lixinyu/snap/new/ceshi/code/e8686506/D2/1/code.py
+/home/lixinyu/snap/new/ceshi/code/e8686506/D1/1/code.py
+/home/lixinyu/snap/new/arc2_solver_select/e8686506.py
+/home/lixinyu/snap/new/arc2_solver_select/arc_utils.py
+
+ succeeded in 266ms:
+import numpy as np
+
+from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
+import random
+
+
+def _piece_sig(pts: np.ndarray) -> tuple[int, int, tuple[tuple[int, int], ...]]:
+    r0, c0, r1, c1 = bbox_coords(pts)
+    coords = tuple(sorted((int(r) - r0, int(c) - c0) for r, c in pts))
+    return (r1 - r0 + 1), (c1 - c0 + 1), coords
+
+
+def _factors(n: int) -> list[tuple[int, int]]:
+    out = []
+    for w in range(1, n + 1):
+        if n % w == 0:
+            h = n // w
+            out.append((h, w))
+    return out
+
+
+def _build_requirements(
+    H: int,
+    W: int,
+    comps_by_color: dict[int, list[list[tuple[int, int]]]],
+) -> np.ndarray:
+    """
+    Build per-cell required color constraints (req[r,c] == -1 means unconstrained).
+
+    Heuristics supported by training examples:
+      - If there is a color with exactly 4 singleton components, those are the four corners.
+      - If there are full horizontal bars of length W-2 in the input, use them as the top/bottom edges
+        between the corners (ordered by their vertical position in the input).
+      - If there is a color with exactly two full vertical line components (width=1) in the input,
+        place them on the left/right edges centered vertically.
+    """
+    req = np.full((H, W), -1, dtype=int)
+
+    # 4 singleton components -> corners
+    corner_colors = [
+        col
+        for col, comps in comps_by_color.items()
+        if len(comps) == 4 and all(len(p) == 1 for p in comps)
+    ]
+    assert len(corner_colors) <= 1, "corner singleton color must be unique when present"
+    corner_color = corner_colors[0] if corner_colors else None
+    if corner_color is not None:
+        req[0, 0] = corner_color
+        req[0, W - 1] = corner_color
+        req[H - 1, 0] = corner_color
+        req[H - 1, W - 1] = corner_color
+
+    # Horizontal bar(s) of length W-2 (filled, height 1)
+    bar_colors: list[tuple[int, int]] = []  # (min_input_row, color)
+    if W >= 3 and corner_color is not None:
+        for col, comps in comps_by_color.items():
+            for pts in comps:
+                r0, c0, r1, c1 = bbox_coords(pts)
+                hh, ww = r1 - r0 + 1, c1 - c0 + 1
+                if hh == 1 and ww == (W - 2) and len(pts) == ww:
+                    bar_colors.append((r0, col))
+                    break
+        if bar_colors:
+            assert len(bar_colors) <= 2, "horizontal edge bar colors must be top/bottom only"
+            bar_colors.sort()
+            top_col = bar_colors[0][1]
+            bot_col = bar_colors[-1][1]
+            req[0, 1 : W - 1] = top_col
+            req[H - 1, 1 : W - 1] = bot_col
+
+    # Two full vertical line components -> left/right edges, centered vertically
+    vertical_line_candidates = []
+    for col, comps in comps_by_color.items():
+        if len(comps) != 2:
+            continue
+        sigs = [_piece_sig(pts) for pts in comps]
+        (h0, w0, coords0), (h1, w1, coords1) = sigs[0], sigs[1]
+        if w0 == 1 and w1 == 1 and h0 == h1 and coords0 == coords1 and h0 > 1:
+            vertical_line_candidates.append((col, h0))
+    assert len(vertical_line_candidates) <= 1, "paired vertical edge-line color must be unique when present"
+    if vertical_line_candidates:
+        col, L = vertical_line_candidates[0]
+        top = (H - L) // 2
+        assert 0 <= top and top + L <= H, "paired vertical edge lines must fit in the output height"
+        req[top : top + L, 0] = col
+        req[top : top + L, W - 1] = col
+
+    return req
+
+
+def _assemble(
+    types: list[dict],
+    H: int,
+    W: int,
+    req: np.ndarray,
+    disallow_touch: set[int] | None = None,
+) -> np.ndarray:
+    board = np.full((H, W), -1, dtype=int)
+    counts = [int(t["cnt"]) for t in types]
+
+    def mirror_ok(r: int, c: int, col: int) -> bool:
+        mc = W - 1 - c
+        v = board[r, mc]
+        return (v == -1) or (v == col)
+
+    def can_place(ti: int, r0: int, c0: int) -> bool:
+        t = types[ti]
+        col = int(t["col"])
+        is_singleton = len(t["coords"]) == 1
+        for dr, dc in t["coords"]:
+            r, c = r0 + dr, c0 + dc
+            if board[r, c] != -1:
+                return False
+            if req[r, c] != -1 and int(req[r, c]) != col:
+                return False
+            if not mirror_ok(r, c, col):
+                return False
+            if is_singleton and not (r == 0 or r == H - 1 or c == 0 or c == W - 1):
+                return False
+            if disallow_touch and col in disallow_touch:
+                for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                    if 0 <= rr < H and 0 <= cc < W and board[rr, cc] == col:
+                        return False
+        return True
+
+    def place(ti: int, r0: int, c0: int) -> list[tuple[int, int]]:
+        t = types[ti]
+        col = int(t["col"])
+        changed = []
+        for dr, dc in t["coords"]:
+            r, c = r0 + dr, c0 + dc
+            board[r, c] = col
+            changed.append((r, c))
+        return changed
+
+    def unplace(changed: list[tuple[int, int]]) -> None:
+        for r, c in changed:
+            board[r, c] = -1
+
+    def placements_for(ti: int) -> list[tuple[int, int]]:
+        t = types[ti]
+        return [(r0, c0)
+                for r0 in range(H - int(t["h"]) + 1)
+                for c0 in range(W - int(t["w"]) + 1)
+                if can_place(ti, r0, c0)]
+
+    # Pure constraint propagation: each step, every type must be forced (1 position)
+    # or batch-forced (positions == cnt). No backtracking. Asserts if stuck.
+    changed = True
+    while changed:
+        changed = False
+        for ti in range(len(types)):
+            if counts[ti] <= 0:
+                continue
+            places = placements_for(ti)
+            assert len(places) > 0, "assembly dead end: a piece has no valid placement"
+            if len(places) == 1:
+                counts[ti] -= 1
+                place(ti, places[0][0], places[0][1])
+                changed = True
+            elif len(places) == counts[ti]:
+                for r0, c0 in places:
+                    counts[ti] -= 1
+                    place(ti, r0, c0)
+                changed = True
+    assert all(c == 0 for c in counts), "assembly not purely propagation-solvable"
+    assert np.array_equal(board, board[:, ::-1]), "assembled board must be LR-symmetric"
+    return board
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Assemble scattered colored fragments into a left-right symmetric rectangle, jigsaw-style.
+
+    Input structure:
+    - bg = most common color; remaining colors form small sprite fragments.
+    - Optional roles: 4 singleton pixels of one color mark corners; horizontal bars mark top/bottom edges; paired vertical lines mark left/right edges.
+
+    Rule:
+    - Collect all non-bg connected components as jigsaw pieces.
+    - Determine output rectangle dimensions from total piece area.
+    - Pack pieces into the rectangle so it is exactly mirror-symmetric (left-right) and same-color pieces never 4-touch.
+
+    Key insight: Left-right symmetry plus the no-same-color-touching constraint make the assembly unique; corner/edge markers anchor it when present.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+
+    # Extract pieces (connected components per color)
+    comps_by_color: dict[int, list[list[tuple[int, int]]]] = {}
+    pieces = []
+    color_piece_count: dict[int, int] = {}
+
+    for col in sorted(set(map(int, np.unique(g)))):
+        if col == bg:
+            continue
+        comps = components_mask(g == col, connectivity=4)
+        comps_by_color[col] = comps
+        color_piece_count[col] = len(comps)
+        for pts in comps:
+            _, _, coords = _piece_sig(pts)
+            pieces.append((col, coords))
+
+    # Group identical pieces into types
+    from collections import Counter
+
+    ctr = Counter(pieces)
+    types = []
+    for (col, coords), cnt in sorted(ctr.items(), key=lambda kv: (-len(kv[0][1]), kv[0][0], kv[0][1])):
+        arr = np.array(coords, dtype=int)
+        h = int(arr[:, 0].max() + 1)
+        w = int(arr[:, 1].max() + 1)
+        types.append({"col": int(col), "coords": coords, "h": h, "w": w, "cnt": int(cnt)})
+
+    total_area = sum(int(t["cnt"]) * len(t["coords"]) for t in types)
+    assert total_area > 0, "total_area must be positive: grid must contain non-background pieces"
+
+    # Disallow 4-neigh touching between different pieces of same color (preserve component counts)
+    # Eval inputs use the unique closest-to-square portrait factor pair as the output shape.
+    dims = [(h, w) for (h, w) in _factors(total_area) if h >= w]
+    assert dims, "at least one portrait factor pair must exist for the total piece area"
+    best_gap = min(abs(h - w) for h, w in dims)
+    best_dims = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+    assert len(best_dims) == 1, "closest-to-square portrait output shape must be unique"
+    H, W = best_dims[0]
+
+    # Frame constraint: under 8-connectivity, 1-2 pieces must exist whose union bbox
+    # equals the output rectangle (H x W). Their relative positions are fixed in output.
+    comps8_all = []
+    for col in sorted(set(map(int, np.unique(g))) - {bg}):
+        for pts in components_mask(g == col, connectivity=8):
+            comps8_all.append((int(col), pts))
+    def _is_lr_symmetric(parts, h, w):
+        """Check if the union of frame parts forms an LR-symmetric bitmap."""
+        all_pts = np.concatenate([p for _, p in parts])
+        r0, c0 = int(all_pts[:, 0].min()), int(all_pts[:, 1].min())
+        bmp = np.zeros((h, w), dtype=bool)
+        for _, pts in parts:
+            for r, c in pts:
+                bmp[int(r) - r0, int(c) - c0] = True
+        return np.array_equal(bmp, bmp[:, ::-1])
+
+    frame_parts: list[tuple[int, np.ndarray]] = []
+    for i, (c1, p1) in enumerate(comps8_all):
+        r0, c0, r1, c1b = bbox_coords(p1)
+        if r1 - r0 + 1 == H and c1b - c0 + 1 == W:
+            if _is_lr_symmetric([(c1, p1)], H, W):
+                frame_parts = [(c1, p1)]
+                break
+        for j in range(i + 1, len(comps8_all)):
+            c2, p2 = comps8_all[j]
+            union = np.concatenate([p1, p2])
+            ur0, uc0, ur1, uc1 = bbox_coords(union)
+            if ur1 - ur0 + 1 == H and uc1 - uc0 + 1 == W:
+                if _is_lr_symmetric([(c1, p1), (c2, p2)], H, W):
+                    frame_parts = [(c1, p1), (c2, p2)]
+                    break
+        if frame_parts:
+            break
+    assert frame_parts, "input must contain 1-2 LR-symmetric pieces (8-conn) whose union bbox equals output dims"
+
+codex
+原题和两个单变体的关键差异已经清楚了：`D1` 把“按颜色分组件”改成“按真实 sprite 取件，并靠 seam connector 判邻接”；`D2` 则把“局部几何唯一”改成“锚点像素对齐到框内 marker”。下一步我会把这两套约束合成一套更窄的生成模板，优先保证 generator 稳定和规则肉眼可见。
+exec
+/bin/bash -lc "sed -n '320,520p' /home/lixinyu/snap/new/ceshi/code/e8686506/D1/1/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+    Key insight: shape fitting alone is no longer enough; the decisive cue is that adjacent pieces must meet through equal-colored connector pixels at the seam.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+
+    comps = components_mask(g != bg, connectivity=8)
+    assert comps, "grid must contain foreground pieces"
+    pieces = [_normalize_piece(pts, g) for pts in comps]
+
+    total_area = int(sum(piece["area"] for piece in pieces))
+    assert total_area > 0, "total area must be positive"
+    dims = [(h, w) for h, w in _factors(total_area) if h >= w]
+    assert dims, "at least one portrait factorization must exist"
+    best_gap = min(abs(h - w) for h, w in dims)
+    best_dims = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+    assert len(best_dims) == 1, "closest-to-square portrait output shape must be unique"
+    H, W = best_dims[0]
+
+    frame_group = _find_frame_group(pieces, H, W)
+    sol = _assemble(pieces, H, W, frame_group)
+    return sol.astype(int)
+
+
+# ---------------------------------------------------------------------------
+# Generator
+# ---------------------------------------------------------------------------
+
+_OUT_H = 10
+_OUT_W = 5
+
+_BODY_COLORS_MIN = 4
+_BODY_COLORS_MAX = 5
+_PIECE_COUNT_MIN = 7
+_PIECE_COUNT_MAX = 14
+_MAX_PIECE_AREA = 6
+
+_CANVAS_MIN = 13
+_CANVAS_MAX = 15
+_SCATTER_PADDING = 1
+_GEN_MAX_RETRIES = 400
+
+
+def _zigzag_frame(H: int) -> tuple[set[tuple[int, int]], int, int]:
+    cells = set()
+    start_c = random.randint(0, 1)
+    c = start_c
+    for r in range(H):
+        cells.add((r, c))
+        if r == H - 1:
+            break
+        move = random.choice(["down", "horiz", "diag"])
+        if move == "down":
+            pass
+        elif move == "horiz":
+            cells.add((r, 1 - c))
+            c = 1 - c
+        else:
+            c = 1 - c
+    return cells, start_c, c
+
+
+def _paint_chunk(grid: np.ndarray, chunk: list[tuple[int, int]], color: int) -> None:
+    W = grid.shape[1]
+    for r, c in chunk:
+        grid[int(r), int(c)] = int(color)
+        grid[int(r), W - 1 - int(c)] = int(color)
+
+
+def _adjacent_colors(grid: np.ndarray, chunk: list[tuple[int, int]], bg_marker: int = -1) -> set[int]:
+    H, W = grid.shape
+    colors = set()
+    full = set()
+    for r, c in chunk:
+        full.add((int(r), int(c)))
+        full.add((int(r), int(W - 1 - int(c))))
+    for r, c in full:
+        for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+            if 0 <= rr < H and 0 <= cc < W:
+                val = int(grid[rr, cc])
+                if val != bg_marker and (rr, cc) not in full:
+                    colors.add(val)
+    return colors
+
+
+def _fill_interior(grid: np.ndarray, fill_pool: list[int]) -> None:
+    half_cells = {(r, c) for r in range(1, _OUT_H - 1) for c in range(1, _OUT_W // 2 + 1)}
+    previous_color = None
+
+    while half_cells:
+        target = random.randint(1, min(3, len(half_cells)))
+        start = random.choice(sorted(half_cells))
+        chunk = [start]
+        half_cells.remove(start)
+        frontier = [start]
+        while len(chunk) < target and frontier:
+            cr, cc = random.choice(frontier)
+            nbrs = []
+            for nr, nc in ((cr - 1, cc), (cr + 1, cc), (cr, cc - 1), (cr, cc + 1)):
+                if (nr, nc) in half_cells:
+                    nbrs.append((nr, nc))
+            if not nbrs:
+                frontier.remove((cr, cc))
+                continue
+            nxt = random.choice(nbrs)
+            half_cells.remove(nxt)
+            chunk.append(nxt)
+            frontier.append(nxt)
+
+        avoid = _adjacent_colors(grid, chunk)
+        if previous_color is not None:
+            avoid.add(int(previous_color))
+        opts = [col for col in fill_pool if col not in avoid]
+        if not opts:
+            opts = [col for col in fill_pool if col != previous_color] or fill_pool
+        col = random.choice(opts)
+        _paint_chunk(grid, chunk, int(col))
+        previous_color = int(col)
+
+
+def _build_body_output() -> tuple[np.ndarray, int] | tuple[None, None]:
+    H, W = _OUT_H, _OUT_W
+    n_body = random.randint(_BODY_COLORS_MIN, _BODY_COLORS_MAX)
+    bg = random.choice([c for c in range(10) if c not in CONNECTOR_COLORS])
+    pool = [c for c in range(10) if c not in CONNECTOR_COLORS and c != bg]
+    random.shuffle(pool)
+    if len(pool) < n_body:
+        return None, None
+    body_palette = pool[:n_body]
+    frame_color = int(body_palette[0])
+    fill_pool = [int(c) for c in body_palette[1:]]
+    if not fill_pool:
+        return None, None
+
+    grid = np.full((H, W), -1, dtype=int)
+    grid[0, :] = frame_color
+    grid[H - 1, :] = frame_color
+    grid[:, 0] = frame_color
+    grid[:, W - 1] = frame_color
+    _fill_interior(grid, fill_pool)
+    if np.any(grid < 0):
+        return None, None
+    return grid.astype(int), int(bg)
+
+
+def _build_structured_output() -> tuple[np.ndarray, int, np.ndarray, set[int]]:
+    H, W = _OUT_H, _OUT_W
+    bg = random.choice([c for c in range(10) if c not in CONNECTOR_COLORS])
+    frame_color = random.choice([c for c in range(10) if c not in CONNECTOR_COLORS and c != bg])
+    out = np.full((H, W), int(frame_color), dtype=int)
+    pid_grid = np.zeros((H, W), dtype=int)
+
+    # Border ring + two inner frame bars.
+    bar_rows = {3, 6}
+    for r in range(H):
+        for c in range(W):
+            if r in (0, H - 1) or c in (0, W - 1) or r in bar_rows:
+                pid_grid[r, c] = 0
+            else:
+                out[r, c] = -1
+                pid_grid[r, c] = -1
+
+    chamber_starts = [1, 4, 7]
+    palette = list(CONNECTOR_COLORS)
+    random.shuffle(palette)
+    next_pid = 1
+    for i, r0 in enumerate(chamber_starts):
+        top_col = int(palette[i % len(palette)])
+        bot_col = int(palette[(i + 1) % len(palette)])
+
+        out[r0 - 1, 1:4] = top_col
+        out[r0 + 2, 1:4] = bot_col
+        out[r0, 0] = top_col
+        out[r0 + 1, 0] = bot_col
+        out[r0, W - 1] = top_col
+        out[r0 + 1, W - 1] = bot_col
+
+        for c in range(1, 4):
+            out[r0, c] = top_col
+            out[r0 + 1, c] = bot_col
+            pid_grid[r0, c] = int(next_pid)
+            pid_grid[r0 + 1, c] = int(next_pid)
+            next_pid += 1
+
+    assert np.all(out >= 0)
+    return out.astype(int), int(bg), pid_grid.astype(int), {0}
+
+
+def _piece_partition(body_out: np.ndarray) -> tuple[list[dict], np.ndarray]:
+    H, W = body_out.shape
+    pid_grid = np.full((H, W), -1, dtype=int)
+    pieces = []
+    for col in sorted(set(map(int, np.unique(body_out)))):
+        for pts in components_mask(body_out == int(col), connectivity=8):
+            r0, c0, r1, c1 = bbox_coords(pts)
+            coords = [(int(r), int(c)) for r, c in pts]
+            pid = len(pieces)
+            for r, c in coords:
+                pid_grid[int(r), int(c)] = int(pid)
+            pieces.append(
+                {
+                    "pid": int(pid),
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/arc_utils.py" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '340,620p' /home/lixinyu/snap/new/ceshi/code/e8686506/D2/1/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+        rv = int(req[or0, oc0])
+        assert rv == -1 or rv == col, "marker must not conflict with fixed frame"
+        req[or0, oc0] = col
+        anchor_targets.setdefault(col, set()).add((or0, oc0))
+
+    for piece in pieces:
+        if piece.get("fixed"):
+            continue
+        col = int(piece["anchor_color"])
+        assert col in anchor_targets, "every scattered piece must have a target anchor marker"
+
+    assert sum(len(v) for v in anchor_targets.values()) == sum(1 for p in pieces if not p.get("fixed"))
+    disallow_touch = {col for col, n in body_counts.items() if n > 1}
+    sol = _assemble(pieces, H, W, req, fixed, anchor_targets, disallow_touch)
+    return sol.astype(int)
+
+
+# --------------- generator (output-first anchored assembly variant) ---------------
+
+# Output dimensions
+_AREA_MIN = 25
+_AREA_MAX = 50
+_WIDTH_REQUIRED = 5
+_HEIGHT_MAX = 10
+
+# Colors
+_BODY_COLORS_MIN = 3
+_BODY_COLORS_MAX = 4
+_ANCHOR_COLORS_MIN = 2
+_ANCHOR_COLORS_MAX = 3
+_CENTER_CAP_PROB = 0.5
+
+# Piece constraints
+_MIN_PIECE_AREA = 3
+_MAX_PIECE_AREA = 10
+_PIECE_COUNT_MIN = 5
+_PIECE_COUNT_MAX = 9
+_MAX_CHUNK_SIZE = 6
+
+# Canvas / scatter
+_CANVAS_MIN = 13
+_CANVAS_MAX = 15
+_SCATTER_PADDING = 1
+
+# Retry
+_GEN_MAX_RETRIES = 400
+
+
+def _valid_dims() -> list[tuple[int, int]]:
+    results = []
+    for area in range(_AREA_MIN, _AREA_MAX + 1):
+        dims = [(area // w, w) for w in range(1, area + 1) if area % w == 0 and area // w >= w]
+        best_gap = min(abs(h - w) for h, w in dims)
+        best = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+        if len(best) == 1:
+            h, w = best[0]
+            if w == _WIDTH_REQUIRED and h <= _HEIGHT_MAX:
+                results.append((h, w))
+    return results
+
+
+_VALID_DIMS = [dims for dims in _valid_dims() if dims[0] % 2 == 0 and dims[0] >= 6]
+_DIM_WEIGHTS = [h * w for h, w in _VALID_DIMS]
+
+
+def _zigzag_frame(H: int) -> tuple[set[tuple[int, int]], int, int]:
+    cells = set()
+    start_c = random.randint(0, 1)
+    c = start_c
+    for r in range(H):
+        cells.add((r, c))
+        if r == H - 1:
+            break
+        move = random.choice(["down", "horiz"])
+        if move == "horiz":
+            cells.add((r, 1 - c))
+            c = 1 - c
+    return cells, start_c, c
+
+
+def _build_base_output(H: int, W: int) -> tuple[np.ndarray | None, int]:
+    n_body = random.randint(_BODY_COLORS_MIN, _BODY_COLORS_MAX)
+    palette = list(range(n_body))
+    random.shuffle(palette)
+    frame_color = palette[0]
+    fill_pool = palette[1:]
+    if not fill_pool:
+        return None, -1
+
+    grid = np.full((H, W), frame_color, dtype=int)
+    prev_col = None
+    for r0 in range(0, H, 2):
+        opts = [f for f in fill_pool if f != prev_col] or fill_pool
+        col = random.choice(opts)
+        grid[r0 : r0 + 2, 1 : W - 1] = col
+        prev_col = col
+    return grid, frame_color
+
+
+def _extract_base_pieces(out: np.ndarray, frame_color: int) -> tuple[list[dict], list[int]]:
+    pieces = []
+    frame_ids = []
+    for col in sorted(map(int, np.unique(out))):
+        for pts in components_mask(out == col, connectivity=4):
+            coords = [(int(r), int(c)) for r, c in pts]
+            piece = {
+                "color": int(col),
+                "coords": coords,
+                "coord_set": frozenset(coords),
+                "area": len(coords),
+            }
+            if col == frame_color:
+                frame_ids.append(len(pieces))
+            pieces.append(piece)
+    return pieces, frame_ids
+
+
+def _mirror_groups(pieces: list[dict], W: int) -> list[list[int]]:
+    lookup = {(piece["color"], piece["coord_set"]): i for i, piece in enumerate(pieces)}
+    groups = []
+    seen = set()
+    for i, piece in enumerate(pieces):
+        if i in seen:
+            continue
+        mirrored = frozenset((r, W - 1 - c) for r, c in piece["coords"])
+        j = lookup[(piece["color"], mirrored)]
+        if j == i:
+            groups.append([i])
+            seen.add(i)
+        else:
+            groups.append(sorted([i, j]))
+            seen.add(i)
+            seen.add(j)
+    return groups
+
+
+def _frame_mask(shape: tuple[int, int], pieces: list[dict], frame_ids: list[int]) -> np.ndarray:
+    H, W = shape
+    mask = np.zeros((H, W), dtype=bool)
+    for idx in frame_ids:
+        for r, c in pieces[idx]["coords"]:
+            mask[r, c] = True
+    return mask
+
+
+def _choose_anchor_positions(
+    out: np.ndarray,
+    pieces: list[dict],
+    frame_ids: list[int],
+    anchor_palette: list[int],
+) -> tuple[np.ndarray | None, list[dict] | None, set[int]]:
+    H, W = out.shape
+    frame_set = set(frame_ids)
+    frame_mask = _frame_mask((H, W), pieces, frame_ids)
+    groups = _mirror_groups(pieces, W)
+    random.shuffle(groups)
+
+    anchored = out.copy()
+    markers: list[dict] = []
+    chosen_markers: set[tuple[int, int]] = set()
+    real_frame_colors: set[int] = set()
+
+    def touches_frame(r: int, c: int) -> bool:
+        for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+            if 0 <= rr < H and 0 <= cc < W and frame_mask[rr, cc]:
+                return True
+        return False
+
+    def touches_marker(r: int, c: int) -> bool:
+        return any((rr, cc) in chosen_markers for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)))
+
+    for group in groups:
+        a_col = random.choice(anchor_palette)
+        if len(group) == 1:
+            idx = group[0]
+            cells = list(pieces[idx]["coords"])
+            if idx in frame_set:
+                candidates = [(r, c) for r, c in cells if c == W // 2]
+                if not candidates:
+                    return None, None, set()
+                r, c = random.choice(candidates)
+                anchored[r, c] = a_col
+                real_frame_colors.add(a_col)
+            else:
+                candidates = [
+                    (r, c)
+                    for r, c in cells
+                    if c == W // 2 and not touches_frame(r, c) and not touches_marker(r, c)
+                ]
+                if not candidates:
+                    return None, None, set()
+                r, c = random.choice(candidates)
+                anchored[r, c] = a_col
+                markers.append({"pos": (r, c), "color": int(a_col)})
+                chosen_markers.add((r, c))
+        else:
+            i, j = group
+            left = i if np.mean([c for _, c in pieces[i]["coords"]]) <= np.mean([c for _, c in pieces[j]["coords"]]) else j
+            right = j if left == i else i
+            candidates = []
+            for r, c in pieces[left]["coords"]:
+                mr = r
+                mc = W - 1 - c
+                if (mr, mc) not in pieces[right]["coord_set"]:
+                    continue
+                if left not in frame_set:
+                    if touches_frame(r, c) or touches_frame(mr, mc):
+                        continue
+                    if touches_marker(r, c) or touches_marker(mr, mc):
+                        continue
+                candidates.append((r, c, mr, mc))
+            if not candidates:
+                return None, None, set()
+            r, c, mr, mc = random.choice(candidates)
+            anchored[r, c] = a_col
+            anchored[mr, mc] = a_col
+            if left in frame_set:
+                real_frame_colors.add(a_col)
+            else:
+                markers.append({"pos": (r, c), "color": int(a_col)})
+                markers.append({"pos": (mr, mc), "color": int(a_col)})
+                chosen_markers.add((r, c))
+                chosen_markers.add((mr, mc))
+
+    return anchored, markers, real_frame_colors
+
+
+def _extract_piece_patch(out: np.ndarray, coords: list[tuple[int, int]], bg: int) -> np.ndarray:
+    arr = np.array(coords, dtype=int)
+    r0, c0, r1, c1 = bbox_coords(arr)
+    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
+    for r, c in coords:
+        patch[r - r0, c - c0] = int(out[r, c])
+    return patch
+
+
+def _make_output() -> tuple[np.ndarray | None, int, list[dict] | None, list[int] | None, list[dict] | None]:
+    H, W = random.choices(_VALID_DIMS, weights=_DIM_WEIGHTS, k=1)[0]
+    base_out, frame_color = _build_base_output(H, W)
+    if base_out is None:
+        return None, 0, None, None, None
+    if not np.array_equal(base_out, base_out[:, ::-1]):
+        return None, 0, None, None, None
+
+    base_pieces, frame_ids = _extract_base_pieces(base_out, frame_color)
+    piece_areas = [int(piece["area"]) for piece in base_pieces]
+    if any(a < _MIN_PIECE_AREA or a > _MAX_PIECE_AREA for a in piece_areas):
+        return None, 0, None, None, None
+    if not (_PIECE_COUNT_MIN <= len(base_pieces) <= _PIECE_COUNT_MAX):
+        return None, 0, None, None, None
+    if any(idx not in frame_ids for idx in range(len(base_pieces))) is False:
+        return None, 0, None, None, None
+
+    bg = random.randint(0, 9)
+    body_colors = sorted(map(int, np.unique(base_out)))
+    available = [c for c in range(10) if c != bg]
+    random.shuffle(available)
+    if len(available) < len(body_colors) + _ANCHOR_COLORS_MIN:
+        return None, 0, None, None, None
+
+    body_cmap = {int(a): available[i] for i, a in enumerate(body_colors)}
+    body_used = set(body_cmap.values())
+    anchor_available = [c for c in available if c not in body_used]
+    if len(anchor_available) < _ANCHOR_COLORS_MIN:
+        return None, 0, None, None, None
+    n_anchor = random.randint(_ANCHOR_COLORS_MIN, min(_ANCHOR_COLORS_MAX, len(anchor_available)))
+    anchor_palette = anchor_available[:n_anchor]
+
+    recolored = np.vectorize(lambda x: body_cmap[int(x)])(base_out)
+    recolored_pieces, recolored_frame_ids = _extract_base_pieces(recolored, body_cmap[frame_color])
+    anchored_out, markers, _ = _choose_anchor_positions(recolored, recolored_pieces, recolored_frame_ids, anchor_palette)
+    if anchored_out is None or markers is None:
+        return None, 0, None, None, None
+    if len(markers) != len(recolored_pieces) - len(recolored_frame_ids):
+        return None, 0, None, None, None
+    return anchored_out.astype(int), bg, markers, recolored_frame_ids, recolored_pieces
+
+
+def _scatter(
+    out: np.ndarray,
+    bg: int,
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/e8686506.json'
+obj=json.load(open(p))
+print('train',len(obj['train']),'test',len(obj['test']))
+for k in ('train','test'):
+    for i,ex in enumerate(obj[k]):
+        inp=ex['input']; out=ex.get('output')
+        print(k,i,len(inp),len(inp[0]), '->', len(out) if out else None, len(out[0]) if out else None)
+PY" in /home/lixinyu/snap/new
+ succeeded in 101ms:
+ succeeded in 135ms:
+train 2 test 1
+train 0 13 13 -> 5 5
+train 1 13 13 -> 8 5
+test 0 15 15 -> 8 5
+
+codex
+约束层次已经够了。接下来我会固定一个更规整的输出模板，让“锚点颜色复用”和“connector 颜色复用”同时存在：锚点只能把件放到一小组候选位置里，真正决定左右/上下邻接的是 seam 上的 connector 配对。
+exec
+/bin/bash -lc 'rg -n "def components_mask|def paste|def random_free_location" /home/lixinyu/snap/new/arc2_solver_select/arc_utils.py /home/lixinyu/snap/new/solvers/arc_utils.py' in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '360,520p' /home/lixinyu/snap/new/arc2_solver_select/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 251ms:
+    if transparent is not None:
+        m &= (patch_view != int(transparent))
+        if not overwrite:
+            m &= (dst_view == int(transparent))
+    else:
+        if not overwrite:
+            raise ValueError("paste: overwrite=False requires transparent to be set")
+
+    dst_view[m] = patch_view[m]
+    return dst
+
+
+def paint_coords(out: np.ndarray, coords: Iterable[Coord], color: int) -> None:
+    """Set out[r,c]=color for each coord (in-bounds only)."""
+    H, W = out.shape
+    v = int(color)
+    for r, c in coords:
+        rr = int(r)
+        cc = int(c)
+        if 0 <= rr < H and 0 <= cc < W:
+            out[rr, cc] = v
+
+
+# =============================================================================
+# Connected components (single unified entrypoint: find_components)
+# =============================================================================
+
+STRUCT4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=int)
+STRUCT8 = np.ones((3, 3), dtype=int)
+
+
+def label_mask(mask: np.ndarray, connectivity: int = 4) -> tuple[np.ndarray, int]:
+    """Connected-components labeling for a boolean mask."""
+    struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+    lab, n = label(mask.astype(bool), structure=struct)
+    return lab, int(n)
+
+
+def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+    """List of components from a boolean mask, each as an (N,2) coords array."""
+    lab, n = label_mask(mask, connectivity=connectivity)
+    return [np.argwhere(lab == k) for k in range(1, n + 1)]
+
+
+def find_components(
+    grid: np.ndarray,
+    *,
+    bg: int | None = None,
+    connectivity: int = 4,
+    monochromatic: bool = True,
+    colors: Sequence[int] | None = None,
+    min_area: int = 1,
+    return_format: str = "dict",
+) -> list[dict] | list[np.ndarray]:
+    """
+    Find connected components in a grid (unified API for ARC-2 + migrated seeds).
+
+    return_format:
+      - \"dict\": list of dicts {color, coords, bbox, area}
+      - \"objects\": list of full-grid arrays containing exactly one component
+    """
+    if bg is None:
+        bg = get_bg(grid)
+    bg = int(bg)
+
+    return_format = str(return_format).lower().strip()
+    if return_format not in {"dict", "objects"}:
+        raise ValueError("find_components: return_format must be 'dict' or 'objects'")
+
+    if colors is None:
+        colors_set = None
+        colors_iter = sorted(set(map(int, grid.flatten())) - {bg})
+    else:
+        colors_set = {int(c) for c in colors}
+        colors_iter = [int(c) for c in colors_set if int(c) != bg]
+
+    # Monochromatic = label per-color
+    if monochromatic:
+        if return_format == "dict":
+            out: list[dict] = []
+            for col in colors_iter:
+                mask = (grid == col)
+                if not mask.any():
+                    continue
+                comps = components_mask(mask, connectivity=connectivity)
+                for coords in comps:
+                    if int(coords.shape[0]) < int(min_area):
+                        continue
+                    out.append(
+                        {
+                            "color": int(col),
+                            "coords": coords,
+                            "bbox": bbox_coords(coords),
+                            "area": int(coords.shape[0]),
+                        }
+                    )
+            return out
+
+        objs: list[np.ndarray] = []
+        struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+        for col in colors_iter:
+            lab, n = label(grid == int(col), structure=struct)
+            for k in range(1, int(n) + 1):
+                m = (lab == k)
+                if int(m.sum()) < int(min_area):
+                    continue
+                obj = np.full_like(grid, bg)
+                obj[m] = int(col)
+                objs.append(obj)
+        return objs
+
+    # Multicolor components = label foreground as a whole
+    struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+    if colors_set is None:
+        fg_mask = (grid != bg)
+    else:
+        fg_mask = (grid != bg) & np.isin(grid, list(colors_set))
+
+    lab, n = label(fg_mask, structure=struct)
+    if return_format == "dict":
+        out: list[dict] = []
+        for k in range(1, int(n) + 1):
+            coords = np.argwhere(lab == k)
+            if coords.size == 0 or int(coords.shape[0]) < int(min_area):
+                continue
+            out.append(
+                {
+                    "color": None,
+                    "coords": coords,
+                    "bbox": bbox_coords(coords),
+                    "area": int(coords.shape[0]),
+                }
+            )
+        return out
+
+    objs: list[np.ndarray] = []
+    for k in range(1, int(n) + 1):
+        m = (lab == k)
+        if int(m.sum()) < int(min_area):
+            continue
+        obj = np.full_like(grid, bg)
+        obj[m] = grid[m]
+        objs.append(obj)
+    return objs
+
+
+# =============================================================================
+# Geometry
+# =============================================================================
+
+
+def flood_fill(grid: np.ndarray, r: int, c: int, color: int, *, connectivity: int = 4) -> None:
+    """Flood fill region containing (r,c) with `color` (in-place)."""
+    H, W = grid.shape
+    r0 = int(r)
+    c0 = int(c)
+    if not (0 <= r0 < H and 0 <= c0 < W):
+        return
+    new_col = int(color)
+    old_col = int(grid[r0, c0])
+    if old_col == new_col:
+
+ succeeded in 271ms:
+/home/lixinyu/snap/new/solvers/arc_utils.py:308:def paste(
+/home/lixinyu/snap/new/solvers/arc_utils.py:398:def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+/home/lixinyu/snap/new/solvers/arc_utils.py:854:def random_free_location(
+/home/lixinyu/snap/new/arc2_solver_select/arc_utils.py:308:def paste(
+/home/lixinyu/snap/new/arc2_solver_select/arc_utils.py:398:def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+/home/lixinyu/snap/new/arc2_solver_select/arc_utils.py:854:def random_free_location(
+
+exec
+/bin/bash -lc "rg --files /home/lixinyu/snap/new | rg '/arc_utils\\.py"'$|''^/home/lixinyu/snap/new/arc_utils'"\\.py"'$'"'" in /home/lixinyu/snap/new
+ exited 1 in 0ms:
+exec
+/bin/bash -lc "rg -n \"sys.path|from arc_utils\" /home/lixinyu/snap/new/ceshi/code_combo -g 'code.py' | head -n 20" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/29/code.py:59:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/18/code.py:42:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/25/code.py:12:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/26/code.py:78:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/31/code.py:14:if str(_SOLVER_DIR) not in sys.path:
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/31/code.py:15:    sys.path.append(str(_SOLVER_DIR))
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/31/code.py:17:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/27/code.py:12:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/a251c730/29/code.py:12:from arc_utils import bbox_coords, components_mask, paste, random_free_location
+/home/lixinyu/snap/new/ceshi/code_combo/a251c730/18/code.py:12:from arc_utils import bbox_coords, components_mask, paste, random_free_location
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/8/code.py:11:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/a251c730/25/code.py:12:from arc_utils import bbox_coords, components_mask, paste, random_free_location
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/24/code.py:52:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/a251c730/26/code.py:12:from arc_utils import bbox_coords, components_mask, paste, random_free_location
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/1/code.py:11:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/9385bd28/18/code.py:10:from arc_utils import bbox, crop_bbox, get_bg
+/home/lixinyu/snap/new/ceshi/code_combo/a251c730/31/code.py:12:from arc_utils import bbox_coords, components_mask, paste, random_free_location
+/home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/3/code.py:11:from arc_utils import find_components, get_bg, label_mask, paste
+/home/lixinyu/snap/new/ceshi/code_combo/a251c730/27/code.py:12:from arc_utils import bbox_coords, components_mask, paste, random_free_location
+/home/lixinyu/snap/new/ceshi/code_combo/9385bd28/8/code.py:10:from arc_utils import get_bg
+
+codex
+还有一个环境点要处理：目标文件被 `spec_from_file_location` 直接加载，不能假设 `arc_utils` 在默认 `sys.path` 上。我会在新文件里加最小的 `sys.path` 引导，避免测试时因为导入路径而假失败。
+exec
+/bin/bash -lc "sed -n '1,70p' /home/lixinyu/snap/new/ceshi/code_combo/2d0172a1/31/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Combo variant of 2d0172a1 (index 31)
+# combo_spec: D14/0+D15/0+D16/1
+# Name: 边缘控制像素+强制垂直排列+规范化后镜像
+
+from __future__ import annotations
+
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+
+_SOLVER_DIR = Path("/home/lixinyu/snap/new/solvers")
+if str(_SOLVER_DIR) not in sys.path:
+    sys.path.append(str(_SOLVER_DIR))
+
+from arc_utils import find_components, get_bg, label_mask, paste
+
+
+"""
+design_analysis:
+  a_concretization_and_trace:
+    - 原题先从粗糙 frame/blob 图恢复包含树，再按原始 row/col band 关系生成规范矩形框+点图。
+    - 本融合版先读边缘控制像素，再忽略其颜色；主体规范化阶段强制所有 frame 内的直接子节点都改为
+      纵向堆叠，最后再按控制边指定的镜像轴翻转整张规范图。
+    - 具体例子：若外框里原本是左右并排的 inner-frame 与 blob，外框外右侧还有一个 blob，
+      原题会输出“内层兄弟仍大致横向关系 + 外侧点在右边”；本题先把内层兄弟改成上下排列，
+      再若控制像素在左/右边，则整张规范图做左右镜像，于是外侧点跑到另一边，内层上下栈保持不变。
+      若控制像素在上/下边，则做上下镜像，外侧点会换到上下相反的一侧。
+  b_complexity_calibration:
+    - 控制边只编码两种镜像轴：左/右边 => 左右镜像；上/下边 => 上下镜像。这样有可见分支，
+      但自由度仍然很小。
+    - 为避免 D15 退化成“左右等价、上下等价”的弱提示，generator 让 outside blob 与控制边同侧，
+      这样镜像后的最终位置会稳定跑到对侧，四条边都各自可观察。
+    - 为避免 D14 退化，generator 偏置输入 sibling 为 horizontal/diagonal，并要求新规范图
+      与原题规范图不同。
+    - 为避免 D16 退化，generator 强制存在一个与目标镜像轴同向的 outside blob，并拒绝
+      “镜像前后完全相同”的规范图。
+  c_implicit_assumption_audit:
+    - 原 main() 假设唯一非背景色就是主体前景；这里先识别边界控制色并擦除，否则它会被误判为 blob。
+    - 原 _layout_group() 假设 sibling 的 row/col overlap 决定 canonical 布局；融合后这个前提失效，
+      必须改为按原始 top-row 排序的固定纵向堆叠。
+    - 原 main() 在得到 canonical mask 后直接返回；融合后还必须追加镜像步骤。
+    - 控制色识别依赖“主体前景不触边”；generator 明确给主体保留至少 1 格边距。
+    - 镜像步骤依赖控制边只出现一条边且不在角上；generator 用同色 1-2 个非角落边缘像素来保证。
+  d_placement_legality:
+    - frame/blob 的粗糙输入仍用显式 gap 和 margin 放置，避免重叠。
+    - outside blob 以正间距贴在 root frame 一侧，但整体绘制后仍与网格边界留出至少 1 格背景，
+      给控制像素留出专用边界槽位。
+    - 所有候选样本都经过新 main() 回算校验。
+  e_visual_observability:
+    - 输入中可见第三种颜色的小边缘标记；输出中可见 mirror 造成的外侧点换边/换上下。
+    - 同时，frame 内部若原本横排或斜排，输出会变成纵排，确保 D14 也肉眼可见。
+    - 样本筛选要求 verticalized canonical 与 legacy canonical 不同，且所选镜像轴确实改变结果。
+  f_visual_cleanliness:
+    - 控制像素只占一条外边，不侵入主体区域。
+    - 输出仍是整洁的单色矩形框与点图；新增变化只体现在 sibling 纵排与整体镜像。
+  g_inferability:
+    - 颜色新增仅一种控制色，且它总是边缘孤立标记，不参与对象排序。
+    - 颜色规则由位置结构支撑：看它在左右边还是上下边，就能归纳出镜像轴；
+      再看 outside blob 总从控制边的同侧翻到对侧，就能归纳出精确边向；看内部 sibling
+      总被整理成竖列，就能归纳出规范化方式。
+"""
+
+
+_EDGE_TO_AXIS = {
+    "left": "horizontal",
+    "right": "horizontal",
+    "top": "vertical",
+    "bottom": "vertical",
+
+ERROR: Reconnecting... 2/5
+ERROR: Reconnecting... 3/5

@@ -1,0 +1,4687 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e3138-4587-7bf3-af79-5239beb115ff
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: cb2d8a2c
+    **摘要**: 绿色像素从网格边缘出发，沿直角转弯路径绕过红色障碍条，每条红色条的最小回避距离由其上蓝色像素数量决定，蓝色像素最终变为红色
+
+    ## 要实现的融合组合
+    - **组合名称**: 蓝色数编码行为模式+GCD间距约束
+    - **combo_spec**: D3/3+D20/2
+
+    ### 融合描述（实现规格）
+
+    蓝色像素数量编码不同行为模式(1=左绕, 2=右绕, 3=穿过, 4=终止)(D20/2)，同时路径在通过障碍区域时按蓝色数步长跳跃前进(D3/3)。当蓝色数=3时路径穿过并按3步长跳跃；=4时终止但GCD间距为4。行为模式与步长参数同时由蓝色数编码。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D3/3** — 距离约束的编码方式 (`trajectory`)
+  - 当前值: distance_constraint——路径与每条障碍条的最小距离 = 该条上蓝色像素的数量，路径必须在该距离之外通过
+  - 改为: GCD间距约束 — 路径不是保持固定最小距离，而是在通过障碍条区域时以蓝色像素数量为步长跳跃前进（涂色位置按GCD间距排列），形成间歇性轨迹。
+  - 来源: gcd_spacing（参考任务: 16de56c4）
+- **D20/2** — 障碍条上蓝色像素的角色 (`meta`)
+  - 当前值: 蓝色像素承担单一角色：计数编码距离约束参数，最后统一变为红色
+  - 改为: 蓝色像素编码路径在该障碍条处的行为模式 — 蓝色像素的数量编码不同的行为模式：1个=绕行左侧，2个=绕行右侧，3个=穿过并变色，4个=路径在此终止。解题者需要推断数量-行为的映射关系，大幅增加了规则推断难度。
+  - 来源: creative（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/cb2d8a2c.py`
+
+    ```python
+    import heapq
+from collections import deque
+
+import numpy as np
+
+from arc_utils import components_mask, neighbors4
+import itertools
+import random
+
+_DIRS_URDL = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Extend a green path from one grid edge to the opposite, routing around red bars at a distance dictated by their blue pixel count.
+
+    Input structure:
+    - bg = azure (8). Red/blue bars (color 2/1) act as obstacles.
+    - A single green (3) pixel sits on a grid border — the path start.
+
+    Rule:
+    - Each bar's keep-out radius equals its number of blue pixels; the path must stay farther than that from every bar cell.
+    - The green pixel extends inward toward the opposite edge, turning at right angles to navigate around forbidden zones.
+    - After the path is drawn, all blue pixels become red.
+
+    Key insight: Blue pixels on a bar encode its danger radius — more blue means a wider no-go zone the path must respect.
+    """
+    g = np.array(grid, copy=True)
+    h, w = g.shape
+
+    BG = 8
+    GREEN = 3
+    BLUE = 1
+    RED = 2
+
+    dirs = _DIRS_URDL  # U, R, D, L
+
+    # --- find the unique green start pixel on the border ---
+    start_pts = np.argwhere(g == GREEN)
+    assert start_pts.shape[0] == 1, "grid must contain exactly one green start pixel"
+    sr, sc = map(int, start_pts[0])
+
+    # Inward initial direction + opposite-edge target.
+    if sr == 0:
+        init_dir = 2  # down
+        goal_kind, goal_val = "row", h - 1
+    elif sr == h - 1:
+        init_dir = 0  # up
+        goal_kind, goal_val = "row", 0
+    elif sc == 0:
+        init_dir = 1  # right
+        goal_kind, goal_val = "col", w - 1
+    elif sc == w - 1:
+        init_dir = 3  # left
+        goal_kind, goal_val = "col", 0
+    else:
+        raise AssertionError("green start must be on a border edge")
+
+    def is_goal(r: int, c: int) -> bool:
+        return (r == goal_val) if goal_kind == "row" else (c == goal_val)
+
+    # --- find bar components (colors {1,2}) ---
+    bar_mask = (g == BLUE) | (g == RED)
+    bar_comps = components_mask(bar_mask, connectivity=4)
+
+    # --- build forbidden region: for each bar, forbid cells within Manhattan distance <= blue_count ---
+    forbidden = np.zeros((h, w), dtype=bool)
+    for comp in bar_comps:
+        blue_count = sum(1 for r, c in comp if g[r, c] == BLUE)
+        radius = int(blue_count)
+
+        dist = np.full((h, w), -1, dtype=np.int16)
+        q = deque()
+        for r, c in comp:
+            dist[r, c] = 0
+            q.append((r, c))
+
+        while q:
+            r, c = q.popleft()
+            d = int(dist[r, c])
+            forbidden[r, c] = True
+            if d == radius:
+                continue
+            for rr, cc in neighbors4(r, c):
+                if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == -1:
+                    dist[rr, cc] = d + 1
+                    q.append((rr, cc))
+
+    blocked = bar_mask | forbidden
+    blocked[sr, sc] = False
+
+    # --- Dijkstra: minimize (steps, turns) ---
+    INF = (10**9, 10**9)
+    best_cost: dict[tuple[int, int, int], tuple[int, int]] = {(sr, sc, init_dir): (0, 0)}
+    prev: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    heap: list[tuple[tuple[int, int], int, int, int]] = [((0, 0), sr, sc, init_dir)]
+
+    goal_state: tuple[int, int, int] | None = None
+    while heap:
+        (steps, turns), r, c, dprev = heapq.heappop(heap)
+        if (steps, turns) != best_cost.get((r, c, dprev), INF):
+            continue
+        if is_goal(r, c) and (r, c) != (sr, sc):
+            goal_state = (r, c, dprev)
+            break
+        for nd, (dr, dc) in enumerate(dirs):
+            rr, cc = r + dr, c + dc
+            if not (0 <= rr < h and 0 <= cc < w):
+                continue
+            if blocked[rr, cc]:
+                continue
+            ncost = (steps + 1, turns + (0 if nd == dprev else 1))
+            key = (rr, cc, nd)
+            if ncost < best_cost.get(key, INF):
+                best_cost[key] = ncost
+                prev[key] = (r, c, dprev)
+                heapq.heappush(heap, (ncost, rr, cc, nd))
+
+    # --- paint path + convert blue -> red ---
+    out = g.copy()
+    assert goal_state is not None, "a valid path to the opposite edge must exist"
+    path: list[tuple[int, int]] = []
+    st = goal_state
+    while True:
+        r, c, _ = st
+        path.append((r, c))
+        if (r, c) == (sr, sc):
+            break
+        st = prev[st]
+    path.reverse()
+    for r, c in path:
+        if out[r, c] == BG:
+            out[r, c] = GREEN
+
+    out[out == BLUE] = RED
+    return out
+
+# --------------- generator (o5x) ---------------
+
+BG = 8
+BLUE = 1
+RED = 2
+GREEN = 3
+
+# --- Tunable parameters (CFG) ---
+# Grid size bounds (rows x cols from spec: 12-29 x 13-26)
+ROWS_LO, ROWS_HI = 12, 29
+COLS_LO, COLS_HI = 13, 26
+# Bar counts and blue-per-bar range
+BAR_COUNT_LO, BAR_COUNT_HI = 1, 4
+BLUE_PER_BAR_LO, BLUE_PER_BAR_HI = 1, 4  # keepout radius encoded per bar
+# Bar length bounds: absolute min/max and cross-axis percentage bounds
+BAR_LEN_MIN, BAR_LEN_MAX = 6, 15
+BAR_CROSS_PCT_LO, BAR_CROSS_PCT_HI = 32, 79  # bar spans 32-79% of cross-axis
+# Generation retry limit
+MAX_GEN_RETRIES = 300
+
+
+def _min_main_len(blues: tuple[int, ...]) -> int:
+    """Minimum main-axis size to fit all bars with required spacing."""
+    last_bar = blues[0] + 2
+    for a, b in zip(blues, blues[1:]):
+        last_bar += a + b + 2
+    return last_bar + 2
+
+
+def _random_composition(total: int, parts: int) -> list[int]:
+    """Distribute `total` into `parts` non-negative integers uniformly (stars-and-bars)."""
+    if parts == 1:
+        return [total]
+    cuts = sorted(random.sample(range(total + parts - 1), parts - 1))
+    out = []
+    prev = -1
+    for cut in cuts + [total + parts - 1]:
+        out.append(cut - prev - 1)
+        prev = cut
+    return out
+
+
+def _choose_blues(count: int, main_hi: int) -> tuple[int, ...]:
+    """Pick blue counts per bar such that they fit within main_hi."""
+    choices = [
+        combo
+        for combo in itertools.product(range(BLUE_PER_BAR_LO, BLUE_PER_BAR_HI + 1), repeat=count)
+        if _min_main_len(combo) <= main_hi
+    ]
+    return random.choice(choices)
+
+
+def _length_bounds(cross_size: int, blue_count: int) -> tuple[int, int] | None:
+    """Valid bar length range given cross-axis size and blue count."""
+    lo = max(BAR_LEN_MIN, 2 * blue_count - 1, (BAR_CROSS_PCT_LO * cross_size + 99) // 100)
+    hi = min(BAR_LEN_MAX, cross_size - blue_count - 1, (BAR_CROSS_PCT_HI * cross_size) // 100)
+    if lo > hi:
+        return None
+    return lo, hi
+
+
+def _paint_bar(grid: np.ndarray, row: int, side: int, length: int, blue_count: int) -> None:
+    """Paint a single bar on `row` starting from the given wall side."""
+    w = grid.shape[1]
+    colors = np.full(length, RED, dtype=int)
+    colors[:2 * blue_count - 1:2] = BLUE  # alternating B at even positions
+    if side == 0:
+        grid[row, :length] = colors
+    else:
+        grid[row, w - length:] = colors[::-1]
+
+
+def _canonical_grid(
+    main_size: int,
+    cross_size: int,
+    blues: tuple[int, ...],
+    first_side: int,
+) -> np.ndarray | None:
+    """Build the grid in canonical orientation (start edge = top, path goes down)."""
+    count = len(blues)
+    slack = main_size - _min_main_len(blues)
+    if slack < 0:
+        return None
+
+    # Distribute slack spacing among gaps (before first bar, between bars)
+    extras = _random_composition(slack, count + 1)
+    row = blues[0] + 2 + extras[0]
+    rows = [row]
+    for i in range(1, count):
+        row += blues[i - 1] + blues[i] + 2 + extras[i]
+        rows.append(row)
+
+    grid = np.full((main_size, cross_size), BG, dtype=int)
+    lengths = []
+    for row, blue_count, side in zip(rows, blues, ((first_side + i) % 2 for i in range(count))):
+        bounds = _length_bounds(cross_size, blue_count)
+        if bounds is None:
+            return None
+        length = random.randint(*bounds)
+        lengths.append(length)
+        _paint_bar(grid, row, side, length, blue_count)
+
+    # Place green start pixel within first bar's cross-axis coverage
+    first_len = lengths[0]
+    if first_side == 0:
+        start_col = random.randint(1, first_len - 1)
+    else:
+        start_col = random.randint(cross_size - first_len, cross_size - 2)
+    grid[0, start_col] = GREEN
+    return grid
+
+
+def _orient_grid(grid: np.ndarray, edge: str) -> np.ndarray:
+    """Rotate canonical (top-start) grid so the start edge matches `edge`."""
+    if edge == "top":
+        return grid.copy()
+    if edge == "bottom":
+        return np.flipud(grid).copy()
+    if edge == "left":
+        return grid.T.copy()
+    return np.fliplr(grid.T).copy()  # edge == "right"
+
+
+def _reaches_opposite_edge(out: np.ndarray, edge: str) -> bool:
+    """Check whether the solved output has green on the edge opposite to `edge`."""
+    if edge == "top":
+        return bool(np.any(out[-1, :] == GREEN))
+    if edge == "bottom":
+        return bool(np.any(out[0, :] == GREEN))
+    if edge == "left":
+        return bool(np.any(out[:, -1] == GREEN))
+    return bool(np.any(out[:, 0] == GREEN))
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Single generation attempt: pick parameters, build grid, validate via solver."""
+    edge = random.choice(("top", "bottom", "left", "right"))
+    if edge in ("top", "bottom"):
+        main_lo, main_hi = ROWS_LO, ROWS_HI
+        cross_lo, cross_hi = COLS_LO, COLS_HI
+    else:
+        main_lo, main_hi = COLS_LO, COLS_HI
+        cross_lo, cross_hi = ROWS_LO, ROWS_HI
+
+    count = random.randint(BAR_COUNT_LO, BAR_COUNT_HI)
+    blues = _choose_blues(count, main_hi)
+    main_size = random.randint(max(main_lo, _min_main_len(blues)), main_hi)
+    cross_size = random.randint(cross_lo, cross_hi)
+    first_side = random.randrange(2)
+
+    canonical = _canonical_grid(main_size, cross_size, blues, first_side)
+    if canonical is None:
+        return None
+    inp = _orient_grid(canonical, edge)
+
+    try:
+        out = main(inp)
+        if not _reaches_opposite_edge(out, edge):
+            return None
+        if not np.array_equal(main(inp), out):
+            return None
+    except Exception:
+        return None
+    return inp
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_GEN_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate a valid cb2d8a2c input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 12-29 rows x 13-26 cols; bg=azure(8)
+  green_start: single green(3) pixel on one border edge (any of 4 edges)
+  bars:
+    count: 1-4 obstacle bars, each a 1-cell-wide line perpendicular to the path direction
+    orientation: horizontal bars for vertical path, vertical bars for horizontal path
+    wall_attachment: each bar touches one side-wall and leaves a gap on the other; consecutive bars alternate walls (left/right or top/bottom)
+    length: 6-15 cells; spans 32-79% of cross-axis
+    color_pattern: from wall-attached end toward open end, alternating B-R-B-R...B (length 2*blue_count-1), then solid R for the remainder
+    blue_count: 1-4 per bar; encodes keepout radius (path must stay Manhattan distance > blue_count from every bar cell)
+    cross_gap: cross-axis uncovered cells = cross_size - bar_length >= blue_count + 1
+  layout:
+    bars sorted along main axis from start edge; inter-bar gap >= blue_A + blue_B + 1
+    start-to-first-bar gap >= first_bar_blue + 1
+    last-bar-to-end gap >= 1
+    start cross-axis position falls within first bar's covered range [observed]
+  output:
+    green path from start edge to opposite edge, right-angle turns around bar keepout zones (2 turns per bar)
+    blue pixels all become red; path painted green on bg cells
+
+generation_strategy:
+  approach: path-first
+  steps:
+    1. Pick grid size, main axis direction (vert/horiz), start edge, and bar count N (1-4)
+    2. Assign blue counts b_1..b_N (each 1-4) and choose alternating wall sides for bars
+    3. Place bars along main axis with sufficient spacing; inter-bar gap >= b_i + b_{i+1} + 1; start gap >= b_1 + 1; end gap >= 1
+    4. For each bar, pick length so cross-gap >= b_i + 1; fill color pattern B-R alternating from wall end
+    5. Run the solver (Dijkstra pathfinding) to get the green path; verify it reaches the opposite edge
+    6. Place green start pixel on the start edge within the first bar's cross-axis coverage
+    7. Output = input + green path painted + blue->red; input = grid with bars + green start only
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/cb2d8a2c/40/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/cb2d8a2c.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/cb2d8a2c/40/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of cb2d8a2c (index 40)
+    # combo_spec: D3/3+D20/2
+    # Name: 蓝色数编码行为模式+GCD间距约束
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/cb2d8a2c/40` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/16de56c4.py` — 参考任务 16de56c4 的 solver（D3/3 的灵感来源）
+codex
+我会先读原始任务代码、参考变体和样例，确认原 solver/generator 的隐式假设，再据此设计融合规则并落到新文件。
+exec
+/bin/bash -lc "sed -n '1,240p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/cb2d8a2c.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+import heapq
+from collections import deque
+
+import numpy as np
+
+from arc_utils import components_mask, neighbors4
+import itertools
+import random
+
+_DIRS_URDL = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Extend a green path from one grid edge to the opposite, routing around red bars at a distance dictated by their blue pixel count.
+
+    Input structure:
+    - bg = azure (8). Red/blue bars (color 2/1) act as obstacles.
+    - A single green (3) pixel sits on a grid border — the path start.
+
+    Rule:
+    - Each bar's keep-out radius equals its number of blue pixels; the path must stay farther than that from every bar cell.
+    - The green pixel extends inward toward the opposite edge, turning at right angles to navigate around forbidden zones.
+    - After the path is drawn, all blue pixels become red.
+
+    Key insight: Blue pixels on a bar encode its danger radius — more blue means a wider no-go zone the path must respect.
+    """
+    g = np.array(grid, copy=True)
+    h, w = g.shape
+
+    BG = 8
+    GREEN = 3
+    BLUE = 1
+    RED = 2
+
+    dirs = _DIRS_URDL  # U, R, D, L
+
+    # --- find the unique green start pixel on the border ---
+    start_pts = np.argwhere(g == GREEN)
+    assert start_pts.shape[0] == 1, "grid must contain exactly one green start pixel"
+    sr, sc = map(int, start_pts[0])
+
+    # Inward initial direction + opposite-edge target.
+    if sr == 0:
+        init_dir = 2  # down
+        goal_kind, goal_val = "row", h - 1
+    elif sr == h - 1:
+        init_dir = 0  # up
+        goal_kind, goal_val = "row", 0
+    elif sc == 0:
+        init_dir = 1  # right
+        goal_kind, goal_val = "col", w - 1
+    elif sc == w - 1:
+        init_dir = 3  # left
+        goal_kind, goal_val = "col", 0
+    else:
+        raise AssertionError("green start must be on a border edge")
+
+    def is_goal(r: int, c: int) -> bool:
+        return (r == goal_val) if goal_kind == "row" else (c == goal_val)
+
+    # --- find bar components (colors {1,2}) ---
+    bar_mask = (g == BLUE) | (g == RED)
+    bar_comps = components_mask(bar_mask, connectivity=4)
+
+    # --- build forbidden region: for each bar, forbid cells within Manhattan distance <= blue_count ---
+    forbidden = np.zeros((h, w), dtype=bool)
+    for comp in bar_comps:
+        blue_count = sum(1 for r, c in comp if g[r, c] == BLUE)
+        radius = int(blue_count)
+
+        dist = np.full((h, w), -1, dtype=np.int16)
+        q = deque()
+        for r, c in comp:
+            dist[r, c] = 0
+            q.append((r, c))
+
+        while q:
+            r, c = q.popleft()
+            d = int(dist[r, c])
+            forbidden[r, c] = True
+            if d == radius:
+                continue
+            for rr, cc in neighbors4(r, c):
+                if 0 <= rr < h and 0 <= cc < w and dist[rr, cc] == -1:
+                    dist[rr, cc] = d + 1
+                    q.append((rr, cc))
+
+    blocked = bar_mask | forbidden
+    blocked[sr, sc] = False
+
+    # --- Dijkstra: minimize (steps, turns) ---
+    INF = (10**9, 10**9)
+    best_cost: dict[tuple[int, int, int], tuple[int, int]] = {(sr, sc, init_dir): (0, 0)}
+    prev: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    heap: list[tuple[tuple[int, int], int, int, int]] = [((0, 0), sr, sc, init_dir)]
+
+    goal_state: tuple[int, int, int] | None = None
+    while heap:
+        (steps, turns), r, c, dprev = heapq.heappop(heap)
+        if (steps, turns) != best_cost.get((r, c, dprev), INF):
+            continue
+        if is_goal(r, c) and (r, c) != (sr, sc):
+            goal_state = (r, c, dprev)
+            break
+        for nd, (dr, dc) in enumerate(dirs):
+            rr, cc = r + dr, c + dc
+            if not (0 <= rr < h and 0 <= cc < w):
+                continue
+            if blocked[rr, cc]:
+                continue
+            ncost = (steps + 1, turns + (0 if nd == dprev else 1))
+            key = (rr, cc, nd)
+            if ncost < best_cost.get(key, INF):
+                best_cost[key] = ncost
+                prev[key] = (r, c, dprev)
+                heapq.heappush(heap, (ncost, rr, cc, nd))
+
+    # --- paint path + convert blue -> red ---
+    out = g.copy()
+    assert goal_state is not None, "a valid path to the opposite edge must exist"
+    path: list[tuple[int, int]] = []
+    st = goal_state
+    while True:
+        r, c, _ = st
+        path.append((r, c))
+        if (r, c) == (sr, sc):
+            break
+        st = prev[st]
+    path.reverse()
+    for r, c in path:
+        if out[r, c] == BG:
+            out[r, c] = GREEN
+
+    out[out == BLUE] = RED
+    return out
+
+# --------------- generator (o5x) ---------------
+
+BG = 8
+BLUE = 1
+RED = 2
+GREEN = 3
+
+# --- Tunable parameters (CFG) ---
+# Grid size bounds (rows x cols from spec: 12-29 x 13-26)
+ROWS_LO, ROWS_HI = 12, 29
+COLS_LO, COLS_HI = 13, 26
+# Bar counts and blue-per-bar range
+BAR_COUNT_LO, BAR_COUNT_HI = 1, 4
+BLUE_PER_BAR_LO, BLUE_PER_BAR_HI = 1, 4  # keepout radius encoded per bar
+# Bar length bounds: absolute min/max and cross-axis percentage bounds
+BAR_LEN_MIN, BAR_LEN_MAX = 6, 15
+BAR_CROSS_PCT_LO, BAR_CROSS_PCT_HI = 32, 79  # bar spans 32-79% of cross-axis
+# Generation retry limit
+MAX_GEN_RETRIES = 300
+
+
+def _min_main_len(blues: tuple[int, ...]) -> int:
+    """Minimum main-axis size to fit all bars with required spacing."""
+    last_bar = blues[0] + 2
+    for a, b in zip(blues, blues[1:]):
+        last_bar += a + b + 2
+    return last_bar + 2
+
+
+def _random_composition(total: int, parts: int) -> list[int]:
+    """Distribute `total` into `parts` non-negative integers uniformly (stars-and-bars)."""
+    if parts == 1:
+        return [total]
+    cuts = sorted(random.sample(range(total + parts - 1), parts - 1))
+    out = []
+    prev = -1
+    for cut in cuts + [total + parts - 1]:
+        out.append(cut - prev - 1)
+        prev = cut
+    return out
+
+
+def _choose_blues(count: int, main_hi: int) -> tuple[int, ...]:
+    """Pick blue counts per bar such that they fit within main_hi."""
+    choices = [
+        combo
+        for combo in itertools.product(range(BLUE_PER_BAR_LO, BLUE_PER_BAR_HI + 1), repeat=count)
+        if _min_main_len(combo) <= main_hi
+    ]
+    return random.choice(choices)
+
+
+def _length_bounds(cross_size: int, blue_count: int) -> tuple[int, int] | None:
+    """Valid bar length range given cross-axis size and blue count."""
+    lo = max(BAR_LEN_MIN, 2 * blue_count - 1, (BAR_CROSS_PCT_LO * cross_size + 99) // 100)
+    hi = min(BAR_LEN_MAX, cross_size - blue_count - 1, (BAR_CROSS_PCT_HI * cross_size) // 100)
+    if lo > hi:
+        return None
+    return lo, hi
+
+
+def _paint_bar(grid: np.ndarray, row: int, side: int, length: int, blue_count: int) -> None:
+    """Paint a single bar on `row` starting from the given wall side."""
+    w = grid.shape[1]
+    colors = np.full(length, RED, dtype=int)
+    colors[:2 * blue_count - 1:2] = BLUE  # alternating B at even positions
+    if side == 0:
+        grid[row, :length] = colors
+    else:
+        grid[row, w - length:] = colors[::-1]
+
+
+def _canonical_grid(
+    main_size: int,
+    cross_size: int,
+    blues: tuple[int, ...],
+    first_side: int,
+) -> np.ndarray | None:
+    """Build the grid in canonical orientation (start edge = top, path goes down)."""
+    count = len(blues)
+    slack = main_size - _min_main_len(blues)
+    if slack < 0:
+        return None
+
+    # Distribute slack spacing among gaps (before first bar, between bars)
+    extras = _random_composition(slack, count + 1)
+    row = blues[0] + 2 + extras[0]
+    rows = [row]
+    for i in range(1, count):
+        row += blues[i - 1] + blues[i] + 2 + extras[i]
+        rows.append(row)
+
+    grid = np.full((main_size, cross_size), BG, dtype=int)
+    lengths = []
+    for row, blue_count, side in zip(rows, blues, ((first_side + i) % 2 for i in range(count))):
+        bounds = _length_bounds(cross_size, blue_count)
+        if bounds is None:
+            return None
+        length = random.randint(*bounds)
+        lengths.append(length)
+        _paint_bar(grid, row, side, length, blue_count)
+
+    # Place green start pixel within first bar's cross-axis coverage
+    first_len = lengths[0]
+    if first_side == 0:
+        start_col = random.randint(1, first_len - 1)
+    else:
+        start_col = random.randint(cross_size - first_len, cross_size - 2)
+    grid[0, start_col] = GREEN
+    return grid
+
+
+def _orient_grid(grid: np.ndarray, edge: str) -> np.ndarray:
+    """Rotate canonical (top-start) grid so the start edge matches `edge`."""
+    if edge == "top":
+        return grid.copy()
+    if edge == "bottom":
+        return np.flipud(grid).copy()
+    if edge == "left":
+        return grid.T.copy()
+    return np.fliplr(grid.T).copy()  # edge == "right"
+
+
+def _reaches_opposite_edge(out: np.ndarray, edge: str) -> bool:
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/16de56c4.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+from collections import defaultdict
+import numpy as np
+from arc_utils import get_bg
+import random
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Fill periodic progressions that shoot from a unique grid edge.
+
+    Input structure:
+    - bg = most common color.  Sparse non-bg dots of several colors.
+    - All repeating colors originate from the same grid edge (top, bottom,
+      left, or right — the one with the most non-bg dots).
+    - Each repeating color has exactly 2 dots per shooting-direction line;
+      their gap defines the step.
+    - Every non-bg dot lies on a shooting-direction line that contains a
+      repeating color.
+
+    Rule:
+    - Determine the unique shooting edge; left/right → rows, top/bottom → columns.
+    - For each shooting-direction line, the repeating color has exactly 2 dots;
+      step = gap between them, offset = first position mod step.
+    - A different-colored dot aligned to the same beat (pos % step == offset) is
+      a companion: it absorbs the ray and becomes the fill color, limiting the
+      fill range to the span between repeating and companion dots.
+    - An unaligned dot is a bystander and left untouched.
+    - Without a companion the repeating color fills the entire line.
+
+    Key insight: the shooting edge is identified by counting boundary dots;
+    the gap between the two marker dots is the period; a companion sharing the
+    modular class acts as a wall that stops the ray and dictates the paint color.
+    """
+    g = np.array(grid, dtype=int)
+    out = g.copy()
+    bg = int(get_bg(g))
+    H, W = g.shape
+
+    # --- Step 1: determine the unique shooting edge ---
+    edge_counts = {
+        'top':    sum(1 for c in range(W) if g[0, c] != bg),
+        'bottom': sum(1 for c in range(W) if g[H - 1, c] != bg),
+        'left':   sum(1 for r in range(H) if g[r, 0] != bg),
+        'right':  sum(1 for r in range(H) if g[r, W - 1] != bg),
+    }
+    max_count = max(edge_counts.values())
+    assert max_count > 0, "No non-bg dots on any edge"
+    winners = [e for e, c in edge_counts.items() if c == max_count]
+    assert len(winners) == 1, f"Ambiguous shooting edge: {winners} (counts={edge_counts})"
+    edge = winners[0]
+
+    by_row = edge in ('left', 'right')
+    num_lines = H if by_row else W
+    line_len = W if by_row else H
+
+    def cell(line: int, pos: int) -> tuple[int, int]:
+        return (line, pos) if by_row else (pos, line)
+
+    # --- Step 2: process each shooting-direction line ---
+    for li in range(num_lines):
+        colors: dict[int, list[int]] = defaultdict(list)
+        for p in range(line_len):
+            v = int(g[cell(li, p)])
+            if v != bg:
+                colors[v].append(p)
+
+        if not colors:
+            continue
+
+        repeating = {c: ps for c, ps in colors.items() if len(ps) >= 2}
+        assert repeating, (
+            f"Line {li} ({'row' if by_row else 'col'}) has non-bg dots "
+            f"{dict(colors)} but no repeating color"
+        )
+
+        for marker, mpos in repeating.items():
+            assert len(mpos) == 2, (
+                f"Line {li} ({'row' if by_row else 'col'}) marker {marker} "
+                f"has {len(mpos)} dots (expected 2): {mpos}"
+            )
+            a, b = sorted(mpos)
+            step = b - a
+            offset = a % step
+
+            companion = None
+            for oc, ops in colors.items():
+                if oc == marker:
+                    continue
+                if any(p % step == offset for p in ops):
+                    companion = oc
+                    break
+
+            if companion is not None:
+                paint = companion
+                all_ps = mpos + colors[companion]
+                lo, hi = min(all_ps), max(all_ps)
+            else:
+                paint = marker
+                lo, hi = 0, line_len - 1
+
+            for p in range(lo, hi + 1):
+                if p % step != offset:
+                    continue
+                rc = cell(li, p)
+                cur = int(out[rc])
+                if cur == bg or cur == marker:
+                    out[rc] = paint
+
+    return out
+
+# --------------- generator (claude-opus-attempt1) ---------------
+
+# --- Configuration ---
+_ROWS_RANGE = (7, 12)
+_COLS_RANGE = (9, 21)
+_ACTIVE_LINES_RANGE = (4, 9)       # number of non-empty shooting lines
+_STEP_RANGE = (1, 5)               # marker dot spacing
+_COLORS = list(range(1, 10))       # non-bg palette
+_EDGES = ('top', 'bottom', 'left', 'right')
+
+# Line type probabilities: marker-only / companion / bystander
+_P_MARKER_ONLY = 0.40
+_P_COMPANION = 0.35                # cumulative threshold = 0.75
+
+_MAX_RETRIES = 300
+
+
+def _choose_dims(edge: str, n_active: int):
+    """Pick (H, W, num_lines, line_len) compatible with edge and active count.
+
+    Returns None if the active count cannot fit the dimension range.
+    """
+    min_num_lines = 2 * n_active - 1  # minimum to fit n_active lines with gap >= 1
+    by_row = edge in ('left', 'right')
+    if by_row:
+        lo = max(_ROWS_RANGE[0], min_num_lines)
+        if lo > _ROWS_RANGE[1]:
+            return None
+        H = random.randint(lo, _ROWS_RANGE[1])
+        W = random.randint(*_COLS_RANGE)
+        return H, W, H, W
+    else:
+        lo = max(_COLS_RANGE[0], min_num_lines)
+        if lo > _COLS_RANGE[1]:
+            return None
+        W = random.randint(lo, _COLS_RANGE[1])
+        H = random.randint(*_ROWS_RANGE)
+        return H, W, W, H
+
+
+def _spaced_indices(n: int, total: int) -> list[int]:
+    """Choose *n* indices from [0, total) with gaps >= 1 between consecutive ones."""
+    available = total - (n - 1)
+    if available < n:
+        return []
+    picks = sorted(random.sample(range(available), n))
+    return [picks[i] + i for i in range(n)]
+
+
+def _build_line_dots(edge: str, line_len: int, marker_color: int, step: int):
+    """Build the dot positions for one active line.
+
+    Returns (dot_list, edge_pos) where each dot is (pos, color).
+    """
+    if edge in ('left', 'top'):
+        edge_pos, inner_pos = 0, step
+    else:
+        edge_pos, inner_pos = line_len - 1, line_len - 1 - step
+    offset = edge_pos % step
+
+    dots = [(edge_pos, marker_color), (inner_pos, marker_color)]
+
+    roll = random.random()
+    if roll < _P_MARKER_ONLY:
+        pass  # marker only
+    elif roll < _P_MARKER_ONLY + _P_COMPANION:
+        # Companion: aligned to beat, beyond inner marker
+        other_colors = [c for c in _COLORS if c != marker_color]
+        if edge in ('left', 'top'):
+            beats = list(range(inner_pos + step, line_len, step))
+        else:
+            beats = list(range(inner_pos - step, -1, -step))
+        if other_colors and beats:
+            dots.append((random.choice(beats), random.choice(other_colors)))
+    else:
+        # Bystander: NOT aligned to beat
+        other_colors = [c for c in _COLORS if c != marker_color]
+        non_beat = [p for p in range(line_len)
+                    if p % step != offset and p not in (edge_pos, inner_pos)]
+        if other_colors and non_beat:
+            dots.append((random.choice(non_beat), random.choice(other_colors)))
+
+    return dots, edge_pos
+
+
+def _count_other_edge_dots(dots_rc: list[tuple[int, int]], edge: str,
+                           H: int, W: int) -> dict[str, int]:
+    """Count how many placed dots land on each non-shooting edge."""
+    boundary = {
+        'top': lambda r, c: r == 0,
+        'bottom': lambda r, c: r == H - 1,
+        'left': lambda r, c: c == 0,
+        'right': lambda r, c: c == W - 1,
+    }
+    counts = {}
+    for oe in _EDGES:
+        if oe == edge:
+            continue
+        check = boundary[oe]
+        counts[oe] = sum(1 for r, c in dots_rc if check(r, c))
+    return counts
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Single attempt to generate a valid input."""
+    n_active = random.randint(*_ACTIVE_LINES_RANGE)
+    edge = random.choice(_EDGES)
+    by_row = edge in ('left', 'right')
+
+    dims = _choose_dims(edge, n_active)
+    if dims is None:
+        return None
+    H, W, num_lines, line_len = dims
+
+    active_lines = _spaced_indices(n_active, num_lines)
+    if not active_lines:
+        return None
+
+    def cell(line: int, pos: int) -> tuple[int, int]:
+        return (line, pos) if by_row else (pos, line)
+
+    inp = np.zeros((H, W), dtype=int)
+    shooting_edge_dots = 0
+    all_rc = []  # (r, c) of every placed dot
+
+    for li in active_lines:
+        marker_color = random.choice(_COLORS)
+        step = random.randint(*_STEP_RANGE)
+        step = min(step, line_len - 1)
+
+        dots, edge_pos = _build_line_dots(edge, line_len, marker_color, step)
+
+        for pos, color in dots:
+            r, c = cell(li, pos)
+            inp[r, c] = color
+            all_rc.append((r, c))
+
+        shooting_edge_dots += 1  # marker always has one dot on the shooting edge
+
+    # Verify shooting edge is unambiguous
+    other_counts = _count_other_edge_dots(all_rc, edge, H, W)
+    if any(cnt >= shooting_edge_dots for cnt in other_counts.values()):
+        return None
+
+    # Validate with solver
+    try:
+        out = main(inp)
+    except Exception:
+        return None
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/cb2d8a2c.json'
+with open(p) as f:
+    data=json.load(f)
+print('train', len(data.get('train', [])), 'test', len(data.get('test', [])))
+for split in ('train','test'):
+    for i,ex in enumerate(data.get(split, [])):
+        gi=ex['input']
+        go=ex['output']
+        print(split, i, len(gi), len(gi[0]), '->', len(go), len(go[0]))
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+train 4 test 2
+train 0 19 13 -> 19 13
+train 1 17 19 -> 17 19
+train 2 19 19 -> 19 19
+train 3 12 19 -> 12 19
+test 0 14 26 -> 14 26
+test 1 29 16 -> 29 16
+
+codex
+我已经确认原题是“按蓝点数决定避让半径”的 Dijkstra 绕行。下一步会把融合规则拆成可执行的局部动作，并检查哪些原始生成假设必须重写。
+exec
+/bin/bash -lc 'rg -n "def components_mask|def components_of_color" /home/lixinyu/snap/new/solvers/arc_utils.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+398:def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json, numpy as np
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/cb2d8a2c.json'
+with open(p) as f:
+    data=json.load(f)
+for split in ('train',):
+    for i,ex in enumerate(data[split]):
+        arr=np.array(ex['input'])
+        print('\\n',split,i)
+        for row in arr:
+            print(''.join(str(x) for x in row))
+PY" in /home/lixinyu/snap/new
+ succeeded in 174ms:
+
+ train 0
+8888888838888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888881212121
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+8888888888888
+
+ train 1
+8888881888888888888
+8888882888888888888
+8888882888888888888
+3888882888888888888
+8888882888888888888
+8888882888888888888
+8888882888888888888
+8888888888888888288
+8888888888888888288
+8888888888888888288
+8888888888888888288
+8888888888888888288
+8888888888888888188
+8888888888888888288
+8888888888888888188
+8888888888888888288
+8888888888888888188
+
+ train 2
+8888388888888888888
+8888888888888888888
+8888888888888888888
+8888888888888888888
+1222222888888888888
+8888888888888888888
+8888888888888888888
+8888888888888888888
+8888888888888888888
+8888888888888888888
+8888222222222222121
+8888888888888888888
+8888888888888888888
+8888888888888888888
+8888888888888888888
+8888888888888888888
+1212228888888888888
+8888888888888888888
+8888888888888888888
+
+ train 3
+8888818888888888888
+8888828888888888888
+8888818888888888888
+8888828888888888888
+3888828888888888888
+8888828888888888888
+8888888888888828888
+8888888888888828888
+8888888888888828888
+8888888888888828888
+8888888888888828888
+8888888888888818888
+
+exec
+/bin/bash -lc "sed -n '398,450p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+    """List of components from a boolean mask, each as an (N,2) coords array."""
+    lab, n = label_mask(mask, connectivity=connectivity)
+    return [np.argwhere(lab == k) for k in range(1, n + 1)]
+
+
+def find_components(
+    grid: np.ndarray,
+    *,
+    bg: int | None = None,
+    connectivity: int = 4,
+    monochromatic: bool = True,
+    colors: Sequence[int] | None = None,
+    min_area: int = 1,
+    return_format: str = "dict",
+) -> list[dict] | list[np.ndarray]:
+    """
+    Find connected components in a grid (unified API for ARC-2 + migrated seeds).
+
+    return_format:
+      - \"dict\": list of dicts {color, coords, bbox, area}
+      - \"objects\": list of full-grid arrays containing exactly one component
+    """
+    if bg is None:
+        bg = get_bg(grid)
+    bg = int(bg)
+
+    return_format = str(return_format).lower().strip()
+    if return_format not in {"dict", "objects"}:
+        raise ValueError("find_components: return_format must be 'dict' or 'objects'")
+
+    if colors is None:
+        colors_set = None
+        colors_iter = sorted(set(map(int, grid.flatten())) - {bg})
+    else:
+        colors_set = {int(c) for c in colors}
+        colors_iter = [int(c) for c in colors_set if int(c) != bg]
+
+    # Monochromatic = label per-color
+    if monochromatic:
+        if return_format == "dict":
+            out: list[dict] = []
+            for col in colors_iter:
+                mask = (grid == col)
+                if not mask.any():
+                    continue
+                comps = components_mask(mask, connectivity=connectivity)
+                for coords in comps:
+                    if int(coords.shape[0]) < int(min_area):
+                        continue
+                    out.append(
+                        {
+                            "color": int(col),
+
+codex
+设计已经收敛，关键调整是把原题“贴墙障碍”改成“浮动横条”，否则 `1=左绕 / 2=右绕` 在原布局里没有双侧可选空间。实现会按这个结构写成确定性轨迹而不是最短路，并让生成器逐条放置障碍、同步维护当前路径列，确保每个蓝点数都真的触发对应行为。
+
+计划：
+- `main()` 先把任意起始边统一旋到“顶边起步”的规范朝向，再按条带顺序解析每根横条的 `blue_count`。
+- 路径规则改成四档：
+  `1 -> 左侧绕行，穿越该条带时步长 1`
+  `2 -> 右侧绕行，穿越该条带时步长 2`
+  `3 -> 直穿障碍，条带内按 3 间隔落点`
+  `4 -> 在该障碍处终止，条带内按 4 间隔落点`
+- 生成器改成 output-first 风格的顺序构造：
+  先选行为序列和各条中心行，再为每条选一个覆盖当前路径列的浮动横条区间；`1/2` 会改变当前列，`3/4` 保持当前列，`4` 只允许出现在最后一条。
+- 文件里会写一段设计/假设审查注释，明确哪些原始隐式前提失效、现在由生成器保证哪些几何条件。
+codex
+现在开始落盘代码：先建目标目录，再一次性写入 solver、generator 和设计审查注释。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/cb2d8a2c/40' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/cb2d8a2c/40/code.py
+diff --git a/ceshi/code_combo/cb2d8a2c/40/code.py b/ceshi/code_combo/cb2d8a2c/40/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0c1d7d535ceea7d11b765510bd45e191a0036d2
+--- /dev/null
++++ b/ceshi/code_combo/cb2d8a2c/40/code.py
+@@ -0,0 +1,414 @@
++# Combo variant of cb2d8a2c (index 40)
++# combo_spec: D3/3+D20/2
++# Name: 蓝色数编码行为模式+GCD间距约束
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask
++
++
++BG = 8
++BLUE = 1
++RED = 2
++GREEN = 3
++
++# --- Tunable parameters (kept close to the seed task where still compatible) ---
++ROWS_LO, ROWS_HI = 12, 29
++COLS_LO, COLS_HI = 13, 26
++BAR_COUNT_LO, BAR_COUNT_HI = 2, 4
++BAR_LEN_MIN, BAR_LEN_MAX = 6, 15
++BAR_CROSS_PCT_LO, BAR_CROSS_PCT_HI = 32, 79
++MAX_GEN_RETRIES = 500
++
++
++# Design analysis for the fused variant
++# ------------------------------------
++# 1. Concrete behavior:
++#    The seed task used wall-attached bars plus a keep-out radius. That layout
++#    cannot express "1=left detour / 2=right detour" because a wall-attached bar
++#    only leaves one bypass side. The fused task therefore switches to floating
++#    horizontal bars in canonical orientation (top-start, path moving downward).
++#    Blue count now has two simultaneous roles:
++#      - behavior code: 1->detour to the left end, 2->detour to the right end,
++#        3->go straight through the bar, 4->terminate after this bar
++#      - spacing code: while crossing that bar's local row-band, green marks are
++#        placed every `blue_count` rows instead of continuously
++#    Example: if the current path column hits a bar with 2 blue cells, the path
++#    reaches row `bar_row-2`, shifts horizontally to `bar_right+1`, then marks
++#    only rows `bar_row-2, bar_row, bar_row+2` on that bypass column.
++#
++# 2. Complexity calibration / observability:
++#    Only four behavior codes exist and each remains tied to the visible blue
++#    count, so the hypothesis space stays small. Counts 2/3/4 create dotted
++#    vertical passages with visibly different spacing, while counts 1/2 also
++#    differ by turning left vs right. The generator avoids one-bar instances and
++#    forces at least one count > 1 so the fused change is visible.
++#
++# 3. Hidden assumptions broken from the seed solver:
++#    - Bars are no longer wall-attached.
++#    - The path no longer minimizes a shortest route; it is reconstructed
++#      deterministically from per-bar behavior codes.
++#    - A bar with four blue cells can stop the path before the opposite edge.
++#    - Count 3 may overwrite a bar cell with green because "through" literally
++#      crosses the obstacle instead of avoiding it.
++#
++# 4. Generator guarantees for those new assumptions:
++#    - After canonicalization every obstacle component is a single horizontal
++#      1-cell-thick bar, sorted by row.
++#    - The current path column lies inside every active bar span, so each bar
++#      truly controls the trajectory.
++#    - For count 1/2 there is free space on the chosen bypass side, and the new
++#      path column stays away from the outer border to keep later bars feasible.
++#    - Count 4 only appears on the last bar, preventing unused clutter below a
++#      forced stop.
++#    - Row spacing satisfies `next_row - next_b >= prev_row + prev_b + 2`, so
++#      the stepped bands do not overlap and remain visually readable.
++
++
++def _start_edge(grid: np.ndarray) -> tuple[str, int, int]:
++    pts = np.argwhere(grid == GREEN)
++    assert pts.shape[0] == 1, "grid must contain exactly one green start pixel"
++    r, c = map(int, pts[0])
++    h, w = grid.shape
++    if r == 0:
++        return "top", r, c
++    if r == h - 1:
++        return "bottom", r, c
++    if c == 0:
++        return "left", r, c
++    if c == w - 1:
++        return "right", r, c
++    raise AssertionError("green start must lie on a border edge")
++
++
++def _to_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid).T.copy()  # edge == "right"
++
++
++def _from_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _extract_bars(grid: np.ndarray) -> list[tuple[int, int, int, int]]:
++    bar_mask = (grid == BLUE) | (grid == RED)
++    comps = components_mask(bar_mask, connectivity=4)
++    bars: list[tuple[int, int, int, int]] = []
++    for comp in comps:
++        rows = {int(r) for r, _ in comp}
++        assert len(rows) == 1, "each obstacle must be a single horizontal bar"
++        row = rows.pop()
++        cols = sorted(int(c) for _, c in comp)
++        c0, c1 = cols[0], cols[-1]
++        blue_count = int(np.sum(grid[row, c0 : c1 + 1] == BLUE))
++        assert 1 <= blue_count <= 4, "blue count must encode one of four behaviors"
++        bars.append((row, c0, c1, blue_count))
++    bars.sort()
++    return bars
++
++
++def _paint_vertical(out: np.ndarray, col: int, r0: int, r1: int, step: int = 1) -> None:
++    a, b = sorted((int(r0), int(r1)))
++    for r in range(a, b + 1, int(step)):
++        out[r, int(col)] = GREEN
++
++
++def _paint_horizontal(out: np.ndarray, row: int, c0: int, c1: int) -> None:
++    a, b = sorted((int(c0), int(c1)))
++    out[int(row), a : b + 1] = GREEN
++
++
++def _solve_canonical(grid: np.ndarray) -> np.ndarray:
++    g = np.array(grid, copy=True)
++    h, _ = g.shape
++
++    start_pts = np.argwhere(g == GREEN)
++    assert start_pts.shape[0] == 1, "canonical grid must keep one start pixel"
++    sr, sc = map(int, start_pts[0])
++    assert sr == 0, "canonical orientation expects the start on the top edge"
++
++    bars = _extract_bars(g)
++    out = g.copy()
++
++    cur_r, cur_c = sr, sc
++    terminated = False
++
++    for idx, (bar_r, c0, c1, blue_count) in enumerate(bars):
++        assert c0 <= cur_c <= c1, "generator must place each active bar across the current path column"
++        entry_r = bar_r - blue_count
++        exit_r = bar_r + blue_count
++        assert entry_r >= cur_r, "bars must be ordered along the main axis"
++
++        _paint_vertical(out, cur_c, cur_r, entry_r, step=1)
++
++        if blue_count == 1:
++            bypass_c = c0 - 1
++            assert bypass_c >= 0
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=1)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 2:
++            bypass_c = c1 + 1
++            assert bypass_c < out.shape[1]
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=2)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 3:
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=3)
++            cur_r = exit_r
++        else:
++            assert idx == len(bars) - 1, "a terminating bar must be the last active bar"
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=4)
++            terminated = True
++            break
++
++    if not terminated:
++        _paint_vertical(out, cur_c, cur_r, h - 1, step=1)
++
++    out[out == BLUE] = RED
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Extend the border start through a sequence of floating bars, where each bar's blue count simultaneously chooses the local action and the spacing of the green marks through that bar's row-band.
++
++    Input structure:
++    - bg = azure (8). Each obstacle is a 1-cell-thick red/blue bar (colors 2/1), and a single green (3) start pixel sits on one border edge.
++    - Bars are ordered along the start-to-opposite direction; after rotating to a canonical top-start view they are horizontal strips that all cross the current path column.
++    - The number of blue cells on a bar is always 1, 2, 3, or 4.
++
++    Rule:
++    - Blue count 1 means detour around the bar's left side; 2 means detour around its right side; 3 means pass straight through the bar; 4 means stop after traversing that bar.
++    - While crossing a bar's local row-band from `row-count` to `row+count`, green is placed every `count` rows instead of continuously, so counts 2/3/4 create dotted progressions.
++    - Outside those local bands the path is continuous, and any remaining blue obstacle cells are converted to red at the end.
++
++    Key insight: the blue tally on each bar is a fused code word: it tells you both which side behavior to execute and what periodic spacing to use while the path advances through that bar's zone.
++    """
++    g = np.array(grid, copy=True)
++    edge, _, _ = _start_edge(g)
++    canonical = _to_canonical(g, edge)
++    solved = _solve_canonical(canonical)
++    return _from_canonical(solved, edge)
++
++
++def _min_main_len(blues: tuple[int, ...]) -> int:
++    row = blues[0] + 1
++    for prev_b, next_b in zip(blues, blues[1:]):
++        row += prev_b + next_b + 2
++    return row + blues[-1] + 2
++
++
++def _random_composition(total: int, parts: int) -> list[int]:
++    if parts == 1:
++        return [total]
++    cuts = sorted(random.sample(range(total + parts - 1), parts - 1))
++    out = []
++    prev = -1
++    for cut in cuts + [total + parts - 1]:
++        out.append(cut - prev - 1)
++        prev = cut
++    return out
++
++
++def _choose_blues(main_hi: int) -> tuple[int, ...]:
++    for _ in range(200):
++        count = random.randint(BAR_COUNT_LO, BAR_COUNT_HI)
++        blues = [random.choice((1, 2, 3)) for _ in range(count)]
++        if random.random() < 0.35:
++            blues[-1] = 4
++        if all(v == 1 for v in blues):
++            blues[random.randrange(len(blues))] = random.choice((2, 3, 4))
++        if len(set(blues)) == 1 and len(blues) >= 3:
++            idx = random.randrange(len(blues) - (1 if blues[-1] == 4 else 0))
++            blues[idx] = random.choice([v for v in (1, 2, 3) if v != blues[idx]])
++        combo = tuple(blues)
++        if _min_main_len(combo) <= main_hi:
++            return combo
++    raise RuntimeError("failed to choose a feasible behavior sequence")
++
++
++def _length_bounds(cross_size: int, blue_count: int) -> tuple[int, int] | None:
++    lo = max(BAR_LEN_MIN, 2 * blue_count - 1, (BAR_CROSS_PCT_LO * cross_size + 99) // 100)
++    hi = min(BAR_LEN_MAX, cross_size - 2, (BAR_CROSS_PCT_HI * cross_size) // 100)
++    if lo > hi:
++        return None
++    return lo, hi
++
++
++def _interval_candidates(cross_size: int, current_col: int, blue_count: int) -> list[tuple[float, int, int, int]]:
++    bounds = _length_bounds(cross_size, blue_count)
++    if bounds is None:
++        return []
++
++    lo_len, hi_len = bounds
++    center = (cross_size - 1) / 2.0
++    candidates: list[tuple[float, int, int, int]] = []
++
++    for length in range(lo_len, hi_len + 1):
++        for c0 in range(1, cross_size - length):
++            c1 = c0 + length - 1
++            if not (c0 <= current_col <= c1):
++                continue
++
++            if blue_count == 1:
++                new_col = c0 - 1
++                if new_col < 2 or current_col - new_col < 2:
++                    continue
++            elif blue_count == 2:
++                new_col = c1 + 1
++                if new_col > cross_size - 3 or new_col - current_col < 2:
++                    continue
++            else:
++                new_col = current_col
++                if current_col in (c0, c1):
++                    continue
++
++            score = abs(new_col - center) + 0.3 * abs((c0 + c1) / 2.0 - center)
++            candidates.append((score, c0, c1, new_col))
++
++    candidates.sort(key=lambda item: item[0])
++    return candidates
++
++
++def _paint_bar(grid: np.ndarray, row: int, c0: int, c1: int, blue_count: int) -> None:
++    length = c1 - c0 + 1
++    colors = np.full(length, RED, dtype=int)
++    colors[: 2 * blue_count - 1 : 2] = BLUE
++    grid[row, c0 : c1 + 1] = colors
++
++
++def _canonical_grid(main_size: int, cross_size: int, blues: tuple[int, ...]) -> np.ndarray | None:
++    slack = main_size - _min_main_len(blues)
++    if slack < 0:
++        return None
++
++    extras = _random_composition(slack, len(blues) + 1)
++    row = blues[0] + 1 + extras[0]
++    rows = [row]
++    for i in range(1, len(blues)):
++        row += blues[i - 1] + blues[i] + 2 + extras[i]
++        rows.append(row)
++
++    grid = np.full((main_size, cross_size), BG, dtype=int)
++    start_col = random.randint(4, cross_size - 5)
++    current_col = start_col
++
++    for row, blue_count in zip(rows, blues):
++        candidates = _interval_candidates(cross_size, current_col, blue_count)
++        if not candidates:
++            return None
++        pool = candidates[: min(10, len(candidates))]
++        _, c0, c1, new_col = random.choice(pool)
++        _paint_bar(grid, row, c0, c1, blue_count)
++        if blue_count in (1, 2):
++            current_col = new_col
++
++    grid[0, start_col] = GREEN
++    return grid
++
++
++def _orient_grid(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return grid.copy()
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _fusion_signature(inp: np.ndarray, out: np.ndarray) -> dict[str, int]:
++    edge, _, _ = _start_edge(inp)
++    cin = _to_canonical(inp, edge)
++    cout = _to_canonical(out, edge)
++    bars = _extract_bars(cin)
++
++    left_turns = 0
++    right_turns = 0
++    through_hits = 0
++    stop_bars = 0
++    stepped_marks = 0
++
++    for row, c0, c1, blue_count in bars:
++        band = cout[max(0, row - blue_count) : min(cout.shape[0], row + blue_count + 1), :]
++        stepped_marks += int(np.sum(band == GREEN))
++        if blue_count == 1 and np.any(cout[row - 1 : row + 2, c0 - 1] == GREEN):
++            left_turns += 1
++        elif blue_count == 2 and np.any(cout[row - 2 : row + 3, c1 + 1] == GREEN):
++            right_turns += 1
++        elif blue_count == 3 and cout[row, c0 : c1 + 1].tolist().count(GREEN) > 0:
++            through_hits += 1
++        elif blue_count == 4:
++            stop_bars += 1
++
++    reached_bottom = int(np.any(cout[-1, :] == GREEN))
++    return {
++        "bars": len(bars),
++        "left_turns": left_turns,
++        "right_turns": right_turns,
++        "through_hits": through_hits,
++        "stop_bars": stop_bars,
++        "reached_bottom": reached_bottom,
++        "stepped_marks": stepped_marks,
++    }
++
++
++def _gen_attempt() -> np.ndarray | None:
++    edge = random.choice(("top", "bottom", "left", "right"))
++    if edge in ("top", "bottom"):
++        main_lo, main_hi = ROWS_LO, ROWS_HI
++        cross_lo, cross_hi = COLS_LO, COLS_HI
++    else:
++        main_lo, main_hi = COLS_LO, COLS_HI
++        cross_lo, cross_hi = ROWS_LO, ROWS_HI
++
++    blues = _choose_blues(main_hi)
++    main_size = random.randint(max(main_lo, _min_main_len(blues)), main_hi)
++    cross_size = random.randint(cross_lo, cross_hi)
++
++    canonical = _canonical_grid(main_size, cross_size, blues)
++    if canonical is None:
++        return None
++    inp = _orient_grid(canonical, edge)
++
++    try:
++        out = main(inp)
++        if not np.array_equal(main(inp), out):
++            return None
++        sig = _fusion_signature(inp, out)
++        if sig["bars"] < 2:
++            return None
++        if sum(v > 0 for v in (sig["left_turns"], sig["right_turns"], sig["through_hits"], sig["stop_bars"])) < 1:
++            return None
++        if blues[-1] == 4:
++            if sig["reached_bottom"] != 0:
++                return None
++        elif sig["reached_bottom"] != 1:
++            return None
++        if max(blues) > 1 and sig["stepped_marks"] <= len(blues):
++            return None
++    except Exception:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid fused cb2d8a2c input")
+
+diff --git a/ceshi/code_combo/cb2d8a2c/40/code.py b/ceshi/code_combo/cb2d8a2c/40/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0c1d7d535ceea7d11b765510bd45e191a0036d2
+--- /dev/null
++++ b/ceshi/code_combo/cb2d8a2c/40/code.py
+@@ -0,0 +1,414 @@
++# Combo variant of cb2d8a2c (index 40)
++# combo_spec: D3/3+D20/2
++# Name: 蓝色数编码行为模式+GCD间距约束
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask
++
++
++BG = 8
++BLUE = 1
++RED = 2
++GREEN = 3
++
++# --- Tunable parameters (kept close to the seed task where still compatible) ---
++ROWS_LO, ROWS_HI = 12, 29
++COLS_LO, COLS_HI = 13, 26
++BAR_COUNT_LO, BAR_COUNT_HI = 2, 4
++BAR_LEN_MIN, BAR_LEN_MAX = 6, 15
++BAR_CROSS_PCT_LO, BAR_CROSS_PCT_HI = 32, 79
++MAX_GEN_RETRIES = 500
++
++
++# Design analysis for the fused variant
++# ------------------------------------
++# 1. Concrete behavior:
++#    The seed task used wall-attached bars plus a keep-out radius. That layout
++#    cannot express "1=left detour / 2=right detour" because a wall-attached bar
++#    only leaves one bypass side. The fused task therefore switches to floating
++#    horizontal bars in canonical orientation (top-start, path moving downward).
++#    Blue count now has two simultaneous roles:
++#      - behavior code: 1->detour to the left end, 2->detour to the right end,
++#        3->go straight through the bar, 4->terminate after this bar
++#      - spacing code: while crossing that bar's local row-band, green marks are
++#        placed every `blue_count` rows instead of continuously
++#    Example: if the current path column hits a bar with 2 blue cells, the path
++#    reaches row `bar_row-2`, shifts horizontally to `bar_right+1`, then marks
++#    only rows `bar_row-2, bar_row, bar_row+2` on that bypass column.
++#
++# 2. Complexity calibration / observability:
++#    Only four behavior codes exist and each remains tied to the visible blue
++#    count, so the hypothesis space stays small. Counts 2/3/4 create dotted
++#    vertical passages with visibly different spacing, while counts 1/2 also
++#    differ by turning left vs right. The generator avoids one-bar instances and
++#    forces at least one count > 1 so the fused change is visible.
++#
++# 3. Hidden assumptions broken from the seed solver:
++#    - Bars are no longer wall-attached.
++#    - The path no longer minimizes a shortest route; it is reconstructed
++#      deterministically from per-bar behavior codes.
++#    - A bar with four blue cells can stop the path before the opposite edge.
++#    - Count 3 may overwrite a bar cell with green because "through" literally
++#      crosses the obstacle instead of avoiding it.
++#
++# 4. Generator guarantees for those new assumptions:
++#    - After canonicalization every obstacle component is a single horizontal
++#      1-cell-thick bar, sorted by row.
++#    - The current path column lies inside every active bar span, so each bar
++#      truly controls the trajectory.
++#    - For count 1/2 there is free space on the chosen bypass side, and the new
++#      path column stays away from the outer border to keep later bars feasible.
++#    - Count 4 only appears on the last bar, preventing unused clutter below a
++#      forced stop.
++#    - Row spacing satisfies `next_row - next_b >= prev_row + prev_b + 2`, so
++#      the stepped bands do not overlap and remain visually readable.
++
++
++def _start_edge(grid: np.ndarray) -> tuple[str, int, int]:
++    pts = np.argwhere(grid == GREEN)
++    assert pts.shape[0] == 1, "grid must contain exactly one green start pixel"
++    r, c = map(int, pts[0])
++    h, w = grid.shape
++    if r == 0:
++        return "top", r, c
++    if r == h - 1:
++        return "bottom", r, c
++    if c == 0:
++        return "left", r, c
++    if c == w - 1:
++        return "right", r, c
++    raise AssertionError("green start must lie on a border edge")
++
++
++def _to_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid).T.copy()  # edge == "right"
++
++
++def _from_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _extract_bars(grid: np.ndarray) -> list[tuple[int, int, int, int]]:
++    bar_mask = (grid == BLUE) | (grid == RED)
++    comps = components_mask(bar_mask, connectivity=4)
++    bars: list[tuple[int, int, int, int]] = []
++    for comp in comps:
++        rows = {int(r) for r, _ in comp}
++        assert len(rows) == 1, "each obstacle must be a single horizontal bar"
++        row = rows.pop()
++        cols = sorted(int(c) for _, c in comp)
++        c0, c1 = cols[0], cols[-1]
++        blue_count = int(np.sum(grid[row, c0 : c1 + 1] == BLUE))
++        assert 1 <= blue_count <= 4, "blue count must encode one of four behaviors"
++        bars.append((row, c0, c1, blue_count))
++    bars.sort()
++    return bars
++
++
++def _paint_vertical(out: np.ndarray, col: int, r0: int, r1: int, step: int = 1) -> None:
++    a, b = sorted((int(r0), int(r1)))
++    for r in range(a, b + 1, int(step)):
++        out[r, int(col)] = GREEN
++
++
++def _paint_horizontal(out: np.ndarray, row: int, c0: int, c1: int) -> None:
++    a, b = sorted((int(c0), int(c1)))
++    out[int(row), a : b + 1] = GREEN
++
++
++def _solve_canonical(grid: np.ndarray) -> np.ndarray:
++    g = np.array(grid, copy=True)
++    h, _ = g.shape
++
++    start_pts = np.argwhere(g == GREEN)
++    assert start_pts.shape[0] == 1, "canonical grid must keep one start pixel"
++    sr, sc = map(int, start_pts[0])
++    assert sr == 0, "canonical orientation expects the start on the top edge"
++
++    bars = _extract_bars(g)
++    out = g.copy()
++
++    cur_r, cur_c = sr, sc
++    terminated = False
++
++    for idx, (bar_r, c0, c1, blue_count) in enumerate(bars):
++        assert c0 <= cur_c <= c1, "generator must place each active bar across the current path column"
++        entry_r = bar_r - blue_count
++        exit_r = bar_r + blue_count
++        assert entry_r >= cur_r, "bars must be ordered along the main axis"
++
++        _paint_vertical(out, cur_c, cur_r, entry_r, step=1)
++
++        if blue_count == 1:
++            bypass_c = c0 - 1
++            assert bypass_c >= 0
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=1)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 2:
++            bypass_c = c1 + 1
++            assert bypass_c < out.shape[1]
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=2)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 3:
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=3)
++            cur_r = exit_r
++        else:
++            assert idx == len(bars) - 1, "a terminating bar must be the last active bar"
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=4)
++            terminated = True
++            break
++
++    if not terminated:
++        _paint_vertical(out, cur_c, cur_r, h - 1, step=1)
++
++    out[out == BLUE] = RED
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Extend the border start through a sequence of floating bars, where each bar's blue count simultaneously chooses the local action and the spacing of the green marks through that bar's row-band.
++
++    Input structure:
++    - bg = azure (8). Each obstacle is a 1-cell-thick red/blue bar (colors 2/1), and a single green (3) start pixel sits on one border edge.
++    - Bars are ordered along the start-to-opposite direction; after rotating to a canonical top-start view they are horizontal strips that all cross the current path column.
++    - The number of blue cells on a bar is always 1, 2, 3, or 4.
++
++    Rule:
++    - Blue count 1 means detour around the bar's left side; 2 means detour around its right side; 3 means pass straight through the bar; 4 means stop after traversing that bar.
++    - While crossing a bar's local row-band from `row-count` to `row+count`, green is placed every `count` rows instead of continuously, so counts 2/3/4 create dotted progressions.
++    - Outside those local bands the path is continuous, and any remaining blue obstacle cells are converted to red at the end.
++
++    Key insight: the blue tally on each bar is a fused code word: it tells you both which side behavior to execute and what periodic spacing to use while the path advances through that bar's zone.
++    """
++    g = np.array(grid, copy=True)
++    edge, _, _ = _start_edge(g)
++    canonical = _to_canonical(g, edge)
++    solved = _solve_canonical(canonical)
++    return _from_canonical(solved, edge)
++
++
++def _min_main_len(blues: tuple[int, ...]) -> int:
++    row = blues[0] + 1
++    for prev_b, next_b in zip(blues, blues[1:]):
++        row += prev_b + next_b + 2
++    return row + blues[-1] + 2
++
++
++def _random_composition(total: int, parts: int) -> list[int]:
++    if parts == 1:
++        return [total]
++    cuts = sorted(random.sample(range(total + parts - 1), parts - 1))
++    out = []
++    prev = -1
++    for cut in cuts + [total + parts - 1]:
++        out.append(cut - prev - 1)
++        prev = cut
++    return out
++
++
++def _choose_blues(main_hi: int) -> tuple[int, ...]:
++    for _ in range(200):
++        count = random.randint(BAR_COUNT_LO, BAR_COUNT_HI)
++        blues = [random.choice((1, 2, 3)) for _ in range(count)]
++        if random.random() < 0.35:
++            blues[-1] = 4
++        if all(v == 1 for v in blues):
++            blues[random.randrange(len(blues))] = random.choice((2, 3, 4))
++        if len(set(blues)) == 1 and len(blues) >= 3:
++            idx = random.randrange(len(blues) - (1 if blues[-1] == 4 else 0))
++            blues[idx] = random.choice([v for v in (1, 2, 3) if v != blues[idx]])
++        combo = tuple(blues)
++        if _min_main_len(combo) <= main_hi:
++            return combo
++    raise RuntimeError("failed to choose a feasible behavior sequence")
++
++
++def _length_bounds(cross_size: int, blue_count: int) -> tuple[int, int] | None:
++    lo = max(BAR_LEN_MIN, 2 * blue_count - 1, (BAR_CROSS_PCT_LO * cross_size + 99) // 100)
++    hi = min(BAR_LEN_MAX, cross_size - 2, (BAR_CROSS_PCT_HI * cross_size) // 100)
++    if lo > hi:
++        return None
++    return lo, hi
++
++
++def _interval_candidates(cross_size: int, current_col: int, blue_count: int) -> list[tuple[float, int, int, int]]:
++    bounds = _length_bounds(cross_size, blue_count)
++    if bounds is None:
++        return []
++
++    lo_len, hi_len = bounds
++    center = (cross_size - 1) / 2.0
++    candidates: list[tuple[float, int, int, int]] = []
++
++    for length in range(lo_len, hi_len + 1):
++        for c0 in range(1, cross_size - length):
++            c1 = c0 + length - 1
++            if not (c0 <= current_col <= c1):
++                continue
++
++            if blue_count == 1:
++                new_col = c0 - 1
++                if new_col < 2 or current_col - new_col < 2:
++                    continue
++            elif blue_count == 2:
++                new_col = c1 + 1
++                if new_col > cross_size - 3 or new_col - current_col < 2:
++                    continue
++            else:
++                new_col = current_col
++                if current_col in (c0, c1):
++                    continue
++
++            score = abs(new_col - center) + 0.3 * abs((c0 + c1) / 2.0 - center)
++            candidates.append((score, c0, c1, new_col))
++
++    candidates.sort(key=lambda item: item[0])
++    return candidates
++
++
++def _paint_bar(grid: np.ndarray, row: int, c0: int, c1: int, blue_count: int) -> None:
++    length = c1 - c0 + 1
++    colors = np.full(length, RED, dtype=int)
++    colors[: 2 * blue_count - 1 : 2] = BLUE
++    grid[row, c0 : c1 + 1] = colors
++
++
++def _canonical_grid(main_size: int, cross_size: int, blues: tuple[int, ...]) -> np.ndarray | None:
++    slack = main_size - _min_main_len(blues)
++    if slack < 0:
++        return None
++
++    extras = _random_composition(slack, len(blues) + 1)
++    row = blues[0] + 1 + extras[0]
++    rows = [row]
++    for i in range(1, len(blues)):
++        row += blues[i - 1] + blues[i] + 2 + extras[i]
++        rows.append(row)
++
++    grid = np.full((main_size, cross_size), BG, dtype=int)
++    start_col = random.randint(4, cross_size - 5)
++    current_col = start_col
++
++    for row, blue_count in zip(rows, blues):
++        candidates = _interval_candidates(cross_size, current_col, blue_count)
++        if not candidates:
++            return None
++        pool = candidates[: min(10, len(candidates))]
++        _, c0, c1, new_col = random.choice(pool)
++        _paint_bar(grid, row, c0, c1, blue_count)
++        if blue_count in (1, 2):
++            current_col = new_col
++
++    grid[0, start_col] = GREEN
++    return grid
++
++
++def _orient_grid(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return grid.copy()
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _fusion_signature(inp: np.ndarray, out: np.ndarray) -> dict[str, int]:
++    edge, _, _ = _start_edge(inp)
++    cin = _to_canonical(inp, edge)
++    cout = _to_canonical(out, edge)
++    bars = _extract_bars(cin)
++
++    left_turns = 0
++    right_turns = 0
++    through_hits = 0
++    stop_bars = 0
++    stepped_marks = 0
++
++    for row, c0, c1, blue_count in bars:
++        band = cout[max(0, row - blue_count) : min(cout.shape[0], row + blue_count + 1), :]
++        stepped_marks += int(np.sum(band == GREEN))
++        if blue_count == 1 and np.any(cout[row - 1 : row + 2, c0 - 1] == GREEN):
++            left_turns += 1
++        elif blue_count == 2 and np.any(cout[row - 2 : row + 3, c1 + 1] == GREEN):
++            right_turns += 1
++        elif blue_count == 3 and cout[row, c0 : c1 + 1].tolist().count(GREEN) > 0:
++            through_hits += 1
++        elif blue_count == 4:
++            stop_bars += 1
++
++    reached_bottom = int(np.any(cout[-1, :] == GREEN))
++    return {
++        "bars": len(bars),
++        "left_turns": left_turns,
++        "right_turns": right_turns,
++        "through_hits": through_hits,
++        "stop_bars": stop_bars,
++        "reached_bottom": reached_bottom,
++        "stepped_marks": stepped_marks,
++    }
++
++
++def _gen_attempt() -> np.ndarray | None:
++    edge = random.choice(("top", "bottom", "left", "right"))
++    if edge in ("top", "bottom"):
++        main_lo, main_hi = ROWS_LO, ROWS_HI
++        cross_lo, cross_hi = COLS_LO, COLS_HI
++    else:
++        main_lo, main_hi = COLS_LO, COLS_HI
++        cross_lo, cross_hi = ROWS_LO, ROWS_HI
++
++    blues = _choose_blues(main_hi)
++    main_size = random.randint(max(main_lo, _min_main_len(blues)), main_hi)
++    cross_size = random.randint(cross_lo, cross_hi)
++
++    canonical = _canonical_grid(main_size, cross_size, blues)
++    if canonical is None:
++        return None
++    inp = _orient_grid(canonical, edge)
++
++    try:
++        out = main(inp)
++        if not np.array_equal(main(inp), out):
++            return None
++        sig = _fusion_signature(inp, out)
++        if sig["bars"] < 2:
++            return None
++        if sum(v > 0 for v in (sig["left_turns"], sig["right_turns"], sig["through_hits"], sig["stop_bars"])) < 1:
++            return None
++        if blues[-1] == 4:
++            if sig["reached_bottom"] != 0:
++                return None
++        elif sig["reached_bottom"] != 1:
++            return None
++        if max(blues) > 1 and sig["stepped_marks"] <= len(blues):
++            return None
++    except Exception:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid fused cb2d8a2c input")
+
+codex
+代码已写入，接下来先跑用户指定的 50 次生成/求解压力测试，再根据失败类型修正几何约束。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/cb2d8a2c/40/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/cb2d8a2c/40/code.py b/ceshi/code_combo/cb2d8a2c/40/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0c1d7d535ceea7d11b765510bd45e191a0036d2
+--- /dev/null
++++ b/ceshi/code_combo/cb2d8a2c/40/code.py
+@@ -0,0 +1,414 @@
++# Combo variant of cb2d8a2c (index 40)
++# combo_spec: D3/3+D20/2
++# Name: 蓝色数编码行为模式+GCD间距约束
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask
++
++
++BG = 8
++BLUE = 1
++RED = 2
++GREEN = 3
++
++# --- Tunable parameters (kept close to the seed task where still compatible) ---
++ROWS_LO, ROWS_HI = 12, 29
++COLS_LO, COLS_HI = 13, 26
++BAR_COUNT_LO, BAR_COUNT_HI = 2, 4
++BAR_LEN_MIN, BAR_LEN_MAX = 6, 15
++BAR_CROSS_PCT_LO, BAR_CROSS_PCT_HI = 32, 79
++MAX_GEN_RETRIES = 500
++
++
++# Design analysis for the fused variant
++# ------------------------------------
++# 1. Concrete behavior:
++#    The seed task used wall-attached bars plus a keep-out radius. That layout
++#    cannot express "1=left detour / 2=right detour" because a wall-attached bar
++#    only leaves one bypass side. The fused task therefore switches to floating
++#    horizontal bars in canonical orientation (top-start, path moving downward).
++#    Blue count now has two simultaneous roles:
++#      - behavior code: 1->detour to the left end, 2->detour to the right end,
++#        3->go straight through the bar, 4->terminate after this bar
++#      - spacing code: while crossing that bar's local row-band, green marks are
++#        placed every `blue_count` rows instead of continuously
++#    Example: if the current path column hits a bar with 2 blue cells, the path
++#    reaches row `bar_row-2`, shifts horizontally to `bar_right+1`, then marks
++#    only rows `bar_row-2, bar_row, bar_row+2` on that bypass column.
++#
++# 2. Complexity calibration / observability:
++#    Only four behavior codes exist and each remains tied to the visible blue
++#    count, so the hypothesis space stays small. Counts 2/3/4 create dotted
++#    vertical passages with visibly different spacing, while counts 1/2 also
++#    differ by turning left vs right. The generator avoids one-bar instances and
++#    forces at least one count > 1 so the fused change is visible.
++#
++# 3. Hidden assumptions broken from the seed solver:
++#    - Bars are no longer wall-attached.
++#    - The path no longer minimizes a shortest route; it is reconstructed
++#      deterministically from per-bar behavior codes.
++#    - A bar with four blue cells can stop the path before the opposite edge.
++#    - Count 3 may overwrite a bar cell with green because "through" literally
++#      crosses the obstacle instead of avoiding it.
++#
++# 4. Generator guarantees for those new assumptions:
++#    - After canonicalization every obstacle component is a single horizontal
++#      1-cell-thick bar, sorted by row.
++#    - The current path column lies inside every active bar span, so each bar
++#      truly controls the trajectory.
++#    - For count 1/2 there is free space on the chosen bypass side, and the new
++#      path column stays away from the outer border to keep later bars feasible.
++#    - Count 4 only appears on the last bar, preventing unused clutter below a
++#      forced stop.
++#    - Row spacing satisfies `next_row - next_b >= prev_row + prev_b + 2`, so
++#      the stepped bands do not overlap and remain visually readable.
++
++
++def _start_edge(grid: np.ndarray) -> tuple[str, int, int]:
++    pts = np.argwhere(grid == GREEN)
++    assert pts.shape[0] == 1, "grid must contain exactly one green start pixel"
++    r, c = map(int, pts[0])
++    h, w = grid.shape
++    if r == 0:
++        return "top", r, c
++    if r == h - 1:
++        return "bottom", r, c
++    if c == 0:
++        return "left", r, c
++    if c == w - 1:
++        return "right", r, c
++    raise AssertionError("green start must lie on a border edge")
++
++
++def _to_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid).T.copy()  # edge == "right"
++
++
++def _from_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _extract_bars(grid: np.ndarray) -> list[tuple[int, int, int, int]]:
++    bar_mask = (grid == BLUE) | (grid == RED)
++    comps = components_mask(bar_mask, connectivity=4)
++    bars: list[tuple[int, int, int, int]] = []
++    for comp in comps:
++        rows = {int(r) for r, _ in comp}
++        assert len(rows) == 1, "each obstacle must be a single horizontal bar"
++        row = rows.pop()
++        cols = sorted(int(c) for _, c in comp)
++        c0, c1 = cols[0], cols[-1]
++        blue_count = int(np.sum(grid[row, c0 : c1 + 1] == BLUE))
++        assert 1 <= blue_count <= 4, "blue count must encode one of four behaviors"
++        bars.append((row, c0, c1, blue_count))
++    bars.sort()
++    return bars
++
++
++def _paint_vertical(out: np.ndarray, col: int, r0: int, r1: int, step: int = 1) -> None:
++    a, b = sorted((int(r0), int(r1)))
++    for r in range(a, b + 1, int(step)):
++        out[r, int(col)] = GREEN
++
++
++def _paint_horizontal(out: np.ndarray, row: int, c0: int, c1: int) -> None:
++    a, b = sorted((int(c0), int(c1)))
++    out[int(row), a : b + 1] = GREEN
++
++
++def _solve_canonical(grid: np.ndarray) -> np.ndarray:
++    g = np.array(grid, copy=True)
++    h, _ = g.shape
++
++    start_pts = np.argwhere(g == GREEN)
++    assert start_pts.shape[0] == 1, "canonical grid must keep one start pixel"
++    sr, sc = map(int, start_pts[0])
++    assert sr == 0, "canonical orientation expects the start on the top edge"
++
++    bars = _extract_bars(g)
++    out = g.copy()
++
++    cur_r, cur_c = sr, sc
++    terminated = False
++
++    for idx, (bar_r, c0, c1, blue_count) in enumerate(bars):
++        assert c0 <= cur_c <= c1, "generator must place each active bar across the current path column"
++        entry_r = bar_r - blue_count
++        exit_r = bar_r + blue_count
++        assert entry_r >= cur_r, "bars must be ordered along the main axis"
++
++        _paint_vertical(out, cur_c, cur_r, entry_r, step=1)
++
++        if blue_count == 1:
++            bypass_c = c0 - 1
++            assert bypass_c >= 0
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=1)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 2:
++            bypass_c = c1 + 1
++            assert bypass_c < out.shape[1]
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=2)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 3:
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=3)
++            cur_r = exit_r
++        else:
++            assert idx == len(bars) - 1, "a terminating bar must be the last active bar"
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=4)
++            terminated = True
++            break
++
++    if not terminated:
++        _paint_vertical(out, cur_c, cur_r, h - 1, step=1)
++
++    out[out == BLUE] = RED
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Extend the border start through a sequence of floating bars, where each bar's blue count simultaneously chooses the local action and the spacing of the green marks through that bar's row-band.
++
++    Input structure:
++    - bg = azure (8). Each obstacle is a 1-cell-thick red/blue bar (colors 2/1), and a single green (3) start pixel sits on one border edge.
++    - Bars are ordered along the start-to-opposite direction; after rotating to a canonical top-start view they are horizontal strips that all cross the current path column.
++    - The number of blue cells on a bar is always 1, 2, 3, or 4.
++
++    Rule:
++    - Blue count 1 means detour around the bar's left side; 2 means detour around its right side; 3 means pass straight through the bar; 4 means stop after traversing that bar.
++    - While crossing a bar's local row-band from `row-count` to `row+count`, green is placed every `count` rows instead of continuously, so counts 2/3/4 create dotted progressions.
++    - Outside those local bands the path is continuous, and any remaining blue obstacle cells are converted to red at the end.
++
++    Key insight: the blue tally on each bar is a fused code word: it tells you both which side behavior to execute and what periodic spacing to use while the path advances through that bar's zone.
++    """
++    g = np.array(grid, copy=True)
++    edge, _, _ = _start_edge(g)
++    canonical = _to_canonical(g, edge)
++    solved = _solve_canonical(canonical)
++    return _from_canonical(solved, edge)
++
++
++def _min_main_len(blues: tuple[int, ...]) -> int:
++    row = blues[0] + 1
++    for prev_b, next_b in zip(blues, blues[1:]):
++        row += prev_b + next_b + 2
++    return row + blues[-1] + 2
++
++
++def _random_composition(total: int, parts: int) -> list[int]:
++    if parts == 1:
++        return [total]
++    cuts = sorted(random.sample(range(total + parts - 1), parts - 1))
++    out = []
++    prev = -1
++    for cut in cuts + [total + parts - 1]:
++        out.append(cut - prev - 1)
++        prev = cut
++    return out
++
++
++def _choose_blues(main_hi: int) -> tuple[int, ...]:
++    for _ in range(200):
++        count = random.randint(BAR_COUNT_LO, BAR_COUNT_HI)
++        blues = [random.choice((1, 2, 3)) for _ in range(count)]
++        if random.random() < 0.35:
++            blues[-1] = 4
++        if all(v == 1 for v in blues):
++            blues[random.randrange(len(blues))] = random.choice((2, 3, 4))
++        if len(set(blues)) == 1 and len(blues) >= 3:
++            idx = random.randrange(len(blues) - (1 if blues[-1] == 4 else 0))
++            blues[idx] = random.choice([v for v in (1, 2, 3) if v != blues[idx]])
++        combo = tuple(blues)
++        if _min_main_len(combo) <= main_hi:
++            return combo
++    raise RuntimeError("failed to choose a feasible behavior sequence")
++
++
++def _length_bounds(cross_size: int, blue_count: int) -> tuple[int, int] | None:
++    lo = max(BAR_LEN_MIN, 2 * blue_count - 1, (BAR_CROSS_PCT_LO * cross_size + 99) // 100)
++    hi = min(BAR_LEN_MAX, cross_size - 2, (BAR_CROSS_PCT_HI * cross_size) // 100)
++    if lo > hi:
++        return None
++    return lo, hi
++
++
++def _interval_candidates(cross_size: int, current_col: int, blue_count: int) -> list[tuple[float, int, int, int]]:
++    bounds = _length_bounds(cross_size, blue_count)
++    if bounds is None:
++        return []
++
++    lo_len, hi_len = bounds
++    center = (cross_size - 1) / 2.0
++    candidates: list[tuple[float, int, int, int]] = []
++
++    for length in range(lo_len, hi_len + 1):
++        for c0 in range(1, cross_size - length):
++            c1 = c0 + length - 1
++            if not (c0 <= current_col <= c1):
++                continue
++
++            if blue_count == 1:
++                new_col = c0 - 1
++                if new_col < 2 or current_col - new_col < 2:
++                    continue
++            elif blue_count == 2:
++                new_col = c1 + 1
++                if new_col > cross_size - 3 or new_col - current_col < 2:
++                    continue
++            else:
++                new_col = current_col
++                if current_col in (c0, c1):
++                    continue
++
++            score = abs(new_col - center) + 0.3 * abs((c0 + c1) / 2.0 - center)
++            candidates.append((score, c0, c1, new_col))
++
++    candidates.sort(key=lambda item: item[0])
++    return candidates
++
++
++def _paint_bar(grid: np.ndarray, row: int, c0: int, c1: int, blue_count: int) -> None:
++    length = c1 - c0 + 1
++    colors = np.full(length, RED, dtype=int)
++    colors[: 2 * blue_count - 1 : 2] = BLUE
++    grid[row, c0 : c1 + 1] = colors
++
++
++def _canonical_grid(main_size: int, cross_size: int, blues: tuple[int, ...]) -> np.ndarray | None:
++    slack = main_size - _min_main_len(blues)
++    if slack < 0:
++        return None
++
++    extras = _random_composition(slack, len(blues) + 1)
++    row = blues[0] + 1 + extras[0]
++    rows = [row]
++    for i in range(1, len(blues)):
++        row += blues[i - 1] + blues[i] + 2 + extras[i]
++        rows.append(row)
++
++    grid = np.full((main_size, cross_size), BG, dtype=int)
++    start_col = random.randint(4, cross_size - 5)
++    current_col = start_col
++
++    for row, blue_count in zip(rows, blues):
++        candidates = _interval_candidates(cross_size, current_col, blue_count)
++        if not candidates:
++            return None
++        pool = candidates[: min(10, len(candidates))]
++        _, c0, c1, new_col = random.choice(pool)
++        _paint_bar(grid, row, c0, c1, blue_count)
++        if blue_count in (1, 2):
++            current_col = new_col
++
++    grid[0, start_col] = GREEN
++    return grid
++
++
++def _orient_grid(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return grid.copy()
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _fusion_signature(inp: np.ndarray, out: np.ndarray) -> dict[str, int]:
++    edge, _, _ = _start_edge(inp)
++    cin = _to_canonical(inp, edge)
++    cout = _to_canonical(out, edge)
++    bars = _extract_bars(cin)
++
++    left_turns = 0
++    right_turns = 0
++    through_hits = 0
++    stop_bars = 0
++    stepped_marks = 0
++
++    for row, c0, c1, blue_count in bars:
++        band = cout[max(0, row - blue_count) : min(cout.shape[0], row + blue_count + 1), :]
++        stepped_marks += int(np.sum(band == GREEN))
++        if blue_count == 1 and np.any(cout[row - 1 : row + 2, c0 - 1] == GREEN):
++            left_turns += 1
++        elif blue_count == 2 and np.any(cout[row - 2 : row + 3, c1 + 1] == GREEN):
++            right_turns += 1
++        elif blue_count == 3 and cout[row, c0 : c1 + 1].tolist().count(GREEN) > 0:
++            through_hits += 1
++        elif blue_count == 4:
++            stop_bars += 1
++
++    reached_bottom = int(np.any(cout[-1, :] == GREEN))
++    return {
++        "bars": len(bars),
++        "left_turns": left_turns,
++        "right_turns": right_turns,
++        "through_hits": through_hits,
++        "stop_bars": stop_bars,
++        "reached_bottom": reached_bottom,
++        "stepped_marks": stepped_marks,
++    }
++
++
++def _gen_attempt() -> np.ndarray | None:
++    edge = random.choice(("top", "bottom", "left", "right"))
++    if edge in ("top", "bottom"):
++        main_lo, main_hi = ROWS_LO, ROWS_HI
++        cross_lo, cross_hi = COLS_LO, COLS_HI
++    else:
++        main_lo, main_hi = COLS_LO, COLS_HI
++        cross_lo, cross_hi = ROWS_LO, ROWS_HI
++
++    blues = _choose_blues(main_hi)
++    main_size = random.randint(max(main_lo, _min_main_len(blues)), main_hi)
++    cross_size = random.randint(cross_lo, cross_hi)
++
++    canonical = _canonical_grid(main_size, cross_size, blues)
++    if canonical is None:
++        return None
++    inp = _orient_grid(canonical, edge)
++
++    try:
++        out = main(inp)
++        if not np.array_equal(main(inp), out):
++            return None
++        sig = _fusion_signature(inp, out)
++        if sig["bars"] < 2:
++            return None
++        if sum(v > 0 for v in (sig["left_turns"], sig["right_turns"], sig["through_hits"], sig["stop_bars"])) < 1:
++            return None
++        if blues[-1] == 4:
++            if sig["reached_bottom"] != 0:
++                return None
++        elif sig["reached_bottom"] != 1:
++            return None
++        if max(blues) > 1 and sig["stepped_marks"] <= len(blues):
++            return None
++    except Exception:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid fused cb2d8a2c input")
+
+ succeeded in 311ms:
+Success: 50/50, Time: 0.1s (1ms/call)
+
+codex
+测试已过。现在做第二层验证：统计 200 个样本里四种蓝点数各自触发的实际局部效果，确认生成器没有退化回原题的“统一绕行”行为。
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util, collections, numpy as np
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/cb2d8a2c/40/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+count_hist = collections.Counter()
+sample_hist = collections.Counter()
+event_hist = collections.Counter()
+bar_total = 0
+for _ in range(200):
+    inp = mod.generate_input()
+    out = mod.main(inp)
+    edge, _, _ = mod._start_edge(inp)
+    cin = mod._to_canonical(inp, edge)
+    bars = mod._extract_bars(cin)
+    sig = mod._fusion_signature(inp, out)
+    sample_hist['samples'] += 1
+    sample_hist['bars_total'] += len(bars)
+    sample_hist['terminated_samples'] += int(sig['stop_bars'] > 0)
+    sample_hist['through_samples'] += int(sig['through_hits'] > 0)
+    sample_hist['left_samples'] += int(sig['left_turns'] > 0)
+    sample_hist['right_samples'] += int(sig['right_turns'] > 0)
+    sample_hist['reached_bottom_samples'] += int(sig['reached_bottom'] > 0)
+    for row, c0, c1, blue in bars:
+        count_hist[blue] += 1
+        bar_total += 1
+        event_hist[f'blue_{blue}'] += 1
+    event_hist['left_turn_bars'] += sig['left_turns']
+    event_hist['right_turn_bars'] += sig['right_turns']
+    event_hist['through_hit_bars'] += sig['through_hits']
+    event_hist['stop_bars'] += sig['stop_bars']
+
+print('sample_hist', dict(sample_hist))
+print('count_hist', dict(count_hist))
+print('event_hist', dict(event_hist))
+print('ratios', {
+    'left_match_rate': event_hist['left_turn_bars'] / max(count_hist[1], 1),
+    'right_match_rate': event_hist['right_turn_bars'] / max(count_hist[2], 1),
+    'through_match_rate': event_hist['through_hit_bars'] / max(count_hist[3], 1),
+    'stop_match_rate': event_hist['stop_bars'] / max(count_hist[4], 1),
+    'terminated_sample_rate': sample_hist['terminated_samples'] / sample_hist['samples'],
+    'through_sample_rate': sample_hist['through_samples'] / sample_hist['samples'],
+})
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/cb2d8a2c/40/code.py b/ceshi/code_combo/cb2d8a2c/40/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0c1d7d535ceea7d11b765510bd45e191a0036d2
+--- /dev/null
++++ b/ceshi/code_combo/cb2d8a2c/40/code.py
+@@ -0,0 +1,414 @@
++# Combo variant of cb2d8a2c (index 40)
++# combo_spec: D3/3+D20/2
++# Name: 蓝色数编码行为模式+GCD间距约束
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask
++
++
++BG = 8
++BLUE = 1
++RED = 2
++GREEN = 3
++
++# --- Tunable parameters (kept close to the seed task where still compatible) ---
++ROWS_LO, ROWS_HI = 12, 29
++COLS_LO, COLS_HI = 13, 26
++BAR_COUNT_LO, BAR_COUNT_HI = 2, 4
++BAR_LEN_MIN, BAR_LEN_MAX = 6, 15
++BAR_CROSS_PCT_LO, BAR_CROSS_PCT_HI = 32, 79
++MAX_GEN_RETRIES = 500
++
++
++# Design analysis for the fused variant
++# ------------------------------------
++# 1. Concrete behavior:
++#    The seed task used wall-attached bars plus a keep-out radius. That layout
++#    cannot express "1=left detour / 2=right detour" because a wall-attached bar
++#    only leaves one bypass side. The fused task therefore switches to floating
++#    horizontal bars in canonical orientation (top-start, path moving downward).
++#    Blue count now has two simultaneous roles:
++#      - behavior code: 1->detour to the left end, 2->detour to the right end,
++#        3->go straight through the bar, 4->terminate after this bar
++#      - spacing code: while crossing that bar's local row-band, green marks are
++#        placed every `blue_count` rows instead of continuously
++#    Example: if the current path column hits a bar with 2 blue cells, the path
++#    reaches row `bar_row-2`, shifts horizontally to `bar_right+1`, then marks
++#    only rows `bar_row-2, bar_row, bar_row+2` on that bypass column.
++#
++# 2. Complexity calibration / observability:
++#    Only four behavior codes exist and each remains tied to the visible blue
++#    count, so the hypothesis space stays small. Counts 2/3/4 create dotted
++#    vertical passages with visibly different spacing, while counts 1/2 also
++#    differ by turning left vs right. The generator avoids one-bar instances and
++#    forces at least one count > 1 so the fused change is visible.
++#
++# 3. Hidden assumptions broken from the seed solver:
++#    - Bars are no longer wall-attached.
++#    - The path no longer minimizes a shortest route; it is reconstructed
++#      deterministically from per-bar behavior codes.
++#    - A bar with four blue cells can stop the path before the opposite edge.
++#    - Count 3 may overwrite a bar cell with green because "through" literally
++#      crosses the obstacle instead of avoiding it.
++#
++# 4. Generator guarantees for those new assumptions:
++#    - After canonicalization every obstacle component is a single horizontal
++#      1-cell-thick bar, sorted by row.
++#    - The current path column lies inside every active bar span, so each bar
++#      truly controls the trajectory.
++#    - For count 1/2 there is free space on the chosen bypass side, and the new
++#      path column stays away from the outer border to keep later bars feasible.
++#    - Count 4 only appears on the last bar, preventing unused clutter below a
++#      forced stop.
++#    - Row spacing satisfies `next_row - next_b >= prev_row + prev_b + 2`, so
++#      the stepped bands do not overlap and remain visually readable.
++
++
++def _start_edge(grid: np.ndarray) -> tuple[str, int, int]:
++    pts = np.argwhere(grid == GREEN)
++    assert pts.shape[0] == 1, "grid must contain exactly one green start pixel"
++    r, c = map(int, pts[0])
++    h, w = grid.shape
++    if r == 0:
++        return "top", r, c
++    if r == h - 1:
++        return "bottom", r, c
++    if c == 0:
++        return "left", r, c
++    if c == w - 1:
++        return "right", r, c
++    raise AssertionError("green start must lie on a border edge")
++
++
++def _to_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid).T.copy()  # edge == "right"
++
++
++def _from_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _extract_bars(grid: np.ndarray) -> list[tuple[int, int, int, int]]:
++    bar_mask = (grid == BLUE) | (grid == RED)
++    comps = components_mask(bar_mask, connectivity=4)
++    bars: list[tuple[int, int, int, int]] = []
++    for comp in comps:
++        rows = {int(r) for r, _ in comp}
++        assert len(rows) == 1, "each obstacle must be a single horizontal bar"
++        row = rows.pop()
++        cols = sorted(int(c) for _, c in comp)
++        c0, c1 = cols[0], cols[-1]
++        blue_count = int(np.sum(grid[row, c0 : c1 + 1] == BLUE))
++        assert 1 <= blue_count <= 4, "blue count must encode one of four behaviors"
++        bars.append((row, c0, c1, blue_count))
++    bars.sort()
++    return bars
++
++
++def _paint_vertical(out: np.ndarray, col: int, r0: int, r1: int, step: int = 1) -> None:
++    a, b = sorted((int(r0), int(r1)))
++    for r in range(a, b + 1, int(step)):
++        out[r, int(col)] = GREEN
++
++
++def _paint_horizontal(out: np.ndarray, row: int, c0: int, c1: int) -> None:
++    a, b = sorted((int(c0), int(c1)))
++    out[int(row), a : b + 1] = GREEN
++
++
++def _solve_canonical(grid: np.ndarray) -> np.ndarray:
++    g = np.array(grid, copy=True)
++    h, _ = g.shape
++
++    start_pts = np.argwhere(g == GREEN)
++    assert start_pts.shape[0] == 1, "canonical grid must keep one start pixel"
++    sr, sc = map(int, start_pts[0])
++    assert sr == 0, "canonical orientation expects the start on the top edge"
++
++    bars = _extract_bars(g)
++    out = g.copy()
++
++    cur_r, cur_c = sr, sc
++    terminated = False
++
++    for idx, (bar_r, c0, c1, blue_count) in enumerate(bars):
++        assert c0 <= cur_c <= c1, "generator must place each active bar across the current path column"
++        entry_r = bar_r - blue_count
++        exit_r = bar_r + blue_count
++        assert entry_r >= cur_r, "bars must be ordered along the main axis"
++
++        _paint_vertical(out, cur_c, cur_r, entry_r, step=1)
++
++        if blue_count == 1:
++            bypass_c = c0 - 1
++            assert bypass_c >= 0
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=1)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 2:
++            bypass_c = c1 + 1
++            assert bypass_c < out.shape[1]
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=2)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 3:
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=3)
++            cur_r = exit_r
++        else:
++            assert idx == len(bars) - 1, "a terminating bar must be the last active bar"
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=4)
++            terminated = True
++            break
++
++    if not terminated:
++        _paint_vertical(out, cur_c, cur_r, h - 1, step=1)
++
++    out[out == BLUE] = RED
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Extend the border start through a sequence of floating bars, where each bar's blue count simultaneously chooses the local action and the spacing of the green marks through that bar's row-band.
++
++    Input structure:
++    - bg = azure (8). Each obstacle is a 1-cell-thick red/blue bar (colors 2/1), and a single green (3) start pixel sits on one border edge.
++    - Bars are ordered along the start-to-opposite direction; after rotating to a canonical top-start view they are horizontal strips that all cross the current path column.
++    - The number of blue cells on a bar is always 1, 2, 3, or 4.
++
++    Rule:
++    - Blue count 1 means detour around the bar's left side; 2 means detour around its right side; 3 means pass straight through the bar; 4 means stop after traversing that bar.
++    - While crossing a bar's local row-band from `row-count` to `row+count`, green is placed every `count` rows instead of continuously, so counts 2/3/4 create dotted progressions.
++    - Outside those local bands the path is continuous, and any remaining blue obstacle cells are converted to red at the end.
++
++    Key insight: the blue tally on each bar is a fused code word: it tells you both which side behavior to execute and what periodic spacing to use while the path advances through that bar's zone.
++    """
++    g = np.array(grid, copy=True)
++    edge, _, _ = _start_edge(g)
++    canonical = _to_canonical(g, edge)
++    solved = _solve_canonical(canonical)
++    return _from_canonical(solved, edge)
++
++
++def _min_main_len(blues: tuple[int, ...]) -> int:
++    row = blues[0] + 1
++    for prev_b, next_b in zip(blues, blues[1:]):
++        row += prev_b + next_b + 2
++    return row + blues[-1] + 2
++
++
++def _random_composition(total: int, parts: int) -> list[int]:
++    if parts == 1:
++        return [total]
++    cuts = sorted(random.sample(range(total + parts - 1), parts - 1))
++    out = []
++    prev = -1
++    for cut in cuts + [total + parts - 1]:
++        out.append(cut - prev - 1)
++        prev = cut
++    return out
++
++
++def _choose_blues(main_hi: int) -> tuple[int, ...]:
++    for _ in range(200):
++        count = random.randint(BAR_COUNT_LO, BAR_COUNT_HI)
++        blues = [random.choice((1, 2, 3)) for _ in range(count)]
++        if random.random() < 0.35:
++            blues[-1] = 4
++        if all(v == 1 for v in blues):
++            blues[random.randrange(len(blues))] = random.choice((2, 3, 4))
++        if len(set(blues)) == 1 and len(blues) >= 3:
++            idx = random.randrange(len(blues) - (1 if blues[-1] == 4 else 0))
++            blues[idx] = random.choice([v for v in (1, 2, 3) if v != blues[idx]])
++        combo = tuple(blues)
++        if _min_main_len(combo) <= main_hi:
++            return combo
++    raise RuntimeError("failed to choose a feasible behavior sequence")
++
++
++def _length_bounds(cross_size: int, blue_count: int) -> tuple[int, int] | None:
++    lo = max(BAR_LEN_MIN, 2 * blue_count - 1, (BAR_CROSS_PCT_LO * cross_size + 99) // 100)
++    hi = min(BAR_LEN_MAX, cross_size - 2, (BAR_CROSS_PCT_HI * cross_size) // 100)
++    if lo > hi:
++        return None
++    return lo, hi
++
++
++def _interval_candidates(cross_size: int, current_col: int, blue_count: int) -> list[tuple[float, int, int, int]]:
++    bounds = _length_bounds(cross_size, blue_count)
++    if bounds is None:
++        return []
++
++    lo_len, hi_len = bounds
++    center = (cross_size - 1) / 2.0
++    candidates: list[tuple[float, int, int, int]] = []
++
++    for length in range(lo_len, hi_len + 1):
++        for c0 in range(1, cross_size - length):
++            c1 = c0 + length - 1
++            if not (c0 <= current_col <= c1):
++                continue
++
++            if blue_count == 1:
++                new_col = c0 - 1
++                if new_col < 2 or current_col - new_col < 2:
++                    continue
++            elif blue_count == 2:
++                new_col = c1 + 1
++                if new_col > cross_size - 3 or new_col - current_col < 2:
++                    continue
++            else:
++                new_col = current_col
++                if current_col in (c0, c1):
++                    continue
++
++            score = abs(new_col - center) + 0.3 * abs((c0 + c1) / 2.0 - center)
++            candidates.append((score, c0, c1, new_col))
++
++    candidates.sort(key=lambda item: item[0])
++    return candidates
++
++
++def _paint_bar(grid: np.ndarray, row: int, c0: int, c1: int, blue_count: int) -> None:
++    length = c1 - c0 + 1
++    colors = np.full(length, RED, dtype=int)
++    colors[: 2 * blue_count - 1 : 2] = BLUE
++    grid[row, c0 : c1 + 1] = colors
++
++
++def _canonical_grid(main_size: int, cross_size: int, blues: tuple[int, ...]) -> np.ndarray | None:
++    slack = main_size - _min_main_len(blues)
++    if slack < 0:
++        return None
++
++    extras = _random_composition(slack, len(blues) + 1)
++    row = blues[0] + 1 + extras[0]
++    rows = [row]
++    for i in range(1, len(blues)):
++        row += blues[i - 1] + blues[i] + 2 + extras[i]
++        rows.append(row)
++
++    grid = np.full((main_size, cross_size), BG, dtype=int)
++    start_col = random.randint(4, cross_size - 5)
++    current_col = start_col
++
++    for row, blue_count in zip(rows, blues):
++        candidates = _interval_candidates(cross_size, current_col, blue_count)
++        if not candidates:
++            return None
++        pool = candidates[: min(10, len(candidates))]
++        _, c0, c1, new_col = random.choice(pool)
++        _paint_bar(grid, row, c0, c1, blue_count)
++        if blue_count in (1, 2):
++            current_col = new_col
++
++    grid[0, start_col] = GREEN
++    return grid
++
++
++def _orient_grid(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return grid.copy()
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _fusion_signature(inp: np.ndarray, out: np.ndarray) -> dict[str, int]:
++    edge, _, _ = _start_edge(inp)
++    cin = _to_canonical(inp, edge)
++    cout = _to_canonical(out, edge)
++    bars = _extract_bars(cin)
++
++    left_turns = 0
++    right_turns = 0
++    through_hits = 0
++    stop_bars = 0
++    stepped_marks = 0
++
++    for row, c0, c1, blue_count in bars:
++        band = cout[max(0, row - blue_count) : min(cout.shape[0], row + blue_count + 1), :]
++        stepped_marks += int(np.sum(band == GREEN))
++        if blue_count == 1 and np.any(cout[row - 1 : row + 2, c0 - 1] == GREEN):
++            left_turns += 1
++        elif blue_count == 2 and np.any(cout[row - 2 : row + 3, c1 + 1] == GREEN):
++            right_turns += 1
++        elif blue_count == 3 and cout[row, c0 : c1 + 1].tolist().count(GREEN) > 0:
++            through_hits += 1
++        elif blue_count == 4:
++            stop_bars += 1
++
++    reached_bottom = int(np.any(cout[-1, :] == GREEN))
++    return {
++        "bars": len(bars),
++        "left_turns": left_turns,
++        "right_turns": right_turns,
++        "through_hits": through_hits,
++        "stop_bars": stop_bars,
++        "reached_bottom": reached_bottom,
++        "stepped_marks": stepped_marks,
++    }
++
++
++def _gen_attempt() -> np.ndarray | None:
++    edge = random.choice(("top", "bottom", "left", "right"))
++    if edge in ("top", "bottom"):
++        main_lo, main_hi = ROWS_LO, ROWS_HI
++        cross_lo, cross_hi = COLS_LO, COLS_HI
++    else:
++        main_lo, main_hi = COLS_LO, COLS_HI
++        cross_lo, cross_hi = ROWS_LO, ROWS_HI
++
++    blues = _choose_blues(main_hi)
++    main_size = random.randint(max(main_lo, _min_main_len(blues)), main_hi)
++    cross_size = random.randint(cross_lo, cross_hi)
++
++    canonical = _canonical_grid(main_size, cross_size, blues)
++    if canonical is None:
++        return None
++    inp = _orient_grid(canonical, edge)
++
++    try:
++        out = main(inp)
++        if not np.array_equal(main(inp), out):
++            return None
++        sig = _fusion_signature(inp, out)
++        if sig["bars"] < 2:
++            return None
++        if sum(v > 0 for v in (sig["left_turns"], sig["right_turns"], sig["through_hits"], sig["stop_bars"])) < 1:
++            return None
++        if blues[-1] == 4:
++            if sig["reached_bottom"] != 0:
++                return None
++        elif sig["reached_bottom"] != 1:
++            return None
++        if max(blues) > 1 and sig["stepped_marks"] <= len(blues):
++            return None
++    except Exception:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid fused cb2d8a2c input")
+
+ succeeded in 565ms:
+sample_hist {'samples': 200, 'bars_total': 551, 'terminated_samples': 68, 'through_samples': 119, 'left_samples': 128, 'right_samples': 130, 'reached_bottom_samples': 132}
+count_hist {1: 163, 4: 68, 2: 175, 3: 145}
+event_hist {'blue_1': 163, 'blue_4': 68, 'left_turn_bars': 163, 'right_turn_bars': 175, 'through_hit_bars': 145, 'stop_bars': 68, 'blue_2': 175, 'blue_3': 145}
+ratios {'left_match_rate': 1.0, 'right_match_rate': 1.0, 'through_match_rate': 1.0, 'stop_match_rate': 1.0, 'terminated_sample_rate': 0.34, 'through_sample_rate': 0.595}
+
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util, numpy as np
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/cb2d8a2c/40/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+for i in range(3):
+    inp = mod.generate_input()
+    out = mod.main(inp)
+    print('\\nSAMPLE', i)
+    print('input')
+    for row in inp:
+        print(''.join(map(str,row.tolist())))
+    print('output')
+    for row in out:
+        print(''.join(map(str,row.tolist())))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/cb2d8a2c/40/code.py b/ceshi/code_combo/cb2d8a2c/40/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0c1d7d535ceea7d11b765510bd45e191a0036d2
+--- /dev/null
++++ b/ceshi/code_combo/cb2d8a2c/40/code.py
+@@ -0,0 +1,414 @@
++# Combo variant of cb2d8a2c (index 40)
++# combo_spec: D3/3+D20/2
++# Name: 蓝色数编码行为模式+GCD间距约束
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask
++
++
++BG = 8
++BLUE = 1
++RED = 2
++GREEN = 3
++
++# --- Tunable parameters (kept close to the seed task where still compatible) ---
++ROWS_LO, ROWS_HI = 12, 29
++COLS_LO, COLS_HI = 13, 26
++BAR_COUNT_LO, BAR_COUNT_HI = 2, 4
++BAR_LEN_MIN, BAR_LEN_MAX = 6, 15
++BAR_CROSS_PCT_LO, BAR_CROSS_PCT_HI = 32, 79
++MAX_GEN_RETRIES = 500
++
++
++# Design analysis for the fused variant
++# ------------------------------------
++# 1. Concrete behavior:
++#    The seed task used wall-attached bars plus a keep-out radius. That layout
++#    cannot express "1=left detour / 2=right detour" because a wall-attached bar
++#    only leaves one bypass side. The fused task therefore switches to floating
++#    horizontal bars in canonical orientation (top-start, path moving downward).
++#    Blue count now has two simultaneous roles:
++#      - behavior code: 1->detour to the left end, 2->detour to the right end,
++#        3->go straight through the bar, 4->terminate after this bar
++#      - spacing code: while crossing that bar's local row-band, green marks are
++#        placed every `blue_count` rows instead of continuously
++#    Example: if the current path column hits a bar with 2 blue cells, the path
++#    reaches row `bar_row-2`, shifts horizontally to `bar_right+1`, then marks
++#    only rows `bar_row-2, bar_row, bar_row+2` on that bypass column.
++#
++# 2. Complexity calibration / observability:
++#    Only four behavior codes exist and each remains tied to the visible blue
++#    count, so the hypothesis space stays small. Counts 2/3/4 create dotted
++#    vertical passages with visibly different spacing, while counts 1/2 also
++#    differ by turning left vs right. The generator avoids one-bar instances and
++#    forces at least one count > 1 so the fused change is visible.
++#
++# 3. Hidden assumptions broken from the seed solver:
++#    - Bars are no longer wall-attached.
++#    - The path no longer minimizes a shortest route; it is reconstructed
++#      deterministically from per-bar behavior codes.
++#    - A bar with four blue cells can stop the path before the opposite edge.
++#    - Count 3 may overwrite a bar cell with green because "through" literally
++#      crosses the obstacle instead of avoiding it.
++#
++# 4. Generator guarantees for those new assumptions:
++#    - After canonicalization every obstacle component is a single horizontal
++#      1-cell-thick bar, sorted by row.
++#    - The current path column lies inside every active bar span, so each bar
++#      truly controls the trajectory.
++#    - For count 1/2 there is free space on the chosen bypass side, and the new
++#      path column stays away from the outer border to keep later bars feasible.
++#    - Count 4 only appears on the last bar, preventing unused clutter below a
++#      forced stop.
++#    - Row spacing satisfies `next_row - next_b >= prev_row + prev_b + 2`, so
++#      the stepped bands do not overlap and remain visually readable.
++
++
++def _start_edge(grid: np.ndarray) -> tuple[str, int, int]:
++    pts = np.argwhere(grid == GREEN)
++    assert pts.shape[0] == 1, "grid must contain exactly one green start pixel"
++    r, c = map(int, pts[0])
++    h, w = grid.shape
++    if r == 0:
++        return "top", r, c
++    if r == h - 1:
++        return "bottom", r, c
++    if c == 0:
++        return "left", r, c
++    if c == w - 1:
++        return "right", r, c
++    raise AssertionError("green start must lie on a border edge")
++
++
++def _to_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid).T.copy()  # edge == "right"
++
++
++def _from_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _extract_bars(grid: np.ndarray) -> list[tuple[int, int, int, int]]:
++    bar_mask = (grid == BLUE) | (grid == RED)
++    comps = components_mask(bar_mask, connectivity=4)
++    bars: list[tuple[int, int, int, int]] = []
++    for comp in comps:
++        rows = {int(r) for r, _ in comp}
++        assert len(rows) == 1, "each obstacle must be a single horizontal bar"
++        row = rows.pop()
++        cols = sorted(int(c) for _, c in comp)
++        c0, c1 = cols[0], cols[-1]
++        blue_count = int(np.sum(grid[row, c0 : c1 + 1] == BLUE))
++        assert 1 <= blue_count <= 4, "blue count must encode one of four behaviors"
++        bars.append((row, c0, c1, blue_count))
++    bars.sort()
++    return bars
++
++
++def _paint_vertical(out: np.ndarray, col: int, r0: int, r1: int, step: int = 1) -> None:
++    a, b = sorted((int(r0), int(r1)))
++    for r in range(a, b + 1, int(step)):
++        out[r, int(col)] = GREEN
++
++
++def _paint_horizontal(out: np.ndarray, row: int, c0: int, c1: int) -> None:
++    a, b = sorted((int(c0), int(c1)))
++    out[int(row), a : b + 1] = GREEN
++
++
++def _solve_canonical(grid: np.ndarray) -> np.ndarray:
++    g = np.array(grid, copy=True)
++    h, _ = g.shape
++
++    start_pts = np.argwhere(g == GREEN)
++    assert start_pts.shape[0] == 1, "canonical grid must keep one start pixel"
++    sr, sc = map(int, start_pts[0])
++    assert sr == 0, "canonical orientation expects the start on the top edge"
++
++    bars = _extract_bars(g)
++    out = g.copy()
++
++    cur_r, cur_c = sr, sc
++    terminated = False
++
++    for idx, (bar_r, c0, c1, blue_count) in enumerate(bars):
++        assert c0 <= cur_c <= c1, "generator must place each active bar across the current path column"
++        entry_r = bar_r - blue_count
++        exit_r = bar_r + blue_count
++        assert entry_r >= cur_r, "bars must be ordered along the main axis"
++
++        _paint_vertical(out, cur_c, cur_r, entry_r, step=1)
++
++        if blue_count == 1:
++            bypass_c = c0 - 1
++            assert bypass_c >= 0
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=1)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 2:
++            bypass_c = c1 + 1
++            assert bypass_c < out.shape[1]
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=2)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 3:
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=3)
++            cur_r = exit_r
++        else:
++            assert idx == len(bars) - 1, "a terminating bar must be the last active bar"
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=4)
++            terminated = True
++            break
++
++    if not terminated:
++        _paint_vertical(out, cur_c, cur_r, h - 1, step=1)
++
++    out[out == BLUE] = RED
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Extend the border start through a sequence of floating bars, where each bar's blue count simultaneously chooses the local action and the spacing of the green marks through that bar's row-band.
++
++    Input structure:
++    - bg = azure (8). Each obstacle is a 1-cell-thick red/blue bar (colors 2/1), and a single green (3) start pixel sits on one border edge.
++    - Bars are ordered along the start-to-opposite direction; after rotating to a canonical top-start view they are horizontal strips that all cross the current path column.
++    - The number of blue cells on a bar is always 1, 2, 3, or 4.
++
++    Rule:
++    - Blue count 1 means detour around the bar's left side; 2 means detour around its right side; 3 means pass straight through the bar; 4 means stop after traversing that bar.
++    - While crossing a bar's local row-band from `row-count` to `row+count`, green is placed every `count` rows instead of continuously, so counts 2/3/4 create dotted progressions.
++    - Outside those local bands the path is continuous, and any remaining blue obstacle cells are converted to red at the end.
++
++    Key insight: the blue tally on each bar is a fused code word: it tells you both which side behavior to execute and what periodic spacing to use while the path advances through that bar's zone.
++    """
++    g = np.array(grid, copy=True)
++    edge, _, _ = _start_edge(g)
++    canonical = _to_canonical(g, edge)
++    solved = _solve_canonical(canonical)
++    return _from_canonical(solved, edge)
++
++
++def _min_main_len(blues: tuple[int, ...]) -> int:
++    row = blues[0] + 1
++    for prev_b, next_b in zip(blues, blues[1:]):
++        row += prev_b + next_b + 2
++    return row + blues[-1] + 2
++
++
++def _random_composition(total: int, parts: int) -> list[int]:
++    if parts == 1:
++        return [total]
++    cuts = sorted(random.sample(range(total + parts - 1), parts - 1))
++    out = []
++    prev = -1
++    for cut in cuts + [total + parts - 1]:
++        out.append(cut - prev - 1)
++        prev = cut
++    return out
++
++
++def _choose_blues(main_hi: int) -> tuple[int, ...]:
++    for _ in range(200):
++        count = random.randint(BAR_COUNT_LO, BAR_COUNT_HI)
++        blues = [random.choice((1, 2, 3)) for _ in range(count)]
++        if random.random() < 0.35:
++            blues[-1] = 4
++        if all(v == 1 for v in blues):
++            blues[random.randrange(len(blues))] = random.choice((2, 3, 4))
++        if len(set(blues)) == 1 and len(blues) >= 3:
++            idx = random.randrange(len(blues) - (1 if blues[-1] == 4 else 0))
++            blues[idx] = random.choice([v for v in (1, 2, 3) if v != blues[idx]])
++        combo = tuple(blues)
++        if _min_main_len(combo) <= main_hi:
++            return combo
++    raise RuntimeError("failed to choose a feasible behavior sequence")
++
++
++def _length_bounds(cross_size: int, blue_count: int) -> tuple[int, int] | None:
++    lo = max(BAR_LEN_MIN, 2 * blue_count - 1, (BAR_CROSS_PCT_LO * cross_size + 99) // 100)
++    hi = min(BAR_LEN_MAX, cross_size - 2, (BAR_CROSS_PCT_HI * cross_size) // 100)
++    if lo > hi:
++        return None
++    return lo, hi
++
++
++def _interval_candidates(cross_size: int, current_col: int, blue_count: int) -> list[tuple[float, int, int, int]]:
++    bounds = _length_bounds(cross_size, blue_count)
++    if bounds is None:
++        return []
++
++    lo_len, hi_len = bounds
++    center = (cross_size - 1) / 2.0
++    candidates: list[tuple[float, int, int, int]] = []
++
++    for length in range(lo_len, hi_len + 1):
++        for c0 in range(1, cross_size - length):
++            c1 = c0 + length - 1
++            if not (c0 <= current_col <= c1):
++                continue
++
++            if blue_count == 1:
++                new_col = c0 - 1
++                if new_col < 2 or current_col - new_col < 2:
++                    continue
++            elif blue_count == 2:
++                new_col = c1 + 1
++                if new_col > cross_size - 3 or new_col - current_col < 2:
++                    continue
++            else:
++                new_col = current_col
++                if current_col in (c0, c1):
++                    continue
++
++            score = abs(new_col - center) + 0.3 * abs((c0 + c1) / 2.0 - center)
++            candidates.append((score, c0, c1, new_col))
++
++    candidates.sort(key=lambda item: item[0])
++    return candidates
++
++
++def _paint_bar(grid: np.ndarray, row: int, c0: int, c1: int, blue_count: int) -> None:
++    length = c1 - c0 + 1
++    colors = np.full(length, RED, dtype=int)
++    colors[: 2 * blue_count - 1 : 2] = BLUE
++    grid[row, c0 : c1 + 1] = colors
++
++
++def _canonical_grid(main_size: int, cross_size: int, blues: tuple[int, ...]) -> np.ndarray | None:
++    slack = main_size - _min_main_len(blues)
++    if slack < 0:
++        return None
++
++    extras = _random_composition(slack, len(blues) + 1)
++    row = blues[0] + 1 + extras[0]
++    rows = [row]
++    for i in range(1, len(blues)):
++        row += blues[i - 1] + blues[i] + 2 + extras[i]
++        rows.append(row)
++
++    grid = np.full((main_size, cross_size), BG, dtype=int)
++    start_col = random.randint(4, cross_size - 5)
++    current_col = start_col
++
++    for row, blue_count in zip(rows, blues):
++        candidates = _interval_candidates(cross_size, current_col, blue_count)
++        if not candidates:
++            return None
++        pool = candidates[: min(10, len(candidates))]
++        _, c0, c1, new_col = random.choice(pool)
++        _paint_bar(grid, row, c0, c1, blue_count)
++        if blue_count in (1, 2):
++            current_col = new_col
++
++    grid[0, start_col] = GREEN
++    return grid
++
++
++def _orient_grid(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return grid.copy()
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _fusion_signature(inp: np.ndarray, out: np.ndarray) -> dict[str, int]:
++    edge, _, _ = _start_edge(inp)
++    cin = _to_canonical(inp, edge)
++    cout = _to_canonical(out, edge)
++    bars = _extract_bars(cin)
++
++    left_turns = 0
++    right_turns = 0
++    through_hits = 0
++    stop_bars = 0
++    stepped_marks = 0
++
++    for row, c0, c1, blue_count in bars:
++        band = cout[max(0, row - blue_count) : min(cout.shape[0], row + blue_count + 1), :]
++        stepped_marks += int(np.sum(band == GREEN))
++        if blue_count == 1 and np.any(cout[row - 1 : row + 2, c0 - 1] == GREEN):
++            left_turns += 1
++        elif blue_count == 2 and np.any(cout[row - 2 : row + 3, c1 + 1] == GREEN):
++            right_turns += 1
++        elif blue_count == 3 and cout[row, c0 : c1 + 1].tolist().count(GREEN) > 0:
++            through_hits += 1
++        elif blue_count == 4:
++            stop_bars += 1
++
++    reached_bottom = int(np.any(cout[-1, :] == GREEN))
++    return {
++        "bars": len(bars),
++        "left_turns": left_turns,
++        "right_turns": right_turns,
++        "through_hits": through_hits,
++        "stop_bars": stop_bars,
++        "reached_bottom": reached_bottom,
++        "stepped_marks": stepped_marks,
++    }
++
++
++def _gen_attempt() -> np.ndarray | None:
++    edge = random.choice(("top", "bottom", "left", "right"))
++    if edge in ("top", "bottom"):
++        main_lo, main_hi = ROWS_LO, ROWS_HI
++        cross_lo, cross_hi = COLS_LO, COLS_HI
++    else:
++        main_lo, main_hi = COLS_LO, COLS_HI
++        cross_lo, cross_hi = ROWS_LO, ROWS_HI
++
++    blues = _choose_blues(main_hi)
++    main_size = random.randint(max(main_lo, _min_main_len(blues)), main_hi)
++    cross_size = random.randint(cross_lo, cross_hi)
++
++    canonical = _canonical_grid(main_size, cross_size, blues)
++    if canonical is None:
++        return None
++    inp = _orient_grid(canonical, edge)
++
++    try:
++        out = main(inp)
++        if not np.array_equal(main(inp), out):
++            return None
++        sig = _fusion_signature(inp, out)
++        if sig["bars"] < 2:
++            return None
++        if sum(v > 0 for v in (sig["left_turns"], sig["right_turns"], sig["through_hits"], sig["stop_bars"])) < 1:
++            return None
++        if blues[-1] == 4:
++            if sig["reached_bottom"] != 0:
++                return None
++        elif sig["reached_bottom"] != 1:
++            return None
++        if max(blues) > 1 and sig["stepped_marks"] <= len(blues):
++            return None
++    except Exception:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid fused cb2d8a2c input")
+
+ succeeded in 290ms:
+
+SAMPLE 0
+input
+88888888888888
+88888888888888
+88888888888888
+88888888888888
+88888888888888
+88888121212228
+88888888888888
+88888888888888
+88888888888888
+88888888888888
+88888888888888
+88888888888888
+88888888888888
+88888888888888
+88888888888888
+88121222222888
+88888888888888
+88888888888888
+88888888888888
+88888888888888
+88888888888888
+81212222888888
+88888888888888
+88888888888888
+88888888888888
+88888838888888
+output
+88888888888388
+88888888888388
+88888888888388
+88888888888888
+88888888888888
+88888222222328
+88888888888888
+88888888888888
+88888888888388
+88888888888388
+88888888888388
+88888888888388
+88888888888388
+88888888888388
+88888888888888
+88222222222388
+88888888888888
+88888888333388
+88888888388888
+88888888388888
+88888888888888
+82222222388888
+88888888888888
+88888833388888
+88888838888888
+88888838888888
+
+SAMPLE 1
+input
+888888888888888888888
+888888888888888888888
+888888888888888888888
+888888888888888888888
+888888888888888888888
+888888881888888888888
+888888882888888888888
+888888881888888888888
+888888882888888881888
+888888881888888882888
+888888882888888882888
+888888882888888882888
+888888882888888882888
+888888882888888882883
+888888882888888882888
+888888888888888882888
+888888888888888882888
+888888888888888882888
+888888888888888888888
+output
+888888888888888888888
+888888888888888888888
+888888888888888888888
+888888888888888888888
+888888888888888888888
+888888882888888888888
+888888882888888888888
+333333883883333333388
+888888882888888882388
+888888882888888882388
+888888882888888882388
+888888882888888882388
+888888882888888882388
+888888882888888882333
+888888882888888882888
+888888888888888882888
+888888888888888882888
+888888888888888882888
+888888888888888888888
+
+SAMPLE 2
+input
+888888888888888888888888
+888888888888888888888888
+888888888881888888888888
+888888888882888888888888
+888888888881888888888888
+888818888882888888888888
+888828888882888888888888
+888818888882888881888888
+888828888882888882888888
+888818888882888882888188
+888828888882888882888283
+888828888882888882888288
+888828888888888882888288
+888828888888888882888288
+888828888888888882888288
+888828888888888882888288
+888828888888888882888288
+888828888888888882888288
+888828888888888882888288
+888828888888888882888288
+888888888888888888888288
+888888888888888888888288
+888888888888888888888288
+888888888888888888888888
+888888888888888888888888
+888888888888888888888888
+output
+888888888888888888888888
+888888888888888888888888
+888888888882888888888888
+888888888882888888888888
+888888888882888888888888
+888828888882888888888888
+888828888882833333388888
+888828888882838882388888
+888828888882838882333338
+888828888882838882888238
+888828888882838882888233
+888828888882838882888288
+338838833383838882888288
+888828888888888882888288
+888828888888888882888288
+888828888888888882888288
+888828888888888882888288
+888828888888888882888288
+888828888888888882888288
+888828888888888882888288
+888888888888888888888288
+888888888888888888888288
+888888888888888888888288
+888888888888888888888888
+888888888888888888888888
+888888888888888888888888
+
+codex
+我又抽样看了几组实际输入输出，局部效果能肉眼区分：`1` 左绕、`2` 右绕、`3` 穿条、`4` 终止，而且 `2/3/4` 在条带内都留下了不同间距的点列。最后补一个编译检查。
+exec
+/bin/bash -lc 'python -m py_compile /home/lixinyu/snap/new/ceshi/code_combo/cb2d8a2c/40/code.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+diff --git a/ceshi/code_combo/cb2d8a2c/40/code.py b/ceshi/code_combo/cb2d8a2c/40/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0c1d7d535ceea7d11b765510bd45e191a0036d2
+--- /dev/null
++++ b/ceshi/code_combo/cb2d8a2c/40/code.py
+@@ -0,0 +1,414 @@
++# Combo variant of cb2d8a2c (index 40)
++# combo_spec: D3/3+D20/2
++# Name: 蓝色数编码行为模式+GCD间距约束
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask
++
++
++BG = 8
++BLUE = 1
++RED = 2
++GREEN = 3
++
++# --- Tunable parameters (kept close to the seed task where still compatible) ---
++ROWS_LO, ROWS_HI = 12, 29
++COLS_LO, COLS_HI = 13, 26
++BAR_COUNT_LO, BAR_COUNT_HI = 2, 4
++BAR_LEN_MIN, BAR_LEN_MAX = 6, 15
++BAR_CROSS_PCT_LO, BAR_CROSS_PCT_HI = 32, 79
++MAX_GEN_RETRIES = 500
++
++
++# Design analysis for the fused variant
++# ------------------------------------
++# 1. Concrete behavior:
++#    The seed task used wall-attached bars plus a keep-out radius. That layout
++#    cannot express "1=left detour / 2=right detour" because a wall-attached bar
++#    only leaves one bypass side. The fused task therefore switches to floating
++#    horizontal bars in canonical orientation (top-start, path moving downward).
++#    Blue count now has two simultaneous roles:
++#      - behavior code: 1->detour to the left end, 2->detour to the right end,
++#        3->go straight through the bar, 4->terminate after this bar
++#      - spacing code: while crossing that bar's local row-band, green marks are
++#        placed every `blue_count` rows instead of continuously
++#    Example: if the current path column hits a bar with 2 blue cells, the path
++#    reaches row `bar_row-2`, shifts horizontally to `bar_right+1`, then marks
++#    only rows `bar_row-2, bar_row, bar_row+2` on that bypass column.
++#
++# 2. Complexity calibration / observability:
++#    Only four behavior codes exist and each remains tied to the visible blue
++#    count, so the hypothesis space stays small. Counts 2/3/4 create dotted
++#    vertical passages with visibly different spacing, while counts 1/2 also
++#    differ by turning left vs right. The generator avoids one-bar instances and
++#    forces at least one count > 1 so the fused change is visible.
++#
++# 3. Hidden assumptions broken from the seed solver:
++#    - Bars are no longer wall-attached.
++#    - The path no longer minimizes a shortest route; it is reconstructed
++#      deterministically from per-bar behavior codes.
++#    - A bar with four blue cells can stop the path before the opposite edge.
++#    - Count 3 may overwrite a bar cell with green because "through" literally
++#      crosses the obstacle instead of avoiding it.
++#
++# 4. Generator guarantees for those new assumptions:
++#    - After canonicalization every obstacle component is a single horizontal
++#      1-cell-thick bar, sorted by row.
++#    - The current path column lies inside every active bar span, so each bar
++#      truly controls the trajectory.
++#    - For count 1/2 there is free space on the chosen bypass side, and the new
++#      path column stays away from the outer border to keep later bars feasible.
++#    - Count 4 only appears on the last bar, preventing unused clutter below a
++#      forced stop.
++#    - Row spacing satisfies `next_row - next_b >= prev_row + prev_b + 2`, so
++#      the stepped bands do not overlap and remain visually readable.
++
++
++def _start_edge(grid: np.ndarray) -> tuple[str, int, int]:
++    pts = np.argwhere(grid == GREEN)
++    assert pts.shape[0] == 1, "grid must contain exactly one green start pixel"
++    r, c = map(int, pts[0])
++    h, w = grid.shape
++    if r == 0:
++        return "top", r, c
++    if r == h - 1:
++        return "bottom", r, c
++    if c == 0:
++        return "left", r, c
++    if c == w - 1:
++        return "right", r, c
++    raise AssertionError("green start must lie on a border edge")
++
++
++def _to_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid).T.copy()  # edge == "right"
++
++
++def _from_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _extract_bars(grid: np.ndarray) -> list[tuple[int, int, int, int]]:
++    bar_mask = (grid == BLUE) | (grid == RED)
++    comps = components_mask(bar_mask, connectivity=4)
++    bars: list[tuple[int, int, int, int]] = []
++    for comp in comps:
++        rows = {int(r) for r, _ in comp}
++        assert len(rows) == 1, "each obstacle must be a single horizontal bar"
++        row = rows.pop()
++        cols = sorted(int(c) for _, c in comp)
++        c0, c1 = cols[0], cols[-1]
++        blue_count = int(np.sum(grid[row, c0 : c1 + 1] == BLUE))
++        assert 1 <= blue_count <= 4, "blue count must encode one of four behaviors"
++        bars.append((row, c0, c1, blue_count))
++    bars.sort()
++    return bars
++
++
++def _paint_vertical(out: np.ndarray, col: int, r0: int, r1: int, step: int = 1) -> None:
++    a, b = sorted((int(r0), int(r1)))
++    for r in range(a, b + 1, int(step)):
++        out[r, int(col)] = GREEN
++
++
++def _paint_horizontal(out: np.ndarray, row: int, c0: int, c1: int) -> None:
++    a, b = sorted((int(c0), int(c1)))
++    out[int(row), a : b + 1] = GREEN
++
++
++def _solve_canonical(grid: np.ndarray) -> np.ndarray:
++    g = np.array(grid, copy=True)
++    h, _ = g.shape
++
++    start_pts = np.argwhere(g == GREEN)
++    assert start_pts.shape[0] == 1, "canonical grid must keep one start pixel"
++    sr, sc = map(int, start_pts[0])
++    assert sr == 0, "canonical orientation expects the start on the top edge"
++
++    bars = _extract_bars(g)
++    out = g.copy()
++
++    cur_r, cur_c = sr, sc
++    terminated = False
++
++    for idx, (bar_r, c0, c1, blue_count) in enumerate(bars):
++        assert c0 <= cur_c <= c1, "generator must place each active bar across the current path column"
++        entry_r = bar_r - blue_count
++        exit_r = bar_r + blue_count
++        assert entry_r >= cur_r, "bars must be ordered along the main axis"
++
++        _paint_vertical(out, cur_c, cur_r, entry_r, step=1)
++
++        if blue_count == 1:
++            bypass_c = c0 - 1
++            assert bypass_c >= 0
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=1)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 2:
++            bypass_c = c1 + 1
++            assert bypass_c < out.shape[1]
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=2)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 3:
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=3)
++            cur_r = exit_r
++        else:
++            assert idx == len(bars) - 1, "a terminating bar must be the last active bar"
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=4)
++            terminated = True
++            break
++
++    if not terminated:
++        _paint_vertical(out, cur_c, cur_r, h - 1, step=1)
++
++    out[out == BLUE] = RED
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Extend the border start through a sequence of floating bars, where each bar's blue count simultaneously chooses the local action and the spacing of the green marks through that bar's row-band.
++
++    Input structure:
++    - bg = azure (8). Each obstacle is a 1-cell-thick red/blue bar (colors 2/1), and a single green (3) start pixel sits on one border edge.
++    - Bars are ordered along the start-to-opposite direction; after rotating to a canonical top-start view they are horizontal strips that all cross the current path column.
++    - The number of blue cells on a bar is always 1, 2, 3, or 4.
++
++    Rule:
++    - Blue count 1 means detour around the bar's left side; 2 means detour around its right side; 3 means pass straight through the bar; 4 means stop after traversing that bar.
++    - While crossing a bar's local row-band from `row-count` to `row+count`, green is placed every `count` rows instead of continuously, so counts 2/3/4 create dotted progressions.
++    - Outside those local bands the path is continuous, and any remaining blue obstacle cells are converted to red at the end.
++
++    Key insight: the blue tally on each bar is a fused code word: it tells you both which side behavior to execute and what periodic spacing to use while the path advances through that bar's zone.
++    """
++    g = np.array(grid, copy=True)
++    edge, _, _ = _start_edge(g)
++    canonical = _to_canonical(g, edge)
++    solved = _solve_canonical(canonical)
++    return _from_canonical(solved, edge)
++
++
++def _min_main_len(blues: tuple[int, ...]) -> int:
++    row = blues[0] + 1
++    for prev_b, next_b in zip(blues, blues[1:]):
++        row += prev_b + next_b + 2
++    return row + blues[-1] + 2
++
++
++def _random_composition(total: int, parts: int) -> list[int]:
++    if parts == 1:
++        return [total]
++    cuts = sorted(random.sample(range(total + parts - 1), parts - 1))
++    out = []
++    prev = -1
++    for cut in cuts + [total + parts - 1]:
++        out.append(cut - prev - 1)
++        prev = cut
++    return out
++
++
++def _choose_blues(main_hi: int) -> tuple[int, ...]:
++    for _ in range(200):
++        count = random.randint(BAR_COUNT_LO, BAR_COUNT_HI)
++        blues = [random.choice((1, 2, 3)) for _ in range(count)]
++        if random.random() < 0.35:
++            blues[-1] = 4
++        if all(v == 1 for v in blues):
++            blues[random.randrange(len(blues))] = random.choice((2, 3, 4))
++        if len(set(blues)) == 1 and len(blues) >= 3:
++            idx = random.randrange(len(blues) - (1 if blues[-1] == 4 else 0))
++            blues[idx] = random.choice([v for v in (1, 2, 3) if v != blues[idx]])
++        combo = tuple(blues)
++        if _min_main_len(combo) <= main_hi:
++            return combo
++    raise RuntimeError("failed to choose a feasible behavior sequence")
++
++
++def _length_bounds(cross_size: int, blue_count: int) -> tuple[int, int] | None:
++    lo = max(BAR_LEN_MIN, 2 * blue_count - 1, (BAR_CROSS_PCT_LO * cross_size + 99) // 100)
++    hi = min(BAR_LEN_MAX, cross_size - 2, (BAR_CROSS_PCT_HI * cross_size) // 100)
++    if lo > hi:
++        return None
++    return lo, hi
++
++
++def _interval_candidates(cross_size: int, current_col: int, blue_count: int) -> list[tuple[float, int, int, int]]:
++    bounds = _length_bounds(cross_size, blue_count)
++    if bounds is None:
++        return []
++
++    lo_len, hi_len = bounds
++    center = (cross_size - 1) / 2.0
++    candidates: list[tuple[float, int, int, int]] = []
++
++    for length in range(lo_len, hi_len + 1):
++        for c0 in range(1, cross_size - length):
++            c1 = c0 + length - 1
++            if not (c0 <= current_col <= c1):
++                continue
++
++            if blue_count == 1:
++                new_col = c0 - 1
++                if new_col < 2 or current_col - new_col < 2:
++                    continue
++            elif blue_count == 2:
++                new_col = c1 + 1
++                if new_col > cross_size - 3 or new_col - current_col < 2:
++                    continue
++            else:
++                new_col = current_col
++                if current_col in (c0, c1):
++                    continue
++
++            score = abs(new_col - center) + 0.3 * abs((c0 + c1) / 2.0 - center)
++            candidates.append((score, c0, c1, new_col))
++
++    candidates.sort(key=lambda item: item[0])
++    return candidates
++
++
++def _paint_bar(grid: np.ndarray, row: int, c0: int, c1: int, blue_count: int) -> None:
++    length = c1 - c0 + 1
++    colors = np.full(length, RED, dtype=int)
++    colors[: 2 * blue_count - 1 : 2] = BLUE
++    grid[row, c0 : c1 + 1] = colors
++
++
++def _canonical_grid(main_size: int, cross_size: int, blues: tuple[int, ...]) -> np.ndarray | None:
++    slack = main_size - _min_main_len(blues)
++    if slack < 0:
++        return None
++
++    extras = _random_composition(slack, len(blues) + 1)
++    row = blues[0] + 1 + extras[0]
++    rows = [row]
++    for i in range(1, len(blues)):
++        row += blues[i - 1] + blues[i] + 2 + extras[i]
++        rows.append(row)
++
++    grid = np.full((main_size, cross_size), BG, dtype=int)
++    start_col = random.randint(4, cross_size - 5)
++    current_col = start_col
++
++    for row, blue_count in zip(rows, blues):
++        candidates = _interval_candidates(cross_size, current_col, blue_count)
++        if not candidates:
++            return None
++        pool = candidates[: min(10, len(candidates))]
++        _, c0, c1, new_col = random.choice(pool)
++        _paint_bar(grid, row, c0, c1, blue_count)
++        if blue_count in (1, 2):
++            current_col = new_col
++
++    grid[0, start_col] = GREEN
++    return grid
++
++
++def _orient_grid(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return grid.copy()
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _fusion_signature(inp: np.ndarray, out: np.ndarray) -> dict[str, int]:
++    edge, _, _ = _start_edge(inp)
++    cin = _to_canonical(inp, edge)
++    cout = _to_canonical(out, edge)
++    bars = _extract_bars(cin)
++
++    left_turns = 0
++    right_turns = 0
++    through_hits = 0
++    stop_bars = 0
++    stepped_marks = 0
++
++    for row, c0, c1, blue_count in bars:
++        band = cout[max(0, row - blue_count) : min(cout.shape[0], row + blue_count + 1), :]
++        stepped_marks += int(np.sum(band == GREEN))
++        if blue_count == 1 and np.any(cout[row - 1 : row + 2, c0 - 1] == GREEN):
++            left_turns += 1
++        elif blue_count == 2 and np.any(cout[row - 2 : row + 3, c1 + 1] == GREEN):
++            right_turns += 1
++        elif blue_count == 3 and cout[row, c0 : c1 + 1].tolist().count(GREEN) > 0:
++            through_hits += 1
++        elif blue_count == 4:
++            stop_bars += 1
++
++    reached_bottom = int(np.any(cout[-1, :] == GREEN))
++    return {
++        "bars": len(bars),
++        "left_turns": left_turns,
++        "right_turns": right_turns,
++        "through_hits": through_hits,
++        "stop_bars": stop_bars,
++        "reached_bottom": reached_bottom,
++        "stepped_marks": stepped_marks,
++    }
++
++
++def _gen_attempt() -> np.ndarray | None:
++    edge = random.choice(("top", "bottom", "left", "right"))
++    if edge in ("top", "bottom"):
++        main_lo, main_hi = ROWS_LO, ROWS_HI
++        cross_lo, cross_hi = COLS_LO, COLS_HI
++    else:
++        main_lo, main_hi = COLS_LO, COLS_HI
++        cross_lo, cross_hi = ROWS_LO, ROWS_HI
++
++    blues = _choose_blues(main_hi)
++    main_size = random.randint(max(main_lo, _min_main_len(blues)), main_hi)
++    cross_size = random.randint(cross_lo, cross_hi)
++
++    canonical = _canonical_grid(main_size, cross_size, blues)
++    if canonical is None:
++        return None
++    inp = _orient_grid(canonical, edge)
++
++    try:
++        out = main(inp)
++        if not np.array_equal(main(inp), out):
++            return None
++        sig = _fusion_signature(inp, out)
++        if sig["bars"] < 2:
++            return None
++        if sum(v > 0 for v in (sig["left_turns"], sig["right_turns"], sig["through_hits"], sig["stop_bars"])) < 1:
++            return None
++        if blues[-1] == 4:
++            if sig["reached_bottom"] != 0:
++                return None
++        elif sig["reached_bottom"] != 1:
++            return None
++        if max(blues) > 1 and sig["stepped_marks"] <= len(blues):
++            return None
++    except Exception:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid fused cb2d8a2c input")
+
+codex
+融合变体代码已写到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/cb2d8a2c/40/code.py)。文件里包含了新的 `main()`、`generate_input()`，以及一段设计/隐式假设审查注释；`main()` 也保留了四段式说明并按融合规则重写了内容。
+
+验证结果：
+- 指定压力测试通过：`Success: 50/50, Time: 0.1s (1ms/call)`
+- `py_compile` 通过
+- 额外做了 200 个样本的融合行为统计，四种蓝点数都实际生效，没有退化回原题：
+  - `1` 左绕命中率 `163/163`
+  - `2` 右绕命中率 `175/175`
+  - `3` 穿过命中率 `145/145`
+  - `4` 终止命中率 `68/68`
+  - 终止样本占比 `34%`
+  - 含穿过样本占比 `59.5%`
+
+实现上的关键改动是把原题的贴墙障碍改成了浮动横条，否则 `1=左绕 / 2=右绕` 在原布局里无解；生成器也同步保证了每根有效障碍都会真正控制当前路径列。
+diff --git a/ceshi/code_combo/cb2d8a2c/40/code.py b/ceshi/code_combo/cb2d8a2c/40/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0c1d7d535ceea7d11b765510bd45e191a0036d2
+--- /dev/null
++++ b/ceshi/code_combo/cb2d8a2c/40/code.py
+@@ -0,0 +1,414 @@
++# Combo variant of cb2d8a2c (index 40)
++# combo_spec: D3/3+D20/2
++# Name: 蓝色数编码行为模式+GCD间距约束
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask
++
++
++BG = 8
++BLUE = 1
++RED = 2
++GREEN = 3
++
++# --- Tunable parameters (kept close to the seed task where still compatible) ---
++ROWS_LO, ROWS_HI = 12, 29
++COLS_LO, COLS_HI = 13, 26
++BAR_COUNT_LO, BAR_COUNT_HI = 2, 4
++BAR_LEN_MIN, BAR_LEN_MAX = 6, 15
++BAR_CROSS_PCT_LO, BAR_CROSS_PCT_HI = 32, 79
++MAX_GEN_RETRIES = 500
++
++
++# Design analysis for the fused variant
++# ------------------------------------
++# 1. Concrete behavior:
++#    The seed task used wall-attached bars plus a keep-out radius. That layout
++#    cannot express "1=left detour / 2=right detour" because a wall-attached bar
++#    only leaves one bypass side. The fused task therefore switches to floating
++#    horizontal bars in canonical orientation (top-start, path moving downward).
++#    Blue count now has two simultaneous roles:
++#      - behavior code: 1->detour to the left end, 2->detour to the right end,
++#        3->go straight through the bar, 4->terminate after this bar
++#      - spacing code: while crossing that bar's local row-band, green marks are
++#        placed every `blue_count` rows instead of continuously
++#    Example: if the current path column hits a bar with 2 blue cells, the path
++#    reaches row `bar_row-2`, shifts horizontally to `bar_right+1`, then marks
++#    only rows `bar_row-2, bar_row, bar_row+2` on that bypass column.
++#
++# 2. Complexity calibration / observability:
++#    Only four behavior codes exist and each remains tied to the visible blue
++#    count, so the hypothesis space stays small. Counts 2/3/4 create dotted
++#    vertical passages with visibly different spacing, while counts 1/2 also
++#    differ by turning left vs right. The generator avoids one-bar instances and
++#    forces at least one count > 1 so the fused change is visible.
++#
++# 3. Hidden assumptions broken from the seed solver:
++#    - Bars are no longer wall-attached.
++#    - The path no longer minimizes a shortest route; it is reconstructed
++#      deterministically from per-bar behavior codes.
++#    - A bar with four blue cells can stop the path before the opposite edge.
++#    - Count 3 may overwrite a bar cell with green because "through" literally
++#      crosses the obstacle instead of avoiding it.
++#
++# 4. Generator guarantees for those new assumptions:
++#    - After canonicalization every obstacle component is a single horizontal
++#      1-cell-thick bar, sorted by row.
++#    - The current path column lies inside every active bar span, so each bar
++#      truly controls the trajectory.
++#    - For count 1/2 there is free space on the chosen bypass side, and the new
++#      path column stays away from the outer border to keep later bars feasible.
++#    - Count 4 only appears on the last bar, preventing unused clutter below a
++#      forced stop.
++#    - Row spacing satisfies `next_row - next_b >= prev_row + prev_b + 2`, so
++#      the stepped bands do not overlap and remain visually readable.
++
++
++def _start_edge(grid: np.ndarray) -> tuple[str, int, int]:
++    pts = np.argwhere(grid == GREEN)
++    assert pts.shape[0] == 1, "grid must contain exactly one green start pixel"
++    r, c = map(int, pts[0])
++    h, w = grid.shape
++    if r == 0:
++        return "top", r, c
++    if r == h - 1:
++        return "bottom", r, c
++    if c == 0:
++        return "left", r, c
++    if c == w - 1:
++        return "right", r, c
++    raise AssertionError("green start must lie on a border edge")
++
++
++def _to_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid).T.copy()  # edge == "right"
++
++
++def _from_canonical(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return np.array(grid, copy=True)
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _extract_bars(grid: np.ndarray) -> list[tuple[int, int, int, int]]:
++    bar_mask = (grid == BLUE) | (grid == RED)
++    comps = components_mask(bar_mask, connectivity=4)
++    bars: list[tuple[int, int, int, int]] = []
++    for comp in comps:
++        rows = {int(r) for r, _ in comp}
++        assert len(rows) == 1, "each obstacle must be a single horizontal bar"
++        row = rows.pop()
++        cols = sorted(int(c) for _, c in comp)
++        c0, c1 = cols[0], cols[-1]
++        blue_count = int(np.sum(grid[row, c0 : c1 + 1] == BLUE))
++        assert 1 <= blue_count <= 4, "blue count must encode one of four behaviors"
++        bars.append((row, c0, c1, blue_count))
++    bars.sort()
++    return bars
++
++
++def _paint_vertical(out: np.ndarray, col: int, r0: int, r1: int, step: int = 1) -> None:
++    a, b = sorted((int(r0), int(r1)))
++    for r in range(a, b + 1, int(step)):
++        out[r, int(col)] = GREEN
++
++
++def _paint_horizontal(out: np.ndarray, row: int, c0: int, c1: int) -> None:
++    a, b = sorted((int(c0), int(c1)))
++    out[int(row), a : b + 1] = GREEN
++
++
++def _solve_canonical(grid: np.ndarray) -> np.ndarray:
++    g = np.array(grid, copy=True)
++    h, _ = g.shape
++
++    start_pts = np.argwhere(g == GREEN)
++    assert start_pts.shape[0] == 1, "canonical grid must keep one start pixel"
++    sr, sc = map(int, start_pts[0])
++    assert sr == 0, "canonical orientation expects the start on the top edge"
++
++    bars = _extract_bars(g)
++    out = g.copy()
++
++    cur_r, cur_c = sr, sc
++    terminated = False
++
++    for idx, (bar_r, c0, c1, blue_count) in enumerate(bars):
++        assert c0 <= cur_c <= c1, "generator must place each active bar across the current path column"
++        entry_r = bar_r - blue_count
++        exit_r = bar_r + blue_count
++        assert entry_r >= cur_r, "bars must be ordered along the main axis"
++
++        _paint_vertical(out, cur_c, cur_r, entry_r, step=1)
++
++        if blue_count == 1:
++            bypass_c = c0 - 1
++            assert bypass_c >= 0
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=1)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 2:
++            bypass_c = c1 + 1
++            assert bypass_c < out.shape[1]
++            _paint_horizontal(out, entry_r, cur_c, bypass_c)
++            _paint_vertical(out, bypass_c, entry_r, exit_r, step=2)
++            cur_r, cur_c = exit_r, bypass_c
++        elif blue_count == 3:
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=3)
++            cur_r = exit_r
++        else:
++            assert idx == len(bars) - 1, "a terminating bar must be the last active bar"
++            _paint_vertical(out, cur_c, entry_r, exit_r, step=4)
++            terminated = True
++            break
++
++    if not terminated:
++        _paint_vertical(out, cur_c, cur_r, h - 1, step=1)
++
++    out[out == BLUE] = RED
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Extend the border start through a sequence of floating bars, where each bar's blue count simultaneously chooses the local action and the spacing of the green marks through that bar's row-band.
++
++    Input structure:
++    - bg = azure (8). Each obstacle is a 1-cell-thick red/blue bar (colors 2/1), and a single green (3) start pixel sits on one border edge.
++    - Bars are ordered along the start-to-opposite direction; after rotating to a canonical top-start view they are horizontal strips that all cross the current path column.
++    - The number of blue cells on a bar is always 1, 2, 3, or 4.
++
++    Rule:
++    - Blue count 1 means detour around the bar's left side; 2 means detour around its right side; 3 means pass straight through the bar; 4 means stop after traversing that bar.
++    - While crossing a bar's local row-band from `row-count` to `row+count`, green is placed every `count` rows instead of continuously, so counts 2/3/4 create dotted progressions.
++    - Outside those local bands the path is continuous, and any remaining blue obstacle cells are converted to red at the end.
++
++    Key insight: the blue tally on each bar is a fused code word: it tells you both which side behavior to execute and what periodic spacing to use while the path advances through that bar's zone.
++    """
++    g = np.array(grid, copy=True)
++    edge, _, _ = _start_edge(g)
++    canonical = _to_canonical(g, edge)
++    solved = _solve_canonical(canonical)
++    return _from_canonical(solved, edge)
++
++
++def _min_main_len(blues: tuple[int, ...]) -> int:
++    row = blues[0] + 1
++    for prev_b, next_b in zip(blues, blues[1:]):
++        row += prev_b + next_b + 2
++    return row + blues[-1] + 2
++
++
++def _random_composition(total: int, parts: int) -> list[int]:
++    if parts == 1:
++        return [total]
++    cuts = sorted(random.sample(range(total + parts - 1), parts - 1))
++    out = []
++    prev = -1
++    for cut in cuts + [total + parts - 1]:
++        out.append(cut - prev - 1)
++        prev = cut
++    return out
++
++
++def _choose_blues(main_hi: int) -> tuple[int, ...]:
++    for _ in range(200):
++        count = random.randint(BAR_COUNT_LO, BAR_COUNT_HI)
++        blues = [random.choice((1, 2, 3)) for _ in range(count)]
++        if random.random() < 0.35:
++            blues[-1] = 4
++        if all(v == 1 for v in blues):
++            blues[random.randrange(len(blues))] = random.choice((2, 3, 4))
++        if len(set(blues)) == 1 and len(blues) >= 3:
++            idx = random.randrange(len(blues) - (1 if blues[-1] == 4 else 0))
++            blues[idx] = random.choice([v for v in (1, 2, 3) if v != blues[idx]])
++        combo = tuple(blues)
++        if _min_main_len(combo) <= main_hi:
++            return combo
++    raise RuntimeError("failed to choose a feasible behavior sequence")
++
++
++def _length_bounds(cross_size: int, blue_count: int) -> tuple[int, int] | None:
++    lo = max(BAR_LEN_MIN, 2 * blue_count - 1, (BAR_CROSS_PCT_LO * cross_size + 99) // 100)
++    hi = min(BAR_LEN_MAX, cross_size - 2, (BAR_CROSS_PCT_HI * cross_size) // 100)
++    if lo > hi:
++        return None
++    return lo, hi
++
++
++def _interval_candidates(cross_size: int, current_col: int, blue_count: int) -> list[tuple[float, int, int, int]]:
++    bounds = _length_bounds(cross_size, blue_count)
++    if bounds is None:
++        return []
++
++    lo_len, hi_len = bounds
++    center = (cross_size - 1) / 2.0
++    candidates: list[tuple[float, int, int, int]] = []
++
++    for length in range(lo_len, hi_len + 1):
++        for c0 in range(1, cross_size - length):
++            c1 = c0 + length - 1
++            if not (c0 <= current_col <= c1):
++                continue
++
++            if blue_count == 1:
++                new_col = c0 - 1
++                if new_col < 2 or current_col - new_col < 2:
++                    continue
++            elif blue_count == 2:
++                new_col = c1 + 1
++                if new_col > cross_size - 3 or new_col - current_col < 2:
++                    continue
++            else:
++                new_col = current_col
++                if current_col in (c0, c1):
++                    continue
++
++            score = abs(new_col - center) + 0.3 * abs((c0 + c1) / 2.0 - center)
++            candidates.append((score, c0, c1, new_col))
++
++    candidates.sort(key=lambda item: item[0])
++    return candidates
++
++
++def _paint_bar(grid: np.ndarray, row: int, c0: int, c1: int, blue_count: int) -> None:
++    length = c1 - c0 + 1
++    colors = np.full(length, RED, dtype=int)
++    colors[: 2 * blue_count - 1 : 2] = BLUE
++    grid[row, c0 : c1 + 1] = colors
++
++
++def _canonical_grid(main_size: int, cross_size: int, blues: tuple[int, ...]) -> np.ndarray | None:
++    slack = main_size - _min_main_len(blues)
++    if slack < 0:
++        return None
++
++    extras = _random_composition(slack, len(blues) + 1)
++    row = blues[0] + 1 + extras[0]
++    rows = [row]
++    for i in range(1, len(blues)):
++        row += blues[i - 1] + blues[i] + 2 + extras[i]
++        rows.append(row)
++
++    grid = np.full((main_size, cross_size), BG, dtype=int)
++    start_col = random.randint(4, cross_size - 5)
++    current_col = start_col
++
++    for row, blue_count in zip(rows, blues):
++        candidates = _interval_candidates(cross_size, current_col, blue_count)
++        if not candidates:
++            return None
++        pool = candidates[: min(10, len(candidates))]
++        _, c0, c1, new_col = random.choice(pool)
++        _paint_bar(grid, row, c0, c1, blue_count)
++        if blue_count in (1, 2):
++            current_col = new_col
++
++    grid[0, start_col] = GREEN
++    return grid
++
++
++def _orient_grid(grid: np.ndarray, edge: str) -> np.ndarray:
++    if edge == "top":
++        return grid.copy()
++    if edge == "bottom":
++        return np.flipud(grid).copy()
++    if edge == "left":
++        return grid.T.copy()
++    return np.fliplr(grid.T).copy()  # edge == "right"
++
++
++def _fusion_signature(inp: np.ndarray, out: np.ndarray) -> dict[str, int]:
++    edge, _, _ = _start_edge(inp)
++    cin = _to_canonical(inp, edge)
++    cout = _to_canonical(out, edge)
++    bars = _extract_bars(cin)
++
++    left_turns = 0
++    right_turns = 0
++    through_hits = 0
++    stop_bars = 0
++    stepped_marks = 0
++
++    for row, c0, c1, blue_count in bars:
++        band = cout[max(0, row - blue_count) : min(cout.shape[0], row + blue_count + 1), :]
++        stepped_marks += int(np.sum(band == GREEN))
++        if blue_count == 1 and np.any(cout[row - 1 : row + 2, c0 - 1] == GREEN):
++            left_turns += 1
++        elif blue_count == 2 and np.any(cout[row - 2 : row + 3, c1 + 1] == GREEN):
++            right_turns += 1
++        elif blue_count == 3 and cout[row, c0 : c1 + 1].tolist().count(GREEN) > 0:
++            through_hits += 1
++        elif blue_count == 4:
++            stop_bars += 1
++
++    reached_bottom = int(np.any(cout[-1, :] == GREEN))
++    return {
++        "bars": len(bars),
++        "left_turns": left_turns,
++        "right_turns": right_turns,
++        "through_hits": through_hits,
++        "stop_bars": stop_bars,
++        "reached_bottom": reached_bottom,
++        "stepped_marks": stepped_marks,
++    }
++
++
++def _gen_attempt() -> np.ndarray | None:
++    edge = random.choice(("top", "bottom", "left", "right"))
++    if edge in ("top", "bottom"):
++        main_lo, main_hi = ROWS_LO, ROWS_HI
++        cross_lo, cross_hi = COLS_LO, COLS_HI
++    else:
++        main_lo, main_hi = COLS_LO, COLS_HI
++        cross_lo, cross_hi = ROWS_LO, ROWS_HI
++
++    blues = _choose_blues(main_hi)
++    main_size = random.randint(max(main_lo, _min_main_len(blues)), main_hi)
++    cross_size = random.randint(cross_lo, cross_hi)
++
++    canonical = _canonical_grid(main_size, cross_size, blues)
++    if canonical is None:
++        return None
++    inp = _orient_grid(canonical, edge)
++
++    try:
++        out = main(inp)
++        if not np.array_equal(main(inp), out):
++            return None
++        sig = _fusion_signature(inp, out)
++        if sig["bars"] < 2:
++            return None
++        if sum(v > 0 for v in (sig["left_turns"], sig["right_turns"], sig["through_hits"], sig["stop_bars"])) < 1:
++            return None
++        if blues[-1] == 4:
++            if sig["reached_bottom"] != 0:
++                return None
++        elif sig["reached_bottom"] != 1:
++            return None
++        if max(blues) > 1 and sig["stepped_marks"] <= len(blues):
++            return None
++    except Exception:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid fused cb2d8a2c input")
+
+tokens used
+90,513
+融合变体代码已写到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/cb2d8a2c/40/code.py)。文件里包含了新的 `main()`、`generate_input()`，以及一段设计/隐式假设审查注释；`main()` 也保留了四段式说明并按融合规则重写了内容。
+
+验证结果：
+- 指定压力测试通过：`Success: 50/50, Time: 0.1s (1ms/call)`
+- `py_compile` 通过
+- 额外做了 200 个样本的融合行为统计，四种蓝点数都实际生效，没有退化回原题：
+  - `1` 左绕命中率 `163/163`
+  - `2` 右绕命中率 `175/175`
+  - `3` 穿过命中率 `145/145`
+  - `4` 终止命中率 `68/68`
+  - 终止样本占比 `34%`
+  - 含穿过样本占比 `59.5%`
+
+实现上的关键改动是把原题的贴墙障碍改成了浮动横条，否则 `1=左绕 / 2=右绕` 在原布局里无解；生成器也同步保证了每根有效障碍都会真正控制当前路径列。

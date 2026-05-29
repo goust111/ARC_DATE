@@ -1,0 +1,4353 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: high
+reasoning summaries: none
+session id: 019e353d-db03-7a51-b606-14ce7f93e307
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: dbff022c
+    **摘要**: 利用网格边缘的2xN或Nx2调色板图例，根据空心精灵的边框颜色查找对应的填充颜色，将精灵内部区域填充为该颜色
+
+    ## 要实现的融合组合
+    - **组合名称**: 角落调色板 + 固定阅读方向
+    - **combo_spec**: D2/0+D3/0
+
+    ### 融合描述（实现规格）
+
+    调色板固定在网格角落位置（如右上角），同时所有调色板统一按固定方向阅读（不随位置变化）。角落增加了定位难度但固定方向降低了方向推理难度，两者产生有趣的难度平衡
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D2/0** — 调色板图例的位置与朝向 (`symbol_instructions`)
+  - 当前值: 调色板为2xN或Nx2色块，位于网格边缘（上/下/左），根据所在边缘确定阅读方向：上边缘从上到下读，下边缘从下到上读，左边缘从左到右读；第一行/列为边框颜色，第二行/列为填充颜色
+  - 改为: 调色板位于网格角落而非边缘中部 — 调色板固定在四个角落之一（如右上角），阅读方向需根据角落位置推断（如右上角可能按列从右到左或按行从上到下）。角落位置增加了方向判断的歧义性
+  - 来源: creative（参考任务: None）
+- **D3/0** — 调色板阅读方向的推断规则 (`symbol_instructions`)
+  - 当前值: 阅读方向由调色板所在边缘决定：上边缘→从上到下，下边缘→从下到上，左边缘→从左到右；第一行/列始终是边框颜色
+  - 改为: 所有调色板统一固定方向（如始终第一行为边框色） — 取消方向随位置变化的规则，所有调色板无论在哪条边缘都按相同方向阅读。降低了方向推理难度，使核心挑战集中在颜色映射本身
+  - 来源: inversion（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/dbff022c.py`
+
+    ```python
+    import numpy as np
+
+from arc_utils import components_mask, neighbors4
+import random
+
+
+def _bg_boundary(g: np.ndarray) -> int:
+    """Most common color along the 1-cell outer border."""
+    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
+    vals, cnts = np.unique(border, return_counts=True)
+    return int(vals[cnts.argmax()])
+
+
+def _best_palette(g: np.ndarray, bg: int) -> tuple[str, int, int]:
+    """
+    Find the 2xN or Nx2 palette block on a grid edge.
+
+    Returns (side, start, end) where:
+      - side in {"top","bottom","left","right"}
+      - for top/bottom: start/end are column indices [start,end)
+      - for left/right: start/end are row indices [start,end)
+    """
+    h, w = g.shape
+    best = None  # (score_tuple, side, start, end)
+
+    def isolated(side: str, start: int, end: int) -> bool:
+        """
+        Palette cells (excluding bg) should not be 4-neigh adjacent to same-colored cells
+        outside the palette region; this prevents accidentally absorbing parts of large sprites
+        that touch the grid edge.
+        """
+        h2, w2 = g.shape
+        pal = np.zeros((h2, w2), dtype=bool)
+        if side == "top":
+            pal[0:2, start:end] = True
+        elif side == "bottom":
+            pal[h2 - 2 : h2, start:end] = True
+        elif side == "left":
+            pal[start:end, 0:2] = True
+        else:
+            pal[start:end, w2 - 2 : w2] = True
+
+        for r, c in zip(*np.where(pal), strict=False):
+            r = int(r)
+            c = int(c)
+            v = int(g[r, c])
+            if v == bg:
+                continue
+            for rr, cc in neighbors4(r, c):
+                if 0 <= rr < h2 and 0 <= cc < w2 and not pal[rr, cc]:
+                    if int(g[rr, cc]) == v:
+                        return False
+        return True
+
+    def consider_top():
+        nonlocal best
+        if h < 2:
+            return
+        a = g[0, :]
+        b = g[1, :]
+        for c0 in range(w):
+            for c1 in range(c0 + 2, w + 1):
+                seg_a = a[c0:c1]
+                seg_b = b[c0:c1]
+                da = set(map(int, np.unique(seg_a)))
+                db = set(map(int, np.unique(seg_b)))
+                da.discard(bg)
+                db.discard(bg)
+                if len(da) < 2 or len(db) < 2:
+                    continue
+                d = da | db
+                if len(d) < 3:
+                    continue
+                # Border keys should be unique (excluding bg) to form a well-defined mapping.
+                border_keys = [int(x) for x in seg_a.tolist() if int(x) != bg]
+                if len(border_keys) == 0:
+                    continue
+                if len(border_keys) != len(set(border_keys)):
+                    continue
+                if not isolated("top", c0, c1):
+                    continue
+                nonbg = int(np.sum(seg_a != bg) + np.sum(seg_b != bg))
+                score = (len(set(border_keys)), len(d), -(c1 - c0), nonbg)
+                cand = (score, "top", c0, c1)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    def consider_bottom():
+        nonlocal best
+        if h < 2:
+            return
+        a = g[h - 1, :]
+        b = g[h - 2, :]
+        for c0 in range(w):
+            for c1 in range(c0 + 2, w + 1):
+                seg_a = a[c0:c1]
+                seg_b = b[c0:c1]
+                da = set(map(int, np.unique(seg_a)))
+                db = set(map(int, np.unique(seg_b)))
+                da.discard(bg)
+                db.discard(bg)
+                if len(da) < 2 or len(db) < 2:
+                    continue
+                d = da | db
+                if len(d) < 3:
+                    continue
+                border_keys = [int(x) for x in seg_a.tolist() if int(x) != bg]
+                if len(border_keys) == 0:
+                    continue
+                if len(border_keys) != len(set(border_keys)):
+                    continue
+                if not isolated("bottom", c0, c1):
+                    continue
+                nonbg = int(np.sum(seg_a != bg) + np.sum(seg_b != bg))
+                score = (len(set(border_keys)), len(d), -(c1 - c0), nonbg)
+                cand = (score, "bottom", c0, c1)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    def consider_left():
+        nonlocal best
+        if w < 2:
+            return
+        a = g[:, 0]
+        b = g[:, 1]
+        for r0 in range(h):
+            for r1 in range(r0 + 2, h + 1):
+                seg_a = a[r0:r1]
+                seg_b = b[r0:r1]
+                da = set(map(int, np.unique(seg_a)))
+                db = set(map(int, np.unique(seg_b)))
+                da.discard(bg)
+                db.discard(bg)
+                if len(da) < 2 or len(db) < 2:
+                    continue
+                d = da | db
+                if len(d) < 3:
+                    continue
+                border_keys = [int(x) for x in seg_a.tolist() if int(x) != bg]
+                if len(border_keys) == 0:
+                    continue
+                if len(border_keys) != len(set(border_keys)):
+                    continue
+                if not isolated("left", r0, r1):
+                    continue
+                nonbg = int(np.sum(seg_a != bg) + np.sum(seg_b != bg))
+                score = (len(set(border_keys)), len(d), -(r1 - r0), nonbg)
+                cand = (score, "left", r0, r1)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    def consider_right():
+        nonlocal best
+        if w < 2:
+            return
+        a = g[:, w - 1]
+        b = g[:, w - 2]
+        for r0 in range(h):
+            for r1 in range(r0 + 2, h + 1):
+                seg_a = a[r0:r1]
+                seg_b = b[r0:r1]
+                da = set(map(int, np.unique(seg_a)))
+                db = set(map(int, np.unique(seg_b)))
+                da.discard(bg)
+                db.discard(bg)
+                if len(da) < 2 or len(db) < 2:
+                    continue
+                d = da | db
+                if len(d) < 3:
+                    continue
+                border_keys = [int(x) for x in seg_a.tolist() if int(x) != bg]
+                if len(border_keys) == 0:
+                    continue
+                if len(border_keys) != len(set(border_keys)):
+                    continue
+                if not isolated("right", r0, r1):
+                    continue
+                nonbg = int(np.sum(seg_a != bg) + np.sum(seg_b != bg))
+                score = (len(set(border_keys)), len(d), -(r1 - r0), nonbg)
+                cand = (score, "right", r0, r1)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    consider_top()
+    consider_bottom()
+    consider_left()
+    consider_right()
+
+    assert best is not None, "_best_palette must find a valid palette region"
+    _, side, start, end = best
+    return side, int(start), int(end)
+
+
+def _palette_mapping(g: np.ndarray, bg: int) -> tuple[dict[int, int], np.ndarray]:
+    """
+    Returns (mapping border->fill, palette_mask).
+    """
+    h, w = g.shape
+    info = _best_palette(g, bg)
+    side, start, end = info
+    pal_mask = np.zeros((h, w), dtype=bool)
+    mapping: dict[int, int] = {}
+
+    if side == "top":
+        pal_mask[0:2, start:end] = True
+        border_line = g[0, start:end]
+        fill_line = g[1, start:end]
+    elif side == "bottom":
+        pal_mask[h - 2 : h, start:end] = True
+        border_line = g[h - 1, start:end]
+        fill_line = g[h - 2, start:end]
+    elif side == "left":
+        pal_mask[start:end, 0:2] = True
+        border_line = g[start:end, 0]
+        fill_line = g[start:end, 1]
+    else:  # right
+        pal_mask[start:end, w - 2 : w] = True
+        border_line = g[start:end, w - 1]
+        fill_line = g[start:end, w - 2]
+
+    for b, f in zip(border_line.tolist(), fill_line.tolist(), strict=False):
+        b = int(b)
+        f = int(f)
+        if b == bg:
+            continue
+        mapping[b] = f
+
+    return mapping, pal_mask
+
+
+def _fill_enclosed_bg_regions(out: np.ndarray, bg: int, mapping: dict[int, int], pal_mask: np.ndarray) -> None:
+    """
+    Find background regions (excluding the palette area) that do NOT touch the grid boundary,
+    and fill each region based on the most common adjacent border color (mapped via palette).
+    """
+    h, w = out.shape
+    bg_mask = (out == bg) & (~pal_mask)
+    comps = components_mask(bg_mask, connectivity=4)
+    for pts in comps:
+        touches_boundary = any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts)
+        if touches_boundary:
+            continue
+
+        adj_counts: dict[int, int] = {}
+        for r, c in pts:
+            for rr, cc in neighbors4(int(r), int(c)):
+                if 0 <= rr < h and 0 <= cc < w:
+                    if pal_mask[rr, cc]:
+                        continue
+                    v = int(out[rr, cc])
+                    if v == bg:
+                        continue
+                    adj_counts[v] = adj_counts.get(v, 0) + 1
+        if not adj_counts:
+            continue
+
+        # Prefer an adjacent color that exists in the mapping; pick the most frequent border.
+        border = None
+        best = -1
+        for col, cnt in adj_counts.items():
+            if col not in mapping:
+                continue
+            if cnt > best:
+                best = cnt
+                border = col
+        if border is None:
+            continue
+
+        fill = int(mapping[border])
+        for r, c in pts:
+            out[r, c] = fill
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Fill hollow sprites' interiors using a color-palette legend on the grid edge.
+
+    Input structure:
+    - bg = most common color. Several hollow sprites with distinct border colors.
+    - A small 2×N or N×2 palette block sits on one grid edge; one row/column lists border colors, the other lists corresponding fill colors.
+
+    Rule:
+    - Locate the palette legend on a grid edge and read it as a border→fill color mapping.
+    - Find enclosed bg regions (holes) inside sprites that don't touch the grid boundary.
+    - For each hole, identify the most common adjacent border color, look it up in the palette, and fill the hole with the mapped fill color.
+
+    Key insight: The palette's edge position and orientation determine reading direction; border colors in the palette uniquely key into fill colors.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = _bg_boundary(g)
+
+    mapping, pal_mask = _palette_mapping(g, bg)
+    assert mapping, "main: palette mapping must be non-empty"
+
+    out = g.copy()
+    _fill_enclosed_bg_regions(out, bg, mapping, pal_mask)
+
+    return out
+
+# --------------- generator (c) ---------------
+
+# -- Configuration constants --------------------------------------------------
+# Grid dimensions
+_GRID_H_MIN, _GRID_H_MAX = 4, 13
+_GRID_W_MIN, _GRID_W_MAX = 10, 15
+_SMALL_H_THRESHOLD = 6        # below this, prefer left/right palette
+_SMALL_H_PALETTE_FLIP = 0.7   # probability of flipping top/bottom -> left/right
+_TINY_H_THRESHOLD = 5         # below this, cap sprite height at 3
+
+# Palette
+_PALETTE_N_MIN, _PALETTE_N_MAX = 2, 5
+
+# Sprite geometry
+_SPRITE_H_MAX = 7
+_SPRITE_W_MAX = 6
+_SPRITE_DIM_SUM_CAP = 10      # if sh + sw exceeds this, clamp sw
+_SPRITE_CELL_MAX = 16
+_FILLED_SPRITE_MAX = 3
+
+# Sprite mutation probabilities
+_P_HORIZ_WALL = 0.3           # add horizontal internal wall
+_P_VERT_WALL = 0.3            # add vertical internal wall
+_P_BORDER_REMOVAL = 0.4       # remove border cells for irregular shapes
+_P_DIAMOND = 0.2              # use diamond shape for 3x3
+
+# Generation
+_MAX_RETRIES = 300
+# -- End configuration --------------------------------------------------------
+
+
+def _get_enclosed_holes(sprite):
+    """Return list of point-arrays for bg components not touching sprite boundary."""
+    h, w = sprite.shape
+    return [pts for pts in components_mask(~sprite, connectivity=4)
+            if not any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts)]
+
+
+def _make_diamond():
+    """Return a 3x3 diamond-shaped boolean mask."""
+    s = np.zeros((3, 3), dtype=bool)
+    s[0, 1] = s[1, 0] = s[1, 2] = s[2, 1] = True
+    return s
+
+
+def _make_hollow_sprite(h, w, rng):
+    """Create hollow sprite (h x w) with at least 1 enclosed bg hole, cell count <= _SPRITE_CELL_MAX."""
+    sprite = np.ones((h, w), dtype=bool)
+    if h >= 3 and w >= 3:
+        sprite[1:-1, 1:-1] = False
+    # Optionally add internal horizontal wall
+    if h >= 5 and w >= 4 and rng.random() < _P_HORIZ_WALL:
+        br = rng.randint(2, h - 2)
+        n = rng.randint(1, w - 2)
+        s = rng.randint(1, w - 1 - n + 1)
+        sprite[br, s:s + n] = True
+    # Optionally add internal vertical wall
+    if h >= 4 and w >= 5 and rng.random() < _P_VERT_WALL:
+        bc = rng.randint(2, w - 2)
+        n = rng.randint(1, h - 2)
+        s = rng.randint(1, h - 1 - n + 1)
+        sprite[s:s + n, bc] = True
+    # Optionally remove border cells for irregularity
+    if rng.random() < _P_BORDER_REMOVAL:
+        bcells = [(r, c) for r in range(h) for c in range(w)
+                  if sprite[r, c] and (r in (0, h - 1) or c in (0, w - 1))]
+        rng.shuffle(bcells)
+        for cr, cc in bcells[:rng.randint(1, min(4, len(bcells)))]:
+            test = sprite.copy()
+            test[cr, cc] = False
+            if _get_enclosed_holes(test):
+                sprite = test
+    if not _get_enclosed_holes(sprite) or int(sprite.sum()) > _SPRITE_CELL_MAX:
+        return None
+    return sprite
+
+
+def _choose_colors(rng, N, num_filled):
+    """Pick palette border/fill colors, distractor color, and filled-sprite keys."""
+    all_c = list(range(1, 10))
+    rng.shuffle(all_c)
+    border_keys = all_c[:N]
+    rng.shuffle(all_c)
+    fill_values = all_c[:N]
+    dist_cands = [c for c in range(1, 10) if c not in border_keys]
+    distractor_color = rng.choice(dist_cands)
+    mapping = dict(zip(border_keys, fill_values))
+    filled_keys = rng.sample(border_keys, num_filled)
+    return border_keys, fill_values, distractor_color, mapping, filled_keys
+
+
+def _build_palette(side, border_keys, fill_values):
+    """Construct the 2xN or Nx2 palette array for the given edge side."""
+    N = len(border_keys)
+    if side in ('top', 'bottom'):
+        pal = np.zeros((2, N), dtype=int)
+        outer, inner = (0, 1) if side == 'top' else (1, 0)
+        pal[outer] = border_keys
+        pal[inner] = fill_values
+    else:
+        pal = np.zeros((N, 2), dtype=int)
+        outer, inner = (0, 1) if side == 'left' else (1, 0)
+        pal[:, outer] = border_keys
+        pal[:, inner] = fill_values
+    return pal
+
+
+def _place_palette(grid, occ, pal, side, rng):
+    """Place palette on the chosen edge and mark its occupancy (with 1-cell padding)."""
+    H, W = grid.shape
+    pal_h, pal_w = pal.shape
+    if side == 'top':
+        pr0, pc0 = 0, rng.randint(0, W - pal_w)
+    elif side == 'bottom':
+        pr0, pc0 = H - pal_h, rng.randint(0, W - pal_w)
+    elif side == 'left':
+        pr0, pc0 = rng.randint(0, H - pal_h), 0
+    else:
+        pr0, pc0 = rng.randint(0, H - pal_h), W - pal_w
+    grid[pr0:pr0 + pal_h, pc0:pc0 + pal_w] = pal
+    occ[max(0, pr0 - 1):min(H, pr0 + pal_h + 1),
+        max(0, pc0 - 1):min(W, pc0 + pal_w + 1)] = True
+
+
+def _find_valid_positions(H, W, occ, mask, holes):
+    """Find all (r0, c0) where mask fits without overlap and holes don't touch grid boundary."""
+    sh, sw = mask.shape
+    positions = []
+    for r0 in range(H - sh + 1):
+        for c0 in range(W - sw + 1):
+            if occ[max(0, r0 - 1):min(H, r0 + sh + 1),
+                   max(0, c0 - 1):min(W, c0 + sw + 1)].any():
+                continue
+            if any(r0 + hr == 0 or c0 + hc == 0 or r0 + hr == H - 1 or c0 + hc == W - 1
+                   for hpts in holes for hr, hc in hpts):
+                continue
+            positions.append((r0, c0))
+    return positions
+
+
+def _paint_sprite(grid, r0, c0, mask, color, fill, holes):
+    """Render a sprite onto the grid: border cells in color, hole cells in fill (if given)."""
+    grid[r0:r0 + mask.shape[0], c0:c0 + mask.shape[1]][mask] = color
+    if fill is not None:
+        for hpts in holes:
+            for hr, hc in hpts:
+                grid[r0 + hr, c0 + hc] = fill
+
+
+def _gen_attempt():
+    rng = random.Random()
+    bg = 0
+
+    # Grid size and palette side
+    H = rng.randint(_GRID_H_MIN, _GRID_H_MAX)
+    W = rng.randint(_GRID_W_MIN, _GRID_W_MAX)
+    side = rng.choice(['top', 'bottom', 'left', 'right'])
+    if H <= _SMALL_H_THRESHOLD and side in ('top', 'bottom') and rng.random() < _SMALL_H_PALETTE_FLIP:
+        side = rng.choice(['left', 'right'])
+
+    max_N = H if side in ('left', 'right') else W
+    N = rng.randint(_PALETTE_N_MIN, min(_PALETTE_N_MAX, max_N))
+
+    # Sprite dimension bounds
+    max_sh = min(_SPRITE_H_MAX, H)
+    max_sw = min(_SPRITE_W_MAX, W)
+    if H <= _TINY_H_THRESHOLD:
+        max_sh = 3
+
+    # Sprite counts
+    num_filled = rng.randint(1, min(_FILLED_SPRITE_MAX, N))
+    total_sprites = num_filled + 1
+
+    # Generate sprite shapes
+    shapes = []
+    for _ in range(total_sprites):
+        sh = rng.randint(3, max_sh)
+        sw = rng.randint(3, max_sw)
+        if sh + sw > _SPRITE_DIM_SUM_CAP:
+            sw = max(3, _SPRITE_DIM_SUM_CAP - sh)
+        if sh == 3 and sw == 3 and rng.random() < _P_DIAMOND:
+            mask = _make_diamond()
+        else:
+            mask = _make_hollow_sprite(sh, sw, rng)
+        if mask is None:
+            return None
+        shapes.append(mask)
+
+    # Colors and palette
+    border_keys, fill_values, distractor_color, mapping, filled_keys = \
+        _choose_colors(rng, N, num_filled)
+    pal = _build_palette(side, border_keys, fill_values)
+
+    grid = np.full((H, W), bg, dtype=int)
+    occ = np.zeros((H, W), dtype=bool)
+    _place_palette(grid, occ, pal, side, rng)
+
+    # Assign colors to sprites: filled sprites use palette keys, last one is distractor
+    infos = []
+    for i, mask in enumerate(shapes):
+        if i < num_filled:
+            c, f = filled_keys[i], mapping[filled_keys[i]]
+        else:
+            c, f = distractor_color, None
+        infos.append((mask, c, f))
+
+    # Place sprites
+    placed = []
+    for mask, color, fill in infos:
+        holes = _get_enclosed_holes(mask)
+        positions = _find_valid_positions(H, W, occ, mask, holes)
+        if not positions:
+            return None
+        r0, c0 = rng.choice(positions)
+        _paint_sprite(grid, r0, c0, mask, color, fill, holes)
+        placed.append((r0, c0, mask, fill))
+        sh, sw = mask.shape
+        occ[max(0, r0 - 1):min(H, r0 + sh + 1),
+            max(0, c0 - 1):min(W, c0 + sw + 1)] = True
+
+    # Derive input from output by clearing filled holes
+    output = grid.copy()
+    inp = grid.copy()
+    for r0, c0, mask, fill in placed:
+        if fill is not None:
+            for hpts in _get_enclosed_holes(mask):
+                for hr, hc in hpts:
+                    inp[r0 + hr, c0 + hc] = bg
+
+    # Validate bg is dominant on border
+    border = np.concatenate([inp[0], inp[-1], inp[1:-1, 0], inp[1:-1, -1]])
+    vals, cnts = np.unique(border, return_counts=True)
+    if int(vals[cnts.argmax()]) != bg:
+        return None
+
+    # Oracle check
+    try:
+        if np.array_equal(main(inp), output):
+            return inp
+    except Exception:
+        pass
+    return None
+
+
+def generate_input():
+    for _ in range(_MAX_RETRIES):
+        r = _gen_attempt()
+        if r is not None:
+            return r
+    raise RuntimeError(f"Failed to generate input after {_MAX_RETRIES} attempts")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 4-13 rows x 10-15 cols, bg=0
+  palette:
+    shape: 2xN or Nx2 block on one grid edge (top/bottom/left/right)
+    entries: 2-5 pairs; outer row/col = border-key colors (all distinct, all non-bg), inner row/col = fill colors (all distinct)
+    no bg cells within palette region
+    isolated from all sprites (no 4-adjacent non-bg cell outside palette shares its color)
+  sprites:
+    count: 2-4 distinct single-color hollow shapes on bg, each separated from others and palette by >=1 bg cell
+    each sprite is a connected or near-connected region of one non-bg color forming a closed or semi-closed boundary with >=1 enclosed bg hole
+    bbox: 3-7 rows x 3-6 cols, cell count 8-16
+    filled_sprites: 1-3 sprites whose border color appears as a palette key; their enclosed holes get filled with the mapped fill color
+    distractor_sprite: exactly 1 sprite whose border color is NOT a palette key; its holes stay unfilled
+    palette may also contain extra entries (border keys with no corresponding sprite): 1-3 unused entries [observed]
+  transformation:
+    for each enclosed bg region not touching grid boundary, find dominant adjacent border color; if in palette mapping, fill hole with mapped fill color; otherwise leave unchanged
+    palette block itself is unchanged
+
+generation_strategy:
+  approach: output-first
+  steps:
+    1. Pick grid size (4-13 x 10-15), bg=0, palette side (top/bottom/left/right), and palette length N (2-5).
+    2. Choose 2N+1 to 2N+3 distinct non-bg colors; assign N as border-keys, N as fill-values, remainder for sprites not in palette.
+    3. Build palette 2xN block: outer line = border-key colors, inner line = fill colors. Place on chosen edge.
+    4. Generate 2-4 hollow single-color sprites (bbox 3-7 x 3-6) with 1-2 enclosed holes each. For filled sprites, use a palette border-key color and pre-fill holes with the mapped fill color (output state). For the 1 distractor sprite, use a color NOT in palette keys and leave holes as bg.
+    5. Place sprites on grid separated from each other and palette by >=1 bg cell.
+    6. Save grid as output. To get input, replace all filled-hole cells back to bg.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dbff022c/33/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dbff022c.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/dbff022c/33/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of dbff022c (index 33)
+    # combo_spec: D2/0+D3/0
+    # Name: 角落调色板 + 固定阅读方向
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/dbff022c/33` 存在（如不存在则创建）。
+
+codex
+先梳理原始 `solver/generator` 和辅助工具，再把融合规则落实成可执行设计，随后直接在目标路径写代码并跑 50 次生成测试。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+    r0 = min(b[0] for b in bbs)
+    c0 = min(b[1] for b in bbs)
+    r1 = max(b[2] for b in bbs)
+    c1 = max(b[3] for b in bbs)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox_h(b: BBox) -> int:
+    r0, _c0, r1, _c1 = b
+    return int(r1 - r0 + 1)
+
+
+def bbox_w(b: BBox) -> int:
+    _r0, c0, _r1, c1 = b
+    return int(c1 - c0 + 1)
+
+
+def bbox_anchor(b: BBox, *, anchor: str = "upper left") -> Coord:
+    """
+    Return an anchor point (r,c) for a bbox.
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/dbff022c.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+import numpy as np
+
+from arc_utils import components_mask, neighbors4
+import random
+
+
+def _bg_boundary(g: np.ndarray) -> int:
+    """Most common color along the 1-cell outer border."""
+    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
+    vals, cnts = np.unique(border, return_counts=True)
+    return int(vals[cnts.argmax()])
+
+
+def _best_palette(g: np.ndarray, bg: int) -> tuple[str, int, int]:
+    """
+    Find the 2xN or Nx2 palette block on a grid edge.
+
+    Returns (side, start, end) where:
+      - side in {"top","bottom","left","right"}
+      - for top/bottom: start/end are column indices [start,end)
+      - for left/right: start/end are row indices [start,end)
+    """
+    h, w = g.shape
+    best = None  # (score_tuple, side, start, end)
+
+    def isolated(side: str, start: int, end: int) -> bool:
+        """
+        Palette cells (excluding bg) should not be 4-neigh adjacent to same-colored cells
+        outside the palette region; this prevents accidentally absorbing parts of large sprites
+        that touch the grid edge.
+        """
+        h2, w2 = g.shape
+        pal = np.zeros((h2, w2), dtype=bool)
+        if side == "top":
+            pal[0:2, start:end] = True
+        elif side == "bottom":
+            pal[h2 - 2 : h2, start:end] = True
+        elif side == "left":
+            pal[start:end, 0:2] = True
+        else:
+            pal[start:end, w2 - 2 : w2] = True
+
+        for r, c in zip(*np.where(pal), strict=False):
+            r = int(r)
+            c = int(c)
+            v = int(g[r, c])
+            if v == bg:
+                continue
+            for rr, cc in neighbors4(r, c):
+                if 0 <= rr < h2 and 0 <= cc < w2 and not pal[rr, cc]:
+                    if int(g[rr, cc]) == v:
+                        return False
+        return True
+
+    def consider_top():
+        nonlocal best
+        if h < 2:
+            return
+        a = g[0, :]
+        b = g[1, :]
+        for c0 in range(w):
+            for c1 in range(c0 + 2, w + 1):
+                seg_a = a[c0:c1]
+                seg_b = b[c0:c1]
+                da = set(map(int, np.unique(seg_a)))
+                db = set(map(int, np.unique(seg_b)))
+                da.discard(bg)
+                db.discard(bg)
+                if len(da) < 2 or len(db) < 2:
+                    continue
+                d = da | db
+                if len(d) < 3:
+                    continue
+                # Border keys should be unique (excluding bg) to form a well-defined mapping.
+                border_keys = [int(x) for x in seg_a.tolist() if int(x) != bg]
+                if len(border_keys) == 0:
+                    continue
+                if len(border_keys) != len(set(border_keys)):
+                    continue
+                if not isolated("top", c0, c1):
+                    continue
+                nonbg = int(np.sum(seg_a != bg) + np.sum(seg_b != bg))
+                score = (len(set(border_keys)), len(d), -(c1 - c0), nonbg)
+                cand = (score, "top", c0, c1)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    def consider_bottom():
+        nonlocal best
+        if h < 2:
+            return
+        a = g[h - 1, :]
+        b = g[h - 2, :]
+        for c0 in range(w):
+            for c1 in range(c0 + 2, w + 1):
+                seg_a = a[c0:c1]
+                seg_b = b[c0:c1]
+                da = set(map(int, np.unique(seg_a)))
+                db = set(map(int, np.unique(seg_b)))
+                da.discard(bg)
+                db.discard(bg)
+                if len(da) < 2 or len(db) < 2:
+                    continue
+                d = da | db
+                if len(d) < 3:
+                    continue
+                border_keys = [int(x) for x in seg_a.tolist() if int(x) != bg]
+                if len(border_keys) == 0:
+                    continue
+                if len(border_keys) != len(set(border_keys)):
+                    continue
+                if not isolated("bottom", c0, c1):
+                    continue
+                nonbg = int(np.sum(seg_a != bg) + np.sum(seg_b != bg))
+                score = (len(set(border_keys)), len(d), -(c1 - c0), nonbg)
+                cand = (score, "bottom", c0, c1)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    def consider_left():
+        nonlocal best
+        if w < 2:
+            return
+        a = g[:, 0]
+        b = g[:, 1]
+        for r0 in range(h):
+            for r1 in range(r0 + 2, h + 1):
+                seg_a = a[r0:r1]
+                seg_b = b[r0:r1]
+                da = set(map(int, np.unique(seg_a)))
+                db = set(map(int, np.unique(seg_b)))
+                da.discard(bg)
+                db.discard(bg)
+                if len(da) < 2 or len(db) < 2:
+                    continue
+                d = da | db
+                if len(d) < 3:
+                    continue
+                border_keys = [int(x) for x in seg_a.tolist() if int(x) != bg]
+                if len(border_keys) == 0:
+                    continue
+                if len(border_keys) != len(set(border_keys)):
+                    continue
+                if not isolated("left", r0, r1):
+                    continue
+                nonbg = int(np.sum(seg_a != bg) + np.sum(seg_b != bg))
+                score = (len(set(border_keys)), len(d), -(r1 - r0), nonbg)
+                cand = (score, "left", r0, r1)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    def consider_right():
+        nonlocal best
+        if w < 2:
+            return
+        a = g[:, w - 1]
+        b = g[:, w - 2]
+        for r0 in range(h):
+            for r1 in range(r0 + 2, h + 1):
+                seg_a = a[r0:r1]
+                seg_b = b[r0:r1]
+                da = set(map(int, np.unique(seg_a)))
+                db = set(map(int, np.unique(seg_b)))
+                da.discard(bg)
+                db.discard(bg)
+                if len(da) < 2 or len(db) < 2:
+                    continue
+                d = da | db
+                if len(d) < 3:
+                    continue
+                border_keys = [int(x) for x in seg_a.tolist() if int(x) != bg]
+                if len(border_keys) == 0:
+                    continue
+                if len(border_keys) != len(set(border_keys)):
+                    continue
+                if not isolated("right", r0, r1):
+                    continue
+                nonbg = int(np.sum(seg_a != bg) + np.sum(seg_b != bg))
+                score = (len(set(border_keys)), len(d), -(r1 - r0), nonbg)
+                cand = (score, "right", r0, r1)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    consider_top()
+    consider_bottom()
+    consider_left()
+    consider_right()
+
+    assert best is not None, "_best_palette must find a valid palette region"
+    _, side, start, end = best
+    return side, int(start), int(end)
+
+
+def _palette_mapping(g: np.ndarray, bg: int) -> tuple[dict[int, int], np.ndarray]:
+    """
+    Returns (mapping border->fill, palette_mask).
+    """
+    h, w = g.shape
+    info = _best_palette(g, bg)
+    side, start, end = info
+    pal_mask = np.zeros((h, w), dtype=bool)
+    mapping: dict[int, int] = {}
+
+    if side == "top":
+        pal_mask[0:2, start:end] = True
+        border_line = g[0, start:end]
+        fill_line = g[1, start:end]
+    elif side == "bottom":
+        pal_mask[h - 2 : h, start:end] = True
+        border_line = g[h - 1, start:end]
+        fill_line = g[h - 2, start:end]
+    elif side == "left":
+        pal_mask[start:end, 0:2] = True
+        border_line = g[start:end, 0]
+        fill_line = g[start:end, 1]
+    else:  # right
+        pal_mask[start:end, w - 2 : w] = True
+        border_line = g[start:end, w - 1]
+        fill_line = g[start:end, w - 2]
+
+    for b, f in zip(border_line.tolist(), fill_line.tolist(), strict=False):
+        b = int(b)
+        f = int(f)
+        if b == bg:
+            continue
+        mapping[b] = f
+
+    return mapping, pal_mask
+
+
+def _fill_enclosed_bg_regions(out: np.ndarray, bg: int, mapping: dict[int, int], pal_mask: np.ndarray) -> None:
+    """
+    Find background regions (excluding the palette area) that do NOT touch the grid boundary,
+    and fill each region based on the most common adjacent border color (mapped via palette).
+    """
+    h, w = out.shape
+    bg_mask = (out == bg) & (~pal_mask)
+    comps = components_mask(bg_mask, connectivity=4)
+    for pts in comps:
+        touches_boundary = any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts)
+        if touches_boundary:
+            continue
+
+        adj_counts: dict[int, int] = {}
+        for r, c in pts:
+            for rr, cc in neighbors4(int(r), int(c)):
+                if 0 <= rr < h and 0 <= cc < w:
+                    if pal_mask[rr, cc]:
+                        continue
+                    v = int(out[rr, cc])
+                    if v == bg:
+                        continue
+                    adj_counts[v] = adj_counts.get(v, 0) + 1
+        if not adj_counts:
+            continue
+
+        # Prefer an adjacent color that exists in the mapping; pick the most frequent border.
+        border = None
+        best = -1
+        for col, cnt in adj_counts.items():
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dbff022c.json'
+with open(p) as f:
+    data=json.load(f)
+print('train', len(data.get('train', [])), 'test', len(data.get('test', [])))
+for split in ('train','test'):
+    for i,ex in enumerate(data.get(split, [])[:3]):
+        inp=ex['input']
+        out=ex['output']
+        print(split, i, len(inp), len(inp[0]), '->', len(out), len(out[0]))
+        print('input')
+        for row in inp:
+            print(''.join(map(str,row)))
+        print('output')
+        for row in out:
+            print(''.join(map(str,row)))
+        print()
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+train 3 test 1
+train 0 12 12 -> 12 12
+input
+044444034695
+040404036729
+044444000000
+000000000000
+033330000000
+030030000000
+030030077770
+030030070770
+003030070070
+000300077070
+000000077770
+000000000000
+output
+044444034695
+046464036729
+044444000000
+000000000000
+033330000000
+033330000000
+033330077770
+033330070770
+003330070070
+000300077070
+000000077770
+000000000000
+
+train 1 10 10 -> 10 10
+input
+2600888800
+4500800800
+6800800800
+8100888800
+0000000000
+0555550444
+0500050404
+0055550444
+0000000404
+0000000444
+output
+2600888800
+4500811800
+6800811800
+8100888800
+0000000000
+0555550444
+0500050454
+0055550444
+0000000454
+0000000444
+
+train 2 4 15 -> 4 15
+input
+026044444022220
+071040004020220
+000040004022020
+000044444022220
+output
+026044444022220
+071040004027220
+000040004022720
+000044444022220
+
+test 0 13 13 -> 13 13
+input
+0111110033330
+0100010030030
+0110010030030
+0011110033330
+0000000000000
+0000000055500
+0020000500050
+0202000500005
+0020000055555
+0000000050000
+0000000000200
+5467800002020
+9831200000200
+output
+0111110033330
+0177710036630
+0117710036630
+0011110033330
+0000000000000
+0000000055500
+0020000500050
+0282000500005
+0020000055555
+0000000050000
+0000000000200
+5467800002820
+9831200000200
+
+
+codex
+设计已经收束到一个明确方案：调色板仍允许 `2xN` 和 `Nx2` 两种形态，但只能贴在四角之一，且无论位于哪个角，始终按调色板局部坐标读取：横向块“上行=边框色、下行=填充色、从左到右配对”，纵向块“左列=边框色、右列=填充色、从上到下配对”。这会直接替换原来“根据所在边缘反转读取”的假设，也要求生成器避免 `2x2` 这种横竖都可解释的歧义，所以我会把调色板长度收紧到 `3-5`。
+实现融合变体需要先替换调色板定位/解析逻辑，再同步收紧生成约束并做退化检查。
+  ✓ 整理原任务假设并落地角落+固定方向设计
+  → 在目标路径实现新 solver/generator 与设计分析注释
+  • 运行 50 次生成测试并修正失败
+  • 统计融合行为指标，确认未退化为原规则
+codex
+现在开始落文件。实现上我会把“角落定位”编码成只枚举四角锚点，再把“固定阅读方向”编码成局部 `bbox` 规则而不是边缘规则；生成器同步改成四角放置、`3-4` 对颜色、键值颜色集分离，并在文件顶部写入设计分析注释，避免这个融合版退化回原题。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/dbff022c/33' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/dbff022c/33/code.py
+diff --git a/ceshi/code_combo/dbff022c/33/code.py b/ceshi/code_combo/dbff022c/33/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..34c797ae3afca1e92ebc596ac50aee5e67ef0151
+--- /dev/null
++++ b/ceshi/code_combo/dbff022c/33/code.py
+@@ -0,0 +1,469 @@
++# Combo variant of dbff022c (index 33)
++# combo_spec: D2/0+D3/0
++# Name: 角落调色板 + 固定阅读方向
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, neighbors4
++
++
++# Design analysis for the fused variant
++# 1. Concrete behavior trace:
++#    A bottom-right horizontal palette now looks like:
++#      [2 3 4]
++#      [7 8 9]
++#    placed in the corner at rows H-2:H, cols W-3:W. The original task would
++#    read the outer bottom row as the border-key line, giving 7->2, 8->3, 9->4.
++#    This combo instead always reads a horizontal palette by local coordinates:
++#    top row = border keys, bottom row = fill values, left-to-right. So the same
++#    corner palette means 2->7, 3->8, 4->9. A sprite outlined with color 3 must
++#    therefore fill with 8, not remain empty and not map in reverse.
++# 2. Complexity calibration:
++#    Corner placement already increases search difficulty, so direction logic is
++#    simplified to a single local rule. To avoid ambiguous 2x2 corner blocks that
++#    could be parsed both horizontally and vertically, palette length is restricted
++#    to 3-4 entries. Border colors and fill colors are generated from disjoint sets,
++#    which makes the mapping legible and ensures fixed-direction cases differ from
++#    the original edge-dependent reading.
++# 3. Broken implicit assumptions from the seed solver:
++#    The seed code assumes the palette sits somewhere along one edge and that bottom
++#    and right palettes must be read "from the outside inward". That assumption is
++#    no longer valid. The new detector only inspects corner-anchored 2xN/Nx2 blocks
++#    and always interprets the first local row/column as border colors.
++# 4. Placement legality:
++#    The generator anchors the palette flush to one of the four corners, reserves a
++#    one-cell padding halo, and only places sprites in non-overlapping positions whose
++#    holes stay away from the global boundary. This keeps the palette and sprites
++#    visually separate and preserves the "enclosed hole" notion needed by the solver.
++# 5. Visual observability:
++#    The combination is human-visible because the palette is clearly in a corner and
++#    fixed-direction cases differ most strongly for bottom and right corners. Since
++#    border and fill colors are disjoint, reversing the readout would obviously fail
++#    to explain the filled interiors in those examples.
++# 6. Visual cleanliness:
++#    Only one palette exists, it has a bg moat around it, sprites are separated by at
++#    least one bg cell, and there is exactly one distractor sprite whose hole stays
++#    empty. This avoids layered clutter and keeps the mapping cue easy to spot.
++# 7. New solver assumptions audited against the generator:
++#    - `_best_palette` assumes the palette is corner-anchored, rectangular, all non-bg,
++#      and isolated from same-colored neighbors outside the palette. The generator
++#      guarantees each of these conditions.
++#    - `_fill_enclosed_bg_regions` assumes holes do not touch the outer boundary and
++#      their dominant adjacent color is the sprite border color. The sprite placement
++#      and output-first construction preserve that property.
++
++
++_CORNERS = ("top_left", "top_right", "bottom_left", "bottom_right")
++_ORIENTATIONS = ("horizontal", "vertical")
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _palette_bounds(
++    shape: tuple[int, int], corner: str, orientation: str, n: int
++) -> tuple[int, int, int, int]:
++    h, w = shape
++    if orientation == "horizontal":
++        ph, pw = 2, n
++        r0 = 0 if corner.startswith("top") else h - ph
++        c0 = 0 if corner.endswith("left") else w - pw
++    else:
++        ph, pw = n, 2
++        r0 = 0 if corner.startswith("top") else h - ph
++        c0 = 0 if corner.endswith("left") else w - pw
++    return int(r0), int(c0), int(ph), int(pw)
++
++
++def _isolated_palette(g: np.ndarray, bg: int, pal_mask: np.ndarray) -> bool:
++    """Palette colors must not 4-touch identical colors outside the palette."""
++    h, w = g.shape
++    for r, c in np.argwhere(pal_mask):
++        r = int(r)
++        c = int(c)
++        v = int(g[r, c])
++        if v == bg:
++            return False
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and not pal_mask[rr, cc]:
++                if int(g[rr, cc]) == v:
++                    return False
++    return True
++
++
++def _best_palette(g: np.ndarray, bg: int) -> tuple[str, str, int, int, int, np.ndarray]:
++    """
++    Find the corner-anchored 2xN or Nx2 palette block.
++
++    Returns (corner, orientation, n, r0, c0, pal_mask).
++    """
++    h, w = g.shape
++    best = None  # (score, corner, orientation, n, r0, c0, pal_mask)
++
++    for corner in _CORNERS:
++        for orientation in _ORIENTATIONS:
++            max_n = w if orientation == "horizontal" else h
++            for n in range(3, max_n + 1):
++                r0, c0, ph, pw = _palette_bounds((h, w), corner, orientation, n)
++                block = g[r0 : r0 + ph, c0 : c0 + pw]
++                if np.any(block == bg):
++                    continue
++
++                if orientation == "horizontal":
++                    border_line = [int(x) for x in block[0, :].tolist()]
++                    fill_line = [int(x) for x in block[1, :].tolist()]
++                else:
++                    border_line = [int(x) for x in block[:, 0].tolist()]
++                    fill_line = [int(x) for x in block[:, 1].tolist()]
++
++                if len(set(border_line)) != n or len(set(fill_line)) != n:
++                    continue
++
++                pal_mask = np.zeros((h, w), dtype=bool)
++                pal_mask[r0 : r0 + ph, c0 : c0 + pw] = True
++                if not _isolated_palette(g, bg, pal_mask):
++                    continue
++
++                score = (n, len(set(border_line) | set(fill_line)))
++                cand = (score, corner, orientation, n, r0, c0, pal_mask)
++                if best is None or cand[0] > best[0]:
++                    best = cand
++
++    assert best is not None, "_best_palette must find a valid corner palette"
++    _, corner, orientation, n, r0, c0, pal_mask = best
++    return corner, orientation, int(n), int(r0), int(c0), pal_mask
++
++
++def _palette_mapping(g: np.ndarray, bg: int) -> tuple[dict[int, int], np.ndarray]:
++    """Return (mapping border->fill, palette_mask)."""
++    _, orientation, n, r0, c0, pal_mask = _best_palette(g, bg)
++
++    if orientation == "horizontal":
++        border_line = g[r0, c0 : c0 + n]
++        fill_line = g[r0 + 1, c0 : c0 + n]
++    else:
++        border_line = g[r0 : r0 + n, c0]
++        fill_line = g[r0 : r0 + n, c0 + 1]
++
++    mapping: dict[int, int] = {}
++    for b, f in zip(border_line.tolist(), fill_line.tolist(), strict=False):
++        mapping[int(b)] = int(f)
++    return mapping, pal_mask
++
++
++def _fill_enclosed_bg_regions(
++    out: np.ndarray, bg: int, mapping: dict[int, int], pal_mask: np.ndarray
++) -> None:
++    """Fill non-boundary bg holes using the dominant adjacent mapped border color."""
++    h, w = out.shape
++    bg_mask = (out == bg) & (~pal_mask)
++    for pts in components_mask(bg_mask, connectivity=4):
++        if any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts):
++            continue
++
++        adj_counts: dict[int, int] = {}
++        for r, c in pts:
++            for rr, cc in neighbors4(int(r), int(c)):
++                if 0 <= rr < h and 0 <= cc < w and not pal_mask[rr, cc]:
++                    v = int(out[rr, cc])
++                    if v != bg:
++                        adj_counts[v] = adj_counts.get(v, 0) + 1
++
++        border = None
++        best = -1
++        for color, cnt in adj_counts.items():
++            if color in mapping and cnt > best:
++                best = cnt
++                border = color
++        if border is None:
++            continue
++
++        fill = mapping[border]
++        for r, c in pts:
++            out[int(r), int(c)] = fill
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Fill hollow sprites by reading a corner palette that uses one fixed local direction.
++
++    Input structure:
++    - The background dominates the outer border.
++    - Several hollow single-color sprites sit away from the edges.
++    - One palette block is anchored flush to a grid corner. It is either 2xN or Nx2,
++      with no background cells inside it. Horizontal palettes always mean
++      "top row = border colors, bottom row = fill colors"; vertical palettes always
++      mean "left column = border colors, right column = fill colors".
++
++    Rule:
++    - Locate the palette among the four corners and decode the border->fill mapping
++      using the fixed local reading convention, not the global edge side.
++    - Find background regions that are enclosed away from the outer boundary.
++    - For each such region, inspect the surrounding sprite color; if that color is a
++      palette key, fill the region with the mapped palette value.
++
++    Key insight:
++    - The only positional challenge is identifying which corner contains the legend.
++      Once found, the palette is read in the same local orientation everywhere, so the
++      decisive step is matching each sprite border color to the palette key line.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++    mapping, pal_mask = _palette_mapping(g, bg)
++
++    out = g.copy()
++    _fill_enclosed_bg_regions(out, bg, mapping, pal_mask)
++    return out
++
++
++# --------------- generator (combo) ---------------
++
++_GRID_H_MIN, _GRID_H_MAX = 5, 13
++_GRID_W_MIN, _GRID_W_MAX = 10, 15
++
++_PALETTE_N_MIN, _PALETTE_N_MAX = 3, 4
++
++_SPRITE_H_MAX = 7
++_SPRITE_W_MAX = 6
++_SPRITE_DIM_SUM_CAP = 10
++_SPRITE_CELL_MAX = 16
++_FILLED_SPRITE_MAX = 3
++
++_P_HORIZ_WALL = 0.3
++_P_VERT_WALL = 0.3
++_P_BORDER_REMOVAL = 0.4
++_P_DIAMOND = 0.2
++
++_MAX_SHAPE_TRIES = 32
++_MAX_RETRIES = 400
++
++
++def _get_enclosed_holes(sprite: np.ndarray) -> list[np.ndarray]:
++    """Return point-arrays for bg components not touching the sprite boundary."""
++    h, w = sprite.shape
++    return [
++        pts
++        for pts in components_mask(~sprite, connectivity=4)
++        if not any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts)
++    ]
++
++
++def _make_diamond() -> np.ndarray:
++    s = np.zeros((3, 3), dtype=bool)
++    s[0, 1] = s[1, 0] = s[1, 2] = s[2, 1] = True
++    return s
++
++
++def _make_hollow_sprite(h: int, w: int, rng: random.Random) -> np.ndarray | None:
++    """Create a hollow sprite with at least one enclosed hole."""
++    sprite = np.ones((h, w), dtype=bool)
++    if h >= 3 and w >= 3:
++        sprite[1:-1, 1:-1] = False
++
++    if h >= 5 and w >= 4 and rng.random() < _P_HORIZ_WALL:
++        br = rng.randint(2, h - 2)
++        n = rng.randint(1, w - 2)
++        s = rng.randint(1, w - n - 1)
++        sprite[br, s : s + n] = True
++
++    if h >= 4 and w >= 5 and rng.random() < _P_VERT_WALL:
++        bc = rng.randint(2, w - 2)
++        n = rng.randint(1, h - 2)
++        s = rng.randint(1, h - n - 1)
++        sprite[s : s + n, bc] = True
++
++    if rng.random() < _P_BORDER_REMOVAL:
++        bcells = [
++            (r, c)
++            for r in range(h)
++            for c in range(w)
++            if sprite[r, c] and (r in (0, h - 1) or c in (0, w - 1))
++        ]
++        rng.shuffle(bcells)
++        for cr, cc in bcells[: rng.randint(1, min(4, len(bcells)))]:
++            test = sprite.copy()
++            test[cr, cc] = False
++            if _get_enclosed_holes(test):
++                sprite = test
++
++    if not _get_enclosed_holes(sprite) or int(sprite.sum()) > _SPRITE_CELL_MAX:
++        return None
++    return sprite
++
++
++def _sample_shape(max_sh: int, max_sw: int, rng: random.Random) -> np.ndarray | None:
++    for _ in range(_MAX_SHAPE_TRIES):
++        sh = rng.randint(3, max_sh)
++        sw = rng.randint(3, max_sw)
++        if sh + sw > _SPRITE_DIM_SUM_CAP:
++            sw = max(3, _SPRITE_DIM_SUM_CAP - sh)
++        if sh == 3 and sw == 3 and rng.random() < _P_DIAMOND:
++            return _make_diamond()
++        mask = _make_hollow_sprite(sh, sw, rng)
++        if mask is not None:
++            return mask
++    return None
++
++
++def _choose_colors(
++    rng: random.Random, n: int, num_filled: int
++) -> tuple[list[int], list[int], int, dict[int, int], list[int]]:
++    """Pick disjoint border/fill colors plus one distractor color."""
++    colors = list(range(1, 10))
++    rng.shuffle(colors)
++    border_keys = colors[:n]
++    fill_values = colors[n : 2 * n]
++    distractor_color = colors[2 * n]
++    mapping = dict(zip(border_keys, fill_values, strict=False))
++    filled_keys = rng.sample(border_keys, num_filled)
++    return border_keys, fill_values, distractor_color, mapping, filled_keys
++
++
++def _build_palette(orientation: str, border_keys: list[int], fill_values: list[int]) -> np.ndarray:
++    """Construct a palette using the fixed local reading direction."""
++    n = len(border_keys)
++    if orientation == "horizontal":
++        pal = np.zeros((2, n), dtype=int)
++        pal[0, :] = border_keys
++        pal[1, :] = fill_values
++    else:
++        pal = np.zeros((n, 2), dtype=int)
++        pal[:, 0] = border_keys
++        pal[:, 1] = fill_values
++    return pal
++
++
++def _place_palette(grid: np.ndarray, occ: np.ndarray, pal: np.ndarray, corner: str) -> None:
++    """Place palette flush to the selected corner and mark a 1-cell padding halo."""
++    h, w = grid.shape
++    ph, pw = pal.shape
++    r0 = 0 if corner.startswith("top") else h - ph
++    c0 = 0 if corner.endswith("left") else w - pw
++    grid[r0 : r0 + ph, c0 : c0 + pw] = pal
++    occ[max(0, r0 - 1) : min(h, r0 + ph + 1), max(0, c0 - 1) : min(w, c0 + pw + 1)] = True
++
++
++def _find_valid_positions(
++    h: int, w: int, occ: np.ndarray, mask: np.ndarray, holes: list[np.ndarray]
++) -> list[tuple[int, int]]:
++    """Find placements with padding and with all hole cells away from the boundary."""
++    sh, sw = mask.shape
++    positions = []
++    for r0 in range(h - sh + 1):
++        for c0 in range(w - sw + 1):
++            if occ[max(0, r0 - 1) : min(h, r0 + sh + 1), max(0, c0 - 1) : min(w, c0 + sw + 1)].any():
++                continue
++            if any(
++                r0 + hr == 0 or c0 + hc == 0 or r0 + hr == h - 1 or c0 + hc == w - 1
++                for hpts in holes
++                for hr, hc in hpts
++            ):
++                continue
++            positions.append((r0, c0))
++    return positions
++
++
++def _paint_sprite(
++    grid: np.ndarray,
++    r0: int,
++    c0: int,
++    mask: np.ndarray,
++    color: int,
++    fill: int | None,
++    holes: list[np.ndarray],
++) -> None:
++    """Render a sprite: border in `color`, optional hole fill in `fill`."""
++    grid[r0 : r0 + mask.shape[0], c0 : c0 + mask.shape[1]][mask] = color
++    if fill is not None:
++        for hpts in holes:
++            for hr, hc in hpts:
++                grid[r0 + int(hr), c0 + int(hc)] = fill
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    bg = 0
++
++    h = rng.randint(_GRID_H_MIN, _GRID_H_MAX)
++    w = rng.randint(_GRID_W_MIN, _GRID_W_MAX)
++    orientation = rng.choice(_ORIENTATIONS)
++    corner = rng.choice(_CORNERS)
++    n = rng.randint(_PALETTE_N_MIN, _PALETTE_N_MAX)
++
++    max_sh = min(_SPRITE_H_MAX, h)
++    max_sw = min(_SPRITE_W_MAX, w)
++
++    num_filled = rng.randint(1, min(_FILLED_SPRITE_MAX, n))
++    total_sprites = num_filled + 1
++
++    shapes = []
++    for _ in range(total_sprites):
++        mask = _sample_shape(max_sh, max_sw, rng)
++        if mask is None:
++            return None
++        shapes.append(mask)
++
++    border_keys, fill_values, distractor_color, mapping, filled_keys = _choose_colors(rng, n, num_filled)
++    pal = _build_palette(orientation, border_keys, fill_values)
++
++    grid = np.full((h, w), bg, dtype=int)
++    occ = np.zeros((h, w), dtype=bool)
++    _place_palette(grid, occ, pal, corner)
++
++    infos = []
++    for i, mask in enumerate(shapes):
++        if i < num_filled:
++            color = filled_keys[i]
++            fill = mapping[color]
++        else:
++            color = distractor_color
++            fill = None
++        infos.append((mask, color, fill))
++    infos.sort(key=lambda item: int(item[0].shape[0] * item[0].shape[1]), reverse=True)
++
++    placed = []
++    for mask, color, fill in infos:
++        holes = _get_enclosed_holes(mask)
++        positions = _find_valid_positions(h, w, occ, mask, holes)
++        if not positions:
++            return None
++        r0, c0 = rng.choice(positions)
++        _paint_sprite(grid, r0, c0, mask, color, fill, holes)
++        placed.append((r0, c0, mask, fill))
++        sh, sw = mask.shape
++        occ[max(0, r0 - 1) : min(h, r0 + sh + 1), max(0, c0 - 1) : min(w, c0 + sw + 1)] = True
++
++    output = grid.copy()
++    inp = grid.copy()
++    for r0, c0, mask, fill in placed:
++        if fill is None:
++            continue
++        for hpts in _get_enclosed_holes(mask):
++            for hr, hc in hpts:
++                inp[r0 + int(hr), c0 + int(hc)] = bg
++
++    border = np.concatenate([inp[0], inp[-1], inp[1:-1, 0], inp[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    if int(vals[cnts.argmax()]) != bg:
++        return None
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        pass
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(_MAX_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate input after {_MAX_RETRIES} attempts")
+
+diff --git a/ceshi/code_combo/dbff022c/33/code.py b/ceshi/code_combo/dbff022c/33/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..34c797ae3afca1e92ebc596ac50aee5e67ef0151
+--- /dev/null
++++ b/ceshi/code_combo/dbff022c/33/code.py
+@@ -0,0 +1,469 @@
++# Combo variant of dbff022c (index 33)
++# combo_spec: D2/0+D3/0
++# Name: 角落调色板 + 固定阅读方向
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, neighbors4
++
++
++# Design analysis for the fused variant
++# 1. Concrete behavior trace:
++#    A bottom-right horizontal palette now looks like:
++#      [2 3 4]
++#      [7 8 9]
++#    placed in the corner at rows H-2:H, cols W-3:W. The original task would
++#    read the outer bottom row as the border-key line, giving 7->2, 8->3, 9->4.
++#    This combo instead always reads a horizontal palette by local coordinates:
++#    top row = border keys, bottom row = fill values, left-to-right. So the same
++#    corner palette means 2->7, 3->8, 4->9. A sprite outlined with color 3 must
++#    therefore fill with 8, not remain empty and not map in reverse.
++# 2. Complexity calibration:
++#    Corner placement already increases search difficulty, so direction logic is
++#    simplified to a single local rule. To avoid ambiguous 2x2 corner blocks that
++#    could be parsed both horizontally and vertically, palette length is restricted
++#    to 3-4 entries. Border colors and fill colors are generated from disjoint sets,
++#    which makes the mapping legible and ensures fixed-direction cases differ from
++#    the original edge-dependent reading.
++# 3. Broken implicit assumptions from the seed solver:
++#    The seed code assumes the palette sits somewhere along one edge and that bottom
++#    and right palettes must be read "from the outside inward". That assumption is
++#    no longer valid. The new detector only inspects corner-anchored 2xN/Nx2 blocks
++#    and always interprets the first local row/column as border colors.
++# 4. Placement legality:
++#    The generator anchors the palette flush to one of the four corners, reserves a
++#    one-cell padding halo, and only places sprites in non-overlapping positions whose
++#    holes stay away from the global boundary. This keeps the palette and sprites
++#    visually separate and preserves the "enclosed hole" notion needed by the solver.
++# 5. Visual observability:
++#    The combination is human-visible because the palette is clearly in a corner and
++#    fixed-direction cases differ most strongly for bottom and right corners. Since
++#    border and fill colors are disjoint, reversing the readout would obviously fail
++#    to explain the filled interiors in those examples.
++# 6. Visual cleanliness:
++#    Only one palette exists, it has a bg moat around it, sprites are separated by at
++#    least one bg cell, and there is exactly one distractor sprite whose hole stays
++#    empty. This avoids layered clutter and keeps the mapping cue easy to spot.
++# 7. New solver assumptions audited against the generator:
++#    - `_best_palette` assumes the palette is corner-anchored, rectangular, all non-bg,
++#      and isolated from same-colored neighbors outside the palette. The generator
++#      guarantees each of these conditions.
++#    - `_fill_enclosed_bg_regions` assumes holes do not touch the outer boundary and
++#      their dominant adjacent color is the sprite border color. The sprite placement
++#      and output-first construction preserve that property.
++
++
++_CORNERS = ("top_left", "top_right", "bottom_left", "bottom_right")
++_ORIENTATIONS = ("horizontal", "vertical")
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _palette_bounds(
++    shape: tuple[int, int], corner: str, orientation: str, n: int
++) -> tuple[int, int, int, int]:
++    h, w = shape
++    if orientation == "horizontal":
++        ph, pw = 2, n
++        r0 = 0 if corner.startswith("top") else h - ph
++        c0 = 0 if corner.endswith("left") else w - pw
++    else:
++        ph, pw = n, 2
++        r0 = 0 if corner.startswith("top") else h - ph
++        c0 = 0 if corner.endswith("left") else w - pw
++    return int(r0), int(c0), int(ph), int(pw)
++
++
++def _isolated_palette(g: np.ndarray, bg: int, pal_mask: np.ndarray) -> bool:
++    """Palette colors must not 4-touch identical colors outside the palette."""
++    h, w = g.shape
++    for r, c in np.argwhere(pal_mask):
++        r = int(r)
++        c = int(c)
++        v = int(g[r, c])
++        if v == bg:
++            return False
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and not pal_mask[rr, cc]:
++                if int(g[rr, cc]) == v:
++                    return False
++    return True
++
++
++def _best_palette(g: np.ndarray, bg: int) -> tuple[str, str, int, int, int, np.ndarray]:
++    """
++    Find the corner-anchored 2xN or Nx2 palette block.
++
++    Returns (corner, orientation, n, r0, c0, pal_mask).
++    """
++    h, w = g.shape
++    best = None  # (score, corner, orientation, n, r0, c0, pal_mask)
++
++    for corner in _CORNERS:
++        for orientation in _ORIENTATIONS:
++            max_n = w if orientation == "horizontal" else h
++            for n in range(3, max_n + 1):
++                r0, c0, ph, pw = _palette_bounds((h, w), corner, orientation, n)
++                block = g[r0 : r0 + ph, c0 : c0 + pw]
++                if np.any(block == bg):
++                    continue
++
++                if orientation == "horizontal":
++                    border_line = [int(x) for x in block[0, :].tolist()]
++                    fill_line = [int(x) for x in block[1, :].tolist()]
++                else:
++                    border_line = [int(x) for x in block[:, 0].tolist()]
++                    fill_line = [int(x) for x in block[:, 1].tolist()]
++
++                if len(set(border_line)) != n or len(set(fill_line)) != n:
++                    continue
++
++                pal_mask = np.zeros((h, w), dtype=bool)
++                pal_mask[r0 : r0 + ph, c0 : c0 + pw] = True
++                if not _isolated_palette(g, bg, pal_mask):
++                    continue
++
++                score = (n, len(set(border_line) | set(fill_line)))
++                cand = (score, corner, orientation, n, r0, c0, pal_mask)
++                if best is None or cand[0] > best[0]:
++                    best = cand
++
++    assert best is not None, "_best_palette must find a valid corner palette"
++    _, corner, orientation, n, r0, c0, pal_mask = best
++    return corner, orientation, int(n), int(r0), int(c0), pal_mask
++
++
++def _palette_mapping(g: np.ndarray, bg: int) -> tuple[dict[int, int], np.ndarray]:
++    """Return (mapping border->fill, palette_mask)."""
++    _, orientation, n, r0, c0, pal_mask = _best_palette(g, bg)
++
++    if orientation == "horizontal":
++        border_line = g[r0, c0 : c0 + n]
++        fill_line = g[r0 + 1, c0 : c0 + n]
++    else:
++        border_line = g[r0 : r0 + n, c0]
++        fill_line = g[r0 : r0 + n, c0 + 1]
++
++    mapping: dict[int, int] = {}
++    for b, f in zip(border_line.tolist(), fill_line.tolist(), strict=False):
++        mapping[int(b)] = int(f)
++    return mapping, pal_mask
++
++
++def _fill_enclosed_bg_regions(
++    out: np.ndarray, bg: int, mapping: dict[int, int], pal_mask: np.ndarray
++) -> None:
++    """Fill non-boundary bg holes using the dominant adjacent mapped border color."""
++    h, w = out.shape
++    bg_mask = (out == bg) & (~pal_mask)
++    for pts in components_mask(bg_mask, connectivity=4):
++        if any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts):
++            continue
++
++        adj_counts: dict[int, int] = {}
++        for r, c in pts:
++            for rr, cc in neighbors4(int(r), int(c)):
++                if 0 <= rr < h and 0 <= cc < w and not pal_mask[rr, cc]:
++                    v = int(out[rr, cc])
++                    if v != bg:
++                        adj_counts[v] = adj_counts.get(v, 0) + 1
++
++        border = None
++        best = -1
++        for color, cnt in adj_counts.items():
++            if color in mapping and cnt > best:
++                best = cnt
++                border = color
++        if border is None:
++            continue
++
++        fill = mapping[border]
++        for r, c in pts:
++            out[int(r), int(c)] = fill
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Fill hollow sprites by reading a corner palette that uses one fixed local direction.
++
++    Input structure:
++    - The background dominates the outer border.
++    - Several hollow single-color sprites sit away from the edges.
++    - One palette block is anchored flush to a grid corner. It is either 2xN or Nx2,
++      with no background cells inside it. Horizontal palettes always mean
++      "top row = border colors, bottom row = fill colors"; vertical palettes always
++      mean "left column = border colors, right column = fill colors".
++
++    Rule:
++    - Locate the palette among the four corners and decode the border->fill mapping
++      using the fixed local reading convention, not the global edge side.
++    - Find background regions that are enclosed away from the outer boundary.
++    - For each such region, inspect the surrounding sprite color; if that color is a
++      palette key, fill the region with the mapped palette value.
++
++    Key insight:
++    - The only positional challenge is identifying which corner contains the legend.
++      Once found, the palette is read in the same local orientation everywhere, so the
++      decisive step is matching each sprite border color to the palette key line.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++    mapping, pal_mask = _palette_mapping(g, bg)
++
++    out = g.copy()
++    _fill_enclosed_bg_regions(out, bg, mapping, pal_mask)
++    return out
++
++
++# --------------- generator (combo) ---------------
++
++_GRID_H_MIN, _GRID_H_MAX = 5, 13
++_GRID_W_MIN, _GRID_W_MAX = 10, 15
++
++_PALETTE_N_MIN, _PALETTE_N_MAX = 3, 4
++
++_SPRITE_H_MAX = 7
++_SPRITE_W_MAX = 6
++_SPRITE_DIM_SUM_CAP = 10
++_SPRITE_CELL_MAX = 16
++_FILLED_SPRITE_MAX = 3
++
++_P_HORIZ_WALL = 0.3
++_P_VERT_WALL = 0.3
++_P_BORDER_REMOVAL = 0.4
++_P_DIAMOND = 0.2
++
++_MAX_SHAPE_TRIES = 32
++_MAX_RETRIES = 400
++
++
++def _get_enclosed_holes(sprite: np.ndarray) -> list[np.ndarray]:
++    """Return point-arrays for bg components not touching the sprite boundary."""
++    h, w = sprite.shape
++    return [
++        pts
++        for pts in components_mask(~sprite, connectivity=4)
++        if not any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts)
++    ]
++
++
++def _make_diamond() -> np.ndarray:
++    s = np.zeros((3, 3), dtype=bool)
++    s[0, 1] = s[1, 0] = s[1, 2] = s[2, 1] = True
++    return s
++
++
++def _make_hollow_sprite(h: int, w: int, rng: random.Random) -> np.ndarray | None:
++    """Create a hollow sprite with at least one enclosed hole."""
++    sprite = np.ones((h, w), dtype=bool)
++    if h >= 3 and w >= 3:
++        sprite[1:-1, 1:-1] = False
++
++    if h >= 5 and w >= 4 and rng.random() < _P_HORIZ_WALL:
++        br = rng.randint(2, h - 2)
++        n = rng.randint(1, w - 2)
++        s = rng.randint(1, w - n - 1)
++        sprite[br, s : s + n] = True
++
++    if h >= 4 and w >= 5 and rng.random() < _P_VERT_WALL:
++        bc = rng.randint(2, w - 2)
++        n = rng.randint(1, h - 2)
++        s = rng.randint(1, h - n - 1)
++        sprite[s : s + n, bc] = True
++
++    if rng.random() < _P_BORDER_REMOVAL:
++        bcells = [
++            (r, c)
++            for r in range(h)
++            for c in range(w)
++            if sprite[r, c] and (r in (0, h - 1) or c in (0, w - 1))
++        ]
++        rng.shuffle(bcells)
++        for cr, cc in bcells[: rng.randint(1, min(4, len(bcells)))]:
++            test = sprite.copy()
++            test[cr, cc] = False
++            if _get_enclosed_holes(test):
++                sprite = test
++
++    if not _get_enclosed_holes(sprite) or int(sprite.sum()) > _SPRITE_CELL_MAX:
++        return None
++    return sprite
++
++
++def _sample_shape(max_sh: int, max_sw: int, rng: random.Random) -> np.ndarray | None:
++    for _ in range(_MAX_SHAPE_TRIES):
++        sh = rng.randint(3, max_sh)
++        sw = rng.randint(3, max_sw)
++        if sh + sw > _SPRITE_DIM_SUM_CAP:
++            sw = max(3, _SPRITE_DIM_SUM_CAP - sh)
++        if sh == 3 and sw == 3 and rng.random() < _P_DIAMOND:
++            return _make_diamond()
++        mask = _make_hollow_sprite(sh, sw, rng)
++        if mask is not None:
++            return mask
++    return None
++
++
++def _choose_colors(
++    rng: random.Random, n: int, num_filled: int
++) -> tuple[list[int], list[int], int, dict[int, int], list[int]]:
++    """Pick disjoint border/fill colors plus one distractor color."""
++    colors = list(range(1, 10))
++    rng.shuffle(colors)
++    border_keys = colors[:n]
++    fill_values = colors[n : 2 * n]
++    distractor_color = colors[2 * n]
++    mapping = dict(zip(border_keys, fill_values, strict=False))
++    filled_keys = rng.sample(border_keys, num_filled)
++    return border_keys, fill_values, distractor_color, mapping, filled_keys
++
++
++def _build_palette(orientation: str, border_keys: list[int], fill_values: list[int]) -> np.ndarray:
++    """Construct a palette using the fixed local reading direction."""
++    n = len(border_keys)
++    if orientation == "horizontal":
++        pal = np.zeros((2, n), dtype=int)
++        pal[0, :] = border_keys
++        pal[1, :] = fill_values
++    else:
++        pal = np.zeros((n, 2), dtype=int)
++        pal[:, 0] = border_keys
++        pal[:, 1] = fill_values
++    return pal
++
++
++def _place_palette(grid: np.ndarray, occ: np.ndarray, pal: np.ndarray, corner: str) -> None:
++    """Place palette flush to the selected corner and mark a 1-cell padding halo."""
++    h, w = grid.shape
++    ph, pw = pal.shape
++    r0 = 0 if corner.startswith("top") else h - ph
++    c0 = 0 if corner.endswith("left") else w - pw
++    grid[r0 : r0 + ph, c0 : c0 + pw] = pal
++    occ[max(0, r0 - 1) : min(h, r0 + ph + 1), max(0, c0 - 1) : min(w, c0 + pw + 1)] = True
++
++
++def _find_valid_positions(
++    h: int, w: int, occ: np.ndarray, mask: np.ndarray, holes: list[np.ndarray]
++) -> list[tuple[int, int]]:
++    """Find placements with padding and with all hole cells away from the boundary."""
++    sh, sw = mask.shape
++    positions = []
++    for r0 in range(h - sh + 1):
++        for c0 in range(w - sw + 1):
++            if occ[max(0, r0 - 1) : min(h, r0 + sh + 1), max(0, c0 - 1) : min(w, c0 + sw + 1)].any():
++                continue
++            if any(
++                r0 + hr == 0 or c0 + hc == 0 or r0 + hr == h - 1 or c0 + hc == w - 1
++                for hpts in holes
++                for hr, hc in hpts
++            ):
++                continue
++            positions.append((r0, c0))
++    return positions
++
++
++def _paint_sprite(
++    grid: np.ndarray,
++    r0: int,
++    c0: int,
++    mask: np.ndarray,
++    color: int,
++    fill: int | None,
++    holes: list[np.ndarray],
++) -> None:
++    """Render a sprite: border in `color`, optional hole fill in `fill`."""
++    grid[r0 : r0 + mask.shape[0], c0 : c0 + mask.shape[1]][mask] = color
++    if fill is not None:
++        for hpts in holes:
++            for hr, hc in hpts:
++                grid[r0 + int(hr), c0 + int(hc)] = fill
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    bg = 0
++
++    h = rng.randint(_GRID_H_MIN, _GRID_H_MAX)
++    w = rng.randint(_GRID_W_MIN, _GRID_W_MAX)
++    orientation = rng.choice(_ORIENTATIONS)
++    corner = rng.choice(_CORNERS)
++    n = rng.randint(_PALETTE_N_MIN, _PALETTE_N_MAX)
++
++    max_sh = min(_SPRITE_H_MAX, h)
++    max_sw = min(_SPRITE_W_MAX, w)
++
++    num_filled = rng.randint(1, min(_FILLED_SPRITE_MAX, n))
++    total_sprites = num_filled + 1
++
++    shapes = []
++    for _ in range(total_sprites):
++        mask = _sample_shape(max_sh, max_sw, rng)
++        if mask is None:
++            return None
++        shapes.append(mask)
++
++    border_keys, fill_values, distractor_color, mapping, filled_keys = _choose_colors(rng, n, num_filled)
++    pal = _build_palette(orientation, border_keys, fill_values)
++
++    grid = np.full((h, w), bg, dtype=int)
++    occ = np.zeros((h, w), dtype=bool)
++    _place_palette(grid, occ, pal, corner)
++
++    infos = []
++    for i, mask in enumerate(shapes):
++        if i < num_filled:
++            color = filled_keys[i]
++            fill = mapping[color]
++        else:
++            color = distractor_color
++            fill = None
++        infos.append((mask, color, fill))
++    infos.sort(key=lambda item: int(item[0].shape[0] * item[0].shape[1]), reverse=True)
++
++    placed = []
++    for mask, color, fill in infos:
++        holes = _get_enclosed_holes(mask)
++        positions = _find_valid_positions(h, w, occ, mask, holes)
++        if not positions:
++            return None
++        r0, c0 = rng.choice(positions)
++        _paint_sprite(grid, r0, c0, mask, color, fill, holes)
++        placed.append((r0, c0, mask, fill))
++        sh, sw = mask.shape
++        occ[max(0, r0 - 1) : min(h, r0 + sh + 1), max(0, c0 - 1) : min(w, c0 + sw + 1)] = True
++
++    output = grid.copy()
++    inp = grid.copy()
++    for r0, c0, mask, fill in placed:
++        if fill is None:
++            continue
++        for hpts in _get_enclosed_holes(mask):
++            for hr, hc in hpts:
++                inp[r0 + int(hr), c0 + int(hc)] = bg
++
++    border = np.concatenate([inp[0], inp[-1], inp[1:-1, 0], inp[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    if int(vals[cnts.argmax()]) != bg:
++        return None
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        pass
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(_MAX_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate input after {_MAX_RETRIES} attempts")
+
+codex
+代码已写入目标路径。接下来先跑用户给的 50 次生成测试，看 solver 和 generator 在这个融合约束下的稳定性，再根据失败类型收紧放置或检测条件。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys; spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dbff022c/33/code.py'); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); ok, fail = 0, 0; t0 = time.time();
+for i in range(50):
+    try:
+        inp = mod.generate_input();
+        out = mod.main(inp);
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0; print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)');
+if ok < 40: sys.exit(1)\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dbff022c/33/code.py b/ceshi/code_combo/dbff022c/33/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..34c797ae3afca1e92ebc596ac50aee5e67ef0151
+--- /dev/null
++++ b/ceshi/code_combo/dbff022c/33/code.py
+@@ -0,0 +1,469 @@
++# Combo variant of dbff022c (index 33)
++# combo_spec: D2/0+D3/0
++# Name: 角落调色板 + 固定阅读方向
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, neighbors4
++
++
++# Design analysis for the fused variant
++# 1. Concrete behavior trace:
++#    A bottom-right horizontal palette now looks like:
++#      [2 3 4]
++#      [7 8 9]
++#    placed in the corner at rows H-2:H, cols W-3:W. The original task would
++#    read the outer bottom row as the border-key line, giving 7->2, 8->3, 9->4.
++#    This combo instead always reads a horizontal palette by local coordinates:
++#    top row = border keys, bottom row = fill values, left-to-right. So the same
++#    corner palette means 2->7, 3->8, 4->9. A sprite outlined with color 3 must
++#    therefore fill with 8, not remain empty and not map in reverse.
++# 2. Complexity calibration:
++#    Corner placement already increases search difficulty, so direction logic is
++#    simplified to a single local rule. To avoid ambiguous 2x2 corner blocks that
++#    could be parsed both horizontally and vertically, palette length is restricted
++#    to 3-4 entries. Border colors and fill colors are generated from disjoint sets,
++#    which makes the mapping legible and ensures fixed-direction cases differ from
++#    the original edge-dependent reading.
++# 3. Broken implicit assumptions from the seed solver:
++#    The seed code assumes the palette sits somewhere along one edge and that bottom
++#    and right palettes must be read "from the outside inward". That assumption is
++#    no longer valid. The new detector only inspects corner-anchored 2xN/Nx2 blocks
++#    and always interprets the first local row/column as border colors.
++# 4. Placement legality:
++#    The generator anchors the palette flush to one of the four corners, reserves a
++#    one-cell padding halo, and only places sprites in non-overlapping positions whose
++#    holes stay away from the global boundary. This keeps the palette and sprites
++#    visually separate and preserves the "enclosed hole" notion needed by the solver.
++# 5. Visual observability:
++#    The combination is human-visible because the palette is clearly in a corner and
++#    fixed-direction cases differ most strongly for bottom and right corners. Since
++#    border and fill colors are disjoint, reversing the readout would obviously fail
++#    to explain the filled interiors in those examples.
++# 6. Visual cleanliness:
++#    Only one palette exists, it has a bg moat around it, sprites are separated by at
++#    least one bg cell, and there is exactly one distractor sprite whose hole stays
++#    empty. This avoids layered clutter and keeps the mapping cue easy to spot.
++# 7. New solver assumptions audited against the generator:
++#    - `_best_palette` assumes the palette is corner-anchored, rectangular, all non-bg,
++#      and isolated from same-colored neighbors outside the palette. The generator
++#      guarantees each of these conditions.
++#    - `_fill_enclosed_bg_regions` assumes holes do not touch the outer boundary and
++#      their dominant adjacent color is the sprite border color. The sprite placement
++#      and output-first construction preserve that property.
++
++
++_CORNERS = ("top_left", "top_right", "bottom_left", "bottom_right")
++_ORIENTATIONS = ("horizontal", "vertical")
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _palette_bounds(
++    shape: tuple[int, int], corner: str, orientation: str, n: int
++) -> tuple[int, int, int, int]:
++    h, w = shape
++    if orientation == "horizontal":
++        ph, pw = 2, n
++        r0 = 0 if corner.startswith("top") else h - ph
++        c0 = 0 if corner.endswith("left") else w - pw
++    else:
++        ph, pw = n, 2
++        r0 = 0 if corner.startswith("top") else h - ph
++        c0 = 0 if corner.endswith("left") else w - pw
++    return int(r0), int(c0), int(ph), int(pw)
++
++
++def _isolated_palette(g: np.ndarray, bg: int, pal_mask: np.ndarray) -> bool:
++    """Palette colors must not 4-touch identical colors outside the palette."""
++    h, w = g.shape
++    for r, c in np.argwhere(pal_mask):
++        r = int(r)
++        c = int(c)
++        v = int(g[r, c])
++        if v == bg:
++            return False
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and not pal_mask[rr, cc]:
++                if int(g[rr, cc]) == v:
++                    return False
++    return True
++
++
++def _best_palette(g: np.ndarray, bg: int) -> tuple[str, str, int, int, int, np.ndarray]:
++    """
++    Find the corner-anchored 2xN or Nx2 palette block.
++
++    Returns (corner, orientation, n, r0, c0, pal_mask).
++    """
++    h, w = g.shape
++    best = None  # (score, corner, orientation, n, r0, c0, pal_mask)
++
++    for corner in _CORNERS:
++        for orientation in _ORIENTATIONS:
++            max_n = w if orientation == "horizontal" else h
++            for n in range(3, max_n + 1):
++                r0, c0, ph, pw = _palette_bounds((h, w), corner, orientation, n)
++                block = g[r0 : r0 + ph, c0 : c0 + pw]
++                if np.any(block == bg):
++                    continue
++
++                if orientation == "horizontal":
++                    border_line = [int(x) for x in block[0, :].tolist()]
++                    fill_line = [int(x) for x in block[1, :].tolist()]
++                else:
++                    border_line = [int(x) for x in block[:, 0].tolist()]
++                    fill_line = [int(x) for x in block[:, 1].tolist()]
++
++                if len(set(border_line)) != n or len(set(fill_line)) != n:
++                    continue
++
++                pal_mask = np.zeros((h, w), dtype=bool)
++                pal_mask[r0 : r0 + ph, c0 : c0 + pw] = True
++                if not _isolated_palette(g, bg, pal_mask):
++                    continue
++
++                score = (n, len(set(border_line) | set(fill_line)))
++                cand = (score, corner, orientation, n, r0, c0, pal_mask)
++                if best is None or cand[0] > best[0]:
++                    best = cand
++
++    assert best is not None, "_best_palette must find a valid corner palette"
++    _, corner, orientation, n, r0, c0, pal_mask = best
++    return corner, orientation, int(n), int(r0), int(c0), pal_mask
++
++
++def _palette_mapping(g: np.ndarray, bg: int) -> tuple[dict[int, int], np.ndarray]:
++    """Return (mapping border->fill, palette_mask)."""
++    _, orientation, n, r0, c0, pal_mask = _best_palette(g, bg)
++
++    if orientation == "horizontal":
++        border_line = g[r0, c0 : c0 + n]
++        fill_line = g[r0 + 1, c0 : c0 + n]
++    else:
++        border_line = g[r0 : r0 + n, c0]
++        fill_line = g[r0 : r0 + n, c0 + 1]
++
++    mapping: dict[int, int] = {}
++    for b, f in zip(border_line.tolist(), fill_line.tolist(), strict=False):
++        mapping[int(b)] = int(f)
++    return mapping, pal_mask
++
++
++def _fill_enclosed_bg_regions(
++    out: np.ndarray, bg: int, mapping: dict[int, int], pal_mask: np.ndarray
++) -> None:
++    """Fill non-boundary bg holes using the dominant adjacent mapped border color."""
++    h, w = out.shape
++    bg_mask = (out == bg) & (~pal_mask)
++    for pts in components_mask(bg_mask, connectivity=4):
++        if any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts):
++            continue
++
++        adj_counts: dict[int, int] = {}
++        for r, c in pts:
++            for rr, cc in neighbors4(int(r), int(c)):
++                if 0 <= rr < h and 0 <= cc < w and not pal_mask[rr, cc]:
++                    v = int(out[rr, cc])
++                    if v != bg:
++                        adj_counts[v] = adj_counts.get(v, 0) + 1
++
++        border = None
++        best = -1
++        for color, cnt in adj_counts.items():
++            if color in mapping and cnt > best:
++                best = cnt
++                border = color
++        if border is None:
++            continue
++
++        fill = mapping[border]
++        for r, c in pts:
++            out[int(r), int(c)] = fill
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Fill hollow sprites by reading a corner palette that uses one fixed local direction.
++
++    Input structure:
++    - The background dominates the outer border.
++    - Several hollow single-color sprites sit away from the edges.
++    - One palette block is anchored flush to a grid corner. It is either 2xN or Nx2,
++      with no background cells inside it. Horizontal palettes always mean
++      "top row = border colors, bottom row = fill colors"; vertical palettes always
++      mean "left column = border colors, right column = fill colors".
++
++    Rule:
++    - Locate the palette among the four corners and decode the border->fill mapping
++      using the fixed local reading convention, not the global edge side.
++    - Find background regions that are enclosed away from the outer boundary.
++    - For each such region, inspect the surrounding sprite color; if that color is a
++      palette key, fill the region with the mapped palette value.
++
++    Key insight:
++    - The only positional challenge is identifying which corner contains the legend.
++      Once found, the palette is read in the same local orientation everywhere, so the
++      decisive step is matching each sprite border color to the palette key line.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++    mapping, pal_mask = _palette_mapping(g, bg)
++
++    out = g.copy()
++    _fill_enclosed_bg_regions(out, bg, mapping, pal_mask)
++    return out
++
++
++# --------------- generator (combo) ---------------
++
++_GRID_H_MIN, _GRID_H_MAX = 5, 13
++_GRID_W_MIN, _GRID_W_MAX = 10, 15
++
++_PALETTE_N_MIN, _PALETTE_N_MAX = 3, 4
++
++_SPRITE_H_MAX = 7
++_SPRITE_W_MAX = 6
++_SPRITE_DIM_SUM_CAP = 10
++_SPRITE_CELL_MAX = 16
++_FILLED_SPRITE_MAX = 3
++
++_P_HORIZ_WALL = 0.3
++_P_VERT_WALL = 0.3
++_P_BORDER_REMOVAL = 0.4
++_P_DIAMOND = 0.2
++
++_MAX_SHAPE_TRIES = 32
++_MAX_RETRIES = 400
++
++
++def _get_enclosed_holes(sprite: np.ndarray) -> list[np.ndarray]:
++    """Return point-arrays for bg components not touching the sprite boundary."""
++    h, w = sprite.shape
++    return [
++        pts
++        for pts in components_mask(~sprite, connectivity=4)
++        if not any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts)
++    ]
++
++
++def _make_diamond() -> np.ndarray:
++    s = np.zeros((3, 3), dtype=bool)
++    s[0, 1] = s[1, 0] = s[1, 2] = s[2, 1] = True
++    return s
++
++
++def _make_hollow_sprite(h: int, w: int, rng: random.Random) -> np.ndarray | None:
++    """Create a hollow sprite with at least one enclosed hole."""
++    sprite = np.ones((h, w), dtype=bool)
++    if h >= 3 and w >= 3:
++        sprite[1:-1, 1:-1] = False
++
++    if h >= 5 and w >= 4 and rng.random() < _P_HORIZ_WALL:
++        br = rng.randint(2, h - 2)
++        n = rng.randint(1, w - 2)
++        s = rng.randint(1, w - n - 1)
++        sprite[br, s : s + n] = True
++
++    if h >= 4 and w >= 5 and rng.random() < _P_VERT_WALL:
++        bc = rng.randint(2, w - 2)
++        n = rng.randint(1, h - 2)
++        s = rng.randint(1, h - n - 1)
++        sprite[s : s + n, bc] = True
++
++    if rng.random() < _P_BORDER_REMOVAL:
++        bcells = [
++            (r, c)
++            for r in range(h)
++            for c in range(w)
++            if sprite[r, c] and (r in (0, h - 1) or c in (0, w - 1))
++        ]
++        rng.shuffle(bcells)
++        for cr, cc in bcells[: rng.randint(1, min(4, len(bcells)))]:
++            test = sprite.copy()
++            test[cr, cc] = False
++            if _get_enclosed_holes(test):
++                sprite = test
++
++    if not _get_enclosed_holes(sprite) or int(sprite.sum()) > _SPRITE_CELL_MAX:
++        return None
++    return sprite
++
++
++def _sample_shape(max_sh: int, max_sw: int, rng: random.Random) -> np.ndarray | None:
++    for _ in range(_MAX_SHAPE_TRIES):
++        sh = rng.randint(3, max_sh)
++        sw = rng.randint(3, max_sw)
++        if sh + sw > _SPRITE_DIM_SUM_CAP:
++            sw = max(3, _SPRITE_DIM_SUM_CAP - sh)
++        if sh == 3 and sw == 3 and rng.random() < _P_DIAMOND:
++            return _make_diamond()
++        mask = _make_hollow_sprite(sh, sw, rng)
++        if mask is not None:
++            return mask
++    return None
++
++
++def _choose_colors(
++    rng: random.Random, n: int, num_filled: int
++) -> tuple[list[int], list[int], int, dict[int, int], list[int]]:
++    """Pick disjoint border/fill colors plus one distractor color."""
++    colors = list(range(1, 10))
++    rng.shuffle(colors)
++    border_keys = colors[:n]
++    fill_values = colors[n : 2 * n]
++    distractor_color = colors[2 * n]
++    mapping = dict(zip(border_keys, fill_values, strict=False))
++    filled_keys = rng.sample(border_keys, num_filled)
++    return border_keys, fill_values, distractor_color, mapping, filled_keys
++
++
++def _build_palette(orientation: str, border_keys: list[int], fill_values: list[int]) -> np.ndarray:
++    """Construct a palette using the fixed local reading direction."""
++    n = len(border_keys)
++    if orientation == "horizontal":
++        pal = np.zeros((2, n), dtype=int)
++        pal[0, :] = border_keys
++        pal[1, :] = fill_values
++    else:
++        pal = np.zeros((n, 2), dtype=int)
++        pal[:, 0] = border_keys
++        pal[:, 1] = fill_values
++    return pal
++
++
++def _place_palette(grid: np.ndarray, occ: np.ndarray, pal: np.ndarray, corner: str) -> None:
++    """Place palette flush to the selected corner and mark a 1-cell padding halo."""
++    h, w = grid.shape
++    ph, pw = pal.shape
++    r0 = 0 if corner.startswith("top") else h - ph
++    c0 = 0 if corner.endswith("left") else w - pw
++    grid[r0 : r0 + ph, c0 : c0 + pw] = pal
++    occ[max(0, r0 - 1) : min(h, r0 + ph + 1), max(0, c0 - 1) : min(w, c0 + pw + 1)] = True
++
++
++def _find_valid_positions(
++    h: int, w: int, occ: np.ndarray, mask: np.ndarray, holes: list[np.ndarray]
++) -> list[tuple[int, int]]:
++    """Find placements with padding and with all hole cells away from the boundary."""
++    sh, sw = mask.shape
++    positions = []
++    for r0 in range(h - sh + 1):
++        for c0 in range(w - sw + 1):
++            if occ[max(0, r0 - 1) : min(h, r0 + sh + 1), max(0, c0 - 1) : min(w, c0 + sw + 1)].any():
++                continue
++            if any(
++                r0 + hr == 0 or c0 + hc == 0 or r0 + hr == h - 1 or c0 + hc == w - 1
++                for hpts in holes
++                for hr, hc in hpts
++            ):
++                continue
++            positions.append((r0, c0))
++    return positions
++
++
++def _paint_sprite(
++    grid: np.ndarray,
++    r0: int,
++    c0: int,
++    mask: np.ndarray,
++    color: int,
++    fill: int | None,
++    holes: list[np.ndarray],
++) -> None:
++    """Render a sprite: border in `color`, optional hole fill in `fill`."""
++    grid[r0 : r0 + mask.shape[0], c0 : c0 + mask.shape[1]][mask] = color
++    if fill is not None:
++        for hpts in holes:
++            for hr, hc in hpts:
++                grid[r0 + int(hr), c0 + int(hc)] = fill
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    bg = 0
++
++    h = rng.randint(_GRID_H_MIN, _GRID_H_MAX)
++    w = rng.randint(_GRID_W_MIN, _GRID_W_MAX)
++    orientation = rng.choice(_ORIENTATIONS)
++    corner = rng.choice(_CORNERS)
++    n = rng.randint(_PALETTE_N_MIN, _PALETTE_N_MAX)
++
++    max_sh = min(_SPRITE_H_MAX, h)
++    max_sw = min(_SPRITE_W_MAX, w)
++
++    num_filled = rng.randint(1, min(_FILLED_SPRITE_MAX, n))
++    total_sprites = num_filled + 1
++
++    shapes = []
++    for _ in range(total_sprites):
++        mask = _sample_shape(max_sh, max_sw, rng)
++        if mask is None:
++            return None
++        shapes.append(mask)
++
++    border_keys, fill_values, distractor_color, mapping, filled_keys = _choose_colors(rng, n, num_filled)
++    pal = _build_palette(orientation, border_keys, fill_values)
++
++    grid = np.full((h, w), bg, dtype=int)
++    occ = np.zeros((h, w), dtype=bool)
++    _place_palette(grid, occ, pal, corner)
++
++    infos = []
++    for i, mask in enumerate(shapes):
++        if i < num_filled:
++            color = filled_keys[i]
++            fill = mapping[color]
++        else:
++            color = distractor_color
++            fill = None
++        infos.append((mask, color, fill))
++    infos.sort(key=lambda item: int(item[0].shape[0] * item[0].shape[1]), reverse=True)
++
++    placed = []
++    for mask, color, fill in infos:
++        holes = _get_enclosed_holes(mask)
++        positions = _find_valid_positions(h, w, occ, mask, holes)
++        if not positions:
++            return None
++        r0, c0 = rng.choice(positions)
++        _paint_sprite(grid, r0, c0, mask, color, fill, holes)
++        placed.append((r0, c0, mask, fill))
++        sh, sw = mask.shape
++        occ[max(0, r0 - 1) : min(h, r0 + sh + 1), max(0, c0 - 1) : min(w, c0 + sw + 1)] = True
++
++    output = grid.copy()
++    inp = grid.copy()
++    for r0, c0, mask, fill in placed:
++        if fill is None:
++            continue
++        for hpts in _get_enclosed_holes(mask):
++            for hr, hc in hpts:
++                inp[r0 + int(hr), c0 + int(hc)] = bg
++
++    border = np.concatenate([inp[0], inp[-1], inp[1:-1, 0], inp[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    if int(vals[cnts.argmax()]) != bg:
++        return None
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        pass
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(_MAX_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate input after {_MAX_RETRIES} attempts")
+
+ succeeded in 575ms:
+Success: 50/50, Time: 0.4s (8ms/call)
+
+codex
+求解稳定性已经过关。现在补做“是否真的发生融合行为”的退化检查：我会统计角落/朝向分布，并量化“如果误用原题的边缘方向规则，输出有多少比例会变错”，这样能直接验证这不是原规则的伪装样本。
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util
+import numpy as np
+from collections import Counter
+
+path='/home/lixinyu/snap/new/ceshi/code_combo/dbff022c/33/code.py'
+spec=importlib.util.spec_from_file_location('variant', path)
+mod=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+
+def original_style_output(inp):
+    g=np.asarray(inp, dtype=int)
+    bg=mod._bg_boundary(g)
+    corner, orientation, n, r0, c0, pal_mask = mod._best_palette(g, bg)
+    if orientation == 'horizontal':
+        top = g[r0, c0:c0+n]
+        bottom = g[r0+1, c0:c0+n]
+        if corner.startswith('top'):
+            border_line, fill_line = top, bottom
+        else:
+            border_line, fill_line = bottom, top
+    else:
+        left = g[r0:r0+n, c0]
+        right = g[r0:r0+n, c0+1]
+        if corner.endswith('left'):
+            border_line, fill_line = left, right
+        else:
+            border_line, fill_line = right, left
+    mapping = {int(b): int(f) for b, f in zip(border_line.tolist(), fill_line.tolist(), strict=False)}
+    out = g.copy()
+    mod._fill_enclosed_bg_regions(out, bg, mapping, pal_mask)
+    return out, corner, orientation, n
+
+layout_counts = Counter()
+disagree = 0
+samples = 200
+for _ in range(samples):
+    inp = mod.generate_input()
+    new_out = mod.main(inp)
+    old_out, corner, orientation, n = original_style_output(inp)
+    layout_counts[(corner, orientation, n)] += 1
+    if not np.array_equal(new_out, old_out):
+        disagree += 1
+
+print('samples', samples)
+print('edge_rule_disagreement', disagree, f'{disagree/samples:.3f}')
+print('layout_distribution')
+for key, count in sorted(layout_counts.items()):
+    print(key, count)
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dbff022c/33/code.py b/ceshi/code_combo/dbff022c/33/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..34c797ae3afca1e92ebc596ac50aee5e67ef0151
+--- /dev/null
++++ b/ceshi/code_combo/dbff022c/33/code.py
+@@ -0,0 +1,469 @@
++# Combo variant of dbff022c (index 33)
++# combo_spec: D2/0+D3/0
++# Name: 角落调色板 + 固定阅读方向
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, neighbors4
++
++
++# Design analysis for the fused variant
++# 1. Concrete behavior trace:
++#    A bottom-right horizontal palette now looks like:
++#      [2 3 4]
++#      [7 8 9]
++#    placed in the corner at rows H-2:H, cols W-3:W. The original task would
++#    read the outer bottom row as the border-key line, giving 7->2, 8->3, 9->4.
++#    This combo instead always reads a horizontal palette by local coordinates:
++#    top row = border keys, bottom row = fill values, left-to-right. So the same
++#    corner palette means 2->7, 3->8, 4->9. A sprite outlined with color 3 must
++#    therefore fill with 8, not remain empty and not map in reverse.
++# 2. Complexity calibration:
++#    Corner placement already increases search difficulty, so direction logic is
++#    simplified to a single local rule. To avoid ambiguous 2x2 corner blocks that
++#    could be parsed both horizontally and vertically, palette length is restricted
++#    to 3-4 entries. Border colors and fill colors are generated from disjoint sets,
++#    which makes the mapping legible and ensures fixed-direction cases differ from
++#    the original edge-dependent reading.
++# 3. Broken implicit assumptions from the seed solver:
++#    The seed code assumes the palette sits somewhere along one edge and that bottom
++#    and right palettes must be read "from the outside inward". That assumption is
++#    no longer valid. The new detector only inspects corner-anchored 2xN/Nx2 blocks
++#    and always interprets the first local row/column as border colors.
++# 4. Placement legality:
++#    The generator anchors the palette flush to one of the four corners, reserves a
++#    one-cell padding halo, and only places sprites in non-overlapping positions whose
++#    holes stay away from the global boundary. This keeps the palette and sprites
++#    visually separate and preserves the "enclosed hole" notion needed by the solver.
++# 5. Visual observability:
++#    The combination is human-visible because the palette is clearly in a corner and
++#    fixed-direction cases differ most strongly for bottom and right corners. Since
++#    border and fill colors are disjoint, reversing the readout would obviously fail
++#    to explain the filled interiors in those examples.
++# 6. Visual cleanliness:
++#    Only one palette exists, it has a bg moat around it, sprites are separated by at
++#    least one bg cell, and there is exactly one distractor sprite whose hole stays
++#    empty. This avoids layered clutter and keeps the mapping cue easy to spot.
++# 7. New solver assumptions audited against the generator:
++#    - `_best_palette` assumes the palette is corner-anchored, rectangular, all non-bg,
++#      and isolated from same-colored neighbors outside the palette. The generator
++#      guarantees each of these conditions.
++#    - `_fill_enclosed_bg_regions` assumes holes do not touch the outer boundary and
++#      their dominant adjacent color is the sprite border color. The sprite placement
++#      and output-first construction preserve that property.
++
++
++_CORNERS = ("top_left", "top_right", "bottom_left", "bottom_right")
++_ORIENTATIONS = ("horizontal", "vertical")
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _palette_bounds(
++    shape: tuple[int, int], corner: str, orientation: str, n: int
++) -> tuple[int, int, int, int]:
++    h, w = shape
++    if orientation == "horizontal":
++        ph, pw = 2, n
++        r0 = 0 if corner.startswith("top") else h - ph
++        c0 = 0 if corner.endswith("left") else w - pw
++    else:
++        ph, pw = n, 2
++        r0 = 0 if corner.startswith("top") else h - ph
++        c0 = 0 if corner.endswith("left") else w - pw
++    return int(r0), int(c0), int(ph), int(pw)
++
++
++def _isolated_palette(g: np.ndarray, bg: int, pal_mask: np.ndarray) -> bool:
++    """Palette colors must not 4-touch identical colors outside the palette."""
++    h, w = g.shape
++    for r, c in np.argwhere(pal_mask):
++        r = int(r)
++        c = int(c)
++        v = int(g[r, c])
++        if v == bg:
++            return False
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and not pal_mask[rr, cc]:
++                if int(g[rr, cc]) == v:
++                    return False
++    return True
++
++
++def _best_palette(g: np.ndarray, bg: int) -> tuple[str, str, int, int, int, np.ndarray]:
++    """
++    Find the corner-anchored 2xN or Nx2 palette block.
++
++    Returns (corner, orientation, n, r0, c0, pal_mask).
++    """
++    h, w = g.shape
++    best = None  # (score, corner, orientation, n, r0, c0, pal_mask)
++
++    for corner in _CORNERS:
++        for orientation in _ORIENTATIONS:
++            max_n = w if orientation == "horizontal" else h
++            for n in range(3, max_n + 1):
++                r0, c0, ph, pw = _palette_bounds((h, w), corner, orientation, n)
++                block = g[r0 : r0 + ph, c0 : c0 + pw]
++                if np.any(block == bg):
++                    continue
++
++                if orientation == "horizontal":
++                    border_line = [int(x) for x in block[0, :].tolist()]
++                    fill_line = [int(x) for x in block[1, :].tolist()]
++                else:
++                    border_line = [int(x) for x in block[:, 0].tolist()]
++                    fill_line = [int(x) for x in block[:, 1].tolist()]
++
++                if len(set(border_line)) != n or len(set(fill_line)) != n:
++                    continue
++
++                pal_mask = np.zeros((h, w), dtype=bool)
++                pal_mask[r0 : r0 + ph, c0 : c0 + pw] = True
++                if not _isolated_palette(g, bg, pal_mask):
++                    continue
++
++                score = (n, len(set(border_line) | set(fill_line)))
++                cand = (score, corner, orientation, n, r0, c0, pal_mask)
++                if best is None or cand[0] > best[0]:
++                    best = cand
++
++    assert best is not None, "_best_palette must find a valid corner palette"
++    _, corner, orientation, n, r0, c0, pal_mask = best
++    return corner, orientation, int(n), int(r0), int(c0), pal_mask
++
++
++def _palette_mapping(g: np.ndarray, bg: int) -> tuple[dict[int, int], np.ndarray]:
++    """Return (mapping border->fill, palette_mask)."""
++    _, orientation, n, r0, c0, pal_mask = _best_palette(g, bg)
++
++    if orientation == "horizontal":
++        border_line = g[r0, c0 : c0 + n]
++        fill_line = g[r0 + 1, c0 : c0 + n]
++    else:
++        border_line = g[r0 : r0 + n, c0]
++        fill_line = g[r0 : r0 + n, c0 + 1]
++
++    mapping: dict[int, int] = {}
++    for b, f in zip(border_line.tolist(), fill_line.tolist(), strict=False):
++        mapping[int(b)] = int(f)
++    return mapping, pal_mask
++
++
++def _fill_enclosed_bg_regions(
++    out: np.ndarray, bg: int, mapping: dict[int, int], pal_mask: np.ndarray
++) -> None:
++    """Fill non-boundary bg holes using the dominant adjacent mapped border color."""
++    h, w = out.shape
++    bg_mask = (out == bg) & (~pal_mask)
++    for pts in components_mask(bg_mask, connectivity=4):
++        if any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts):
++            continue
++
++        adj_counts: dict[int, int] = {}
++        for r, c in pts:
++            for rr, cc in neighbors4(int(r), int(c)):
++                if 0 <= rr < h and 0 <= cc < w and not pal_mask[rr, cc]:
++                    v = int(out[rr, cc])
++                    if v != bg:
++                        adj_counts[v] = adj_counts.get(v, 0) + 1
++
++        border = None
++        best = -1
++        for color, cnt in adj_counts.items():
++            if color in mapping and cnt > best:
++                best = cnt
++                border = color
++        if border is None:
++            continue
++
++        fill = mapping[border]
++        for r, c in pts:
++            out[int(r), int(c)] = fill
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Fill hollow sprites by reading a corner palette that uses one fixed local direction.
++
++    Input structure:
++    - The background dominates the outer border.
++    - Several hollow single-color sprites sit away from the edges.
++    - One palette block is anchored flush to a grid corner. It is either 2xN or Nx2,
++      with no background cells inside it. Horizontal palettes always mean
++      "top row = border colors, bottom row = fill colors"; vertical palettes always
++      mean "left column = border colors, right column = fill colors".
++
++    Rule:
++    - Locate the palette among the four corners and decode the border->fill mapping
++      using the fixed local reading convention, not the global edge side.
++    - Find background regions that are enclosed away from the outer boundary.
++    - For each such region, inspect the surrounding sprite color; if that color is a
++      palette key, fill the region with the mapped palette value.
++
++    Key insight:
++    - The only positional challenge is identifying which corner contains the legend.
++      Once found, the palette is read in the same local orientation everywhere, so the
++      decisive step is matching each sprite border color to the palette key line.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++    mapping, pal_mask = _palette_mapping(g, bg)
++
++    out = g.copy()
++    _fill_enclosed_bg_regions(out, bg, mapping, pal_mask)
++    return out
++
++
++# --------------- generator (combo) ---------------
++
++_GRID_H_MIN, _GRID_H_MAX = 5, 13
++_GRID_W_MIN, _GRID_W_MAX = 10, 15
++
++_PALETTE_N_MIN, _PALETTE_N_MAX = 3, 4
++
++_SPRITE_H_MAX = 7
++_SPRITE_W_MAX = 6
++_SPRITE_DIM_SUM_CAP = 10
++_SPRITE_CELL_MAX = 16
++_FILLED_SPRITE_MAX = 3
++
++_P_HORIZ_WALL = 0.3
++_P_VERT_WALL = 0.3
++_P_BORDER_REMOVAL = 0.4
++_P_DIAMOND = 0.2
++
++_MAX_SHAPE_TRIES = 32
++_MAX_RETRIES = 400
++
++
++def _get_enclosed_holes(sprite: np.ndarray) -> list[np.ndarray]:
++    """Return point-arrays for bg components not touching the sprite boundary."""
++    h, w = sprite.shape
++    return [
++        pts
++        for pts in components_mask(~sprite, connectivity=4)
++        if not any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts)
++    ]
++
++
++def _make_diamond() -> np.ndarray:
++    s = np.zeros((3, 3), dtype=bool)
++    s[0, 1] = s[1, 0] = s[1, 2] = s[2, 1] = True
++    return s
++
++
++def _make_hollow_sprite(h: int, w: int, rng: random.Random) -> np.ndarray | None:
++    """Create a hollow sprite with at least one enclosed hole."""
++    sprite = np.ones((h, w), dtype=bool)
++    if h >= 3 and w >= 3:
++        sprite[1:-1, 1:-1] = False
++
++    if h >= 5 and w >= 4 and rng.random() < _P_HORIZ_WALL:
++        br = rng.randint(2, h - 2)
++        n = rng.randint(1, w - 2)
++        s = rng.randint(1, w - n - 1)
++        sprite[br, s : s + n] = True
++
++    if h >= 4 and w >= 5 and rng.random() < _P_VERT_WALL:
++        bc = rng.randint(2, w - 2)
++        n = rng.randint(1, h - 2)
++        s = rng.randint(1, h - n - 1)
++        sprite[s : s + n, bc] = True
++
++    if rng.random() < _P_BORDER_REMOVAL:
++        bcells = [
++            (r, c)
++            for r in range(h)
++            for c in range(w)
++            if sprite[r, c] and (r in (0, h - 1) or c in (0, w - 1))
++        ]
++        rng.shuffle(bcells)
++        for cr, cc in bcells[: rng.randint(1, min(4, len(bcells)))]:
++            test = sprite.copy()
++            test[cr, cc] = False
++            if _get_enclosed_holes(test):
++                sprite = test
++
++    if not _get_enclosed_holes(sprite) or int(sprite.sum()) > _SPRITE_CELL_MAX:
++        return None
++    return sprite
++
++
++def _sample_shape(max_sh: int, max_sw: int, rng: random.Random) -> np.ndarray | None:
++    for _ in range(_MAX_SHAPE_TRIES):
++        sh = rng.randint(3, max_sh)
++        sw = rng.randint(3, max_sw)
++        if sh + sw > _SPRITE_DIM_SUM_CAP:
++            sw = max(3, _SPRITE_DIM_SUM_CAP - sh)
++        if sh == 3 and sw == 3 and rng.random() < _P_DIAMOND:
++            return _make_diamond()
++        mask = _make_hollow_sprite(sh, sw, rng)
++        if mask is not None:
++            return mask
++    return None
++
++
++def _choose_colors(
++    rng: random.Random, n: int, num_filled: int
++) -> tuple[list[int], list[int], int, dict[int, int], list[int]]:
++    """Pick disjoint border/fill colors plus one distractor color."""
++    colors = list(range(1, 10))
++    rng.shuffle(colors)
++    border_keys = colors[:n]
++    fill_values = colors[n : 2 * n]
++    distractor_color = colors[2 * n]
++    mapping = dict(zip(border_keys, fill_values, strict=False))
++    filled_keys = rng.sample(border_keys, num_filled)
++    return border_keys, fill_values, distractor_color, mapping, filled_keys
++
++
++def _build_palette(orientation: str, border_keys: list[int], fill_values: list[int]) -> np.ndarray:
++    """Construct a palette using the fixed local reading direction."""
++    n = len(border_keys)
++    if orientation == "horizontal":
++        pal = np.zeros((2, n), dtype=int)
++        pal[0, :] = border_keys
++        pal[1, :] = fill_values
++    else:
++        pal = np.zeros((n, 2), dtype=int)
++        pal[:, 0] = border_keys
++        pal[:, 1] = fill_values
++    return pal
++
++
++def _place_palette(grid: np.ndarray, occ: np.ndarray, pal: np.ndarray, corner: str) -> None:
++    """Place palette flush to the selected corner and mark a 1-cell padding halo."""
++    h, w = grid.shape
++    ph, pw = pal.shape
++    r0 = 0 if corner.startswith("top") else h - ph
++    c0 = 0 if corner.endswith("left") else w - pw
++    grid[r0 : r0 + ph, c0 : c0 + pw] = pal
++    occ[max(0, r0 - 1) : min(h, r0 + ph + 1), max(0, c0 - 1) : min(w, c0 + pw + 1)] = True
++
++
++def _find_valid_positions(
++    h: int, w: int, occ: np.ndarray, mask: np.ndarray, holes: list[np.ndarray]
++) -> list[tuple[int, int]]:
++    """Find placements with padding and with all hole cells away from the boundary."""
++    sh, sw = mask.shape
++    positions = []
++    for r0 in range(h - sh + 1):
++        for c0 in range(w - sw + 1):
++            if occ[max(0, r0 - 1) : min(h, r0 + sh + 1), max(0, c0 - 1) : min(w, c0 + sw + 1)].any():
++                continue
++            if any(
++                r0 + hr == 0 or c0 + hc == 0 or r0 + hr == h - 1 or c0 + hc == w - 1
++                for hpts in holes
++                for hr, hc in hpts
++            ):
++                continue
++            positions.append((r0, c0))
++    return positions
++
++
++def _paint_sprite(
++    grid: np.ndarray,
++    r0: int,
++    c0: int,
++    mask: np.ndarray,
++    color: int,
++    fill: int | None,
++    holes: list[np.ndarray],
++) -> None:
++    """Render a sprite: border in `color`, optional hole fill in `fill`."""
++    grid[r0 : r0 + mask.shape[0], c0 : c0 + mask.shape[1]][mask] = color
++    if fill is not None:
++        for hpts in holes:
++            for hr, hc in hpts:
++                grid[r0 + int(hr), c0 + int(hc)] = fill
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    bg = 0
++
++    h = rng.randint(_GRID_H_MIN, _GRID_H_MAX)
++    w = rng.randint(_GRID_W_MIN, _GRID_W_MAX)
++    orientation = rng.choice(_ORIENTATIONS)
++    corner = rng.choice(_CORNERS)
++    n = rng.randint(_PALETTE_N_MIN, _PALETTE_N_MAX)
++
++    max_sh = min(_SPRITE_H_MAX, h)
++    max_sw = min(_SPRITE_W_MAX, w)
++
++    num_filled = rng.randint(1, min(_FILLED_SPRITE_MAX, n))
++    total_sprites = num_filled + 1
++
++    shapes = []
++    for _ in range(total_sprites):
++        mask = _sample_shape(max_sh, max_sw, rng)
++        if mask is None:
++            return None
++        shapes.append(mask)
++
++    border_keys, fill_values, distractor_color, mapping, filled_keys = _choose_colors(rng, n, num_filled)
++    pal = _build_palette(orientation, border_keys, fill_values)
++
++    grid = np.full((h, w), bg, dtype=int)
++    occ = np.zeros((h, w), dtype=bool)
++    _place_palette(grid, occ, pal, corner)
++
++    infos = []
++    for i, mask in enumerate(shapes):
++        if i < num_filled:
++            color = filled_keys[i]
++            fill = mapping[color]
++        else:
++            color = distractor_color
++            fill = None
++        infos.append((mask, color, fill))
++    infos.sort(key=lambda item: int(item[0].shape[0] * item[0].shape[1]), reverse=True)
++
++    placed = []
++    for mask, color, fill in infos:
++        holes = _get_enclosed_holes(mask)
++        positions = _find_valid_positions(h, w, occ, mask, holes)
++        if not positions:
++            return None
++        r0, c0 = rng.choice(positions)
++        _paint_sprite(grid, r0, c0, mask, color, fill, holes)
++        placed.append((r0, c0, mask, fill))
++        sh, sw = mask.shape
++        occ[max(0, r0 - 1) : min(h, r0 + sh + 1), max(0, c0 - 1) : min(w, c0 + sw + 1)] = True
++
++    output = grid.copy()
++    inp = grid.copy()
++    for r0, c0, mask, fill in placed:
++        if fill is None:
++            continue
++        for hpts in _get_enclosed_holes(mask):
++            for hr, hc in hpts:
++                inp[r0 + int(hr), c0 + int(hc)] = bg
++
++    border = np.concatenate([inp[0], inp[-1], inp[1:-1, 0], inp[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    if int(vals[cnts.argmax()]) != bg:
++        return None
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        pass
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(_MAX_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate input after {_MAX_RETRIES} attempts")
+
+ succeeded in 1508ms:
+samples 200
+edge_rule_disagreement 99 0.495
+layout_distribution
+('bottom_left', 'horizontal', 3) 16
+('bottom_left', 'horizontal', 4) 15
+('bottom_left', 'vertical', 3) 14
+('bottom_left', 'vertical', 4) 12
+('bottom_right', 'horizontal', 3) 10
+('bottom_right', 'horizontal', 4) 10
+('bottom_right', 'vertical', 3) 11
+('bottom_right', 'vertical', 4) 11
+('top_left', 'horizontal', 3) 17
+('top_left', 'horizontal', 4) 9
+('top_left', 'vertical', 3) 10
+('top_left', 'vertical', 4) 12
+('top_right', 'horizontal', 3) 10
+('top_right', 'horizontal', 4) 17
+('top_right', 'vertical', 3) 9
+('top_right', 'vertical', 4) 17
+
+diff --git a/ceshi/code_combo/dbff022c/33/code.py b/ceshi/code_combo/dbff022c/33/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..34c797ae3afca1e92ebc596ac50aee5e67ef0151
+--- /dev/null
++++ b/ceshi/code_combo/dbff022c/33/code.py
+@@ -0,0 +1,469 @@
++# Combo variant of dbff022c (index 33)
++# combo_spec: D2/0+D3/0
++# Name: 角落调色板 + 固定阅读方向
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, neighbors4
++
++
++# Design analysis for the fused variant
++# 1. Concrete behavior trace:
++#    A bottom-right horizontal palette now looks like:
++#      [2 3 4]
++#      [7 8 9]
++#    placed in the corner at rows H-2:H, cols W-3:W. The original task would
++#    read the outer bottom row as the border-key line, giving 7->2, 8->3, 9->4.
++#    This combo instead always reads a horizontal palette by local coordinates:
++#    top row = border keys, bottom row = fill values, left-to-right. So the same
++#    corner palette means 2->7, 3->8, 4->9. A sprite outlined with color 3 must
++#    therefore fill with 8, not remain empty and not map in reverse.
++# 2. Complexity calibration:
++#    Corner placement already increases search difficulty, so direction logic is
++#    simplified to a single local rule. To avoid ambiguous 2x2 corner blocks that
++#    could be parsed both horizontally and vertically, palette length is restricted
++#    to 3-4 entries. Border colors and fill colors are generated from disjoint sets,
++#    which makes the mapping legible and ensures fixed-direction cases differ from
++#    the original edge-dependent reading.
++# 3. Broken implicit assumptions from the seed solver:
++#    The seed code assumes the palette sits somewhere along one edge and that bottom
++#    and right palettes must be read "from the outside inward". That assumption is
++#    no longer valid. The new detector only inspects corner-anchored 2xN/Nx2 blocks
++#    and always interprets the first local row/column as border colors.
++# 4. Placement legality:
++#    The generator anchors the palette flush to one of the four corners, reserves a
++#    one-cell padding halo, and only places sprites in non-overlapping positions whose
++#    holes stay away from the global boundary. This keeps the palette and sprites
++#    visually separate and preserves the "enclosed hole" notion needed by the solver.
++# 5. Visual observability:
++#    The combination is human-visible because the palette is clearly in a corner and
++#    fixed-direction cases differ most strongly for bottom and right corners. Since
++#    border and fill colors are disjoint, reversing the readout would obviously fail
++#    to explain the filled interiors in those examples.
++# 6. Visual cleanliness:
++#    Only one palette exists, it has a bg moat around it, sprites are separated by at
++#    least one bg cell, and there is exactly one distractor sprite whose hole stays
++#    empty. This avoids layered clutter and keeps the mapping cue easy to spot.
++# 7. New solver assumptions audited against the generator:
++#    - `_best_palette` assumes the palette is corner-anchored, rectangular, all non-bg,
++#      and isolated from same-colored neighbors outside the palette. The generator
++#      guarantees each of these conditions.
++#    - `_fill_enclosed_bg_regions` assumes holes do not touch the outer boundary and
++#      their dominant adjacent color is the sprite border color. The sprite placement
++#      and output-first construction preserve that property.
++
++
++_CORNERS = ("top_left", "top_right", "bottom_left", "bottom_right")
++_ORIENTATIONS = ("horizontal", "vertical")
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _palette_bounds(
++    shape: tuple[int, int], corner: str, orientation: str, n: int
++) -> tuple[int, int, int, int]:
++    h, w = shape
++    if orientation == "horizontal":
++        ph, pw = 2, n
++        r0 = 0 if corner.startswith("top") else h - ph
++        c0 = 0 if corner.endswith("left") else w - pw
++    else:
++        ph, pw = n, 2
++        r0 = 0 if corner.startswith("top") else h - ph
++        c0 = 0 if corner.endswith("left") else w - pw
++    return int(r0), int(c0), int(ph), int(pw)
++
++
++def _isolated_palette(g: np.ndarray, bg: int, pal_mask: np.ndarray) -> bool:
++    """Palette colors must not 4-touch identical colors outside the palette."""
++    h, w = g.shape
++    for r, c in np.argwhere(pal_mask):
++        r = int(r)
++        c = int(c)
++        v = int(g[r, c])
++        if v == bg:
++            return False
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and not pal_mask[rr, cc]:
++                if int(g[rr, cc]) == v:
++                    return False
++    return True
++
++
++def _best_palette(g: np.ndarray, bg: int) -> tuple[str, str, int, int, int, np.ndarray]:
++    """
++    Find the corner-anchored 2xN or Nx2 palette block.
++
++    Returns (corner, orientation, n, r0, c0, pal_mask).
++    """
++    h, w = g.shape
++    best = None  # (score, corner, orientation, n, r0, c0, pal_mask)
++
++    for corner in _CORNERS:
++        for orientation in _ORIENTATIONS:
++            max_n = w if orientation == "horizontal" else h
++            for n in range(3, max_n + 1):
++                r0, c0, ph, pw = _palette_bounds((h, w), corner, orientation, n)
++                block = g[r0 : r0 + ph, c0 : c0 + pw]
++                if np.any(block == bg):
++                    continue
++
++                if orientation == "horizontal":
++                    border_line = [int(x) for x in block[0, :].tolist()]
++                    fill_line = [int(x) for x in block[1, :].tolist()]
++                else:
++                    border_line = [int(x) for x in block[:, 0].tolist()]
++                    fill_line = [int(x) for x in block[:, 1].tolist()]
++
++                if len(set(border_line)) != n or len(set(fill_line)) != n:
++                    continue
++
++                pal_mask = np.zeros((h, w), dtype=bool)
++                pal_mask[r0 : r0 + ph, c0 : c0 + pw] = True
++                if not _isolated_palette(g, bg, pal_mask):
++                    continue
++
++                score = (n, len(set(border_line) | set(fill_line)))
++                cand = (score, corner, orientation, n, r0, c0, pal_mask)
++                if best is None or cand[0] > best[0]:
++                    best = cand
++
++    assert best is not None, "_best_palette must find a valid corner palette"
++    _, corner, orientation, n, r0, c0, pal_mask = best
++    return corner, orientation, int(n), int(r0), int(c0), pal_mask
++
++
++def _palette_mapping(g: np.ndarray, bg: int) -> tuple[dict[int, int], np.ndarray]:
++    """Return (mapping border->fill, palette_mask)."""
++    _, orientation, n, r0, c0, pal_mask = _best_palette(g, bg)
++
++    if orientation == "horizontal":
++        border_line = g[r0, c0 : c0 + n]
++        fill_line = g[r0 + 1, c0 : c0 + n]
++    else:
++        border_line = g[r0 : r0 + n, c0]
++        fill_line = g[r0 : r0 + n, c0 + 1]
++
++    mapping: dict[int, int] = {}
++    for b, f in zip(border_line.tolist(), fill_line.tolist(), strict=False):
++        mapping[int(b)] = int(f)
++    return mapping, pal_mask
++
++
++def _fill_enclosed_bg_regions(
++    out: np.ndarray, bg: int, mapping: dict[int, int], pal_mask: np.ndarray
++) -> None:
++    """Fill non-boundary bg holes using the dominant adjacent mapped border color."""
++    h, w = out.shape
++    bg_mask = (out == bg) & (~pal_mask)
++    for pts in components_mask(bg_mask, connectivity=4):
++        if any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts):
++            continue
++
++        adj_counts: dict[int, int] = {}
++        for r, c in pts:
++            for rr, cc in neighbors4(int(r), int(c)):
++                if 0 <= rr < h and 0 <= cc < w and not pal_mask[rr, cc]:
++                    v = int(out[rr, cc])
++                    if v != bg:
++                        adj_counts[v] = adj_counts.get(v, 0) + 1
++
++        border = None
++        best = -1
++        for color, cnt in adj_counts.items():
++            if color in mapping and cnt > best:
++                best = cnt
++                border = color
++        if border is None:
++            continue
++
++        fill = mapping[border]
++        for r, c in pts:
++            out[int(r), int(c)] = fill
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Fill hollow sprites by reading a corner palette that uses one fixed local direction.
++
++    Input structure:
++    - The background dominates the outer border.
++    - Several hollow single-color sprites sit away from the edges.
++    - One palette block is anchored flush to a grid corner. It is either 2xN or Nx2,
++      with no background cells inside it. Horizontal palettes always mean
++      "top row = border colors, bottom row = fill colors"; vertical palettes always
++      mean "left column = border colors, right column = fill colors".
++
++    Rule:
++    - Locate the palette among the four corners and decode the border->fill mapping
++      using the fixed local reading convention, not the global edge side.
++    - Find background regions that are enclosed away from the outer boundary.
++    - For each such region, inspect the surrounding sprite color; if that color is a
++      palette key, fill the region with the mapped palette value.
++
++    Key insight:
++    - The only positional challenge is identifying which corner contains the legend.
++      Once found, the palette is read in the same local orientation everywhere, so the
++      decisive step is matching each sprite border color to the palette key line.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++    mapping, pal_mask = _palette_mapping(g, bg)
++
++    out = g.copy()
++    _fill_enclosed_bg_regions(out, bg, mapping, pal_mask)
++    return out
++
++
++# --------------- generator (combo) ---------------
++
++_GRID_H_MIN, _GRID_H_MAX = 5, 13
++_GRID_W_MIN, _GRID_W_MAX = 10, 15
++
++_PALETTE_N_MIN, _PALETTE_N_MAX = 3, 4
++
++_SPRITE_H_MAX = 7
++_SPRITE_W_MAX = 6
++_SPRITE_DIM_SUM_CAP = 10
++_SPRITE_CELL_MAX = 16
++_FILLED_SPRITE_MAX = 3
++
++_P_HORIZ_WALL = 0.3
++_P_VERT_WALL = 0.3
++_P_BORDER_REMOVAL = 0.4
++_P_DIAMOND = 0.2
++
++_MAX_SHAPE_TRIES = 32
++_MAX_RETRIES = 400
++
++
++def _get_enclosed_holes(sprite: np.ndarray) -> list[np.ndarray]:
++    """Return point-arrays for bg components not touching the sprite boundary."""
++    h, w = sprite.shape
++    return [
++        pts
++        for pts in components_mask(~sprite, connectivity=4)
++        if not any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts)
++    ]
++
++
++def _make_diamond() -> np.ndarray:
++    s = np.zeros((3, 3), dtype=bool)
++    s[0, 1] = s[1, 0] = s[1, 2] = s[2, 1] = True
++    return s
++
++
++def _make_hollow_sprite(h: int, w: int, rng: random.Random) -> np.ndarray | None:
++    """Create a hollow sprite with at least one enclosed hole."""
++    sprite = np.ones((h, w), dtype=bool)
++    if h >= 3 and w >= 3:
++        sprite[1:-1, 1:-1] = False
++
++    if h >= 5 and w >= 4 and rng.random() < _P_HORIZ_WALL:
++        br = rng.randint(2, h - 2)
++        n = rng.randint(1, w - 2)
++        s = rng.randint(1, w - n - 1)
++        sprite[br, s : s + n] = True
++
++    if h >= 4 and w >= 5 and rng.random() < _P_VERT_WALL:
++        bc = rng.randint(2, w - 2)
++        n = rng.randint(1, h - 2)
++        s = rng.randint(1, h - n - 1)
++        sprite[s : s + n, bc] = True
++
++    if rng.random() < _P_BORDER_REMOVAL:
++        bcells = [
++            (r, c)
++            for r in range(h)
++            for c in range(w)
++            if sprite[r, c] and (r in (0, h - 1) or c in (0, w - 1))
++        ]
++        rng.shuffle(bcells)
++        for cr, cc in bcells[: rng.randint(1, min(4, len(bcells)))]:
++            test = sprite.copy()
++            test[cr, cc] = False
++            if _get_enclosed_holes(test):
++                sprite = test
++
++    if not _get_enclosed_holes(sprite) or int(sprite.sum()) > _SPRITE_CELL_MAX:
++        return None
++    return sprite
++
++
++def _sample_shape(max_sh: int, max_sw: int, rng: random.Random) -> np.ndarray | None:
++    for _ in range(_MAX_SHAPE_TRIES):
++        sh = rng.randint(3, max_sh)
++        sw = rng.randint(3, max_sw)
++        if sh + sw > _SPRITE_DIM_SUM_CAP:
++            sw = max(3, _SPRITE_DIM_SUM_CAP - sh)
++        if sh == 3 and sw == 3 and rng.random() < _P_DIAMOND:
++            return _make_diamond()
++        mask = _make_hollow_sprite(sh, sw, rng)
++        if mask is not None:
++            return mask
++    return None
++
++
++def _choose_colors(
++    rng: random.Random, n: int, num_filled: int
++) -> tuple[list[int], list[int], int, dict[int, int], list[int]]:
++    """Pick disjoint border/fill colors plus one distractor color."""
++    colors = list(range(1, 10))
++    rng.shuffle(colors)
++    border_keys = colors[:n]
++    fill_values = colors[n : 2 * n]
++    distractor_color = colors[2 * n]
++    mapping = dict(zip(border_keys, fill_values, strict=False))
++    filled_keys = rng.sample(border_keys, num_filled)
++    return border_keys, fill_values, distractor_color, mapping, filled_keys
++
++
++def _build_palette(orientation: str, border_keys: list[int], fill_values: list[int]) -> np.ndarray:
++    """Construct a palette using the fixed local reading direction."""
++    n = len(border_keys)
++    if orientation == "horizontal":
++        pal = np.zeros((2, n), dtype=int)
++        pal[0, :] = border_keys
++        pal[1, :] = fill_values
++    else:
++        pal = np.zeros((n, 2), dtype=int)
++        pal[:, 0] = border_keys
++        pal[:, 1] = fill_values
++    return pal
++
++
++def _place_palette(grid: np.ndarray, occ: np.ndarray, pal: np.ndarray, corner: str) -> None:
++    """Place palette flush to the selected corner and mark a 1-cell padding halo."""
++    h, w = grid.shape
++    ph, pw = pal.shape
++    r0 = 0 if corner.startswith("top") else h - ph
++    c0 = 0 if corner.endswith("left") else w - pw
++    grid[r0 : r0 + ph, c0 : c0 + pw] = pal
++    occ[max(0, r0 - 1) : min(h, r0 + ph + 1), max(0, c0 - 1) : min(w, c0 + pw + 1)] = True
++
++
++def _find_valid_positions(
++    h: int, w: int, occ: np.ndarray, mask: np.ndarray, holes: list[np.ndarray]
++) -> list[tuple[int, int]]:
++    """Find placements with padding and with all hole cells away from the boundary."""
++    sh, sw = mask.shape
++    positions = []
++    for r0 in range(h - sh + 1):
++        for c0 in range(w - sw + 1):
++            if occ[max(0, r0 - 1) : min(h, r0 + sh + 1), max(0, c0 - 1) : min(w, c0 + sw + 1)].any():
++                continue
++            if any(
++                r0 + hr == 0 or c0 + hc == 0 or r0 + hr == h - 1 or c0 + hc == w - 1
++                for hpts in holes
++                for hr, hc in hpts
++            ):
++                continue
++            positions.append((r0, c0))
++    return positions
++
++
++def _paint_sprite(
++    grid: np.ndarray,
++    r0: int,
++    c0: int,
++    mask: np.ndarray,
++    color: int,
++    fill: int | None,
++    holes: list[np.ndarray],
++) -> None:
++    """Render a sprite: border in `color`, optional hole fill in `fill`."""
++    grid[r0 : r0 + mask.shape[0], c0 : c0 + mask.shape[1]][mask] = color
++    if fill is not None:
++        for hpts in holes:
++            for hr, hc in hpts:
++                grid[r0 + int(hr), c0 + int(hc)] = fill
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    bg = 0
++
++    h = rng.randint(_GRID_H_MIN, _GRID_H_MAX)
++    w = rng.randint(_GRID_W_MIN, _GRID_W_MAX)
++    orientation = rng.choice(_ORIENTATIONS)
++    corner = rng.choice(_CORNERS)
++    n = rng.randint(_PALETTE_N_MIN, _PALETTE_N_MAX)
++
++    max_sh = min(_SPRITE_H_MAX, h)
++    max_sw = min(_SPRITE_W_MAX, w)
++
++    num_filled = rng.randint(1, min(_FILLED_SPRITE_MAX, n))
++    total_sprites = num_filled + 1
++
++    shapes = []
++    for _ in range(total_sprites):
++        mask = _sample_shape(max_sh, max_sw, rng)
++        if mask is None:
++            return None
++        shapes.append(mask)
++
++    border_keys, fill_values, distractor_color, mapping, filled_keys = _choose_colors(rng, n, num_filled)
++    pal = _build_palette(orientation, border_keys, fill_values)
++
++    grid = np.full((h, w), bg, dtype=int)
++    occ = np.zeros((h, w), dtype=bool)
++    _place_palette(grid, occ, pal, corner)
++
++    infos = []
++    for i, mask in enumerate(shapes):
++        if i < num_filled:
++            color = filled_keys[i]
++            fill = mapping[color]
++        else:
++            color = distractor_color
++            fill = None
++        infos.append((mask, color, fill))
++    infos.sort(key=lambda item: int(item[0].shape[0] * item[0].shape[1]), reverse=True)
++
++    placed = []
++    for mask, color, fill in infos:
++        holes = _get_enclosed_holes(mask)
++        positions = _find_valid_positions(h, w, occ, mask, holes)
++        if not positions:
++            return None
++        r0, c0 = rng.choice(positions)
++        _paint_sprite(grid, r0, c0, mask, color, fill, holes)
++        placed.append((r0, c0, mask, fill))
++        sh, sw = mask.shape
++        occ[max(0, r0 - 1) : min(h, r0 + sh + 1), max(0, c0 - 1) : min(w, c0 + sw + 1)] = True
++
++    output = grid.copy()
++    inp = grid.copy()
++    for r0, c0, mask, fill in placed:
++        if fill is None:
++            continue
++        for hpts in _get_enclosed_holes(mask):
++            for hr, hc in hpts:
++                inp[r0 + int(hr), c0 + int(hc)] = bg
++
++    border = np.concatenate([inp[0], inp[-1], inp[1:-1, 0], inp[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    if int(vals[cnts.argmax()]) != bg:
++        return None
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        pass
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(_MAX_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate input after {_MAX_RETRIES} attempts")
+
+codex
+已完成，代码保存在 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dbff022c/33/code.py)。
+
+这个融合版把原题改成了“四角锚定调色板 + 固定局部读取方向”：
+横向调色板始终按“上行=边框色、下行=填充色”读取，纵向调色板始终按“左列=边框色、右列=填充色”读取，不再随所在边/角反转。为避免角落里的 `2x2` 横竖歧义，我把调色板长度收紧到 `3-4`，并让边框色与填充色集合分离，这样底角/右角样例会明显区别于原规则。
+
+验证结果：
+- 50 次生成稳定性测试：`Success: 50/50`
+- 退化检查：对 200 个样本，若误用原题“随边缘反转”的读取规则，有 `99/200 = 49.5%` 的样本会得到不同输出
+- 布局覆盖：四个角、横纵两种朝向、`N=3/4` 都实际出现，没有退化成单一角落或单一朝向
+
+如果你要，我可以再补一份这个融合版相对原版的逐函数 diff 说明。
+diff --git a/ceshi/code_combo/dbff022c/33/code.py b/ceshi/code_combo/dbff022c/33/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..34c797ae3afca1e92ebc596ac50aee5e67ef0151
+--- /dev/null
++++ b/ceshi/code_combo/dbff022c/33/code.py
+@@ -0,0 +1,469 @@
++# Combo variant of dbff022c (index 33)
++# combo_spec: D2/0+D3/0
++# Name: 角落调色板 + 固定阅读方向
++
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, neighbors4
++
++
++# Design analysis for the fused variant
++# 1. Concrete behavior trace:
++#    A bottom-right horizontal palette now looks like:
++#      [2 3 4]
++#      [7 8 9]
++#    placed in the corner at rows H-2:H, cols W-3:W. The original task would
++#    read the outer bottom row as the border-key line, giving 7->2, 8->3, 9->4.
++#    This combo instead always reads a horizontal palette by local coordinates:
++#    top row = border keys, bottom row = fill values, left-to-right. So the same
++#    corner palette means 2->7, 3->8, 4->9. A sprite outlined with color 3 must
++#    therefore fill with 8, not remain empty and not map in reverse.
++# 2. Complexity calibration:
++#    Corner placement already increases search difficulty, so direction logic is
++#    simplified to a single local rule. To avoid ambiguous 2x2 corner blocks that
++#    could be parsed both horizontally and vertically, palette length is restricted
++#    to 3-4 entries. Border colors and fill colors are generated from disjoint sets,
++#    which makes the mapping legible and ensures fixed-direction cases differ from
++#    the original edge-dependent reading.
++# 3. Broken implicit assumptions from the seed solver:
++#    The seed code assumes the palette sits somewhere along one edge and that bottom
++#    and right palettes must be read "from the outside inward". That assumption is
++#    no longer valid. The new detector only inspects corner-anchored 2xN/Nx2 blocks
++#    and always interprets the first local row/column as border colors.
++# 4. Placement legality:
++#    The generator anchors the palette flush to one of the four corners, reserves a
++#    one-cell padding halo, and only places sprites in non-overlapping positions whose
++#    holes stay away from the global boundary. This keeps the palette and sprites
++#    visually separate and preserves the "enclosed hole" notion needed by the solver.
++# 5. Visual observability:
++#    The combination is human-visible because the palette is clearly in a corner and
++#    fixed-direction cases differ most strongly for bottom and right corners. Since
++#    border and fill colors are disjoint, reversing the readout would obviously fail
++#    to explain the filled interiors in those examples.
++# 6. Visual cleanliness:
++#    Only one palette exists, it has a bg moat around it, sprites are separated by at
++#    least one bg cell, and there is exactly one distractor sprite whose hole stays
++#    empty. This avoids layered clutter and keeps the mapping cue easy to spot.
++# 7. New solver assumptions audited against the generator:
++#    - `_best_palette` assumes the palette is corner-anchored, rectangular, all non-bg,
++#      and isolated from same-colored neighbors outside the palette. The generator
++#      guarantees each of these conditions.
++#    - `_fill_enclosed_bg_regions` assumes holes do not touch the outer boundary and
++#      their dominant adjacent color is the sprite border color. The sprite placement
++#      and output-first construction preserve that property.
++
++
++_CORNERS = ("top_left", "top_right", "bottom_left", "bottom_right")
++_ORIENTATIONS = ("horizontal", "vertical")
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _palette_bounds(
++    shape: tuple[int, int], corner: str, orientation: str, n: int
++) -> tuple[int, int, int, int]:
++    h, w = shape
++    if orientation == "horizontal":
++        ph, pw = 2, n
++        r0 = 0 if corner.startswith("top") else h - ph
++        c0 = 0 if corner.endswith("left") else w - pw
++    else:
++        ph, pw = n, 2
++        r0 = 0 if corner.startswith("top") else h - ph
++        c0 = 0 if corner.endswith("left") else w - pw
++    return int(r0), int(c0), int(ph), int(pw)
++
++
++def _isolated_palette(g: np.ndarray, bg: int, pal_mask: np.ndarray) -> bool:
++    """Palette colors must not 4-touch identical colors outside the palette."""
++    h, w = g.shape
++    for r, c in np.argwhere(pal_mask):
++        r = int(r)
++        c = int(c)
++        v = int(g[r, c])
++        if v == bg:
++            return False
++        for rr, cc in neighbors4(r, c):
++            if 0 <= rr < h and 0 <= cc < w and not pal_mask[rr, cc]:
++                if int(g[rr, cc]) == v:
++                    return False
++    return True
++
++
++def _best_palette(g: np.ndarray, bg: int) -> tuple[str, str, int, int, int, np.ndarray]:
++    """
++    Find the corner-anchored 2xN or Nx2 palette block.
++
++    Returns (corner, orientation, n, r0, c0, pal_mask).
++    """
++    h, w = g.shape
++    best = None  # (score, corner, orientation, n, r0, c0, pal_mask)
++
++    for corner in _CORNERS:
++        for orientation in _ORIENTATIONS:
++            max_n = w if orientation == "horizontal" else h
++            for n in range(3, max_n + 1):
++                r0, c0, ph, pw = _palette_bounds((h, w), corner, orientation, n)
++                block = g[r0 : r0 + ph, c0 : c0 + pw]
++                if np.any(block == bg):
++                    continue
++
++                if orientation == "horizontal":
++                    border_line = [int(x) for x in block[0, :].tolist()]
++                    fill_line = [int(x) for x in block[1, :].tolist()]
++                else:
++                    border_line = [int(x) for x in block[:, 0].tolist()]
++                    fill_line = [int(x) for x in block[:, 1].tolist()]
++
++                if len(set(border_line)) != n or len(set(fill_line)) != n:
++                    continue
++
++                pal_mask = np.zeros((h, w), dtype=bool)
++                pal_mask[r0 : r0 + ph, c0 : c0 + pw] = True
++                if not _isolated_palette(g, bg, pal_mask):
++                    continue
++
++                score = (n, len(set(border_line) | set(fill_line)))
++                cand = (score, corner, orientation, n, r0, c0, pal_mask)
++                if best is None or cand[0] > best[0]:
++                    best = cand
++
++    assert best is not None, "_best_palette must find a valid corner palette"
++    _, corner, orientation, n, r0, c0, pal_mask = best
++    return corner, orientation, int(n), int(r0), int(c0), pal_mask
++
++
++def _palette_mapping(g: np.ndarray, bg: int) -> tuple[dict[int, int], np.ndarray]:
++    """Return (mapping border->fill, palette_mask)."""
++    _, orientation, n, r0, c0, pal_mask = _best_palette(g, bg)
++
++    if orientation == "horizontal":
++        border_line = g[r0, c0 : c0 + n]
++        fill_line = g[r0 + 1, c0 : c0 + n]
++    else:
++        border_line = g[r0 : r0 + n, c0]
++        fill_line = g[r0 : r0 + n, c0 + 1]
++
++    mapping: dict[int, int] = {}
++    for b, f in zip(border_line.tolist(), fill_line.tolist(), strict=False):
++        mapping[int(b)] = int(f)
++    return mapping, pal_mask
++
++
++def _fill_enclosed_bg_regions(
++    out: np.ndarray, bg: int, mapping: dict[int, int], pal_mask: np.ndarray
++) -> None:
++    """Fill non-boundary bg holes using the dominant adjacent mapped border color."""
++    h, w = out.shape
++    bg_mask = (out == bg) & (~pal_mask)
++    for pts in components_mask(bg_mask, connectivity=4):
++        if any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts):
++            continue
++
++        adj_counts: dict[int, int] = {}
++        for r, c in pts:
++            for rr, cc in neighbors4(int(r), int(c)):
++                if 0 <= rr < h and 0 <= cc < w and not pal_mask[rr, cc]:
++                    v = int(out[rr, cc])
++                    if v != bg:
++                        adj_counts[v] = adj_counts.get(v, 0) + 1
++
++        border = None
++        best = -1
++        for color, cnt in adj_counts.items():
++            if color in mapping and cnt > best:
++                best = cnt
++                border = color
++        if border is None:
++            continue
++
++        fill = mapping[border]
++        for r, c in pts:
++            out[int(r), int(c)] = fill
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Fill hollow sprites by reading a corner palette that uses one fixed local direction.
++
++    Input structure:
++    - The background dominates the outer border.
++    - Several hollow single-color sprites sit away from the edges.
++    - One palette block is anchored flush to a grid corner. It is either 2xN or Nx2,
++      with no background cells inside it. Horizontal palettes always mean
++      "top row = border colors, bottom row = fill colors"; vertical palettes always
++      mean "left column = border colors, right column = fill colors".
++
++    Rule:
++    - Locate the palette among the four corners and decode the border->fill mapping
++      using the fixed local reading convention, not the global edge side.
++    - Find background regions that are enclosed away from the outer boundary.
++    - For each such region, inspect the surrounding sprite color; if that color is a
++      palette key, fill the region with the mapped palette value.
++
++    Key insight:
++    - The only positional challenge is identifying which corner contains the legend.
++      Once found, the palette is read in the same local orientation everywhere, so the
++      decisive step is matching each sprite border color to the palette key line.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++    mapping, pal_mask = _palette_mapping(g, bg)
++
++    out = g.copy()
++    _fill_enclosed_bg_regions(out, bg, mapping, pal_mask)
++    return out
++
++
++# --------------- generator (combo) ---------------
++
++_GRID_H_MIN, _GRID_H_MAX = 5, 13
++_GRID_W_MIN, _GRID_W_MAX = 10, 15
++
++_PALETTE_N_MIN, _PALETTE_N_MAX = 3, 4
++
++_SPRITE_H_MAX = 7
++_SPRITE_W_MAX = 6
++_SPRITE_DIM_SUM_CAP = 10
++_SPRITE_CELL_MAX = 16
++_FILLED_SPRITE_MAX = 3
++
++_P_HORIZ_WALL = 0.3
++_P_VERT_WALL = 0.3
++_P_BORDER_REMOVAL = 0.4
++_P_DIAMOND = 0.2
++
++_MAX_SHAPE_TRIES = 32
++_MAX_RETRIES = 400
++
++
++def _get_enclosed_holes(sprite: np.ndarray) -> list[np.ndarray]:
++    """Return point-arrays for bg components not touching the sprite boundary."""
++    h, w = sprite.shape
++    return [
++        pts
++        for pts in components_mask(~sprite, connectivity=4)
++        if not any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts)
++    ]
++
++
++def _make_diamond() -> np.ndarray:
++    s = np.zeros((3, 3), dtype=bool)
++    s[0, 1] = s[1, 0] = s[1, 2] = s[2, 1] = True
++    return s
++
++
++def _make_hollow_sprite(h: int, w: int, rng: random.Random) -> np.ndarray | None:
++    """Create a hollow sprite with at least one enclosed hole."""
++    sprite = np.ones((h, w), dtype=bool)
++    if h >= 3 and w >= 3:
++        sprite[1:-1, 1:-1] = False
++
++    if h >= 5 and w >= 4 and rng.random() < _P_HORIZ_WALL:
++        br = rng.randint(2, h - 2)
++        n = rng.randint(1, w - 2)
++        s = rng.randint(1, w - n - 1)
++        sprite[br, s : s + n] = True
++
++    if h >= 4 and w >= 5 and rng.random() < _P_VERT_WALL:
++        bc = rng.randint(2, w - 2)
++        n = rng.randint(1, h - 2)
++        s = rng.randint(1, h - n - 1)
++        sprite[s : s + n, bc] = True
++
++    if rng.random() < _P_BORDER_REMOVAL:
++        bcells = [
++            (r, c)
++            for r in range(h)
++            for c in range(w)
++            if sprite[r, c] and (r in (0, h - 1) or c in (0, w - 1))
++        ]
++        rng.shuffle(bcells)
++        for cr, cc in bcells[: rng.randint(1, min(4, len(bcells)))]:
++            test = sprite.copy()
++            test[cr, cc] = False
++            if _get_enclosed_holes(test):
++                sprite = test
++
++    if not _get_enclosed_holes(sprite) or int(sprite.sum()) > _SPRITE_CELL_MAX:
++        return None
++    return sprite
++
++
++def _sample_shape(max_sh: int, max_sw: int, rng: random.Random) -> np.ndarray | None:
++    for _ in range(_MAX_SHAPE_TRIES):
++        sh = rng.randint(3, max_sh)
++        sw = rng.randint(3, max_sw)
++        if sh + sw > _SPRITE_DIM_SUM_CAP:
++            sw = max(3, _SPRITE_DIM_SUM_CAP - sh)
++        if sh == 3 and sw == 3 and rng.random() < _P_DIAMOND:
++            return _make_diamond()
++        mask = _make_hollow_sprite(sh, sw, rng)
++        if mask is not None:
++            return mask
++    return None
++
++
++def _choose_colors(
++    rng: random.Random, n: int, num_filled: int
++) -> tuple[list[int], list[int], int, dict[int, int], list[int]]:
++    """Pick disjoint border/fill colors plus one distractor color."""
++    colors = list(range(1, 10))
++    rng.shuffle(colors)
++    border_keys = colors[:n]
++    fill_values = colors[n : 2 * n]
++    distractor_color = colors[2 * n]
++    mapping = dict(zip(border_keys, fill_values, strict=False))
++    filled_keys = rng.sample(border_keys, num_filled)
++    return border_keys, fill_values, distractor_color, mapping, filled_keys
++
++
++def _build_palette(orientation: str, border_keys: list[int], fill_values: list[int]) -> np.ndarray:
++    """Construct a palette using the fixed local reading direction."""
++    n = len(border_keys)
++    if orientation == "horizontal":
++        pal = np.zeros((2, n), dtype=int)
++        pal[0, :] = border_keys
++        pal[1, :] = fill_values
++    else:
++        pal = np.zeros((n, 2), dtype=int)
++        pal[:, 0] = border_keys
++        pal[:, 1] = fill_values
++    return pal
++
++
++def _place_palette(grid: np.ndarray, occ: np.ndarray, pal: np.ndarray, corner: str) -> None:
++    """Place palette flush to the selected corner and mark a 1-cell padding halo."""
++    h, w = grid.shape
++    ph, pw = pal.shape
++    r0 = 0 if corner.startswith("top") else h - ph
++    c0 = 0 if corner.endswith("left") else w - pw
++    grid[r0 : r0 + ph, c0 : c0 + pw] = pal
++    occ[max(0, r0 - 1) : min(h, r0 + ph + 1), max(0, c0 - 1) : min(w, c0 + pw + 1)] = True
++
++
++def _find_valid_positions(
++    h: int, w: int, occ: np.ndarray, mask: np.ndarray, holes: list[np.ndarray]
++) -> list[tuple[int, int]]:
++    """Find placements with padding and with all hole cells away from the boundary."""
++    sh, sw = mask.shape
++    positions = []
++    for r0 in range(h - sh + 1):
++        for c0 in range(w - sw + 1):
++            if occ[max(0, r0 - 1) : min(h, r0 + sh + 1), max(0, c0 - 1) : min(w, c0 + sw + 1)].any():
++                continue
++            if any(
++                r0 + hr == 0 or c0 + hc == 0 or r0 + hr == h - 1 or c0 + hc == w - 1
++                for hpts in holes
++                for hr, hc in hpts
++            ):
++                continue
++            positions.append((r0, c0))
++    return positions
++
++
++def _paint_sprite(
++    grid: np.ndarray,
++    r0: int,
++    c0: int,
++    mask: np.ndarray,
++    color: int,
++    fill: int | None,
++    holes: list[np.ndarray],
++) -> None:
++    """Render a sprite: border in `color`, optional hole fill in `fill`."""
++    grid[r0 : r0 + mask.shape[0], c0 : c0 + mask.shape[1]][mask] = color
++    if fill is not None:
++        for hpts in holes:
++            for hr, hc in hpts:
++                grid[r0 + int(hr), c0 + int(hc)] = fill
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    bg = 0
++
++    h = rng.randint(_GRID_H_MIN, _GRID_H_MAX)
++    w = rng.randint(_GRID_W_MIN, _GRID_W_MAX)
++    orientation = rng.choice(_ORIENTATIONS)
++    corner = rng.choice(_CORNERS)
++    n = rng.randint(_PALETTE_N_MIN, _PALETTE_N_MAX)
++
++    max_sh = min(_SPRITE_H_MAX, h)
++    max_sw = min(_SPRITE_W_MAX, w)
++
++    num_filled = rng.randint(1, min(_FILLED_SPRITE_MAX, n))
++    total_sprites = num_filled + 1
++
++    shapes = []
++    for _ in range(total_sprites):
++        mask = _sample_shape(max_sh, max_sw, rng)
++        if mask is None:
++            return None
++        shapes.append(mask)
++
++    border_keys, fill_values, distractor_color, mapping, filled_keys = _choose_colors(rng, n, num_filled)
++    pal = _build_palette(orientation, border_keys, fill_values)
++
++    grid = np.full((h, w), bg, dtype=int)
++    occ = np.zeros((h, w), dtype=bool)
++    _place_palette(grid, occ, pal, corner)
++
++    infos = []
++    for i, mask in enumerate(shapes):
++        if i < num_filled:
++            color = filled_keys[i]
++            fill = mapping[color]
++        else:
++            color = distractor_color
++            fill = None
++        infos.append((mask, color, fill))
++    infos.sort(key=lambda item: int(item[0].shape[0] * item[0].shape[1]), reverse=True)
++
++    placed = []
++    for mask, color, fill in infos:
++        holes = _get_enclosed_holes(mask)
++        positions = _find_valid_positions(h, w, occ, mask, holes)
++        if not positions:
++            return None
++        r0, c0 = rng.choice(positions)
++        _paint_sprite(grid, r0, c0, mask, color, fill, holes)
++        placed.append((r0, c0, mask, fill))
++        sh, sw = mask.shape
++        occ[max(0, r0 - 1) : min(h, r0 + sh + 1), max(0, c0 - 1) : min(w, c0 + sw + 1)] = True
++
++    output = grid.copy()
++    inp = grid.copy()
++    for r0, c0, mask, fill in placed:
++        if fill is None:
++            continue
++        for hpts in _get_enclosed_holes(mask):
++            for hr, hc in hpts:
++                inp[r0 + int(hr), c0 + int(hc)] = bg
++
++    border = np.concatenate([inp[0], inp[-1], inp[1:-1, 0], inp[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    if int(vals[cnts.argmax()]) != bg:
++        return None
++
++    try:
++        if np.array_equal(main(inp), output):
++            return inp
++    except Exception:
++        pass
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(_MAX_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            return result
++    raise RuntimeError(f"Failed to generate input after {_MAX_RETRIES} attempts")
+
+tokens used
+68,012
+已完成，代码保存在 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dbff022c/33/code.py)。
+
+这个融合版把原题改成了“四角锚定调色板 + 固定局部读取方向”：
+横向调色板始终按“上行=边框色、下行=填充色”读取，纵向调色板始终按“左列=边框色、右列=填充色”读取，不再随所在边/角反转。为避免角落里的 `2x2` 横竖歧义，我把调色板长度收紧到 `3-4`，并让边框色与填充色集合分离，这样底角/右角样例会明显区别于原规则。
+
+验证结果：
+- 50 次生成稳定性测试：`Success: 50/50`
+- 退化检查：对 200 个样本，若误用原题“随边缘反转”的读取规则，有 `99/200 = 49.5%` 的样本会得到不同输出
+- 布局覆盖：四个角、横纵两种朝向、`N=3/4` 都实际出现，没有退化成单一角落或单一朝向
+
+如果你要，我可以再补一份这个融合版相对原版的逐函数 diff 说明。

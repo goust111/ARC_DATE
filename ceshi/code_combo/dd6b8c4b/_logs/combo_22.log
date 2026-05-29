@@ -1,0 +1,3173 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: high
+reasoning summaries: none
+session id: 019e3512-5303-72f2-b9e0-8fca3c123878
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: dd6b8c4b
+    **摘要**: 通过橙色背景从绿色方块进行flood-fill可达性检测，收集可达的栗色像素，按距离排序后以行优先顺序填入绿色方块内部
+
+    ## 要实现的融合组合
+    - **组合名称**: 边缘像素作为源+方块位于角落
+    - **combo_spec**: D5/2+D14/1
+
+    ### 融合描述（实现规格）
+
+    被收集的像素限定在网格边缘（D5/2），方块不在中心而偏向角落（D14/1）。方块偏角落使得不同边缘的可达性高度不对称——靠近方块角落的边缘更容易可达，远端边缘可能被墙壁完全阻隔。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D5/2** — 源对象（被收集的对象） (`src`)
+  - 当前值: 栗色（maroon/9）散布像素——散落在网格各处的单个栗色像素，作为被收集的目标
+  - 改为: 网格边缘像素作为源 — 被收集的像素限定在网格边缘（第一/最后行列），而非散布在整个网格中。这限制了源的空间分布，使可达性判断更有规律性。
+  - 来源: control_pixels（参考任务: 4a21e3da）
+- **D14/1** — 品红框架与方块的空间关系 (`obstacle`)
+  - 当前值: 品红框架紧邻绿色方块外侧，形成围绕方块的边界结构，框架与方块之间无间隔
+  - 改为: 方块位于框架角落（非中心） — 绿色方块不在品红框架的中心位置，而是偏向某个角落。这使得不同方向的可达性不对称，解题者需要考虑方块位置对收集结果的影响。
+  - 来源: creative（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/dd6b8c4b.py`
+
+    ```python
+    import numpy as np
+
+from arc_utils import neighbors4
+import random
+from collections import deque
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Move the closest reachable maroon pixels into the 3×3 block around the unique red center.
+
+    Input structure:
+    - bg = orange floor, magenta walls, scattered maroon (9) pixels.
+    - A unique red (2) pixel marks the center of a 3×3 destination block.
+
+    Rule:
+    - Maroon pixels connected to the destination through floor/maroon cells (not blocked by walls) are candidates.
+    - Rank candidates by distance to the destination; the closest ones fill the block in row-major order.
+    - Moved maroons are erased (replaced with floor color).
+
+    Key insight: Wall barriers restrict connectivity — only maroon pixels reachable via flood-fill through the floor qualify, so proximity alone isn't enough.
+    """
+
+    grid = np.asarray(grid, dtype=int)
+    h, w = grid.shape
+    out = grid.copy()
+
+    centers = np.argwhere(grid == 2)
+    assert len(centers) == 1, "grid must have exactly one red (2) center pixel"
+    cr, cc = map(int, centers[0])
+
+    # Destination = 3x3 block around the center.
+    dest_cells: list[tuple[int, int]] = []
+    for r in range(cr - 1, cr + 2):
+        for c in range(cc - 1, cc + 2):
+            if 0 <= r < h and 0 <= c < w:
+                dest_cells.append((r, c))
+    dest_cells.sort()
+    dest_set = set(dest_cells)
+
+    # Infer floor color from the ring around the destination.
+    ring_colors: list[int] = []
+    for r, c in dest_cells:
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and (rr, cc2) not in dest_set:
+                ring_colors.append(int(grid[rr, cc2]))
+
+    cand_ring = [x for x in ring_colors if x not in (2, 3, 9)]
+    assert cand_ring, "ring around destination must contain passable (non-maroon, non-red, non-wall) cells to infer floor color"
+    _vals, _cnts = np.unique(cand_ring, return_counts=True)
+    ring_blocker = int(_vals[_cnts.argmax()])
+    other = [int(x) for x in np.unique(grid) if int(x) not in (2, 3, 9, ring_blocker)]
+    floor = other[0] if len(other) == 1 else (max(other, key=lambda c: int((grid == c).sum())) if other else None)
+    if floor is None:
+        floor = ring_blocker
+
+    passable = {floor, 9}
+
+    # BFS start = passable cells adjacent to the destination.
+    starts: list[tuple[int, int]] = []
+    seen = set()
+    for r, c in dest_cells:
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and int(grid[rr, cc2]) in passable:
+                if (rr, cc2) not in seen:
+                    seen.add((rr, cc2))
+                    starts.append((rr, cc2))
+    assert starts, "there must be at least one passable cell adjacent to the destination block to begin BFS"
+
+    INF = 10**9
+    dist = np.full((h, w), INF, dtype=int)
+    q = list(starts)
+    for r, c in starts:
+        dist[r, c] = 0
+
+    qi = 0
+    while qi < len(q):
+        r, c = q[qi]
+        qi += 1
+        d = dist[r, c]
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and int(grid[rr, cc2]) in passable and dist[rr, cc2] == INF:
+                dist[rr, cc2] = d + 1
+                q.append((rr, cc2))
+
+    maroons = [(int(dist[r, c]), int(r), int(c)) for r, c in np.argwhere(grid == 9)]
+    maroons = [t for t in maroons if t[0] < INF]
+    maroons.sort()  # by distance then row then col
+
+    k = min(len(dest_cells), len(maroons))
+    chosen = {(r, c) for _, r, c in maroons[:k]}
+
+    for r, c in chosen:
+        out[r, c] = floor
+
+    for r, c in dest_cells[:k]:
+        out[r, c] = 9
+
+    return out
+
+# --------------- generator (c) ---------------
+
+# ---- CFG: tunable generation parameters ----
+GRID_H, GRID_W = 11, 11          # canvas size (fixed per spec)
+CENTER_R, CENTER_C = 5, 5        # dest block center
+FLOOR_COLOR, WALL_COLOR = 7, 6   # orange floor, magenta wall
+DEST_COLOR, RED_CENTER = 3, 2    # green ring, red center
+MAROON = 9
+
+WALL_PROB = 0.75                  # probability of placing walls
+RING_GAP_RANGE = (1, 4)          # number of corridor openings in wall ring
+WALL_STYLES = ['arms', 'frame', 'mixed']
+
+# Wall extension parameters per style
+ARM_EXTEND_PROB = 0.5             # per-cell chance of extending an arm (arms style)
+ARM_LENGTH_RANGE = (1, 5)         # arm extension length (arms style)
+FRAME_DIST_RANGE = (3, 4)        # outer frame distance from center
+FRAME_CONNECT_PROB = 0.4          # chance of connecting inner ring to outer frame
+FRAME_GAP_REMOVE_PROB = 0.3       # chance of removing an outer frame cell
+MIXED_EXTEND_PROB = 0.6           # per-cell chance of extending (mixed style)
+
+FILL_K_RANGE = (2, 9)            # how many maroon fill the dest block
+DISTRACTOR_MAX = 10               # max unreachable distractor maroons
+TOTAL_MAROON_RANGE = (4, 16)     # total maroon count bounds
+MIN_REACHABLE = 2                 # minimum reachable floor cells to accept layout
+GEN_RETRIES = 300                 # max generation attempts
+
+
+def _bfs_reachable(grid, dest_set):
+    """BFS from floor cells adjacent to dest through floor cells. Returns set of reachable (r,c)."""
+    visited = set()
+    queue = deque()
+    for dr, dc in dest_set:
+        for nr, nc in neighbors4(dr, dc):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                if grid[nr, nc] == FLOOR_COLOR and (nr, nc) not in visited:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+    while queue:
+        r, c = queue.popleft()
+        for nr, nc in neighbors4(r, c):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in visited:
+                if grid[nr, nc] == FLOOR_COLOR and (nr, nc) not in dest_set:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+    return visited
+
+
+def _outward_dirs(r, c):
+    """Return directions pointing away from center for a ring cell."""
+    dirs = []
+    if r < CENTER_R: dirs.append((-1, 0))
+    if r > CENTER_R: dirs.append((1, 0))
+    if c < CENTER_C: dirs.append((0, -1))
+    if c > CENTER_C: dirs.append((0, 1))
+    return dirs
+
+
+def _extend_arm(wall_cells, dest_set, r, c, max_len):
+    """Extend a wall arm outward from (r,c) in a random outward direction, up to max_len cells."""
+    dirs = _outward_dirs(r, c)
+    if not dirs:
+        return
+    dr, dc = random.choice(dirs)
+    length = random.randint(1, max_len)
+    nr, nc = r, c
+    for _ in range(length):
+        nr, nc = nr + dr, nc + dc
+        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+            wall_cells.add((nr, nc))
+        else:
+            break
+
+
+def _build_walls(grid, dest_set):
+    """Build wall barrier around dest with corridor openings, extending outward."""
+    # Ring = cells 4-adjacent to dest but not in dest
+    ring = set()
+    for dr, dc in dest_set:
+        for nr, nc in neighbors4(dr, dc):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                ring.add((nr, nc))
+    ring = sorted(ring)
+
+    # Choose gaps as corridor openings
+    num_gaps = random.randint(*RING_GAP_RANGE)
+    gap_cells = set(random.sample(ring, num_gaps))
+    wall_ring = [cell for cell in ring if cell not in gap_cells]
+    wall_cells = set(wall_ring)
+
+    style = random.choice(WALL_STYLES)
+
+    if style == 'arms':
+        for r, c in wall_ring:
+            if random.random() < ARM_EXTEND_PROB:
+                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
+
+    elif style == 'frame':
+        # Outer frame at distance 3-4 from center
+        dist2 = random.randint(*FRAME_DIST_RANGE)
+        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
+            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
+                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
+                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
+                        wall_cells.add((r, c))
+        # Connect inner ring to outer frame
+        for r, c in wall_ring:
+            dirs = _outward_dirs(r, c)
+            if dirs and random.random() < FRAME_CONNECT_PROB:
+                dr, dc = random.choice(dirs)
+                nr, nc = r + dr, c + dc
+                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                    wall_cells.add((nr, nc))
+                    nr, nc = nr + dr, nc + dc
+        # Remove some outer frame cells for gaps
+        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
+        if outer_frame:
+            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
+            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
+                if random.random() < FRAME_GAP_REMOVE_PROB:
+                    wall_cells.discard(rc)
+
+    else:  # mixed
+        for r, c in wall_ring:
+            if random.random() < MIXED_EXTEND_PROB:
+                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
+                _extend_arm(wall_cells, dest_set, r, c, max_len)
+
+    for r, c in wall_cells:
+        grid[r, c] = WALL_COLOR
+
+
+def _gen_attempt():
+    """Build a candidate input grid; returns the grid or None on failure."""
+    dest_cells = [(r, c) for r in range(CENTER_R - 1, CENTER_R + 2)
+                  for c in range(CENTER_C - 1, CENTER_C + 2)]
+    dest_set = set(dest_cells)
+
+    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
+    for r, c in dest_cells:
+        grid[r, c] = DEST_COLOR
+    grid[CENTER_R, CENTER_C] = RED_CENTER
+
+    if random.random() < WALL_PROB:
+        _build_walls(grid, dest_set)
+
+    reachable_floor = _bfs_reachable(grid, dest_set)
+    if len(reachable_floor) < MIN_REACHABLE:
+        return None
+
+    all_floor = {(r, c) for r in range(GRID_H) for c in range(GRID_W)
+                 if grid[r, c] == FLOOR_COLOR and (r, c) not in dest_set}
+    unreachable_floor = all_floor - reachable_floor
+
+    # Choose fill count k
+    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
+    if max_k < FILL_K_RANGE[0]:
+        return None
+    k = random.randint(FILL_K_RANGE[0], max_k)
+
+    # Choose distractor count
+    max_dist = min(DISTRACTOR_MAX, len(unreachable_floor))
+    num_distractors = random.randint(0, max_dist) if max_dist > 0 else 0
+
+    # Enforce total maroon count within bounds
+    total = k + num_distractors
+    if total < TOTAL_MAROON_RANGE[0]:
+        needed = TOTAL_MAROON_RANGE[0] - total
+        if len(unreachable_floor) >= num_distractors + needed:
+            num_distractors += needed
+        elif max_k >= k + needed:
+            k += needed
+        else:
+            return None
+    if k + num_distractors > TOTAL_MAROON_RANGE[1]:
+        num_distractors = max(0, TOTAL_MAROON_RANGE[1] - k)
+
+    source_cells = random.sample(list(reachable_floor), k)
+    distractor_cells = random.sample(list(unreachable_floor), num_distractors)
+
+    # Build INPUT: dest is green+red, maroon on source and distractor positions
+    inp = grid.copy()
+    for r, c in source_cells + distractor_cells:
+        inp[r, c] = MAROON
+
+    # Build expected OUTPUT: first k dest cells (row-major) become maroon, sources erased
+    out = grid.copy()
+    for r, c in dest_cells[:k]:
+        out[r, c] = MAROON
+    for r, c in distractor_cells:
+        out[r, c] = MAROON
+
+    # Validate with solver
+    try:
+        result = main(inp)
+        if np.array_equal(result, out):
+            return inp
+    except Exception:
+        pass
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        result = _gen_attempt()
+        if result is not None:
+            return result
+    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 11x11, always
+  colors: floor=orange(7), wall=magenta(6) or absent, dest_ring=green(3), center=red(2), tokens=maroon(9)
+  dest_block:
+    shape: 3x3 centered at (5,5), always
+    content: 8 green cells surrounding 1 red center
+  walls:
+    presence: 0-1 wall colors; 4/5 examples have walls [observed]
+    role: wall cells adjacent to dest block restrict BFS; partitions floor into connected components
+    structure: single connected or multi-component wall forming corridors/barriers around dest
+    wall_surrounds_dest: wall occupies most of the 16-cell ring at distance 2 from center, with 1-4 floor gaps serving as corridor openings
+  maroon_tokens:
+    count: 4-16
+    placement: scattered on floor cells, never inside dest block, never on wall
+    reachable: 2-15 tokens reachable via 4-connected BFS through floor+maroon from dest openings
+    unreachable: 0-10 tokens in walled-off floor regions (distractors)
+    reachable_fill_range: 2-9 (min of 9 and reachable count); varies to show partial and full fills
+  transformation:
+    rule: BFS from passable cells adjacent to dest block through floor+maroon; rank reachable maroon by distance (ties broken by row then col); closest k fill dest in row-major order; moved maroon erased to floor
+    conservation: total maroon count preserved (moved, not created/destroyed)
+    dest_fill: first k cells in row-major order become maroon(9), rest keep green(3)/red(2)
+
+generation_strategy:
+  approach: output-first
+  steps:
+    1. Fix grid 11x11, dest block at rows 4-6 cols 4-6 (green ring + red center).
+    2. Decide fill count k in 2-9. Place k maroon in dest row-major; remaining dest cells keep green/red.
+    3. Decide if walls exist (yes/no). If yes, pick wall=6 floor=7 (or swap roles).
+    4. If walls, build wall barrier around dest with 1-4 floor gaps as corridor openings. Wall forms connected or near-connected frame at ~distance 2 from center, extending outward as corridor arms.
+    5. Place k maroon tokens on floor cells reachable from dest openings via BFS, at varied distances. These are the sources that will be erased in output.
+    6. Optionally place 0-10 additional maroon tokens in unreachable floor regions (walled off from dest) as distractors.
+    7. Derive input: copy output grid, move maroon from dest back to source positions (restore dest to green/red), place erased maroon back on floor.
+    8. Validate: run solver on input and confirm output matches.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/22/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dd6b8c4b.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/22/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of dd6b8c4b (index 22)
+    # combo_spec: D5/2+D14/1
+    # Name: 边缘像素作为源+方块位于角落
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/22` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/4a21e3da.py` — 参考任务 4a21e3da 的 solver（D5/2 的灵感来源）
+
+codex
+先核对原题实现、参考变体和样例结构，再据此做融合设计，之后直接改写 solver 和 generator 并跑成功率测试。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/dd6b8c4b.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+import numpy as np
+
+from arc_utils import neighbors4
+import random
+from collections import deque
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Move the closest reachable maroon pixels into the 3×3 block around the unique red center.
+
+    Input structure:
+    - bg = orange floor, magenta walls, scattered maroon (9) pixels.
+    - A unique red (2) pixel marks the center of a 3×3 destination block.
+
+    Rule:
+    - Maroon pixels connected to the destination through floor/maroon cells (not blocked by walls) are candidates.
+    - Rank candidates by distance to the destination; the closest ones fill the block in row-major order.
+    - Moved maroons are erased (replaced with floor color).
+
+    Key insight: Wall barriers restrict connectivity — only maroon pixels reachable via flood-fill through the floor qualify, so proximity alone isn't enough.
+    """
+
+    grid = np.asarray(grid, dtype=int)
+    h, w = grid.shape
+    out = grid.copy()
+
+    centers = np.argwhere(grid == 2)
+    assert len(centers) == 1, "grid must have exactly one red (2) center pixel"
+    cr, cc = map(int, centers[0])
+
+    # Destination = 3x3 block around the center.
+    dest_cells: list[tuple[int, int]] = []
+    for r in range(cr - 1, cr + 2):
+        for c in range(cc - 1, cc + 2):
+            if 0 <= r < h and 0 <= c < w:
+                dest_cells.append((r, c))
+    dest_cells.sort()
+    dest_set = set(dest_cells)
+
+    # Infer floor color from the ring around the destination.
+    ring_colors: list[int] = []
+    for r, c in dest_cells:
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and (rr, cc2) not in dest_set:
+                ring_colors.append(int(grid[rr, cc2]))
+
+    cand_ring = [x for x in ring_colors if x not in (2, 3, 9)]
+    assert cand_ring, "ring around destination must contain passable (non-maroon, non-red, non-wall) cells to infer floor color"
+    _vals, _cnts = np.unique(cand_ring, return_counts=True)
+    ring_blocker = int(_vals[_cnts.argmax()])
+    other = [int(x) for x in np.unique(grid) if int(x) not in (2, 3, 9, ring_blocker)]
+    floor = other[0] if len(other) == 1 else (max(other, key=lambda c: int((grid == c).sum())) if other else None)
+    if floor is None:
+        floor = ring_blocker
+
+    passable = {floor, 9}
+
+    # BFS start = passable cells adjacent to the destination.
+    starts: list[tuple[int, int]] = []
+    seen = set()
+    for r, c in dest_cells:
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and int(grid[rr, cc2]) in passable:
+                if (rr, cc2) not in seen:
+                    seen.add((rr, cc2))
+                    starts.append((rr, cc2))
+    assert starts, "there must be at least one passable cell adjacent to the destination block to begin BFS"
+
+    INF = 10**9
+    dist = np.full((h, w), INF, dtype=int)
+    q = list(starts)
+    for r, c in starts:
+        dist[r, c] = 0
+
+    qi = 0
+    while qi < len(q):
+        r, c = q[qi]
+        qi += 1
+        d = dist[r, c]
+        for rr, cc2 in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc2 < w and int(grid[rr, cc2]) in passable and dist[rr, cc2] == INF:
+                dist[rr, cc2] = d + 1
+                q.append((rr, cc2))
+
+    maroons = [(int(dist[r, c]), int(r), int(c)) for r, c in np.argwhere(grid == 9)]
+    maroons = [t for t in maroons if t[0] < INF]
+    maroons.sort()  # by distance then row then col
+
+    k = min(len(dest_cells), len(maroons))
+    chosen = {(r, c) for _, r, c in maroons[:k]}
+
+    for r, c in chosen:
+        out[r, c] = floor
+
+    for r, c in dest_cells[:k]:
+        out[r, c] = 9
+
+    return out
+
+# --------------- generator (c) ---------------
+
+# ---- CFG: tunable generation parameters ----
+GRID_H, GRID_W = 11, 11          # canvas size (fixed per spec)
+CENTER_R, CENTER_C = 5, 5        # dest block center
+FLOOR_COLOR, WALL_COLOR = 7, 6   # orange floor, magenta wall
+DEST_COLOR, RED_CENTER = 3, 2    # green ring, red center
+MAROON = 9
+
+WALL_PROB = 0.75                  # probability of placing walls
+RING_GAP_RANGE = (1, 4)          # number of corridor openings in wall ring
+WALL_STYLES = ['arms', 'frame', 'mixed']
+
+# Wall extension parameters per style
+ARM_EXTEND_PROB = 0.5             # per-cell chance of extending an arm (arms style)
+ARM_LENGTH_RANGE = (1, 5)         # arm extension length (arms style)
+FRAME_DIST_RANGE = (3, 4)        # outer frame distance from center
+FRAME_CONNECT_PROB = 0.4          # chance of connecting inner ring to outer frame
+FRAME_GAP_REMOVE_PROB = 0.3       # chance of removing an outer frame cell
+MIXED_EXTEND_PROB = 0.6           # per-cell chance of extending (mixed style)
+
+FILL_K_RANGE = (2, 9)            # how many maroon fill the dest block
+DISTRACTOR_MAX = 10               # max unreachable distractor maroons
+TOTAL_MAROON_RANGE = (4, 16)     # total maroon count bounds
+MIN_REACHABLE = 2                 # minimum reachable floor cells to accept layout
+GEN_RETRIES = 300                 # max generation attempts
+
+
+def _bfs_reachable(grid, dest_set):
+    """BFS from floor cells adjacent to dest through floor cells. Returns set of reachable (r,c)."""
+    visited = set()
+    queue = deque()
+    for dr, dc in dest_set:
+        for nr, nc in neighbors4(dr, dc):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                if grid[nr, nc] == FLOOR_COLOR and (nr, nc) not in visited:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+    while queue:
+        r, c = queue.popleft()
+        for nr, nc in neighbors4(r, c):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in visited:
+                if grid[nr, nc] == FLOOR_COLOR and (nr, nc) not in dest_set:
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+    return visited
+
+
+def _outward_dirs(r, c):
+    """Return directions pointing away from center for a ring cell."""
+    dirs = []
+    if r < CENTER_R: dirs.append((-1, 0))
+    if r > CENTER_R: dirs.append((1, 0))
+    if c < CENTER_C: dirs.append((0, -1))
+    if c > CENTER_C: dirs.append((0, 1))
+    return dirs
+
+
+def _extend_arm(wall_cells, dest_set, r, c, max_len):
+    """Extend a wall arm outward from (r,c) in a random outward direction, up to max_len cells."""
+    dirs = _outward_dirs(r, c)
+    if not dirs:
+        return
+    dr, dc = random.choice(dirs)
+    length = random.randint(1, max_len)
+    nr, nc = r, c
+    for _ in range(length):
+        nr, nc = nr + dr, nc + dc
+        if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+            wall_cells.add((nr, nc))
+        else:
+            break
+
+
+def _build_walls(grid, dest_set):
+    """Build wall barrier around dest with corridor openings, extending outward."""
+    # Ring = cells 4-adjacent to dest but not in dest
+    ring = set()
+    for dr, dc in dest_set:
+        for nr, nc in neighbors4(dr, dc):
+            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                ring.add((nr, nc))
+    ring = sorted(ring)
+
+    # Choose gaps as corridor openings
+    num_gaps = random.randint(*RING_GAP_RANGE)
+    gap_cells = set(random.sample(ring, num_gaps))
+    wall_ring = [cell for cell in ring if cell not in gap_cells]
+    wall_cells = set(wall_ring)
+
+    style = random.choice(WALL_STYLES)
+
+    if style == 'arms':
+        for r, c in wall_ring:
+            if random.random() < ARM_EXTEND_PROB:
+                _extend_arm(wall_cells, dest_set, r, c, ARM_LENGTH_RANGE[1])
+
+    elif style == 'frame':
+        # Outer frame at distance 3-4 from center
+        dist2 = random.randint(*FRAME_DIST_RANGE)
+        for r in range(CENTER_R - dist2, CENTER_R + dist2 + 1):
+            for c in range(CENTER_C - dist2, CENTER_C + dist2 + 1):
+                if 0 <= r < GRID_H and 0 <= c < GRID_W and (r, c) not in dest_set:
+                    if r in (CENTER_R - dist2, CENTER_R + dist2) or c in (CENTER_C - dist2, CENTER_C + dist2):
+                        wall_cells.add((r, c))
+        # Connect inner ring to outer frame
+        for r, c in wall_ring:
+            dirs = _outward_dirs(r, c)
+            if dirs and random.random() < FRAME_CONNECT_PROB:
+                dr, dc = random.choice(dirs)
+                nr, nc = r + dr, c + dc
+                while 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
+                    wall_cells.add((nr, nc))
+                    nr, nc = nr + dr, nc + dc
+        # Remove some outer frame cells for gaps
+        outer_frame = [cell for cell in wall_cells if cell not in set(wall_ring)]
+        if outer_frame:
+            n_remove = random.randint(1, max(1, len(outer_frame) // 4))
+            for rc in random.sample(outer_frame, min(n_remove, len(outer_frame))):
+                if random.random() < FRAME_GAP_REMOVE_PROB:
+                    wall_cells.discard(rc)
+
+    else:  # mixed
+        for r, c in wall_ring:
+            if random.random() < MIXED_EXTEND_PROB:
+                max_len = max(1, GRID_H - abs(r - CENTER_R) - 2)
+                _extend_arm(wall_cells, dest_set, r, c, max_len)
+
+    for r, c in wall_cells:
+        grid[r, c] = WALL_COLOR
+
+
+def _gen_attempt():
+    """Build a candidate input grid; returns the grid or None on failure."""
+    dest_cells = [(r, c) for r in range(CENTER_R - 1, CENTER_R + 2)
+                  for c in range(CENTER_C - 1, CENTER_C + 2)]
+    dest_set = set(dest_cells)
+
+    grid = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
+    for r, c in dest_cells:
+        grid[r, c] = DEST_COLOR
+    grid[CENTER_R, CENTER_C] = RED_CENTER
+
+    if random.random() < WALL_PROB:
+        _build_walls(grid, dest_set)
+
+    reachable_floor = _bfs_reachable(grid, dest_set)
+    if len(reachable_floor) < MIN_REACHABLE:
+        return None
+
+    all_floor = {(r, c) for r in range(GRID_H) for c in range(GRID_W)
+                 if grid[r, c] == FLOOR_COLOR and (r, c) not in dest_set}
+    unreachable_floor = all_floor - reachable_floor
+
+    # Choose fill count k
+    max_k = min(FILL_K_RANGE[1], len(reachable_floor))
+    if max_k < FILL_K_RANGE[0]:
+        return None
+    k = random.randint(FILL_K_RANGE[0], max_k)
+
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/4a21e3da.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+import numpy as np
+from arc_utils import colors_present, get_bg
+import random
+from arc_utils import is_contiguous
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Cut a sprite along border-control rays and slide pieces to grid corners.
+
+    Input structure:
+    - bg, fg (main object, ~centered), ctrl (1-2 pixels on grid edges).
+
+    Rule:
+    - Draw rays inward from each ctrl pixel along its row/col, painting only bg cells up to the farthest fg pixel (intermittent).
+    - Rays partition the grid; fg on the cut line stays in place.
+    - Cut pieces in regions touching a control edge slide to that corner; others vanish.
+
+    Key insight: Only regions sharing a border edge with a control pixel keep their piece; the ray skips fg cells.
+    """
+    g = np.array(grid, dtype=int)
+    H, W = g.shape
+    bg = int(get_bg(g))
+
+    nonbg = colors_present(g, exclude={bg})
+
+    # Control color is the only non-bg color present on the border.
+    border_cols = set(map(int, g[0, :])) | set(map(int, g[-1, :])) | set(map(int, g[:, 0])) | set(map(int, g[:, -1]))
+    border_cols.discard(int(bg))
+    assert not (not border_cols)
+    ctrl = int(sorted(border_cols)[0])
+    fg = int(next(c for c in nonbg if int(c) != int(ctrl)))
+
+    ctrl_pts = [(int(r), int(c)) for r, c in np.argwhere(g == int(ctrl))]
+
+    # Split lines (at most one vertical and one horizontal in these tasks).
+    E: set[str] = set()
+    c_split: int | None = None
+    r_split: int | None = None
+    for r, c in ctrl_pts:
+        if int(r) == 0:
+            E.add("top")
+            c_split = int(c)
+        elif int(r) == int(H - 1):
+            E.add("bottom")
+            c_split = int(c)
+        elif int(c) == 0:
+            E.add("left")
+            r_split = int(r)
+        elif int(c) == int(W - 1):
+            E.add("right")
+            r_split = int(r)
+
+    out = np.full((H, W), int(bg), dtype=int)
+
+    # --- Stage 1: draw rays on background cells only (but keep the control pixel itself). ---
+    for r, c in ctrl_pts:
+        if int(r) == 0:
+            rows = [int(rr) for rr in np.argwhere(g[:, int(c)] == int(fg)).flatten()]
+            if rows:
+                stop = int(max(rows))
+                for rr in range(0, int(stop) + 1):
+                    if int(g[int(rr), int(c)]) == int(bg):
+                        out[int(rr), int(c)] = int(ctrl)
+        elif int(r) == int(H - 1):
+            rows = [int(rr) for rr in np.argwhere(g[:, int(c)] == int(fg)).flatten()]
+            if rows:
+                stop = int(min(rows))
+                for rr in range(int(H - 1), int(stop) - 1, -1):
+                    if int(g[int(rr), int(c)]) == int(bg):
+                        out[int(rr), int(c)] = int(ctrl)
+        elif int(c) == 0:
+            cols = [int(cc) for cc in np.argwhere(g[int(r), :] == int(fg)).flatten()]
+            if cols:
+                stop = int(max(cols))
+                for cc in range(0, int(stop) + 1):
+                    if int(g[int(r), int(cc)]) == int(bg):
+                        out[int(r), int(cc)] = int(ctrl)
+        elif int(c) == int(W - 1):
+            cols = [int(cc) for cc in np.argwhere(g[int(r), :] == int(fg)).flatten()]
+            if cols:
+                stop = int(min(cols))
+                for cc in range(int(W - 1), int(stop) - 1, -1):
+                    if int(g[int(r), int(cc)]) == int(bg):
+                        out[int(r), int(cc)] = int(ctrl)
+
+    for r, c in ctrl_pts:
+        out[int(r), int(c)] = int(ctrl)
+
+    # Foreground pixels on split line(s) remain in place.
+    for r, c in np.argwhere(g == int(fg)):
+        r = int(r)
+        c = int(c)
+        if (c_split is not None and int(c) == int(c_split)) or (r_split is not None and int(r) == int(r_split)):
+            out[int(r), int(c)] = int(fg)
+
+    # --- Stage 2: move cut parts from each rectangular region to its target corner. ---
+    regions: dict[tuple[str, str], list[tuple[int, int]]] = {}
+    for r, c in np.argwhere(g == int(fg)):
+        r = int(r)
+        c = int(c)
+        if (c_split is not None and int(c) == int(c_split)) or (r_split is not None and int(r) == int(r_split)):
+            continue
+        hs = "A"
+        vs = "A"
+        if r_split is not None:
+            hs = "T" if int(r) < int(r_split) else "B"
+        if c_split is not None:
+            vs = "L" if int(c) < int(c_split) else "R"
+        regions.setdefault((hs, vs), []).append((int(r), int(c)))
+
+    def touches_edges(hs: str, vs: str) -> set[str]:
+        te: set[str] = set()
+        if hs in ("T", "A"):
+            te.add("top")
+        if hs in ("B", "A"):
+            te.add("bottom")
+        if vs in ("L", "A"):
+            te.add("left")
+        if vs in ("R", "A"):
+            te.add("right")
+        return te
+
+    def pick_dest(hs: str, vs: str) -> tuple[str, str]:
+        if r_split is not None:
+            dh = hs
+        else:
+            if ("top" in E) and ("bottom" not in E):
+                dh = "T"
+            elif ("bottom" in E) and ("top" not in E):
+                dh = "B"
+            else:
+                dh = "T"
+        if c_split is not None:
+            dv = vs
+        else:
+            if ("left" in E) and ("right" not in E):
+                dv = "L"
+            elif ("right" in E) and ("left" not in E):
+                dv = "R"
+            else:
+                dv = "L"
+        return str(dh), str(dv)
+
+    for (hs, vs), pts in regions.items():
+        if not (touches_edges(hs, vs) & E):
+            continue
+
+        dh, dv = pick_dest(hs, vs)
+        rs = [r for r, _ in pts]
+        cs = [c for _, c in pts]
+        rmin, rmax = int(min(rs)), int(max(rs))
+        cmin, cmax = int(min(cs)), int(max(cs))
+        dr = int(0 - rmin) if dh == "T" else int((H - 1) - rmax)
+        dc = int(0 - cmin) if dv == "L" else int((W - 1) - cmax)
+
+        for r, c in pts:
+            rr = int(r + dr)
+            cc = int(c + dc)
+            if 0 <= rr < H and 0 <= cc < W:
+                out[int(rr), int(cc)] = int(fg)
+
+    return out
+
+# --------------- generator (Claude#1) ---------------
+
+def _grow_piece(max_h, max_w, target_px):
+    """Grow a connected piece up to max_h x max_w targeting target_px pixels."""
+    cells = {(0, 0)}
+    for _ in range(target_px - 1):
+        neighbors = set()
+        for r, c in cells:
+            for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nr, nc = r+dr, c+dc
+                if (nr, nc) not in cells:
+                    neighbors.add((nr, nc))
+        valid = [(nr, nc) for nr, nc in neighbors
+                 if max(r for r, _ in cells | {(nr,nc)}) - min(r for r, _ in cells | {(nr,nc)}) + 1 <= max_h
+                 and max(c for _, c in cells | {(nr,nc)}) - min(c for _, c in cells | {(nr,nc)}) + 1 <= max_w]
+        if not valid: break
+        cells.add(random.choice(valid))
+    rs = [r for r, _ in cells]; cs = [c for _, c in cells]
+    return frozenset((r - min(rs), c - min(cs)) for r, c in cells)
+
+
+def _gen_attempt():
+    S = random.randint(18, 20)
+    H = W = S
+    bg, fg, ctrl_color = 1, 7, 2
+
+    # Weight toward 2-ctrl to compensate for higher rejection rate
+    num_ctrl = random.choices([1, 2], weights=[1, 4])[0]
+    if num_ctrl == 1:
+        ctrl_edges = [random.choice(['top', 'bottom', 'left', 'right'])]
+    else:
+        ctrl_edges = [random.choice(['top', 'bottom']), random.choice(['left', 'right'])]
+
+    c_split = r_split = None
+    ctrl_pts = []
+    E = set(ctrl_edges)
+    has_v = has_h = False
+
+    for edge in ctrl_edges:
+        if edge in ('top', 'bottom'):
+            c_split = random.randint(int(W*0.4), int(W*0.6))
+            ctrl_pts.append((0 if edge == 'top' else H-1, c_split))
+            has_v = True
+        else:
+            r_split = random.randint(int(H*0.4), int(H*0.6))
+            ctrl_pts.append((r_split, 0 if edge == 'left' else W-1))
+            has_h = True
+
+    def pick_dest(hs, vs):
+        if r_split is not None: dh = hs
+        elif 'top' in E and 'bottom' not in E: dh = 'T'
+        elif 'bottom' in E and 'top' not in E: dh = 'B'
+        else: dh = 'T'
+        if c_split is not None: dv = vs
+        elif 'left' in E and 'right' not in E: dv = 'L'
+        elif 'right' in E and 'left' not in E: dv = 'R'
+        else: dv = 'L'
+        return dh, dv
+
+    def touches_E(hs, vs):
+        te = set()
+        if hs in ('T','A'): te.add('top')
+        if hs in ('B','A'): te.add('bottom')
+        if vs in ('L','A'): te.add('left')
+        if vs in ('R','A'): te.add('right')
+        return bool(te & E)
+
+    if has_h and has_v:
+        all_regions = [('T','L'), ('T','R'), ('B','L'), ('B','R')]
+    elif has_v:
+        all_regions = [('A','L'), ('A','R')]
+    else:
+        all_regions = [('T','A'), ('B','A')]
+
+    kept = [r for r in all_regions if touches_E(*r)]
+    vanish = [r for r in all_regions if r not in kept]
+
+    # Sprite bbox (spec: 5-8 x 8-10)
+    sprite_h = random.randint(5, 8)
+    sprite_w = random.randint(8, 10)
+
+    # Place sprite with split at 40-60% through bbox
+    if has_v:
+        frac = random.uniform(0.4, 0.6)
+        sprite_c0 = c_split - int(frac * sprite_w)
+        sprite_c0 = max(4, min(sprite_c0, W - 5 - sprite_w + 1))
+        if sprite_c0 > W - 5 - sprite_w + 1: return None
+        if c_split <= sprite_c0 or c_split >= sprite_c0 + sprite_w - 1: return None
+    else:
+        hi = W - 5 - sprite_w + 1
+        if hi < 4: return None
+        sprite_c0 = random.randint(4, hi)
+
+    if has_h:
+        frac = random.uniform(0.4, 0.6)
+        sprite_r0 = r_split - int(frac * sprite_h)
+
+exec
+/bin/bash -lc "sed -n '1,220p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json, pathlib
+p = pathlib.Path('/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dd6b8c4b.json')
+obj = json.loads(p.read_text())
+for sec in ('train','test'):
+    print('SECTION', sec)
+    for i,ex in enumerate(obj[sec]):
+        grid = ex['input']
+        print('example', i, 'size', len(grid), len(grid[0]))
+        colors = sorted({v for row in grid for v in row})
+        print('colors', colors)
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+SECTION train
+example 0 size 11 11
+colors [2, 3, 6, 7, 9]
+example 1 size 11 11
+colors [2, 3, 6, 7, 9]
+example 2 size 11 11
+colors [2, 3, 7, 9]
+SECTION test
+example 0 size 11 11
+colors [2, 3, 6, 7, 9]
+example 1 size 11 11
+colors [2, 3, 6, 7, 9]
+
+codex
+参考代码已经确认：原题的核心不变，变的是“候选栗色像素只在边缘出现”以及“绿色 3x3 目标块不再固定在中心，而是偏到某个角落形成明显的不对称可达性”。接下来我会把这两点一起落到 solver 的定位逻辑、BFS 起点和生成器的放置约束里。
+exec
+/bin/bash -lc "python - <<'PY'
+import json, pathlib
+p = pathlib.Path('/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dd6b8c4b.json')
+obj = json.loads(p.read_text())
+for sec in ('train',):
+    for i,ex in enumerate(obj[sec]):
+        print('INPUT', i)
+        for row in ex['input']:
+            print(' '.join(map(str,row)))
+        print('OUTPUT', i)
+        for row in ex['output']:
+            print(' '.join(map(str,row)))
+        print()
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+INPUT 0
+7 7 7 7 7 7 7 7 7 7 7
+7 6 6 6 6 6 6 6 9 9 7
+7 6 9 9 7 7 7 6 9 9 7
+7 6 6 6 6 6 6 6 7 7 7
+7 7 7 6 3 3 3 6 7 7 7
+7 7 7 6 3 2 3 6 7 9 7
+7 9 7 6 3 3 3 6 7 7 7
+9 9 7 6 6 7 6 6 6 6 7
+7 7 7 6 7 7 7 9 9 6 7
+7 7 7 6 6 6 6 6 6 6 7
+7 7 7 7 7 7 7 7 7 7 7
+OUTPUT 0
+7 7 7 7 7 7 7 7 7 7 7
+7 6 6 6 6 6 6 6 9 9 7
+7 6 9 9 7 7 7 6 9 9 7
+7 6 6 6 6 6 6 6 7 7 7
+7 7 7 6 9 9 3 6 7 7 7
+7 7 7 6 3 2 3 6 7 9 7
+7 9 7 6 3 3 3 6 7 7 7
+9 9 7 6 6 7 6 6 6 6 7
+7 7 7 6 7 7 7 7 7 6 7
+7 7 7 6 6 6 6 6 6 6 7
+7 7 7 7 7 7 7 7 7 7 7
+
+INPUT 1
+7 7 7 7 7 7 9 9 9 7 7
+7 7 7 7 7 7 9 9 7 7 9
+7 7 7 7 7 7 7 7 7 7 9
+9 7 7 6 6 6 6 6 6 6 6
+7 7 7 6 3 3 3 6 9 7 7
+7 7 9 6 3 2 3 6 7 7 7
+7 7 7 6 3 3 3 6 7 9 7
+7 7 7 6 7 7 7 6 7 7 7
+7 9 7 6 7 9 7 6 7 7 7
+7 7 9 6 7 9 7 6 7 7 7
+7 7 7 7 7 7 7 7 7 7 7
+OUTPUT 1
+7 7 7 7 7 7 9 9 9 7 7
+7 7 7 7 7 7 7 9 7 7 9
+7 7 7 7 7 7 7 7 7 7 9
+7 7 7 6 6 6 6 6 6 6 6
+7 7 7 6 9 9 9 6 7 7 7
+7 7 7 6 9 9 9 6 7 7 7
+7 7 7 6 9 9 9 6 7 7 7
+7 7 7 6 7 7 7 6 7 7 7
+7 7 7 6 7 7 7 6 7 7 7
+7 7 7 6 7 7 7 6 7 7 7
+7 7 7 7 7 7 7 7 7 7 7
+
+INPUT 2
+7 7 7 7 7 7 7 7 7 7 7
+7 7 7 7 7 7 7 7 7 9 7
+7 7 9 7 7 7 7 7 7 7 9
+7 7 7 7 7 7 7 7 7 7 7
+7 7 7 7 3 3 3 7 7 7 7
+7 7 7 7 3 2 3 7 7 7 7
+7 7 7 7 3 3 3 7 7 7 7
+7 7 7 7 7 7 7 7 7 7 7
+7 7 7 7 7 7 7 7 7 7 7
+7 7 7 7 7 7 7 7 9 7 7
+7 7 7 7 7 7 7 7 7 7 7
+OUTPUT 2
+7 7 7 7 7 7 7 7 7 7 7
+7 7 7 7 7 7 7 7 7 7 7
+7 7 7 7 7 7 7 7 7 7 7
+7 7 7 7 7 7 7 7 7 7 7
+7 7 7 7 9 9 9 7 7 7 7
+7 7 7 7 9 2 3 7 7 7 7
+7 7 7 7 3 3 3 7 7 7 7
+7 7 7 7 7 7 7 7 7 7 7
+7 7 7 7 7 7 7 7 7 7 7
+7 7 7 7 7 7 7 7 7 7 7
+7 7 7 7 7 7 7 7 7 7 7
+
+
+codex
+实现方案已经收敛：solver 只改两处核心假设，`red` 定位目标块可在四个偏角位置，候选栗色像素只从边框里筛；generator 则保留原题“墙壁+BFS+按距离填 3x3”的骨架，但把目标块改为四个角位之一，并只在边框上放可达/不可达栗色像素。接下来我先落代码，再用批量统计验证它没有退化回原题。
+  ✓ Inspect original task, reference variant, and dataset structure to pin down the fused rule
+  → Implement fused solver/generator with embedded design analysis comments at target path
+  • Run success-rate test, fix failures if any, then quantify fused-behavior metrics
+codex
+准备落文件了。我会把设计分析直接写进代码头部注释，随后保存到目标路径并立刻跑 50 次生成/求解测试。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/22' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+exec
+/bin/bash -lc "if [ -f /home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/22/code.py ]; then sed -n '1,40p' /home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/22/code.py; fi" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/22/code.py
+diff --git a/ceshi/code_combo/dd6b8c4b/22/code.py b/ceshi/code_combo/dd6b8c4b/22/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cdafd3df26c1f1e3f89c6c9f48cd91e47177ce06
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/22/code.py
+@@ -0,0 +1,328 @@
++# Combo variant of dd6b8c4b (index 22)
++# combo_spec: D5/2+D14/1
++# Name: 边缘像素作为源+方块位于角落
++
++import random
++from collections import Counter, deque
++
++import numpy as np
++
++from arc_utils import neighbors4
++
++# Design analysis for the fused variant
++# a) Concrete behavior:
++#    The original task used a centered 3x3 destination and maroon tokens scattered anywhere on floor.
++#    Here the red-centered 3x3 block moves to one of four corner-biased centers: (3,3), (3,7), (7,3), (7,7).
++#    Maroon sources are no longer interior speckles: every movable or distracting maroon lies on the outer border.
++#    Example: with the block near the top-left, a ring of magenta walls plus long barriers on the bottom/right
++#    makes top/left border cells easy to reach while bottom/right border cells can be sealed off. BFS still decides
++#    which maroons qualify, but now the candidate pool itself is visibly "edge only" and strongly asymmetric.
++# b) Complexity calibration:
++#    The target keeps only four corner-biased placements instead of arbitrary offsets, so humans can notice the
++#    positional change from a few examples. Border-only maroons are a strong visual cue, and the wall layout uses
++#    repeated side-aligned barriers rather than noisy free-form walls.
++# c) Implicit assumptions reviewed:
++#    - main() can no longer assume the center is fixed at (5,5); it must locate the unique red cell.
++#    - Collectible maroons are filtered to border cells only; interior maroons, if present, are ignored as sources.
++#    - Distance ranking is still row/col visible, not dependent on hidden color ids or metadata.
++#    - BFS still assumes at least one passable opening next to the block; generator guarantees near-side gaps.
++# d) Placement legality:
++#    The chosen centers keep the full 5x5 wall frame in-bounds. Walls, destination cells, and border maroons occupy
++#    disjoint cell sets, and all source/distractor maroons are sampled only from floor border cells.
++# e) Visual observability:
++#    In 2-4 examples, a solver can see that maroons only appear on the boundary and that the block sits off-center.
++#    Which border maroons move is explained by visible corridors/openings rather than invisible bookkeeping.
++# f) Visual cleanliness:
++#    Each role has its own region: the 3x3 target, a magenta wall frame, and edge-only maroons. This avoids the
++#    clutter of mixed interior tokens and keeps the asymmetric reachability legible.
++# g) Inferrability of change:
++#    No new color remapping is introduced. The only semantic change is positional: "border maroons reachable through
++#    visible floor corridors move into the corner-biased 3x3 block."
++
++GRID_H, GRID_W = 11, 11
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++MAROON = 9
++
++CORNER_CENTERS = [(3, 3), (3, 7), (7, 3), (7, 7)]
++FILL_K_RANGE = (2, 9)
++TOTAL_MAROON_RANGE = (4, 16)
++GEN_RETRIES = 400
++EXTRA_FAR_GAP_PROB = 0.35
++NEAR_ARM_PROB = 0.35
++
++
++def _is_border(r: int, c: int, h: int, w: int) -> bool:
++    return r == 0 or c == 0 or r == h - 1 or c == w - 1
++
++
++def _dest_cells(cr: int, cc: int) -> list[tuple[int, int]]:
++    return [(r, c) for r in range(cr - 1, cr + 2) for c in range(cc - 1, cc + 2)]
++
++
++def _frame_ring(cr: int, cc: int) -> list[tuple[int, int]]:
++    ring = []
++    for r in range(cr - 2, cr + 3):
++        for c in range(cc - 2, cc + 3):
++            if max(abs(r - cr), abs(c - cc)) == 2:
++                ring.append((r, c))
++    return sorted(ring)
++
++
++def _near_sides(cr: int, cc: int) -> tuple[str, str]:
++    return ("top" if cr < GRID_H // 2 else "bottom", "left" if cc < GRID_W // 2 else "right")
++
++
++def _side_tags(cr: int, cc: int, r: int, c: int) -> set[str]:
++    tags: set[str] = set()
++    if r == cr - 2:
++        tags.add("top")
++    if r == cr + 2:
++        tags.add("bottom")
++    if c == cc - 2:
++        tags.add("left")
++    if c == cc + 2:
++        tags.add("right")
++    return tags
++
++
++def _outward_dirs(cr: int, cc: int, r: int, c: int) -> list[tuple[int, int]]:
++    dirs: list[tuple[int, int]] = []
++    if r < cr:
++        dirs.append((-1, 0))
++    if r > cr:
++        dirs.append((1, 0))
++    if c < cc:
++        dirs.append((0, -1))
++    if c > cc:
++        dirs.append((0, 1))
++    return dirs
++
++
++def _extend_to_border(wall_cells: set[tuple[int, int]], cr: int, cc: int, r: int, c: int, side: str) -> None:
++    dr, dc = {
++        "top": (-1, 0),
++        "bottom": (1, 0),
++        "left": (0, -1),
++        "right": (0, 1),
++    }[side]
++    nr, nc = r, c
++    while 0 <= nr < GRID_H and 0 <= nc < GRID_W:
++        wall_cells.add((nr, nc))
++        nr += dr
++        nc += dc
++
++
++def _build_walls(grid: np.ndarray, cr: int, cc: int, dest_set: set[tuple[int, int]]) -> None:
++    near_v, near_h = _near_sides(cr, cc)
++    far_v = "bottom" if near_v == "top" else "top"
++    far_h = "right" if near_h == "left" else "left"
++
++    ring = _frame_ring(cr, cc)
++    near_pool = [cell for cell in ring if _side_tags(cr, cc, *cell) & {near_v, near_h}]
++    far_pool = [cell for cell in ring if _side_tags(cr, cc, *cell) & {far_v, far_h}]
++
++    num_near_gaps = random.randint(1, 3)
++    gap_cells = set(random.sample(near_pool, min(num_near_gaps, len(near_pool))))
++    if far_pool and random.random() < EXTRA_FAR_GAP_PROB:
++        gap_cells.add(random.choice(far_pool))
++
++    wall_cells = {cell for cell in ring if cell not in gap_cells}
++
++    # Long far-side barriers are the main source of asymmetric edge reachability.
++    for r, c in list(wall_cells):
++        tags = _side_tags(cr, cc, r, c)
++        if far_v in tags:
++            _extend_to_border(wall_cells, cr, cc, r, c, far_v)
++        if far_h in tags:
++            _extend_to_border(wall_cells, cr, cc, r, c, far_h)
++
++    # A few short near-side arms keep layouts varied without destroying the main opening.
++    for r, c in list(wall_cells):
++        tags = _side_tags(cr, cc, r, c)
++        if tags & {near_v, near_h} and random.random() < NEAR_ARM_PROB:
++            dirs = _outward_dirs(cr, cc, r, c)
++            if dirs:
++                dr, dc = random.choice(dirs)
++                nr, nc = r + dr, c + dc
++                steps = random.randint(1, 2)
++                for _ in range(steps):
++                    if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                        wall_cells.add((nr, nc))
++                        nr += dr
++                        nc += dc
++                    else:
++                        break
++
++    for r, c in wall_cells:
++        if (r, c) not in dest_set:
++            grid[r, c] = WALL_COLOR
++
++
++def _bfs_reachable(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> set[tuple[int, int]]:
++    visited: set[tuple[int, int]] = set()
++    queue: deque[tuple[int, int]] = deque()
++    for r, c in dest_set:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set and grid[nr, nc] == FLOOR_COLOR:
++                if (nr, nc) not in visited:
++                    visited.add((nr, nc))
++                    queue.append((nr, nc))
++
++    while queue:
++        r, c = queue.popleft()
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in visited:
++                if (nr, nc) not in dest_set and grid[nr, nc] == FLOOR_COLOR:
++                    visited.add((nr, nc))
++                    queue.append((nr, nc))
++    return visited
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Move the nearest reachable border maroons into the off-center 3x3 block around the red pixel.
++
++    Input structure:
++    - Orange floor and magenta walls form corridors around a green 3x3 block whose red center is shifted toward a corner.
++    - Maroon source pixels appear only on the outer border of the grid; some border maroons may be cut off by walls.
++
++    Rule:
++    - Find the unique red cell, take its surrounding 3x3 as the destination, then flood-fill outward through floor and maroon cells.
++    - Only border maroons reached by that flood-fill are candidates; sort them by BFS distance, then row, then column.
++    - Move the closest candidates into the destination in row-major order and erase the moved border sources back to floor.
++
++    Key insight:
++    - The asymmetry comes from two places at once: candidate maroons live only on the border, and the target block sits closer to
++      some borders than others. Visible wall barriers decide which border sides can actually contribute maroons.
++    """
++
++    grid = np.asarray(grid, dtype=int)
++    h, w = grid.shape
++    out = grid.copy()
++
++    centers = np.argwhere(grid == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center"
++    cr, cc = map(int, centers[0])
++
++    dest_cells = _dest_cells(cr, cc)
++    dest_set = set(dest_cells)
++
++    floor_candidates = [int(x) for x in grid.flatten() if int(x) not in (RED_CENTER, DEST_COLOR, WALL_COLOR, MAROON)]
++    assert floor_candidates, "grid must contain a passable floor color"
++    floor = Counter(floor_candidates).most_common(1)[0][0]
++    passable = {floor, MAROON}
++
++    starts: list[tuple[int, int]] = []
++    seen = set()
++    for r, c in dest_cells:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < h and 0 <= nc < w and int(grid[nr, nc]) in passable and (nr, nc) not in seen:
++                seen.add((nr, nc))
++                starts.append((nr, nc))
++    assert starts, "destination block must have at least one passable opening"
++
++    inf = 10**9
++    dist = np.full((h, w), inf, dtype=int)
++    q = deque(starts)
++    for r, c in starts:
++        dist[r, c] = 0
++
++    while q:
++        r, c = q.popleft()
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < h and 0 <= nc < w and int(grid[nr, nc]) in passable and dist[nr, nc] == inf:
++                dist[nr, nc] = dist[r, c] + 1
++                q.append((nr, nc))
++
++    maroons = []
++    for r, c in np.argwhere(grid == MAROON):
++        r = int(r)
++        c = int(c)
++        if _is_border(r, c, h, w) and int(dist[r, c]) < inf:
++            maroons.append((int(dist[r, c]), r, c))
++    maroons.sort()
++
++    k = min(len(dest_cells), len(maroons))
++    chosen = {(r, c) for _, r, c in maroons[:k]}
++
++    for r, c in chosen:
++        out[r, c] = floor
++    for r, c in dest_cells[:k]:
++        out[r, c] = MAROON
++
++    return out
++
++
++def _gen_attempt() -> np.ndarray | None:
++    cr, cc = random.choice(CORNER_CENTERS)
++    dest_cells = _dest_cells(cr, cc)
++    dest_set = set(dest_cells)
++
++    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in dest_cells:
++        base[r, c] = DEST_COLOR
++    base[cr, cc] = RED_CENTER
++
++    _build_walls(base, cr, cc, dest_set)
++
++    reachable_floor = _bfs_reachable(base, dest_set)
++    border_floor = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if base[r, c] == FLOOR_COLOR and _is_border(r, c, GRID_H, GRID_W)
++    }
++    reachable_edge = sorted(border_floor & reachable_floor)
++    unreachable_edge = sorted(border_floor - reachable_floor)
++
++    max_k = min(FILL_K_RANGE[1], len(reachable_edge))
++    if max_k < FILL_K_RANGE[0]:
++        return None
++    k = random.randint(FILL_K_RANGE[0], max_k)
++
++    total_low = max(TOTAL_MAROON_RANGE[0], k)
++    total_high = min(TOTAL_MAROON_RANGE[1], k + len(unreachable_edge))
++    if total_high < total_low:
++        return None
++    total = random.randint(total_low, total_high)
++    num_distractors = total - k
++
++    source_cells = random.sample(reachable_edge, k)
++    distractor_cells = random.sample(unreachable_edge, num_distractors)
++
++    inp = base.copy()
++    for r, c in source_cells + distractor_cells:
++        inp[r, c] = MAROON
++
++    out = base.copy()
++    for r, c in source_cells:
++        out[r, c] = FLOOR_COLOR
++    for r, c in distractor_cells:
++        out[r, c] = MAROON
++    for r, c in dest_cells[:k]:
++        out[r, c] = MAROON
++
++    try:
++        result = main(inp)
++    except Exception:
++        return None
++
++    if not np.array_equal(result, out):
++        return None
++
++    # Fusion guardrails: ensure this did not collapse back to the original centered/scattered regime.
++    if (cr, cc) == (5, 5):
++        return None
++    if any(not _is_border(r, c, GRID_H, GRID_W) for r, c in source_cells + distractor_cells):
++        return None
++
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+diff --git a/ceshi/code_combo/dd6b8c4b/22/code.py b/ceshi/code_combo/dd6b8c4b/22/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cdafd3df26c1f1e3f89c6c9f48cd91e47177ce06
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/22/code.py
+@@ -0,0 +1,328 @@
++# Combo variant of dd6b8c4b (index 22)
++# combo_spec: D5/2+D14/1
++# Name: 边缘像素作为源+方块位于角落
++
++import random
++from collections import Counter, deque
++
++import numpy as np
++
++from arc_utils import neighbors4
++
++# Design analysis for the fused variant
++# a) Concrete behavior:
++#    The original task used a centered 3x3 destination and maroon tokens scattered anywhere on floor.
++#    Here the red-centered 3x3 block moves to one of four corner-biased centers: (3,3), (3,7), (7,3), (7,7).
++#    Maroon sources are no longer interior speckles: every movable or distracting maroon lies on the outer border.
++#    Example: with the block near the top-left, a ring of magenta walls plus long barriers on the bottom/right
++#    makes top/left border cells easy to reach while bottom/right border cells can be sealed off. BFS still decides
++#    which maroons qualify, but now the candidate pool itself is visibly "edge only" and strongly asymmetric.
++# b) Complexity calibration:
++#    The target keeps only four corner-biased placements instead of arbitrary offsets, so humans can notice the
++#    positional change from a few examples. Border-only maroons are a strong visual cue, and the wall layout uses
++#    repeated side-aligned barriers rather than noisy free-form walls.
++# c) Implicit assumptions reviewed:
++#    - main() can no longer assume the center is fixed at (5,5); it must locate the unique red cell.
++#    - Collectible maroons are filtered to border cells only; interior maroons, if present, are ignored as sources.
++#    - Distance ranking is still row/col visible, not dependent on hidden color ids or metadata.
++#    - BFS still assumes at least one passable opening next to the block; generator guarantees near-side gaps.
++# d) Placement legality:
++#    The chosen centers keep the full 5x5 wall frame in-bounds. Walls, destination cells, and border maroons occupy
++#    disjoint cell sets, and all source/distractor maroons are sampled only from floor border cells.
++# e) Visual observability:
++#    In 2-4 examples, a solver can see that maroons only appear on the boundary and that the block sits off-center.
++#    Which border maroons move is explained by visible corridors/openings rather than invisible bookkeeping.
++# f) Visual cleanliness:
++#    Each role has its own region: the 3x3 target, a magenta wall frame, and edge-only maroons. This avoids the
++#    clutter of mixed interior tokens and keeps the asymmetric reachability legible.
++# g) Inferrability of change:
++#    No new color remapping is introduced. The only semantic change is positional: "border maroons reachable through
++#    visible floor corridors move into the corner-biased 3x3 block."
++
++GRID_H, GRID_W = 11, 11
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++MAROON = 9
++
++CORNER_CENTERS = [(3, 3), (3, 7), (7, 3), (7, 7)]
++FILL_K_RANGE = (2, 9)
++TOTAL_MAROON_RANGE = (4, 16)
++GEN_RETRIES = 400
++EXTRA_FAR_GAP_PROB = 0.35
++NEAR_ARM_PROB = 0.35
++
++
++def _is_border(r: int, c: int, h: int, w: int) -> bool:
++    return r == 0 or c == 0 or r == h - 1 or c == w - 1
++
++
++def _dest_cells(cr: int, cc: int) -> list[tuple[int, int]]:
++    return [(r, c) for r in range(cr - 1, cr + 2) for c in range(cc - 1, cc + 2)]
++
++
++def _frame_ring(cr: int, cc: int) -> list[tuple[int, int]]:
++    ring = []
++    for r in range(cr - 2, cr + 3):
++        for c in range(cc - 2, cc + 3):
++            if max(abs(r - cr), abs(c - cc)) == 2:
++                ring.append((r, c))
++    return sorted(ring)
++
++
++def _near_sides(cr: int, cc: int) -> tuple[str, str]:
++    return ("top" if cr < GRID_H // 2 else "bottom", "left" if cc < GRID_W // 2 else "right")
++
++
++def _side_tags(cr: int, cc: int, r: int, c: int) -> set[str]:
++    tags: set[str] = set()
++    if r == cr - 2:
++        tags.add("top")
++    if r == cr + 2:
++        tags.add("bottom")
++    if c == cc - 2:
++        tags.add("left")
++    if c == cc + 2:
++        tags.add("right")
++    return tags
++
++
++def _outward_dirs(cr: int, cc: int, r: int, c: int) -> list[tuple[int, int]]:
++    dirs: list[tuple[int, int]] = []
++    if r < cr:
++        dirs.append((-1, 0))
++    if r > cr:
++        dirs.append((1, 0))
++    if c < cc:
++        dirs.append((0, -1))
++    if c > cc:
++        dirs.append((0, 1))
++    return dirs
++
++
++def _extend_to_border(wall_cells: set[tuple[int, int]], cr: int, cc: int, r: int, c: int, side: str) -> None:
++    dr, dc = {
++        "top": (-1, 0),
++        "bottom": (1, 0),
++        "left": (0, -1),
++        "right": (0, 1),
++    }[side]
++    nr, nc = r, c
++    while 0 <= nr < GRID_H and 0 <= nc < GRID_W:
++        wall_cells.add((nr, nc))
++        nr += dr
++        nc += dc
++
++
++def _build_walls(grid: np.ndarray, cr: int, cc: int, dest_set: set[tuple[int, int]]) -> None:
++    near_v, near_h = _near_sides(cr, cc)
++    far_v = "bottom" if near_v == "top" else "top"
++    far_h = "right" if near_h == "left" else "left"
++
++    ring = _frame_ring(cr, cc)
++    near_pool = [cell for cell in ring if _side_tags(cr, cc, *cell) & {near_v, near_h}]
++    far_pool = [cell for cell in ring if _side_tags(cr, cc, *cell) & {far_v, far_h}]
++
++    num_near_gaps = random.randint(1, 3)
++    gap_cells = set(random.sample(near_pool, min(num_near_gaps, len(near_pool))))
++    if far_pool and random.random() < EXTRA_FAR_GAP_PROB:
++        gap_cells.add(random.choice(far_pool))
++
++    wall_cells = {cell for cell in ring if cell not in gap_cells}
++
++    # Long far-side barriers are the main source of asymmetric edge reachability.
++    for r, c in list(wall_cells):
++        tags = _side_tags(cr, cc, r, c)
++        if far_v in tags:
++            _extend_to_border(wall_cells, cr, cc, r, c, far_v)
++        if far_h in tags:
++            _extend_to_border(wall_cells, cr, cc, r, c, far_h)
++
++    # A few short near-side arms keep layouts varied without destroying the main opening.
++    for r, c in list(wall_cells):
++        tags = _side_tags(cr, cc, r, c)
++        if tags & {near_v, near_h} and random.random() < NEAR_ARM_PROB:
++            dirs = _outward_dirs(cr, cc, r, c)
++            if dirs:
++                dr, dc = random.choice(dirs)
++                nr, nc = r + dr, c + dc
++                steps = random.randint(1, 2)
++                for _ in range(steps):
++                    if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                        wall_cells.add((nr, nc))
++                        nr += dr
++                        nc += dc
++                    else:
++                        break
++
++    for r, c in wall_cells:
++        if (r, c) not in dest_set:
++            grid[r, c] = WALL_COLOR
++
++
++def _bfs_reachable(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> set[tuple[int, int]]:
++    visited: set[tuple[int, int]] = set()
++    queue: deque[tuple[int, int]] = deque()
++    for r, c in dest_set:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set and grid[nr, nc] == FLOOR_COLOR:
++                if (nr, nc) not in visited:
++                    visited.add((nr, nc))
++                    queue.append((nr, nc))
++
++    while queue:
++        r, c = queue.popleft()
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in visited:
++                if (nr, nc) not in dest_set and grid[nr, nc] == FLOOR_COLOR:
++                    visited.add((nr, nc))
++                    queue.append((nr, nc))
++    return visited
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Move the nearest reachable border maroons into the off-center 3x3 block around the red pixel.
++
++    Input structure:
++    - Orange floor and magenta walls form corridors around a green 3x3 block whose red center is shifted toward a corner.
++    - Maroon source pixels appear only on the outer border of the grid; some border maroons may be cut off by walls.
++
++    Rule:
++    - Find the unique red cell, take its surrounding 3x3 as the destination, then flood-fill outward through floor and maroon cells.
++    - Only border maroons reached by that flood-fill are candidates; sort them by BFS distance, then row, then column.
++    - Move the closest candidates into the destination in row-major order and erase the moved border sources back to floor.
++
++    Key insight:
++    - The asymmetry comes from two places at once: candidate maroons live only on the border, and the target block sits closer to
++      some borders than others. Visible wall barriers decide which border sides can actually contribute maroons.
++    """
++
++    grid = np.asarray(grid, dtype=int)
++    h, w = grid.shape
++    out = grid.copy()
++
++    centers = np.argwhere(grid == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center"
++    cr, cc = map(int, centers[0])
++
++    dest_cells = _dest_cells(cr, cc)
++    dest_set = set(dest_cells)
++
++    floor_candidates = [int(x) for x in grid.flatten() if int(x) not in (RED_CENTER, DEST_COLOR, WALL_COLOR, MAROON)]
++    assert floor_candidates, "grid must contain a passable floor color"
++    floor = Counter(floor_candidates).most_common(1)[0][0]
++    passable = {floor, MAROON}
++
++    starts: list[tuple[int, int]] = []
++    seen = set()
++    for r, c in dest_cells:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < h and 0 <= nc < w and int(grid[nr, nc]) in passable and (nr, nc) not in seen:
++                seen.add((nr, nc))
++                starts.append((nr, nc))
++    assert starts, "destination block must have at least one passable opening"
++
++    inf = 10**9
++    dist = np.full((h, w), inf, dtype=int)
++    q = deque(starts)
++    for r, c in starts:
++        dist[r, c] = 0
++
++    while q:
++        r, c = q.popleft()
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < h and 0 <= nc < w and int(grid[nr, nc]) in passable and dist[nr, nc] == inf:
++                dist[nr, nc] = dist[r, c] + 1
++                q.append((nr, nc))
++
++    maroons = []
++    for r, c in np.argwhere(grid == MAROON):
++        r = int(r)
++        c = int(c)
++        if _is_border(r, c, h, w) and int(dist[r, c]) < inf:
++            maroons.append((int(dist[r, c]), r, c))
++    maroons.sort()
++
++    k = min(len(dest_cells), len(maroons))
++    chosen = {(r, c) for _, r, c in maroons[:k]}
++
++    for r, c in chosen:
++        out[r, c] = floor
++    for r, c in dest_cells[:k]:
++        out[r, c] = MAROON
++
++    return out
++
++
++def _gen_attempt() -> np.ndarray | None:
++    cr, cc = random.choice(CORNER_CENTERS)
++    dest_cells = _dest_cells(cr, cc)
++    dest_set = set(dest_cells)
++
++    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in dest_cells:
++        base[r, c] = DEST_COLOR
++    base[cr, cc] = RED_CENTER
++
++    _build_walls(base, cr, cc, dest_set)
++
++    reachable_floor = _bfs_reachable(base, dest_set)
++    border_floor = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if base[r, c] == FLOOR_COLOR and _is_border(r, c, GRID_H, GRID_W)
++    }
++    reachable_edge = sorted(border_floor & reachable_floor)
++    unreachable_edge = sorted(border_floor - reachable_floor)
++
++    max_k = min(FILL_K_RANGE[1], len(reachable_edge))
++    if max_k < FILL_K_RANGE[0]:
++        return None
++    k = random.randint(FILL_K_RANGE[0], max_k)
++
++    total_low = max(TOTAL_MAROON_RANGE[0], k)
++    total_high = min(TOTAL_MAROON_RANGE[1], k + len(unreachable_edge))
++    if total_high < total_low:
++        return None
++    total = random.randint(total_low, total_high)
++    num_distractors = total - k
++
++    source_cells = random.sample(reachable_edge, k)
++    distractor_cells = random.sample(unreachable_edge, num_distractors)
++
++    inp = base.copy()
++    for r, c in source_cells + distractor_cells:
++        inp[r, c] = MAROON
++
++    out = base.copy()
++    for r, c in source_cells:
++        out[r, c] = FLOOR_COLOR
++    for r, c in distractor_cells:
++        out[r, c] = MAROON
++    for r, c in dest_cells[:k]:
++        out[r, c] = MAROON
++
++    try:
++        result = main(inp)
++    except Exception:
++        return None
++
++    if not np.array_equal(result, out):
++        return None
++
++    # Fusion guardrails: ensure this did not collapse back to the original centered/scattered regime.
++    if (cr, cc) == (5, 5):
++        return None
++    if any(not _is_border(r, c, GRID_H, GRID_W) for r, c in source_cells + distractor_cells):
++        return None
++
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/22/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dd6b8c4b/22/code.py b/ceshi/code_combo/dd6b8c4b/22/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cdafd3df26c1f1e3f89c6c9f48cd91e47177ce06
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/22/code.py
+@@ -0,0 +1,328 @@
++# Combo variant of dd6b8c4b (index 22)
++# combo_spec: D5/2+D14/1
++# Name: 边缘像素作为源+方块位于角落
++
++import random
++from collections import Counter, deque
++
++import numpy as np
++
++from arc_utils import neighbors4
++
++# Design analysis for the fused variant
++# a) Concrete behavior:
++#    The original task used a centered 3x3 destination and maroon tokens scattered anywhere on floor.
++#    Here the red-centered 3x3 block moves to one of four corner-biased centers: (3,3), (3,7), (7,3), (7,7).
++#    Maroon sources are no longer interior speckles: every movable or distracting maroon lies on the outer border.
++#    Example: with the block near the top-left, a ring of magenta walls plus long barriers on the bottom/right
++#    makes top/left border cells easy to reach while bottom/right border cells can be sealed off. BFS still decides
++#    which maroons qualify, but now the candidate pool itself is visibly "edge only" and strongly asymmetric.
++# b) Complexity calibration:
++#    The target keeps only four corner-biased placements instead of arbitrary offsets, so humans can notice the
++#    positional change from a few examples. Border-only maroons are a strong visual cue, and the wall layout uses
++#    repeated side-aligned barriers rather than noisy free-form walls.
++# c) Implicit assumptions reviewed:
++#    - main() can no longer assume the center is fixed at (5,5); it must locate the unique red cell.
++#    - Collectible maroons are filtered to border cells only; interior maroons, if present, are ignored as sources.
++#    - Distance ranking is still row/col visible, not dependent on hidden color ids or metadata.
++#    - BFS still assumes at least one passable opening next to the block; generator guarantees near-side gaps.
++# d) Placement legality:
++#    The chosen centers keep the full 5x5 wall frame in-bounds. Walls, destination cells, and border maroons occupy
++#    disjoint cell sets, and all source/distractor maroons are sampled only from floor border cells.
++# e) Visual observability:
++#    In 2-4 examples, a solver can see that maroons only appear on the boundary and that the block sits off-center.
++#    Which border maroons move is explained by visible corridors/openings rather than invisible bookkeeping.
++# f) Visual cleanliness:
++#    Each role has its own region: the 3x3 target, a magenta wall frame, and edge-only maroons. This avoids the
++#    clutter of mixed interior tokens and keeps the asymmetric reachability legible.
++# g) Inferrability of change:
++#    No new color remapping is introduced. The only semantic change is positional: "border maroons reachable through
++#    visible floor corridors move into the corner-biased 3x3 block."
++
++GRID_H, GRID_W = 11, 11
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++MAROON = 9
++
++CORNER_CENTERS = [(3, 3), (3, 7), (7, 3), (7, 7)]
++FILL_K_RANGE = (2, 9)
++TOTAL_MAROON_RANGE = (4, 16)
++GEN_RETRIES = 400
++EXTRA_FAR_GAP_PROB = 0.35
++NEAR_ARM_PROB = 0.35
++
++
++def _is_border(r: int, c: int, h: int, w: int) -> bool:
++    return r == 0 or c == 0 or r == h - 1 or c == w - 1
++
++
++def _dest_cells(cr: int, cc: int) -> list[tuple[int, int]]:
++    return [(r, c) for r in range(cr - 1, cr + 2) for c in range(cc - 1, cc + 2)]
++
++
++def _frame_ring(cr: int, cc: int) -> list[tuple[int, int]]:
++    ring = []
++    for r in range(cr - 2, cr + 3):
++        for c in range(cc - 2, cc + 3):
++            if max(abs(r - cr), abs(c - cc)) == 2:
++                ring.append((r, c))
++    return sorted(ring)
++
++
++def _near_sides(cr: int, cc: int) -> tuple[str, str]:
++    return ("top" if cr < GRID_H // 2 else "bottom", "left" if cc < GRID_W // 2 else "right")
++
++
++def _side_tags(cr: int, cc: int, r: int, c: int) -> set[str]:
++    tags: set[str] = set()
++    if r == cr - 2:
++        tags.add("top")
++    if r == cr + 2:
++        tags.add("bottom")
++    if c == cc - 2:
++        tags.add("left")
++    if c == cc + 2:
++        tags.add("right")
++    return tags
++
++
++def _outward_dirs(cr: int, cc: int, r: int, c: int) -> list[tuple[int, int]]:
++    dirs: list[tuple[int, int]] = []
++    if r < cr:
++        dirs.append((-1, 0))
++    if r > cr:
++        dirs.append((1, 0))
++    if c < cc:
++        dirs.append((0, -1))
++    if c > cc:
++        dirs.append((0, 1))
++    return dirs
++
++
++def _extend_to_border(wall_cells: set[tuple[int, int]], cr: int, cc: int, r: int, c: int, side: str) -> None:
++    dr, dc = {
++        "top": (-1, 0),
++        "bottom": (1, 0),
++        "left": (0, -1),
++        "right": (0, 1),
++    }[side]
++    nr, nc = r, c
++    while 0 <= nr < GRID_H and 0 <= nc < GRID_W:
++        wall_cells.add((nr, nc))
++        nr += dr
++        nc += dc
++
++
++def _build_walls(grid: np.ndarray, cr: int, cc: int, dest_set: set[tuple[int, int]]) -> None:
++    near_v, near_h = _near_sides(cr, cc)
++    far_v = "bottom" if near_v == "top" else "top"
++    far_h = "right" if near_h == "left" else "left"
++
++    ring = _frame_ring(cr, cc)
++    near_pool = [cell for cell in ring if _side_tags(cr, cc, *cell) & {near_v, near_h}]
++    far_pool = [cell for cell in ring if _side_tags(cr, cc, *cell) & {far_v, far_h}]
++
++    num_near_gaps = random.randint(1, 3)
++    gap_cells = set(random.sample(near_pool, min(num_near_gaps, len(near_pool))))
++    if far_pool and random.random() < EXTRA_FAR_GAP_PROB:
++        gap_cells.add(random.choice(far_pool))
++
++    wall_cells = {cell for cell in ring if cell not in gap_cells}
++
++    # Long far-side barriers are the main source of asymmetric edge reachability.
++    for r, c in list(wall_cells):
++        tags = _side_tags(cr, cc, r, c)
++        if far_v in tags:
++            _extend_to_border(wall_cells, cr, cc, r, c, far_v)
++        if far_h in tags:
++            _extend_to_border(wall_cells, cr, cc, r, c, far_h)
++
++    # A few short near-side arms keep layouts varied without destroying the main opening.
++    for r, c in list(wall_cells):
++        tags = _side_tags(cr, cc, r, c)
++        if tags & {near_v, near_h} and random.random() < NEAR_ARM_PROB:
++            dirs = _outward_dirs(cr, cc, r, c)
++            if dirs:
++                dr, dc = random.choice(dirs)
++                nr, nc = r + dr, c + dc
++                steps = random.randint(1, 2)
++                for _ in range(steps):
++                    if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                        wall_cells.add((nr, nc))
++                        nr += dr
++                        nc += dc
++                    else:
++                        break
++
++    for r, c in wall_cells:
++        if (r, c) not in dest_set:
++            grid[r, c] = WALL_COLOR
++
++
++def _bfs_reachable(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> set[tuple[int, int]]:
++    visited: set[tuple[int, int]] = set()
++    queue: deque[tuple[int, int]] = deque()
++    for r, c in dest_set:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set and grid[nr, nc] == FLOOR_COLOR:
++                if (nr, nc) not in visited:
++                    visited.add((nr, nc))
++                    queue.append((nr, nc))
++
++    while queue:
++        r, c = queue.popleft()
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in visited:
++                if (nr, nc) not in dest_set and grid[nr, nc] == FLOOR_COLOR:
++                    visited.add((nr, nc))
++                    queue.append((nr, nc))
++    return visited
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Move the nearest reachable border maroons into the off-center 3x3 block around the red pixel.
++
++    Input structure:
++    - Orange floor and magenta walls form corridors around a green 3x3 block whose red center is shifted toward a corner.
++    - Maroon source pixels appear only on the outer border of the grid; some border maroons may be cut off by walls.
++
++    Rule:
++    - Find the unique red cell, take its surrounding 3x3 as the destination, then flood-fill outward through floor and maroon cells.
++    - Only border maroons reached by that flood-fill are candidates; sort them by BFS distance, then row, then column.
++    - Move the closest candidates into the destination in row-major order and erase the moved border sources back to floor.
++
++    Key insight:
++    - The asymmetry comes from two places at once: candidate maroons live only on the border, and the target block sits closer to
++      some borders than others. Visible wall barriers decide which border sides can actually contribute maroons.
++    """
++
++    grid = np.asarray(grid, dtype=int)
++    h, w = grid.shape
++    out = grid.copy()
++
++    centers = np.argwhere(grid == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center"
++    cr, cc = map(int, centers[0])
++
++    dest_cells = _dest_cells(cr, cc)
++    dest_set = set(dest_cells)
++
++    floor_candidates = [int(x) for x in grid.flatten() if int(x) not in (RED_CENTER, DEST_COLOR, WALL_COLOR, MAROON)]
++    assert floor_candidates, "grid must contain a passable floor color"
++    floor = Counter(floor_candidates).most_common(1)[0][0]
++    passable = {floor, MAROON}
++
++    starts: list[tuple[int, int]] = []
++    seen = set()
++    for r, c in dest_cells:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < h and 0 <= nc < w and int(grid[nr, nc]) in passable and (nr, nc) not in seen:
++                seen.add((nr, nc))
++                starts.append((nr, nc))
++    assert starts, "destination block must have at least one passable opening"
++
++    inf = 10**9
++    dist = np.full((h, w), inf, dtype=int)
++    q = deque(starts)
++    for r, c in starts:
++        dist[r, c] = 0
++
++    while q:
++        r, c = q.popleft()
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < h and 0 <= nc < w and int(grid[nr, nc]) in passable and dist[nr, nc] == inf:
++                dist[nr, nc] = dist[r, c] + 1
++                q.append((nr, nc))
++
++    maroons = []
++    for r, c in np.argwhere(grid == MAROON):
++        r = int(r)
++        c = int(c)
++        if _is_border(r, c, h, w) and int(dist[r, c]) < inf:
++            maroons.append((int(dist[r, c]), r, c))
++    maroons.sort()
++
++    k = min(len(dest_cells), len(maroons))
++    chosen = {(r, c) for _, r, c in maroons[:k]}
++
++    for r, c in chosen:
++        out[r, c] = floor
++    for r, c in dest_cells[:k]:
++        out[r, c] = MAROON
++
++    return out
++
++
++def _gen_attempt() -> np.ndarray | None:
++    cr, cc = random.choice(CORNER_CENTERS)
++    dest_cells = _dest_cells(cr, cc)
++    dest_set = set(dest_cells)
++
++    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in dest_cells:
++        base[r, c] = DEST_COLOR
++    base[cr, cc] = RED_CENTER
++
++    _build_walls(base, cr, cc, dest_set)
++
++    reachable_floor = _bfs_reachable(base, dest_set)
++    border_floor = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if base[r, c] == FLOOR_COLOR and _is_border(r, c, GRID_H, GRID_W)
++    }
++    reachable_edge = sorted(border_floor & reachable_floor)
++    unreachable_edge = sorted(border_floor - reachable_floor)
++
++    max_k = min(FILL_K_RANGE[1], len(reachable_edge))
++    if max_k < FILL_K_RANGE[0]:
++        return None
++    k = random.randint(FILL_K_RANGE[0], max_k)
++
++    total_low = max(TOTAL_MAROON_RANGE[0], k)
++    total_high = min(TOTAL_MAROON_RANGE[1], k + len(unreachable_edge))
++    if total_high < total_low:
++        return None
++    total = random.randint(total_low, total_high)
++    num_distractors = total - k
++
++    source_cells = random.sample(reachable_edge, k)
++    distractor_cells = random.sample(unreachable_edge, num_distractors)
++
++    inp = base.copy()
++    for r, c in source_cells + distractor_cells:
++        inp[r, c] = MAROON
++
++    out = base.copy()
++    for r, c in source_cells:
++        out[r, c] = FLOOR_COLOR
++    for r, c in distractor_cells:
++        out[r, c] = MAROON
++    for r, c in dest_cells[:k]:
++        out[r, c] = MAROON
++
++    try:
++        result = main(inp)
++    except Exception:
++        return None
++
++    if not np.array_equal(result, out):
++        return None
++
++    # Fusion guardrails: ensure this did not collapse back to the original centered/scattered regime.
++    if (cr, cc) == (5, 5):
++        return None
++    if any(not _is_border(r, c, GRID_H, GRID_W) for r, c in source_cells + distractor_cells):
++        return None
++
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+ succeeded in 300ms:
+Success: 50/50, Time: 0.0s (1ms/call)
+
+codex
+50 次基本成功率已经过了。现在补做“融合行为不是退化”的量化检查，重点看三件事：栗色是否始终只在边缘、红心是否始终落在四个偏角中心、以及可达边缘是否明显偏向近侧而非远侧。
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util
+from collections import Counter
+import numpy as np
+
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/22/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+side_counts = Counter()
+center_counts = Counter()
+all_border_only = 0
+far_zero = 0
+near_gt_far = 0
+samples = 200
+
+for _ in range(samples):
+    g = mod.generate_input()
+    center = tuple(map(int, np.argwhere(g == mod.RED_CENTER)[0]))
+    center_counts[center] += 1
+    maroons = [tuple(map(int, rc)) for rc in np.argwhere(g == mod.MAROON)]
+    if all(mod._is_border(r, c, mod.GRID_H, mod.GRID_W) for r, c in maroons):
+        all_border_only += 1
+
+    dest_set = set(mod._dest_cells(*center))
+    floor_grid = g.copy()
+    floor_grid[floor_grid == mod.MAROON] = mod.FLOOR_COLOR
+    reachable = mod._bfs_reachable(floor_grid, dest_set)
+    reachable_edge = {(r, c) for (r, c) in reachable if mod._is_border(r, c, mod.GRID_H, mod.GRID_W)}
+
+    near_v, near_h = mod._near_sides(*center)
+    far_v = 'bottom' if near_v == 'top' else 'top'
+    far_h = 'right' if near_h == 'left' else 'left'
+
+    def side_of(rc):
+        r, c = rc
+        tags = set()
+        if r == 0: tags.add('top')
+        if r == mod.GRID_H - 1: tags.add('bottom')
+        if c == 0: tags.add('left')
+        if c == mod.GRID_W - 1: tags.add('right')
+        return tags
+
+    near = 0
+    far = 0
+    sides = set()
+    for rc in reachable_edge:
+        tags = side_of(rc)
+        sides |= tags
+        if tags & {near_v, near_h}:
+            near += 1
+        if tags & {far_v, far_h}:
+            far += 1
+    side_counts[len(sides)] += 1
+    if far == 0:
+        far_zero += 1
+    if near > far:
+        near_gt_far += 1
+
+print('border_only', all_border_only, '/', samples)
+print('centers', dict(center_counts))
+print('reachable_side_count_distribution', dict(side_counts))
+print('far_reachable_zero', far_zero, '/', samples)
+print('near_reachable_gt_far', near_gt_far, '/', samples)
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dd6b8c4b/22/code.py b/ceshi/code_combo/dd6b8c4b/22/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cdafd3df26c1f1e3f89c6c9f48cd91e47177ce06
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/22/code.py
+@@ -0,0 +1,328 @@
++# Combo variant of dd6b8c4b (index 22)
++# combo_spec: D5/2+D14/1
++# Name: 边缘像素作为源+方块位于角落
++
++import random
++from collections import Counter, deque
++
++import numpy as np
++
++from arc_utils import neighbors4
++
++# Design analysis for the fused variant
++# a) Concrete behavior:
++#    The original task used a centered 3x3 destination and maroon tokens scattered anywhere on floor.
++#    Here the red-centered 3x3 block moves to one of four corner-biased centers: (3,3), (3,7), (7,3), (7,7).
++#    Maroon sources are no longer interior speckles: every movable or distracting maroon lies on the outer border.
++#    Example: with the block near the top-left, a ring of magenta walls plus long barriers on the bottom/right
++#    makes top/left border cells easy to reach while bottom/right border cells can be sealed off. BFS still decides
++#    which maroons qualify, but now the candidate pool itself is visibly "edge only" and strongly asymmetric.
++# b) Complexity calibration:
++#    The target keeps only four corner-biased placements instead of arbitrary offsets, so humans can notice the
++#    positional change from a few examples. Border-only maroons are a strong visual cue, and the wall layout uses
++#    repeated side-aligned barriers rather than noisy free-form walls.
++# c) Implicit assumptions reviewed:
++#    - main() can no longer assume the center is fixed at (5,5); it must locate the unique red cell.
++#    - Collectible maroons are filtered to border cells only; interior maroons, if present, are ignored as sources.
++#    - Distance ranking is still row/col visible, not dependent on hidden color ids or metadata.
++#    - BFS still assumes at least one passable opening next to the block; generator guarantees near-side gaps.
++# d) Placement legality:
++#    The chosen centers keep the full 5x5 wall frame in-bounds. Walls, destination cells, and border maroons occupy
++#    disjoint cell sets, and all source/distractor maroons are sampled only from floor border cells.
++# e) Visual observability:
++#    In 2-4 examples, a solver can see that maroons only appear on the boundary and that the block sits off-center.
++#    Which border maroons move is explained by visible corridors/openings rather than invisible bookkeeping.
++# f) Visual cleanliness:
++#    Each role has its own region: the 3x3 target, a magenta wall frame, and edge-only maroons. This avoids the
++#    clutter of mixed interior tokens and keeps the asymmetric reachability legible.
++# g) Inferrability of change:
++#    No new color remapping is introduced. The only semantic change is positional: "border maroons reachable through
++#    visible floor corridors move into the corner-biased 3x3 block."
++
++GRID_H, GRID_W = 11, 11
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++MAROON = 9
++
++CORNER_CENTERS = [(3, 3), (3, 7), (7, 3), (7, 7)]
++FILL_K_RANGE = (2, 9)
++TOTAL_MAROON_RANGE = (4, 16)
++GEN_RETRIES = 400
++EXTRA_FAR_GAP_PROB = 0.35
++NEAR_ARM_PROB = 0.35
++
++
++def _is_border(r: int, c: int, h: int, w: int) -> bool:
++    return r == 0 or c == 0 or r == h - 1 or c == w - 1
++
++
++def _dest_cells(cr: int, cc: int) -> list[tuple[int, int]]:
++    return [(r, c) for r in range(cr - 1, cr + 2) for c in range(cc - 1, cc + 2)]
++
++
++def _frame_ring(cr: int, cc: int) -> list[tuple[int, int]]:
++    ring = []
++    for r in range(cr - 2, cr + 3):
++        for c in range(cc - 2, cc + 3):
++            if max(abs(r - cr), abs(c - cc)) == 2:
++                ring.append((r, c))
++    return sorted(ring)
++
++
++def _near_sides(cr: int, cc: int) -> tuple[str, str]:
++    return ("top" if cr < GRID_H // 2 else "bottom", "left" if cc < GRID_W // 2 else "right")
++
++
++def _side_tags(cr: int, cc: int, r: int, c: int) -> set[str]:
++    tags: set[str] = set()
++    if r == cr - 2:
++        tags.add("top")
++    if r == cr + 2:
++        tags.add("bottom")
++    if c == cc - 2:
++        tags.add("left")
++    if c == cc + 2:
++        tags.add("right")
++    return tags
++
++
++def _outward_dirs(cr: int, cc: int, r: int, c: int) -> list[tuple[int, int]]:
++    dirs: list[tuple[int, int]] = []
++    if r < cr:
++        dirs.append((-1, 0))
++    if r > cr:
++        dirs.append((1, 0))
++    if c < cc:
++        dirs.append((0, -1))
++    if c > cc:
++        dirs.append((0, 1))
++    return dirs
++
++
++def _extend_to_border(wall_cells: set[tuple[int, int]], cr: int, cc: int, r: int, c: int, side: str) -> None:
++    dr, dc = {
++        "top": (-1, 0),
++        "bottom": (1, 0),
++        "left": (0, -1),
++        "right": (0, 1),
++    }[side]
++    nr, nc = r, c
++    while 0 <= nr < GRID_H and 0 <= nc < GRID_W:
++        wall_cells.add((nr, nc))
++        nr += dr
++        nc += dc
++
++
++def _build_walls(grid: np.ndarray, cr: int, cc: int, dest_set: set[tuple[int, int]]) -> None:
++    near_v, near_h = _near_sides(cr, cc)
++    far_v = "bottom" if near_v == "top" else "top"
++    far_h = "right" if near_h == "left" else "left"
++
++    ring = _frame_ring(cr, cc)
++    near_pool = [cell for cell in ring if _side_tags(cr, cc, *cell) & {near_v, near_h}]
++    far_pool = [cell for cell in ring if _side_tags(cr, cc, *cell) & {far_v, far_h}]
++
++    num_near_gaps = random.randint(1, 3)
++    gap_cells = set(random.sample(near_pool, min(num_near_gaps, len(near_pool))))
++    if far_pool and random.random() < EXTRA_FAR_GAP_PROB:
++        gap_cells.add(random.choice(far_pool))
++
++    wall_cells = {cell for cell in ring if cell not in gap_cells}
++
++    # Long far-side barriers are the main source of asymmetric edge reachability.
++    for r, c in list(wall_cells):
++        tags = _side_tags(cr, cc, r, c)
++        if far_v in tags:
++            _extend_to_border(wall_cells, cr, cc, r, c, far_v)
++        if far_h in tags:
++            _extend_to_border(wall_cells, cr, cc, r, c, far_h)
++
++    # A few short near-side arms keep layouts varied without destroying the main opening.
++    for r, c in list(wall_cells):
++        tags = _side_tags(cr, cc, r, c)
++        if tags & {near_v, near_h} and random.random() < NEAR_ARM_PROB:
++            dirs = _outward_dirs(cr, cc, r, c)
++            if dirs:
++                dr, dc = random.choice(dirs)
++                nr, nc = r + dr, c + dc
++                steps = random.randint(1, 2)
++                for _ in range(steps):
++                    if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                        wall_cells.add((nr, nc))
++                        nr += dr
++                        nc += dc
++                    else:
++                        break
++
++    for r, c in wall_cells:
++        if (r, c) not in dest_set:
++            grid[r, c] = WALL_COLOR
++
++
++def _bfs_reachable(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> set[tuple[int, int]]:
++    visited: set[tuple[int, int]] = set()
++    queue: deque[tuple[int, int]] = deque()
++    for r, c in dest_set:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set and grid[nr, nc] == FLOOR_COLOR:
++                if (nr, nc) not in visited:
++                    visited.add((nr, nc))
++                    queue.append((nr, nc))
++
++    while queue:
++        r, c = queue.popleft()
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in visited:
++                if (nr, nc) not in dest_set and grid[nr, nc] == FLOOR_COLOR:
++                    visited.add((nr, nc))
++                    queue.append((nr, nc))
++    return visited
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Move the nearest reachable border maroons into the off-center 3x3 block around the red pixel.
++
++    Input structure:
++    - Orange floor and magenta walls form corridors around a green 3x3 block whose red center is shifted toward a corner.
++    - Maroon source pixels appear only on the outer border of the grid; some border maroons may be cut off by walls.
++
++    Rule:
++    - Find the unique red cell, take its surrounding 3x3 as the destination, then flood-fill outward through floor and maroon cells.
++    - Only border maroons reached by that flood-fill are candidates; sort them by BFS distance, then row, then column.
++    - Move the closest candidates into the destination in row-major order and erase the moved border sources back to floor.
++
++    Key insight:
++    - The asymmetry comes from two places at once: candidate maroons live only on the border, and the target block sits closer to
++      some borders than others. Visible wall barriers decide which border sides can actually contribute maroons.
++    """
++
++    grid = np.asarray(grid, dtype=int)
++    h, w = grid.shape
++    out = grid.copy()
++
++    centers = np.argwhere(grid == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center"
++    cr, cc = map(int, centers[0])
++
++    dest_cells = _dest_cells(cr, cc)
++    dest_set = set(dest_cells)
++
++    floor_candidates = [int(x) for x in grid.flatten() if int(x) not in (RED_CENTER, DEST_COLOR, WALL_COLOR, MAROON)]
++    assert floor_candidates, "grid must contain a passable floor color"
++    floor = Counter(floor_candidates).most_common(1)[0][0]
++    passable = {floor, MAROON}
++
++    starts: list[tuple[int, int]] = []
++    seen = set()
++    for r, c in dest_cells:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < h and 0 <= nc < w and int(grid[nr, nc]) in passable and (nr, nc) not in seen:
++                seen.add((nr, nc))
++                starts.append((nr, nc))
++    assert starts, "destination block must have at least one passable opening"
++
++    inf = 10**9
++    dist = np.full((h, w), inf, dtype=int)
++    q = deque(starts)
++    for r, c in starts:
++        dist[r, c] = 0
++
++    while q:
++        r, c = q.popleft()
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < h and 0 <= nc < w and int(grid[nr, nc]) in passable and dist[nr, nc] == inf:
++                dist[nr, nc] = dist[r, c] + 1
++                q.append((nr, nc))
++
++    maroons = []
++    for r, c in np.argwhere(grid == MAROON):
++        r = int(r)
++        c = int(c)
++        if _is_border(r, c, h, w) and int(dist[r, c]) < inf:
++            maroons.append((int(dist[r, c]), r, c))
++    maroons.sort()
++
++    k = min(len(dest_cells), len(maroons))
++    chosen = {(r, c) for _, r, c in maroons[:k]}
++
++    for r, c in chosen:
++        out[r, c] = floor
++    for r, c in dest_cells[:k]:
++        out[r, c] = MAROON
++
++    return out
++
++
++def _gen_attempt() -> np.ndarray | None:
++    cr, cc = random.choice(CORNER_CENTERS)
++    dest_cells = _dest_cells(cr, cc)
++    dest_set = set(dest_cells)
++
++    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in dest_cells:
++        base[r, c] = DEST_COLOR
++    base[cr, cc] = RED_CENTER
++
++    _build_walls(base, cr, cc, dest_set)
++
++    reachable_floor = _bfs_reachable(base, dest_set)
++    border_floor = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if base[r, c] == FLOOR_COLOR and _is_border(r, c, GRID_H, GRID_W)
++    }
++    reachable_edge = sorted(border_floor & reachable_floor)
++    unreachable_edge = sorted(border_floor - reachable_floor)
++
++    max_k = min(FILL_K_RANGE[1], len(reachable_edge))
++    if max_k < FILL_K_RANGE[0]:
++        return None
++    k = random.randint(FILL_K_RANGE[0], max_k)
++
++    total_low = max(TOTAL_MAROON_RANGE[0], k)
++    total_high = min(TOTAL_MAROON_RANGE[1], k + len(unreachable_edge))
++    if total_high < total_low:
++        return None
++    total = random.randint(total_low, total_high)
++    num_distractors = total - k
++
++    source_cells = random.sample(reachable_edge, k)
++    distractor_cells = random.sample(unreachable_edge, num_distractors)
++
++    inp = base.copy()
++    for r, c in source_cells + distractor_cells:
++        inp[r, c] = MAROON
++
++    out = base.copy()
++    for r, c in source_cells:
++        out[r, c] = FLOOR_COLOR
++    for r, c in distractor_cells:
++        out[r, c] = MAROON
++    for r, c in dest_cells[:k]:
++        out[r, c] = MAROON
++
++    try:
++        result = main(inp)
++    except Exception:
++        return None
++
++    if not np.array_equal(result, out):
++        return None
++
++    # Fusion guardrails: ensure this did not collapse back to the original centered/scattered regime.
++    if (cr, cc) == (5, 5):
++        return None
++    if any(not _is_border(r, c, GRID_H, GRID_W) for r, c in source_cells + distractor_cells):
++        return None
++
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+ succeeded in 373ms:
+border_only 200 / 200
+centers {(3, 7): 55, (7, 7): 52, (7, 3): 60, (3, 3): 33}
+reachable_side_count_distribution {2: 78, 4: 19, 3: 83, 1: 20}
+far_reachable_zero 78 / 200
+near_reachable_gt_far 198 / 200
+
+codex
+融合变体代码已写入 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/22/code.py)。文件头部加入了组合标识，`main()` 也按要求重写了四段式说明，并把设计分析与隐式假设审查写进了代码注释。
+
+验证结果：
+- 成功率测试：`50/50`
+- 速度：约 `1ms/call`
+- 融合行为统计（200 个样本）：
+  - 边缘栗色像素占比：`200/200` 样本全部只在外边框放置 maroon
+  - 偏角中心分布：仅出现在 `(3,3) (3,7) (7,3) (7,7)`
+  - 可达性非对称：`198/200` 样本中“近侧可达边缘数 > 远侧可达边缘数”，`78/200` 样本远侧边缘完全不可达
+
+这说明生成器没有退化回原题的“中心目标块 + 内部分散源像素”模式。
+diff --git a/ceshi/code_combo/dd6b8c4b/22/code.py b/ceshi/code_combo/dd6b8c4b/22/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cdafd3df26c1f1e3f89c6c9f48cd91e47177ce06
+--- /dev/null
++++ b/ceshi/code_combo/dd6b8c4b/22/code.py
+@@ -0,0 +1,328 @@
++# Combo variant of dd6b8c4b (index 22)
++# combo_spec: D5/2+D14/1
++# Name: 边缘像素作为源+方块位于角落
++
++import random
++from collections import Counter, deque
++
++import numpy as np
++
++from arc_utils import neighbors4
++
++# Design analysis for the fused variant
++# a) Concrete behavior:
++#    The original task used a centered 3x3 destination and maroon tokens scattered anywhere on floor.
++#    Here the red-centered 3x3 block moves to one of four corner-biased centers: (3,3), (3,7), (7,3), (7,7).
++#    Maroon sources are no longer interior speckles: every movable or distracting maroon lies on the outer border.
++#    Example: with the block near the top-left, a ring of magenta walls plus long barriers on the bottom/right
++#    makes top/left border cells easy to reach while bottom/right border cells can be sealed off. BFS still decides
++#    which maroons qualify, but now the candidate pool itself is visibly "edge only" and strongly asymmetric.
++# b) Complexity calibration:
++#    The target keeps only four corner-biased placements instead of arbitrary offsets, so humans can notice the
++#    positional change from a few examples. Border-only maroons are a strong visual cue, and the wall layout uses
++#    repeated side-aligned barriers rather than noisy free-form walls.
++# c) Implicit assumptions reviewed:
++#    - main() can no longer assume the center is fixed at (5,5); it must locate the unique red cell.
++#    - Collectible maroons are filtered to border cells only; interior maroons, if present, are ignored as sources.
++#    - Distance ranking is still row/col visible, not dependent on hidden color ids or metadata.
++#    - BFS still assumes at least one passable opening next to the block; generator guarantees near-side gaps.
++# d) Placement legality:
++#    The chosen centers keep the full 5x5 wall frame in-bounds. Walls, destination cells, and border maroons occupy
++#    disjoint cell sets, and all source/distractor maroons are sampled only from floor border cells.
++# e) Visual observability:
++#    In 2-4 examples, a solver can see that maroons only appear on the boundary and that the block sits off-center.
++#    Which border maroons move is explained by visible corridors/openings rather than invisible bookkeeping.
++# f) Visual cleanliness:
++#    Each role has its own region: the 3x3 target, a magenta wall frame, and edge-only maroons. This avoids the
++#    clutter of mixed interior tokens and keeps the asymmetric reachability legible.
++# g) Inferrability of change:
++#    No new color remapping is introduced. The only semantic change is positional: "border maroons reachable through
++#    visible floor corridors move into the corner-biased 3x3 block."
++
++GRID_H, GRID_W = 11, 11
++FLOOR_COLOR, WALL_COLOR = 7, 6
++DEST_COLOR, RED_CENTER = 3, 2
++MAROON = 9
++
++CORNER_CENTERS = [(3, 3), (3, 7), (7, 3), (7, 7)]
++FILL_K_RANGE = (2, 9)
++TOTAL_MAROON_RANGE = (4, 16)
++GEN_RETRIES = 400
++EXTRA_FAR_GAP_PROB = 0.35
++NEAR_ARM_PROB = 0.35
++
++
++def _is_border(r: int, c: int, h: int, w: int) -> bool:
++    return r == 0 or c == 0 or r == h - 1 or c == w - 1
++
++
++def _dest_cells(cr: int, cc: int) -> list[tuple[int, int]]:
++    return [(r, c) for r in range(cr - 1, cr + 2) for c in range(cc - 1, cc + 2)]
++
++
++def _frame_ring(cr: int, cc: int) -> list[tuple[int, int]]:
++    ring = []
++    for r in range(cr - 2, cr + 3):
++        for c in range(cc - 2, cc + 3):
++            if max(abs(r - cr), abs(c - cc)) == 2:
++                ring.append((r, c))
++    return sorted(ring)
++
++
++def _near_sides(cr: int, cc: int) -> tuple[str, str]:
++    return ("top" if cr < GRID_H // 2 else "bottom", "left" if cc < GRID_W // 2 else "right")
++
++
++def _side_tags(cr: int, cc: int, r: int, c: int) -> set[str]:
++    tags: set[str] = set()
++    if r == cr - 2:
++        tags.add("top")
++    if r == cr + 2:
++        tags.add("bottom")
++    if c == cc - 2:
++        tags.add("left")
++    if c == cc + 2:
++        tags.add("right")
++    return tags
++
++
++def _outward_dirs(cr: int, cc: int, r: int, c: int) -> list[tuple[int, int]]:
++    dirs: list[tuple[int, int]] = []
++    if r < cr:
++        dirs.append((-1, 0))
++    if r > cr:
++        dirs.append((1, 0))
++    if c < cc:
++        dirs.append((0, -1))
++    if c > cc:
++        dirs.append((0, 1))
++    return dirs
++
++
++def _extend_to_border(wall_cells: set[tuple[int, int]], cr: int, cc: int, r: int, c: int, side: str) -> None:
++    dr, dc = {
++        "top": (-1, 0),
++        "bottom": (1, 0),
++        "left": (0, -1),
++        "right": (0, 1),
++    }[side]
++    nr, nc = r, c
++    while 0 <= nr < GRID_H and 0 <= nc < GRID_W:
++        wall_cells.add((nr, nc))
++        nr += dr
++        nc += dc
++
++
++def _build_walls(grid: np.ndarray, cr: int, cc: int, dest_set: set[tuple[int, int]]) -> None:
++    near_v, near_h = _near_sides(cr, cc)
++    far_v = "bottom" if near_v == "top" else "top"
++    far_h = "right" if near_h == "left" else "left"
++
++    ring = _frame_ring(cr, cc)
++    near_pool = [cell for cell in ring if _side_tags(cr, cc, *cell) & {near_v, near_h}]
++    far_pool = [cell for cell in ring if _side_tags(cr, cc, *cell) & {far_v, far_h}]
++
++    num_near_gaps = random.randint(1, 3)
++    gap_cells = set(random.sample(near_pool, min(num_near_gaps, len(near_pool))))
++    if far_pool and random.random() < EXTRA_FAR_GAP_PROB:
++        gap_cells.add(random.choice(far_pool))
++
++    wall_cells = {cell for cell in ring if cell not in gap_cells}
++
++    # Long far-side barriers are the main source of asymmetric edge reachability.
++    for r, c in list(wall_cells):
++        tags = _side_tags(cr, cc, r, c)
++        if far_v in tags:
++            _extend_to_border(wall_cells, cr, cc, r, c, far_v)
++        if far_h in tags:
++            _extend_to_border(wall_cells, cr, cc, r, c, far_h)
++
++    # A few short near-side arms keep layouts varied without destroying the main opening.
++    for r, c in list(wall_cells):
++        tags = _side_tags(cr, cc, r, c)
++        if tags & {near_v, near_h} and random.random() < NEAR_ARM_PROB:
++            dirs = _outward_dirs(cr, cc, r, c)
++            if dirs:
++                dr, dc = random.choice(dirs)
++                nr, nc = r + dr, c + dc
++                steps = random.randint(1, 2)
++                for _ in range(steps):
++                    if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set:
++                        wall_cells.add((nr, nc))
++                        nr += dr
++                        nc += dc
++                    else:
++                        break
++
++    for r, c in wall_cells:
++        if (r, c) not in dest_set:
++            grid[r, c] = WALL_COLOR
++
++
++def _bfs_reachable(grid: np.ndarray, dest_set: set[tuple[int, int]]) -> set[tuple[int, int]]:
++    visited: set[tuple[int, int]] = set()
++    queue: deque[tuple[int, int]] = deque()
++    for r, c in dest_set:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in dest_set and grid[nr, nc] == FLOOR_COLOR:
++                if (nr, nc) not in visited:
++                    visited.add((nr, nc))
++                    queue.append((nr, nc))
++
++    while queue:
++        r, c = queue.popleft()
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < GRID_H and 0 <= nc < GRID_W and (nr, nc) not in visited:
++                if (nr, nc) not in dest_set and grid[nr, nc] == FLOOR_COLOR:
++                    visited.add((nr, nc))
++                    queue.append((nr, nc))
++    return visited
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Move the nearest reachable border maroons into the off-center 3x3 block around the red pixel.
++
++    Input structure:
++    - Orange floor and magenta walls form corridors around a green 3x3 block whose red center is shifted toward a corner.
++    - Maroon source pixels appear only on the outer border of the grid; some border maroons may be cut off by walls.
++
++    Rule:
++    - Find the unique red cell, take its surrounding 3x3 as the destination, then flood-fill outward through floor and maroon cells.
++    - Only border maroons reached by that flood-fill are candidates; sort them by BFS distance, then row, then column.
++    - Move the closest candidates into the destination in row-major order and erase the moved border sources back to floor.
++
++    Key insight:
++    - The asymmetry comes from two places at once: candidate maroons live only on the border, and the target block sits closer to
++      some borders than others. Visible wall barriers decide which border sides can actually contribute maroons.
++    """
++
++    grid = np.asarray(grid, dtype=int)
++    h, w = grid.shape
++    out = grid.copy()
++
++    centers = np.argwhere(grid == RED_CENTER)
++    assert len(centers) == 1, "grid must have exactly one red center"
++    cr, cc = map(int, centers[0])
++
++    dest_cells = _dest_cells(cr, cc)
++    dest_set = set(dest_cells)
++
++    floor_candidates = [int(x) for x in grid.flatten() if int(x) not in (RED_CENTER, DEST_COLOR, WALL_COLOR, MAROON)]
++    assert floor_candidates, "grid must contain a passable floor color"
++    floor = Counter(floor_candidates).most_common(1)[0][0]
++    passable = {floor, MAROON}
++
++    starts: list[tuple[int, int]] = []
++    seen = set()
++    for r, c in dest_cells:
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < h and 0 <= nc < w and int(grid[nr, nc]) in passable and (nr, nc) not in seen:
++                seen.add((nr, nc))
++                starts.append((nr, nc))
++    assert starts, "destination block must have at least one passable opening"
++
++    inf = 10**9
++    dist = np.full((h, w), inf, dtype=int)
++    q = deque(starts)
++    for r, c in starts:
++        dist[r, c] = 0
++
++    while q:
++        r, c = q.popleft()
++        for nr, nc in neighbors4(r, c):
++            if 0 <= nr < h and 0 <= nc < w and int(grid[nr, nc]) in passable and dist[nr, nc] == inf:
++                dist[nr, nc] = dist[r, c] + 1
++                q.append((nr, nc))
++
++    maroons = []
++    for r, c in np.argwhere(grid == MAROON):
++        r = int(r)
++        c = int(c)
++        if _is_border(r, c, h, w) and int(dist[r, c]) < inf:
++            maroons.append((int(dist[r, c]), r, c))
++    maroons.sort()
++
++    k = min(len(dest_cells), len(maroons))
++    chosen = {(r, c) for _, r, c in maroons[:k]}
++
++    for r, c in chosen:
++        out[r, c] = floor
++    for r, c in dest_cells[:k]:
++        out[r, c] = MAROON
++
++    return out
++
++
++def _gen_attempt() -> np.ndarray | None:
++    cr, cc = random.choice(CORNER_CENTERS)
++    dest_cells = _dest_cells(cr, cc)
++    dest_set = set(dest_cells)
++
++    base = np.full((GRID_H, GRID_W), FLOOR_COLOR, dtype=int)
++    for r, c in dest_cells:
++        base[r, c] = DEST_COLOR
++    base[cr, cc] = RED_CENTER
++
++    _build_walls(base, cr, cc, dest_set)
++
++    reachable_floor = _bfs_reachable(base, dest_set)
++    border_floor = {
++        (r, c)
++        for r in range(GRID_H)
++        for c in range(GRID_W)
++        if base[r, c] == FLOOR_COLOR and _is_border(r, c, GRID_H, GRID_W)
++    }
++    reachable_edge = sorted(border_floor & reachable_floor)
++    unreachable_edge = sorted(border_floor - reachable_floor)
++
++    max_k = min(FILL_K_RANGE[1], len(reachable_edge))
++    if max_k < FILL_K_RANGE[0]:
++        return None
++    k = random.randint(FILL_K_RANGE[0], max_k)
++
++    total_low = max(TOTAL_MAROON_RANGE[0], k)
++    total_high = min(TOTAL_MAROON_RANGE[1], k + len(unreachable_edge))
++    if total_high < total_low:
++        return None
++    total = random.randint(total_low, total_high)
++    num_distractors = total - k
++
++    source_cells = random.sample(reachable_edge, k)
++    distractor_cells = random.sample(unreachable_edge, num_distractors)
++
++    inp = base.copy()
++    for r, c in source_cells + distractor_cells:
++        inp[r, c] = MAROON
++
++    out = base.copy()
++    for r, c in source_cells:
++        out[r, c] = FLOOR_COLOR
++    for r, c in distractor_cells:
++        out[r, c] = MAROON
++    for r, c in dest_cells[:k]:
++        out[r, c] = MAROON
++
++    try:
++        result = main(inp)
++    except Exception:
++        return None
++
++    if not np.array_equal(result, out):
++        return None
++
++    # Fusion guardrails: ensure this did not collapse back to the original centered/scattered regime.
++    if (cr, cc) == (5, 5):
++        return None
++    if any(not _is_border(r, c, GRID_H, GRID_W) for r, c in source_cells + distractor_cells):
++        return None
++
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(GEN_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"Failed to generate valid input after {GEN_RETRIES} attempts")
+
+tokens used
+69,248
+融合变体代码已写入 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dd6b8c4b/22/code.py)。文件头部加入了组合标识，`main()` 也按要求重写了四段式说明，并把设计分析与隐式假设审查写进了代码注释。
+
+验证结果：
+- 成功率测试：`50/50`
+- 速度：约 `1ms/call`
+- 融合行为统计（200 个样本）：
+  - 边缘栗色像素占比：`200/200` 样本全部只在外边框放置 maroon
+  - 偏角中心分布：仅出现在 `(3,3) (3,7) (7,3) (7,7)`
+  - 可达性非对称：`198/200` 样本中“近侧可达边缘数 > 远侧可达边缘数”，`78/200` 样本远侧边缘完全不可达
+
+这说明生成器没有退化回原题的“中心目标块 + 内部分散源像素”模式。

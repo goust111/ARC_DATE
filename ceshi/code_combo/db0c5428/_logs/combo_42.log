@@ -1,0 +1,3741 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: high
+reasoning summaries: none
+session id: 019e34c8-4cf5-7640-991b-39991fa751a1
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: db0c5428
+    **摘要**: 输入为一个9x9图案（3x3块阵列，中心块缺失），输出将每个非中心块复制到点对称的外部槽位形成5x5块网格，同时根据周围块的朝向像素重建中心块
+
+    ## 要实现的融合组合
+    - **组合名称**: 颜色匹配映射+特殊标记色空洞
+    - **combo_spec**: D1/3+D12/0
+
+    ### 融合描述（实现规格）
+
+    外部槽位有颜色标记决定映射（D1/3），空洞使用特殊标记色而非背景色（D12/0）。两种标记色共存于图案中——外部标记色指示映射目标，空洞标记色标识缺失区域。解题者需要区分两种标记的功能
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D1/3** — 块到外部槽位的映射规则 (`match_cond`)
+  - 当前值: 每个非中心3x3块被复制到以中心为对称点的对侧外部槽位，即block(r,c)映射到5x5网格的(4-2r, 4-2c)位置
+  - 改为: 颜色匹配决定映射目标 — 外部槽位中预放置单个颜色标记像素，块需要根据自身主色与标记颜色的匹配关系确定映射到哪个槽位。将空间规则转化为颜色匹配规则，推理路径完全改变
+  - 来源: catalog_tag_name（参考任务: 4c416de3）
+- **D12/0** — 背景色与空洞的区分方式 (`meta`)
+  - 当前值: 空洞区域填充与网格背景相同的颜色8，空洞通过其在图案内部的位置和被非背景像素包围来识别
+  - 改为: 空洞使用特殊标记色（非背景色） — 空洞区域用一种图案中未出现的特殊颜色填充（如颜色0），与背景色不同。解题者通过颜色直接识别空洞而非通过位置推断，降低识别难度但改变视觉线索
+  - 来源: creative（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/db0c5428.py`
+
+    ```python
+    from __future__ import annotations
+
+import numpy as np
+
+from arc_utils import bbox, crop_bbox, get_bg, paste
+import random
+
+
+def _major_foreground_color(g: np.ndarray, bg: int) -> int:
+    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
+    assert vals.size, "input must contain foreground colors"
+    return int(vals[int(np.argmax(counts))])
+
+
+def _center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
+    assert block == 3, "this task uses 3x3 blocks"
+    main = _major_foreground_color(g, bg)
+    patch = np.full((block, block), main, dtype=int)
+
+    hole_r = int(r0) + block
+    hole_c = int(c0) + block
+    offsets = [-1, 1, 3]
+    for r in range(block):
+        for c in range(block):
+            if r == block // 2 and c == block // 2:
+                continue
+            patch[r, c] = int(g[hole_r + offsets[r], hole_c + offsets[c]])
+    return patch
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand a 3x3 block motif into a 5x5 block motif around its missing center.
+
+    Input structure:
+    - Teal background surrounds one 9x9 foreground motif.
+    - The motif is a 3x3 array of 3x3 blocks; the middle block is empty teal.
+    - Colored pixels immediately around the empty middle block encode the border
+      of the missing center block.
+
+    Rule:
+    - Keep the original 9x9 motif in place.
+    - Copy each of the eight surrounding 3x3 blocks to the opposite outer slot
+      of the implied 5x5 block grid, without rotating it.
+    - Fill the center block from the eight pixels around the hole; its center is
+      the motif's majority foreground color.
+
+    Key insight: The visible 9x9 motif is the middle of a larger periodic
+    block-level pattern, and the empty center is reconstructed from its immediate
+    inner boundary.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+    motif_bbox = bbox(g != bg)
+    assert motif_bbox is not None, "expected a foreground motif"
+    r0, c0, r1, c1 = motif_bbox
+    h = int(r1 - r0 + 1)
+    w = int(c1 - c0 + 1)
+    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
+    block = h // 3
+
+    out = g.copy()
+    expanded_r0 = int(r0) - block
+    expanded_c0 = int(c0) - block
+
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = crop_bbox(
+                g,
+                (
+                    int(r0) + br * block,
+                    int(c0) + bc * block,
+                    int(r0) + (br + 1) * block - 1,
+                    int(c0) + (bc + 1) * block - 1,
+                ),
+            )
+            dst_r = expanded_r0 + (4 - 2 * br) * block
+            dst_c = expanded_c0 + (4 - 2 * bc) * block
+            paste(out, src, dst_r, dst_c)
+
+    paste(out, _center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# -- CFG: canvas & structure --
+GRID_SIZE_MIN, GRID_SIZE_MAX = 16, 19       # square grid side length
+BLOCK = 3                                    # block side length
+MOTIF_SIZE = BLOCK * 3                       # 9x9 motif (3x3 grid of blocks)
+EXPANDED_SIZE = BLOCK * 5                    # 15x15 expanded output region
+MOTIF_PAD = 3                                # min distance from motif edge to grid edge
+
+# -- CFG: colors --
+BG = 8                                       # background color
+FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
+COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4      # total foreground colors (incl. majority)
+
+# -- CFG: majority pixel counts (corner block + edge block combined) --
+MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16  # range for sum of major pixels in b00+b01
+CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8        # major pixels in corner block (diag-sym)
+EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8            # major pixels in edge block (LR-sym)
+
+# -- CFG: generation --
+MAX_RETRIES = 300
+
+# -- Symmetry orbits for 3x3 blocks --
+# Diagonal-symmetric orbits (b00 == b00.T): cells sharing a diag-orbit get the same color
+DIAG_ORBITS = (
+    ((0, 0),), ((1, 1),), ((2, 2),),
+    ((0, 1), (1, 0)),
+    ((0, 2), (2, 0)),
+    ((1, 2), (2, 1)),
+)
+# LR-symmetric orbits (b01 == fliplr(b01)): cells sharing an LR-orbit get the same color
+LR_ORBITS = (
+    ((0, 0), (0, 2)),
+    ((1, 0), (1, 2)),
+    ((2, 0), (2, 2)),
+    ((0, 1),), ((1, 1),), ((2, 1),),
+)
+
+# Row/col indices for sampling inner-boundary pixels that fill the center patch.
+# Maps block-local (r,c) -> motif row/col via BLOCK + offset.
+_CENTER_OFFSETS = np.array([-1, 1, 3])
+
+
+def _major_orbits(orbits, forced_minor, target_count):
+    """Enumerate all orbit subsets whose total pixel count equals target_count,
+    excluding orbits that contain any forced_minor coordinate, then pick one."""
+    forced_minor = set(forced_minor)
+    usable = [
+        idx for idx, orbit in enumerate(orbits)
+        if all(coord not in forced_minor for coord in orbit)
+    ]
+    choices = []
+    for mask in range(1 << len(usable)):
+        selected = set()
+        total = 0
+        for bit, idx in enumerate(usable):
+            if mask & (1 << bit):
+                selected.add(idx)
+                total += len(orbits[idx])
+        if total == target_count:
+            choices.append(selected)
+    assert choices, "unreachable symmetric majority count"
+    return random.choice(choices)
+
+
+def _seed_block(orbits, forced_minor, majority, target_count):
+    """Build a BLOCK x BLOCK array with majority color placed in orbits totalling
+    target_count pixels. Returns (block, minor_orbits) where minor_orbits is a list
+    of (block_ref, orbit) pairs whose colors are still unset (-1)."""
+    block = np.full((BLOCK, BLOCK), -1, dtype=int)
+    major_idxs = _major_orbits(orbits, forced_minor, target_count)
+    minor_orbits = []
+    for idx, orbit in enumerate(orbits):
+        if idx in major_idxs:
+            for r, c in orbit:
+                block[r, c] = majority
+        else:
+            minor_orbits.append((block, orbit))
+    return block, minor_orbits
+
+
+def _assign_minor_colors(minor_orbits, colors):
+    """Assign minor colors to unfilled orbits, guaranteeing each color appears at
+    least once (remaining orbits get random picks)."""
+    random.shuffle(minor_orbits)
+    guaranteed = list(colors)
+    random.shuffle(guaranteed)
+    assignments = guaranteed + [
+        random.choice(colors) for _ in range(len(minor_orbits) - len(guaranteed))
+    ]
+    for (block, orbit), color in zip(minor_orbits, assignments):
+        for r, c in orbit:
+            block[r, c] = color
+
+
+def _make_blocks(majority, minor_colors, corner_major, edge_major):
+    """Build the two seed blocks (b00=corner, b01=edge) with D4/LR symmetry."""
+    b00, corner_minors = _seed_block(DIAG_ORBITS, [(2, 2)], majority, corner_major)
+    b01, edge_minors = _seed_block(LR_ORBITS, [(2, 1)], majority, edge_major)
+    minor_orbits = corner_minors + edge_minors
+    assert len(minor_orbits) >= len(minor_colors)
+    _assign_minor_colors(minor_orbits, minor_colors)
+    assert np.all(b00 != -1) and np.all(b01 != -1)
+    return b00, b01
+
+
+def _assemble_motif(b00, b01):
+    """Assemble the 9x9 motif from two seed blocks via D4 symmetry; center block is bg."""
+    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
+    blocks = {
+        (0, 0): b00,
+        (0, 1): b01,
+        (0, 2): np.fliplr(b00),
+        (1, 0): b01.T,
+        (1, 2): np.rot90(b01, -1),
+        (2, 0): np.flipud(b00),
+        (2, 1): np.flipud(b01),
+        (2, 2): np.rot90(b00, 2),
+    }
+    for (br, bc), blk in blocks.items():
+        paste(motif, blk, br * BLOCK, bc * BLOCK)
+    return motif
+
+
+def _gen_center_patch(motif, majority):
+    """Reconstruct the center block from the 8 inner-boundary pixels of the motif.
+    Center pixel is the majority foreground color."""
+    rows = BLOCK + _CENTER_OFFSETS
+    cols = BLOCK + _CENTER_OFFSETS
+    patch = motif[np.ix_(rows, cols)].copy()
+    patch[1, 1] = majority
+    return patch
+
+
+def _expanded_output(motif, center):
+    """Build the 15x15 expanded region: original motif (with center filled) in the
+    middle, each surrounding block mirrored to the opposite outer slot."""
+    expanded = np.full((EXPANDED_SIZE, EXPANDED_SIZE), BG, dtype=int)
+    output_motif = motif.copy()
+    paste(output_motif, center, BLOCK, BLOCK)
+    paste(expanded, output_motif, BLOCK, BLOCK)
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = motif[br * BLOCK:(br + 1) * BLOCK, bc * BLOCK:(bc + 1) * BLOCK]
+            paste(expanded, src, (4 - 2 * br) * BLOCK, (4 - 2 * bc) * BLOCK)
+    return expanded
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Single generation attempt: build motif, verify via oracle, return input or None."""
+    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
+    color_count = random.randint(COLOR_COUNT_MIN, COLOR_COUNT_MAX)
+    colors = random.sample(FOREGROUND_COLORS, color_count)
+    majority = colors[0]
+    minor_colors = colors[1:]
+
+    # Choose how many majority pixels across both seed blocks
+    possible_totals = [
+        total for total in range(MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX + 1)
+        if 18 - total >= len(minor_colors)
+    ]
+    majority_total = random.choice(possible_totals)
+    pairs = [
+        (corner, majority_total - corner)
+        for corner in range(CORNER_MAJOR_MIN, CORNER_MAJOR_MAX + 1)
+        if EDGE_MAJOR_MIN <= majority_total - corner <= EDGE_MAJOR_MAX
+    ]
+    corner_major, edge_major = random.choice(pairs)
+
+    b00, b01 = _make_blocks(majority, minor_colors, corner_major, edge_major)
+    motif = _assemble_motif(b00, b01)
+    center = _gen_center_patch(motif, majority)
+    expanded = _expanded_output(motif, center)
+
+    r0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
+    c0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
+    inp = np.full((n, n), BG, dtype=int)
+    out = np.full((n, n), BG, dtype=int)
+    paste(inp, motif, r0, c0)
+    paste(out, expanded, r0 - BLOCK, c0 - BLOCK)
+
+    if np.array_equal(main(inp), out):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise AssertionError("failed to generate a valid db0c5428 input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    task_id: db0c5428
+spec:
+  grid: 16-19 rows x 16-19 cols, square [observed], bg=8
+  motif: 9x9 foreground region (3x3 arrangement of 3x3 blocks), center block is bg
+  placement: motif at (r0, c0) with r0 >= 3, c0 >= 3, r0 + 12 <= rows, c0 + 12 <= cols
+  symmetry: entire 9x9 motif has D4 symmetry (LR, UD, 180, both diagonals)
+  corner_block_b00: 3x3, diag-symmetric (b00 == b00.T), determines all 4 corners via D4 rotations
+  edge_block_b01: 3x3, LR-symmetric, determines all 4 edges via D4 rotations
+  block_relationships: |
+    corners: b02=flipLR(b00), b20=flipUD(b00), b22=rot180(b00)
+    edges:   b10=b01.T, b12=rot270(b01), b21=flipUD(b01)
+  colors: 2-4 foreground colors, one is majority (56-89% of motif pixels)
+  center_reconstruction: |
+    8 inner-boundary pixels (corners of adjacent blocks facing the hole) fill
+    center block; center pixel = majority foreground color
+  output: same grid size; original 8 blocks preserved; center block filled;
+    each block copied to opposite slot in a 5x5 block grid (no rotation)
+  expanded_layout: |
+    X . X . X
+    . X X X .
+    X X X X X    (X=block, .=bg; center 3x3 is original motif)
+    . X X X .
+    X . X . X
+generation_strategy:
+  approach: output-first
+  steps:
+    1. Pick grid size N x N in [16..19].
+    2. Choose 2-4 foreground colors; designate one as majority.
+    3. Build b00 (corner seed): random 3x3, diag-symmetric (b00 == b00.T),
+       majority color fills most pixels (>=5 of 9). b00[2,2] must differ from majority.
+    4. Build b01 (edge seed): random 3x3, LR-symmetric, mostly majority color.
+       b01[2,1] should be non-majority (it becomes an inner-boundary pixel).
+    5. Derive all 8 blocks via D4 symmetry. Assemble 9x9 motif; set center block to bg.
+    6. Choose (r0, c0) with r0 in [3, N-12], c0 in [3, N-12]. Place motif on bg grid.
+    7. Verify expanded 5x5 block region fits in grid (guaranteed by step 6).
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+## 已有单变体参考代码
+
+以下组成项已有单变体实现，可作为融合时的参考：
+
+            ### 参考代码: D1/3
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/db0c5428/D1/3/code.py`
+
+            ```python
+            # Variant of db0c5428
+# Dimension: D1 — 块到外部槽位的映射规则 (match_cond)
+# Change: 每个非中心3x3块被复制到以中心为对称点的对侧外部槽位，即block(r,c)映射到5x5网格的(4-2r, 4-2c)... → 颜色匹配决定映射目标
+
+from __future__ import annotations
+
+from collections import Counter
+import random
+
+import numpy as np
+
+from arc_utils import crop_bbox, get_bg, paste
+
+
+# Design analysis for the D1 variant
+# ----------------------------------
+# a) Concrete behavior:
+#    - The visible motif is still a 9x9 ring of eight 3x3 blocks around a missing
+#      3x3 center. The output still expands to an implied 5x5 block lattice and
+#      still reconstructs the center patch from the pixels facing the hole.
+#    - The changed part is the outer-copy rule. Input now contains one colored
+#      marker pixel at the center of each of the eight outer 3x3 slots. A source
+#      block no longer goes to its point-symmetric opposite slot. Instead, the
+#      solver reads the block's major color and copies that block into whichever
+#      outer slot carries the same color marker.
+#    - Small trace:
+#      original: block(0,0) always copied to slot(4,4), block(0,1) always to
+#      slot(4,2), purely by coordinates.
+#      variant: if block(0,0) is mostly color 6 and the marker with color 6 sits
+#      at outer slot(0,2), the block goes to slot(0,2) regardless of geometry.
+#      The reasoning path changes from spatial reflection to color matching.
+# b) Complexity calibration:
+#    - To avoid ambiguous matching, every source block gets a distinct major color.
+#      The eight outer markers are a permutation of those same eight colors.
+#      This keeps the rule easy to perceive while making the target layout depend
+#      entirely on the marker permutation.
+# c) Hidden assumptions in the original main():
+#    - `bbox(g != bg)` no longer works because marker pixels enlarge the overall
+#      bbox to the full 15x15 implied region. The new solver must isolate the
+#      largest connected non-bg component, which is the 9x9 motif.
+#    - The original outer-slot destination formula assumed a fixed spatial map.
+#      That assumption is removed; slot choice is now read from marker colors.
+#    - The original center pixel used the motif-wide majority color. With eight
+#      distinct block-major colors that would be unstable, so the new center uses
+#      the modal color among the eight sampled boundary pixels around the hole.
+# d) Placement legality:
+#    - The motif still sits with a 3-cell margin so the full 15x15 expanded region
+#      remains in-bounds. Outer markers are placed at the exact centers of those
+#      eight outer slots, never touching the motif component.
+# e) Visual observability:
+#    - The input visibly shows eight dominant-color blocks plus eight isolated
+#      outer markers. Across examples, the marker permutation changes, so the user
+#      can see that outer placement follows color equality rather than reflection.
+# f) Visual cleanliness:
+#    - Each outer slot starts with exactly one centered marker pixel. There is no
+#      overlap among markers, motif, or reconstructed center.
+# g) Color-inference guardrails:
+#    - No ordering by numeric color id is used. Only visible equality matters:
+#      a marker with the same color as a block's dominant color selects that block.
+# h) Anti-degeneration metric:
+#    - The generator measures how many outer slots disagree with the original
+#      opposite-slot mapping on the same input. It enforces at least 4 mismatches,
+#      so the generated samples do not collapse back to the original task.
+# i) New solver assumptions to satisfy:
+#    - The largest non-bg connected component is the 9x9 motif.
+#    - If two blocks share a major color, they must be identical because the solver
+#      uses color -> block lookup. The generator uses unique major colors, which is
+#      stronger than required and guarantees this property.
+#    - Each outer slot center contains a non-bg marker whose color matches some
+#      source block's major color.
+
+
+BLOCK = 3
+MOTIF_SIZE = BLOCK * 3
+EXPANDED_SIZE = BLOCK * 5
+
+GRID_SIZE_MIN, GRID_SIZE_MAX = 16, 19
+MOTIF_PAD = 3
+BG = 8
+FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
+MAX_RETRIES = 300
+MIN_ANTI_ORIGINAL_MISMATCH = 4
+
+SOURCE_POSITIONS = (
+    (0, 0), (0, 1), (0, 2),
+    (1, 0),         (1, 2),
+    (2, 0), (2, 1), (2, 2),
+)
+OUTER_SLOTS = (
+    (0, 0), (0, 2), (0, 4),
+    (2, 0),         (2, 4),
+    (4, 0), (4, 2), (4, 4),
+)
+ORTHOGONAL_POSITIONS = {(0, 1), (1, 0), (1, 2), (2, 1)}
+INNER_SAMPLE_COORD = {
+    (0, 0): (2, 2),
+    (0, 1): (2, 1),
+    (0, 2): (2, 0),
+    (1, 0): (1, 2),
+    (1, 2): (1, 0),
+    (2, 0): (0, 2),
+    (2, 1): (0, 1),
+    (2, 2): (0, 0),
+}
+CENTER_OFFSETS = np.array([-1, 1, 3], dtype=int)
+
+
+def _major_block_color(block: np.ndarray, bg: int) -> int:
+    vals, counts = np.unique(block[block != int(bg)], return_counts=True)
+    assert vals.size, "block must contain foreground colors"
+    return int(vals[int(np.argmax(counts))])
+
+
+def _largest_component_bbox(g: np.ndarray, bg: int) -> tuple[int, int, int, int] | None:
+    mask = g != int(bg)
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    best_bbox = None
+    best_size = -1
+    for r in range(h):
+        for c in range(w):
+            if not mask[r, c] or seen[r, c]:
+                continue
+            stack = [(r, c)]
+            seen[r, c] = True
+            size = 0
+            r0 = r1 = r
+            c0 = c1 = c
+            while stack:
+                rr, cc = stack.pop()
+                size += 1
+                r0 = min(r0, rr)
+                r1 = max(r1, rr)
+                c0 = min(c0, cc)
+                c1 = max(c1, cc)
+                for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nr, nc = rr + dr, cc + dc
+                    if 0 <= nr < h and 0 <= nc < w and mask[nr, nc] and not seen[nr, nc]:
+                        seen[nr, nc] = True
+                        stack.append((nr, nc))
+            if size > best_size:
+                best_size = size
+                best_bbox = (r0, c0, r1, c1)
+    return best_bbox
+
+
+def _center_patch(g: np.ndarray, r0: int, c0: int, block: int) -> np.ndarray:
+    assert block == 3, "this variant uses 3x3 blocks"
+    hole_r = int(r0) + block
+    hole_c = int(c0) + block
+    rows = hole_r + CENTER_OFFSETS
+    cols = hole_c + CENTER_OFFSETS
+    patch = g[np.ix_(rows, cols)].copy()
+    ring_vals = [int(patch[r, c]) for r in range(block) for c in range(block) if (r, c) != (1, 1)]
+    patch[1, 1] = Counter(ring_vals).most_common(1)[0][0]
+    return patch
+
+
+def _slot_marker_color(
+    g: np.ndarray,
+    expanded_r0: int,
+    expanded_c0: int,
+    slot_br: int,
+    slot_bc: int,
+    block: int,
+    bg: int,
+) -> int:
+    sr = expanded_r0 + slot_br * block
+    sc = expanded_c0 + slot_bc * block
+    marker = int(g[sr + block // 2, sc + block // 2])
+    assert marker != int(bg), f"outer slot {(slot_br, slot_bc)} is missing its marker"
+    return marker
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand a 3x3 block motif into a 5x5 block motif using color-tagged outer slots.
+
+    Input structure:
+    - Teal background contains one 9x9 motif made of eight 3x3 blocks around an
+      empty 3x3 center.
+    - The pixels facing the hole still encode the border of the missing center.
+    - Each of the eight outer 3x3 slots contains a single centered marker pixel
+      whose color names which source block belongs there.
+
+    Rule:
+    - Keep the original 9x9 motif in place.
+    - Reconstruct the center block from the eight sampled boundary pixels; the
+      center cell takes the most frequent of those eight colors.
+    - For each outer slot, read its marker color and copy in the surrounding 3x3
+      source block whose major color matches that marker.
+
+    Key insight: the outer layout is no longer determined by geometric symmetry.
+    The marker colors create a color-to-block lookup, so destination slots must be
+    solved by matching dominant block colors to those markers.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = int(get_bg(g))
+    motif_bbox = _largest_component_bbox(g, bg)
+    assert motif_bbox is not None, "expected a foreground motif"
+    r0, c0, r1, c1 = motif_bbox
+    h = int(r1 - r0 + 1)
+    w = int(c1 - c0 + 1)
+    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
+    block = h // 3
+    assert block == 3, "this variant expects a 9x9 motif"
+
+    out = g.copy()
+    expanded_r0 = int(r0) - block
+    expanded_c0 = int(c0) - block
+
+    blocks_by_color: dict[int, np.ndarray] = {}
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = crop_bbox(
+                g,
+                (
+                    int(r0) + br * block,
+                    int(c0) + bc * block,
+                    int(r0) + (br + 1) * block - 1,
+                    int(c0) + (bc + 1) * block - 1,
+                ),
+            )
+            major = _major_block_color(src, bg)
+            if major in blocks_by_color:
+                assert np.array_equal(blocks_by_color[major], src), (
+                    "reused marker colors require identical source blocks"
+                )
+            else:
+                blocks_by_color[major] = src
+
+    for slot_br, slot_bc in OUTER_SLOTS:
+        marker = _slot_marker_color(g, expanded_r0, expanded_c0, slot_br, slot_bc, block, bg)
+        assert marker in blocks_by_color, f"no source block has major color {marker}"
+        paste(out, blocks_by_color[marker], expanded_r0 + slot_br * block, expanded_c0 + slot_bc * block)
+
+    paste(out, _center_patch(g, int(r0), int(c0), block), int(r0) + block, int(c0) + block)
+    return out
+
+
+def _random_block(main_color: int, ring_color: int, sample_coord: tuple[int, int]) -> np.ndarray:
+    block = np.full((BLOCK, BLOCK), main_color, dtype=int)
+    if ring_color != main_color:
+        block[sample_coord] = ring_color
+    remaining = [(r, c) for r in range(BLOCK) for c in range(BLOCK) if (r, c) != sample_coord]
+    extra_coords = random.sample(remaining, 2)
+    accent_pool = [color for color in FOREGROUND_COLORS if color != main_color]
+    extra_colors = random.sample(accent_pool, 2)
+    for (rr, cc), color in zip(extra_coords, extra_colors):
+        block[rr, cc] = color
+    return block
+
+
+def _assemble_motif(blocks: dict[tuple[int, int], np.ndarray]) -> np.ndarray:
+    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
+    for pos, block in blocks.items():
+        br, bc = pos
+        paste(motif, block, br * BLOCK, bc * BLOCK)
+    return motif
+
+
+def _marker_mismatch_count(
+    source_colors: dict[tuple[int, int], int],
+    marker_colors: dict[tuple[int, int], int],
+) -> int:
+    mismatches = 0
+    for br, bc in SOURCE_POSITIONS:
+        old_slot = (4 - 2 * br, 4 - 2 * bc)
+        if marker_colors[old_slot] != source_colors[(br, bc)]:
+            mismatches += 1
+    return mismatches
+
+
+def _expanded_output(
+    motif: np.ndarray,
+    center: np.ndarray,
+    blocks_by_color: dict[int, np.ndarray],
+    marker_colors: dict[tuple[int, int], int],
+) -> np.ndarray:
+    expanded = np.full((EXPANDED_SIZE, EXPANDED_SIZE), BG, dtype=int)
+    output_motif = motif.copy()
+    paste(output_motif, center, BLOCK, BLOCK)
+    paste(expanded, output_motif, BLOCK, BLOCK)
+    for slot_br, slot_bc in OUTER_SLOTS:
+        paste(expanded, blocks_by_color[marker_colors[(slot_br, slot_bc)]], slot_br * BLOCK, slot_bc * BLOCK)
+    return expanded
+
+
+def _gen_attempt() -> tuple[np.ndarray, int] | None:
+    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
+    source_color_list = random.sample(FOREGROUND_COLORS, len(SOURCE_POSITIONS))
+    source_colors = {pos: color for pos, color in zip(SOURCE_POSITIONS, source_color_list)}
+
+    marker_perm = random.sample(source_color_list, len(source_color_list))
+    marker_colors = {slot: color for slot, color in zip(OUTER_SLOTS, marker_perm)}
+    mismatch_count = _marker_mismatch_count(source_colors, marker_colors)
+    if mismatch_count < MIN_ANTI_ORIGINAL_MISMATCH:
+        return None
+
+    center_color = random.choice(source_color_list)
+    ring_colors: dict[tuple[int, int], int] = {}
+    for pos in SOURCE_POSITIONS:
+        if pos in ORTHOGONAL_POSITIONS:
+            ring_colors[pos] = center_color
+        else:
+            candidates = [color for color in FOREGROUND_COLORS if color != center_color]
+            ring_colors[pos] = random.choice(candidates)
+
+    blocks = {
+        pos: _random_block(source_colors[pos], ring_colors[pos], INNER_SAMPLE_COORD[pos])
+        for pos in SOURCE_POSITIONS
+    }
+    motif = _assemble_motif(blocks)
+    center = _center_patch(motif, 0, 0, BLOCK)
+    if int(center[1, 1]) != center_color:
+        return None
+
+    blocks_by_color = {source_colors[pos]: blocks[pos] for pos in SOURCE_POSITIONS}
+    expanded = _expanded_output(motif, center, blocks_by_color, marker_colors)
+
+    r0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
+    c0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
+    inp = np.full((n, n), BG, dtype=int)
+    out = np.full((n, n), BG, dtype=int)
+    paste(inp, motif, r0, c0)
+    paste(out, expanded, r0 - BLOCK, c0 - BLOCK)
+    for slot_br, slot_bc in OUTER_SLOTS:
+        sr = r0 - BLOCK + slot_br * BLOCK
+        sc = c0 - BLOCK + slot_bc * BLOCK
+        inp[sr + 1, sc + 1] = marker_colors[(slot_br, slot_bc)]
+
+    if np.array_equal(main(inp), out):
+        return inp, mismatch_count
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        result = _gen_attempt()
+        if result is not None:
+            grid, _mismatch_count = result
+            return grid
+    raise AssertionError("failed to generate a valid db0c5428 D1 variant input")
+
+            ```
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/42/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/db0c5428.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/42/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of db0c5428 (index 42)
+    # combo_spec: D1/3+D12/0
+    # Name: 颜色匹配映射+特殊标记色空洞
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/42` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/4c416de3.py` — 参考任务 4c416de3 的 solver（D1/3 的灵感来源）
+
+codex
+我先读原始 solver、单变体参考和工具函数，确认哪些隐式假设会被 `D1/3 + D12/0` 同时打破，然后直接在目标路径实现并跑 50 次稳定性测试。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/db0c5428.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+
+import numpy as np
+
+from arc_utils import bbox, crop_bbox, get_bg, paste
+import random
+
+
+def _major_foreground_color(g: np.ndarray, bg: int) -> int:
+    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
+    assert vals.size, "input must contain foreground colors"
+    return int(vals[int(np.argmax(counts))])
+
+
+def _center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
+    assert block == 3, "this task uses 3x3 blocks"
+    main = _major_foreground_color(g, bg)
+    patch = np.full((block, block), main, dtype=int)
+
+    hole_r = int(r0) + block
+    hole_c = int(c0) + block
+    offsets = [-1, 1, 3]
+    for r in range(block):
+        for c in range(block):
+            if r == block // 2 and c == block // 2:
+                continue
+            patch[r, c] = int(g[hole_r + offsets[r], hole_c + offsets[c]])
+    return patch
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand a 3x3 block motif into a 5x5 block motif around its missing center.
+
+    Input structure:
+    - Teal background surrounds one 9x9 foreground motif.
+    - The motif is a 3x3 array of 3x3 blocks; the middle block is empty teal.
+    - Colored pixels immediately around the empty middle block encode the border
+      of the missing center block.
+
+    Rule:
+    - Keep the original 9x9 motif in place.
+    - Copy each of the eight surrounding 3x3 blocks to the opposite outer slot
+      of the implied 5x5 block grid, without rotating it.
+    - Fill the center block from the eight pixels around the hole; its center is
+      the motif's majority foreground color.
+
+    Key insight: The visible 9x9 motif is the middle of a larger periodic
+    block-level pattern, and the empty center is reconstructed from its immediate
+    inner boundary.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+    motif_bbox = bbox(g != bg)
+    assert motif_bbox is not None, "expected a foreground motif"
+    r0, c0, r1, c1 = motif_bbox
+    h = int(r1 - r0 + 1)
+    w = int(c1 - c0 + 1)
+    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
+    block = h // 3
+
+    out = g.copy()
+    expanded_r0 = int(r0) - block
+    expanded_c0 = int(c0) - block
+
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = crop_bbox(
+                g,
+                (
+                    int(r0) + br * block,
+                    int(c0) + bc * block,
+                    int(r0) + (br + 1) * block - 1,
+                    int(c0) + (bc + 1) * block - 1,
+                ),
+            )
+            dst_r = expanded_r0 + (4 - 2 * br) * block
+            dst_c = expanded_c0 + (4 - 2 * bc) * block
+            paste(out, src, dst_r, dst_c)
+
+    paste(out, _center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# -- CFG: canvas & structure --
+GRID_SIZE_MIN, GRID_SIZE_MAX = 16, 19       # square grid side length
+BLOCK = 3                                    # block side length
+MOTIF_SIZE = BLOCK * 3                       # 9x9 motif (3x3 grid of blocks)
+EXPANDED_SIZE = BLOCK * 5                    # 15x15 expanded output region
+MOTIF_PAD = 3                                # min distance from motif edge to grid edge
+
+# -- CFG: colors --
+BG = 8                                       # background color
+FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
+COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4      # total foreground colors (incl. majority)
+
+# -- CFG: majority pixel counts (corner block + edge block combined) --
+MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16  # range for sum of major pixels in b00+b01
+CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8        # major pixels in corner block (diag-sym)
+EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8            # major pixels in edge block (LR-sym)
+
+# -- CFG: generation --
+MAX_RETRIES = 300
+
+# -- Symmetry orbits for 3x3 blocks --
+# Diagonal-symmetric orbits (b00 == b00.T): cells sharing a diag-orbit get the same color
+DIAG_ORBITS = (
+    ((0, 0),), ((1, 1),), ((2, 2),),
+    ((0, 1), (1, 0)),
+    ((0, 2), (2, 0)),
+    ((1, 2), (2, 1)),
+)
+# LR-symmetric orbits (b01 == fliplr(b01)): cells sharing an LR-orbit get the same color
+LR_ORBITS = (
+    ((0, 0), (0, 2)),
+    ((1, 0), (1, 2)),
+    ((2, 0), (2, 2)),
+    ((0, 1),), ((1, 1),), ((2, 1),),
+)
+
+# Row/col indices for sampling inner-boundary pixels that fill the center patch.
+# Maps block-local (r,c) -> motif row/col via BLOCK + offset.
+_CENTER_OFFSETS = np.array([-1, 1, 3])
+
+
+def _major_orbits(orbits, forced_minor, target_count):
+    """Enumerate all orbit subsets whose total pixel count equals target_count,
+    excluding orbits that contain any forced_minor coordinate, then pick one."""
+    forced_minor = set(forced_minor)
+    usable = [
+        idx for idx, orbit in enumerate(orbits)
+        if all(coord not in forced_minor for coord in orbit)
+    ]
+    choices = []
+    for mask in range(1 << len(usable)):
+        selected = set()
+        total = 0
+        for bit, idx in enumerate(usable):
+            if mask & (1 << bit):
+                selected.add(idx)
+                total += len(orbits[idx])
+        if total == target_count:
+            choices.append(selected)
+    assert choices, "unreachable symmetric majority count"
+    return random.choice(choices)
+
+
+def _seed_block(orbits, forced_minor, majority, target_count):
+    """Build a BLOCK x BLOCK array with majority color placed in orbits totalling
+    target_count pixels. Returns (block, minor_orbits) where minor_orbits is a list
+    of (block_ref, orbit) pairs whose colors are still unset (-1)."""
+    block = np.full((BLOCK, BLOCK), -1, dtype=int)
+    major_idxs = _major_orbits(orbits, forced_minor, target_count)
+    minor_orbits = []
+    for idx, orbit in enumerate(orbits):
+        if idx in major_idxs:
+            for r, c in orbit:
+                block[r, c] = majority
+        else:
+            minor_orbits.append((block, orbit))
+    return block, minor_orbits
+
+
+def _assign_minor_colors(minor_orbits, colors):
+    """Assign minor colors to unfilled orbits, guaranteeing each color appears at
+    least once (remaining orbits get random picks)."""
+    random.shuffle(minor_orbits)
+    guaranteed = list(colors)
+    random.shuffle(guaranteed)
+    assignments = guaranteed + [
+        random.choice(colors) for _ in range(len(minor_orbits) - len(guaranteed))
+    ]
+    for (block, orbit), color in zip(minor_orbits, assignments):
+        for r, c in orbit:
+            block[r, c] = color
+
+
+def _make_blocks(majority, minor_colors, corner_major, edge_major):
+    """Build the two seed blocks (b00=corner, b01=edge) with D4/LR symmetry."""
+    b00, corner_minors = _seed_block(DIAG_ORBITS, [(2, 2)], majority, corner_major)
+    b01, edge_minors = _seed_block(LR_ORBITS, [(2, 1)], majority, edge_major)
+    minor_orbits = corner_minors + edge_minors
+    assert len(minor_orbits) >= len(minor_colors)
+    _assign_minor_colors(minor_orbits, minor_colors)
+    assert np.all(b00 != -1) and np.all(b01 != -1)
+    return b00, b01
+
+
+def _assemble_motif(b00, b01):
+    """Assemble the 9x9 motif from two seed blocks via D4 symmetry; center block is bg."""
+    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
+    blocks = {
+        (0, 0): b00,
+        (0, 1): b01,
+        (0, 2): np.fliplr(b00),
+        (1, 0): b01.T,
+        (1, 2): np.rot90(b01, -1),
+        (2, 0): np.flipud(b00),
+        (2, 1): np.flipud(b01),
+        (2, 2): np.rot90(b00, 2),
+    }
+    for (br, bc), blk in blocks.items():
+        paste(motif, blk, br * BLOCK, bc * BLOCK)
+    return motif
+
+
+def _gen_center_patch(motif, majority):
+    """Reconstruct the center block from the 8 inner-boundary pixels of the motif.
+    Center pixel is the majority foreground color."""
+    rows = BLOCK + _CENTER_OFFSETS
+    cols = BLOCK + _CENTER_OFFSETS
+    patch = motif[np.ix_(rows, cols)].copy()
+    patch[1, 1] = majority
+    return patch
+
+
+def _expanded_output(motif, center):
+    """Build the 15x15 expanded region: original motif (with center filled) in the
+    middle, each surrounding block mirrored to the opposite outer slot."""
+    expanded = np.full((EXPANDED_SIZE, EXPANDED_SIZE), BG, dtype=int)
+    output_motif = motif.copy()
+    paste(output_motif, center, BLOCK, BLOCK)
+    paste(expanded, output_motif, BLOCK, BLOCK)
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = motif[br * BLOCK:(br + 1) * BLOCK, bc * BLOCK:(bc + 1) * BLOCK]
+            paste(expanded, src, (4 - 2 * br) * BLOCK, (4 - 2 * bc) * BLOCK)
+    return expanded
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Single generation attempt: build motif, verify via oracle, return input or None."""
+    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
+    color_count = random.randint(COLOR_COUNT_MIN, COLOR_COUNT_MAX)
+    colors = random.sample(FOREGROUND_COLORS, color_count)
+    majority = colors[0]
+    minor_colors = colors[1:]
+
+    # Choose how many majority pixels across both seed blocks
+    possible_totals = [
+        total for total in range(MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX + 1)
+        if 18 - total >= len(minor_colors)
+    ]
+    majority_total = random.choice(possible_totals)
+    pairs = [
+        (corner, majority_total - corner)
+        for corner in range(CORNER_MAJOR_MIN, CORNER_MAJOR_MAX + 1)
+        if EDGE_MAJOR_MIN <= majority_total - corner <= EDGE_MAJOR_MAX
+    ]
+    corner_major, edge_major = random.choice(pairs)
+
+    b00, b01 = _make_blocks(majority, minor_colors, corner_major, edge_major)
+    motif = _assemble_motif(b00, b01)
+    center = _gen_center_patch(motif, majority)
+    expanded = _expanded_output(motif, center)
+
+exec
+/bin/bash -lc "sed -n '1,360p' /home/lixinyu/snap/new/ceshi/code/db0c5428/D1/3/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Variant of db0c5428
+# Dimension: D1 — 块到外部槽位的映射规则 (match_cond)
+# Change: 每个非中心3x3块被复制到以中心为对称点的对侧外部槽位，即block(r,c)映射到5x5网格的(4-2r, 4-2c)... → 颜色匹配决定映射目标
+
+from __future__ import annotations
+
+from collections import Counter
+import random
+
+import numpy as np
+
+from arc_utils import crop_bbox, get_bg, paste
+
+
+# Design analysis for the D1 variant
+# ----------------------------------
+# a) Concrete behavior:
+#    - The visible motif is still a 9x9 ring of eight 3x3 blocks around a missing
+#      3x3 center. The output still expands to an implied 5x5 block lattice and
+#      still reconstructs the center patch from the pixels facing the hole.
+#    - The changed part is the outer-copy rule. Input now contains one colored
+#      marker pixel at the center of each of the eight outer 3x3 slots. A source
+#      block no longer goes to its point-symmetric opposite slot. Instead, the
+#      solver reads the block's major color and copies that block into whichever
+#      outer slot carries the same color marker.
+#    - Small trace:
+#      original: block(0,0) always copied to slot(4,4), block(0,1) always to
+#      slot(4,2), purely by coordinates.
+#      variant: if block(0,0) is mostly color 6 and the marker with color 6 sits
+#      at outer slot(0,2), the block goes to slot(0,2) regardless of geometry.
+#      The reasoning path changes from spatial reflection to color matching.
+# b) Complexity calibration:
+#    - To avoid ambiguous matching, every source block gets a distinct major color.
+#      The eight outer markers are a permutation of those same eight colors.
+#      This keeps the rule easy to perceive while making the target layout depend
+#      entirely on the marker permutation.
+# c) Hidden assumptions in the original main():
+#    - `bbox(g != bg)` no longer works because marker pixels enlarge the overall
+#      bbox to the full 15x15 implied region. The new solver must isolate the
+#      largest connected non-bg component, which is the 9x9 motif.
+#    - The original outer-slot destination formula assumed a fixed spatial map.
+#      That assumption is removed; slot choice is now read from marker colors.
+#    - The original center pixel used the motif-wide majority color. With eight
+#      distinct block-major colors that would be unstable, so the new center uses
+#      the modal color among the eight sampled boundary pixels around the hole.
+# d) Placement legality:
+#    - The motif still sits with a 3-cell margin so the full 15x15 expanded region
+#      remains in-bounds. Outer markers are placed at the exact centers of those
+#      eight outer slots, never touching the motif component.
+# e) Visual observability:
+#    - The input visibly shows eight dominant-color blocks plus eight isolated
+#      outer markers. Across examples, the marker permutation changes, so the user
+#      can see that outer placement follows color equality rather than reflection.
+# f) Visual cleanliness:
+#    - Each outer slot starts with exactly one centered marker pixel. There is no
+#      overlap among markers, motif, or reconstructed center.
+# g) Color-inference guardrails:
+#    - No ordering by numeric color id is used. Only visible equality matters:
+#      a marker with the same color as a block's dominant color selects that block.
+# h) Anti-degeneration metric:
+#    - The generator measures how many outer slots disagree with the original
+#      opposite-slot mapping on the same input. It enforces at least 4 mismatches,
+#      so the generated samples do not collapse back to the original task.
+# i) New solver assumptions to satisfy:
+#    - The largest non-bg connected component is the 9x9 motif.
+#    - If two blocks share a major color, they must be identical because the solver
+#      uses color -> block lookup. The generator uses unique major colors, which is
+#      stronger than required and guarantees this property.
+#    - Each outer slot center contains a non-bg marker whose color matches some
+#      source block's major color.
+
+
+BLOCK = 3
+MOTIF_SIZE = BLOCK * 3
+EXPANDED_SIZE = BLOCK * 5
+
+GRID_SIZE_MIN, GRID_SIZE_MAX = 16, 19
+MOTIF_PAD = 3
+BG = 8
+FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
+MAX_RETRIES = 300
+MIN_ANTI_ORIGINAL_MISMATCH = 4
+
+SOURCE_POSITIONS = (
+    (0, 0), (0, 1), (0, 2),
+    (1, 0),         (1, 2),
+    (2, 0), (2, 1), (2, 2),
+)
+OUTER_SLOTS = (
+    (0, 0), (0, 2), (0, 4),
+    (2, 0),         (2, 4),
+    (4, 0), (4, 2), (4, 4),
+)
+ORTHOGONAL_POSITIONS = {(0, 1), (1, 0), (1, 2), (2, 1)}
+INNER_SAMPLE_COORD = {
+    (0, 0): (2, 2),
+    (0, 1): (2, 1),
+    (0, 2): (2, 0),
+    (1, 0): (1, 2),
+    (1, 2): (1, 0),
+    (2, 0): (0, 2),
+    (2, 1): (0, 1),
+    (2, 2): (0, 0),
+}
+CENTER_OFFSETS = np.array([-1, 1, 3], dtype=int)
+
+
+def _major_block_color(block: np.ndarray, bg: int) -> int:
+    vals, counts = np.unique(block[block != int(bg)], return_counts=True)
+    assert vals.size, "block must contain foreground colors"
+    return int(vals[int(np.argmax(counts))])
+
+
+def _largest_component_bbox(g: np.ndarray, bg: int) -> tuple[int, int, int, int] | None:
+    mask = g != int(bg)
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    best_bbox = None
+    best_size = -1
+    for r in range(h):
+        for c in range(w):
+            if not mask[r, c] or seen[r, c]:
+                continue
+            stack = [(r, c)]
+            seen[r, c] = True
+            size = 0
+            r0 = r1 = r
+            c0 = c1 = c
+            while stack:
+                rr, cc = stack.pop()
+                size += 1
+                r0 = min(r0, rr)
+                r1 = max(r1, rr)
+                c0 = min(c0, cc)
+                c1 = max(c1, cc)
+                for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nr, nc = rr + dr, cc + dc
+                    if 0 <= nr < h and 0 <= nc < w and mask[nr, nc] and not seen[nr, nc]:
+                        seen[nr, nc] = True
+                        stack.append((nr, nc))
+            if size > best_size:
+                best_size = size
+                best_bbox = (r0, c0, r1, c1)
+    return best_bbox
+
+
+def _center_patch(g: np.ndarray, r0: int, c0: int, block: int) -> np.ndarray:
+    assert block == 3, "this variant uses 3x3 blocks"
+    hole_r = int(r0) + block
+    hole_c = int(c0) + block
+    rows = hole_r + CENTER_OFFSETS
+    cols = hole_c + CENTER_OFFSETS
+    patch = g[np.ix_(rows, cols)].copy()
+    ring_vals = [int(patch[r, c]) for r in range(block) for c in range(block) if (r, c) != (1, 1)]
+    patch[1, 1] = Counter(ring_vals).most_common(1)[0][0]
+    return patch
+
+
+def _slot_marker_color(
+    g: np.ndarray,
+    expanded_r0: int,
+    expanded_c0: int,
+    slot_br: int,
+    slot_bc: int,
+    block: int,
+    bg: int,
+) -> int:
+    sr = expanded_r0 + slot_br * block
+    sc = expanded_c0 + slot_bc * block
+    marker = int(g[sr + block // 2, sc + block // 2])
+    assert marker != int(bg), f"outer slot {(slot_br, slot_bc)} is missing its marker"
+    return marker
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand a 3x3 block motif into a 5x5 block motif using color-tagged outer slots.
+
+    Input structure:
+    - Teal background contains one 9x9 motif made of eight 3x3 blocks around an
+      empty 3x3 center.
+    - The pixels facing the hole still encode the border of the missing center.
+    - Each of the eight outer 3x3 slots contains a single centered marker pixel
+      whose color names which source block belongs there.
+
+    Rule:
+    - Keep the original 9x9 motif in place.
+    - Reconstruct the center block from the eight sampled boundary pixels; the
+      center cell takes the most frequent of those eight colors.
+    - For each outer slot, read its marker color and copy in the surrounding 3x3
+      source block whose major color matches that marker.
+
+    Key insight: the outer layout is no longer determined by geometric symmetry.
+    The marker colors create a color-to-block lookup, so destination slots must be
+    solved by matching dominant block colors to those markers.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = int(get_bg(g))
+    motif_bbox = _largest_component_bbox(g, bg)
+    assert motif_bbox is not None, "expected a foreground motif"
+    r0, c0, r1, c1 = motif_bbox
+    h = int(r1 - r0 + 1)
+    w = int(c1 - c0 + 1)
+    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
+    block = h // 3
+    assert block == 3, "this variant expects a 9x9 motif"
+
+    out = g.copy()
+    expanded_r0 = int(r0) - block
+    expanded_c0 = int(c0) - block
+
+    blocks_by_color: dict[int, np.ndarray] = {}
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = crop_bbox(
+                g,
+                (
+                    int(r0) + br * block,
+                    int(c0) + bc * block,
+                    int(r0) + (br + 1) * block - 1,
+                    int(c0) + (bc + 1) * block - 1,
+                ),
+            )
+            major = _major_block_color(src, bg)
+            if major in blocks_by_color:
+                assert np.array_equal(blocks_by_color[major], src), (
+                    "reused marker colors require identical source blocks"
+                )
+            else:
+                blocks_by_color[major] = src
+
+    for slot_br, slot_bc in OUTER_SLOTS:
+        marker = _slot_marker_color(g, expanded_r0, expanded_c0, slot_br, slot_bc, block, bg)
+        assert marker in blocks_by_color, f"no source block has major color {marker}"
+        paste(out, blocks_by_color[marker], expanded_r0 + slot_br * block, expanded_c0 + slot_bc * block)
+
+    paste(out, _center_patch(g, int(r0), int(c0), block), int(r0) + block, int(c0) + block)
+    return out
+
+
+def _random_block(main_color: int, ring_color: int, sample_coord: tuple[int, int]) -> np.ndarray:
+    block = np.full((BLOCK, BLOCK), main_color, dtype=int)
+    if ring_color != main_color:
+        block[sample_coord] = ring_color
+    remaining = [(r, c) for r in range(BLOCK) for c in range(BLOCK) if (r, c) != sample_coord]
+    extra_coords = random.sample(remaining, 2)
+    accent_pool = [color for color in FOREGROUND_COLORS if color != main_color]
+    extra_colors = random.sample(accent_pool, 2)
+    for (rr, cc), color in zip(extra_coords, extra_colors):
+        block[rr, cc] = color
+    return block
+
+
+def _assemble_motif(blocks: dict[tuple[int, int], np.ndarray]) -> np.ndarray:
+    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
+    for pos, block in blocks.items():
+        br, bc = pos
+        paste(motif, block, br * BLOCK, bc * BLOCK)
+    return motif
+
+
+def _marker_mismatch_count(
+    source_colors: dict[tuple[int, int], int],
+    marker_colors: dict[tuple[int, int], int],
+) -> int:
+    mismatches = 0
+    for br, bc in SOURCE_POSITIONS:
+        old_slot = (4 - 2 * br, 4 - 2 * bc)
+        if marker_colors[old_slot] != source_colors[(br, bc)]:
+            mismatches += 1
+    return mismatches
+
+
+def _expanded_output(
+    motif: np.ndarray,
+    center: np.ndarray,
+    blocks_by_color: dict[int, np.ndarray],
+    marker_colors: dict[tuple[int, int], int],
+) -> np.ndarray:
+    expanded = np.full((EXPANDED_SIZE, EXPANDED_SIZE), BG, dtype=int)
+    output_motif = motif.copy()
+    paste(output_motif, center, BLOCK, BLOCK)
+    paste(expanded, output_motif, BLOCK, BLOCK)
+    for slot_br, slot_bc in OUTER_SLOTS:
+        paste(expanded, blocks_by_color[marker_colors[(slot_br, slot_bc)]], slot_br * BLOCK, slot_bc * BLOCK)
+    return expanded
+
+
+def _gen_attempt() -> tuple[np.ndarray, int] | None:
+    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
+    source_color_list = random.sample(FOREGROUND_COLORS, len(SOURCE_POSITIONS))
+    source_colors = {pos: color for pos, color in zip(SOURCE_POSITIONS, source_color_list)}
+
+    marker_perm = random.sample(source_color_list, len(source_color_list))
+    marker_colors = {slot: color for slot, color in zip(OUTER_SLOTS, marker_perm)}
+    mismatch_count = _marker_mismatch_count(source_colors, marker_colors)
+    if mismatch_count < MIN_ANTI_ORIGINAL_MISMATCH:
+        return None
+
+    center_color = random.choice(source_color_list)
+    ring_colors: dict[tuple[int, int], int] = {}
+    for pos in SOURCE_POSITIONS:
+        if pos in ORTHOGONAL_POSITIONS:
+            ring_colors[pos] = center_color
+        else:
+            candidates = [color for color in FOREGROUND_COLORS if color != center_color]
+            ring_colors[pos] = random.choice(candidates)
+
+    blocks = {
+        pos: _random_block(source_colors[pos], ring_colors[pos], INNER_SAMPLE_COORD[pos])
+        for pos in SOURCE_POSITIONS
+    }
+    motif = _assemble_motif(blocks)
+    center = _center_patch(motif, 0, 0, BLOCK)
+    if int(center[1, 1]) != center_color:
+        return None
+
+    blocks_by_color = {source_colors[pos]: blocks[pos] for pos in SOURCE_POSITIONS}
+    expanded = _expanded_output(motif, center, blocks_by_color, marker_colors)
+
+    r0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
+    c0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
+    inp = np.full((n, n), BG, dtype=int)
+    out = np.full((n, n), BG, dtype=int)
+    paste(inp, motif, r0, c0)
+    paste(out, expanded, r0 - BLOCK, c0 - BLOCK)
+    for slot_br, slot_bc in OUTER_SLOTS:
+        sr = r0 - BLOCK + slot_br * BLOCK
+        sc = c0 - BLOCK + slot_bc * BLOCK
+        inp[sr + 1, sc + 1] = marker_colors[(slot_br, slot_bc)]
+
+    if np.array_equal(main(inp), out):
+        return inp, mismatch_count
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        result = _gen_attempt()
+        if result is not None:
+            grid, _mismatch_count = result
+            return grid
+    raise AssertionError("failed to generate a valid db0c5428 D1 variant input")
+
+exec
+/bin/bash -lc "sed -n '1,240p' /home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/db0c5428.json" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+{"train": [{"input": [[8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 6, 6, 4, 4, 6, 4, 4, 6, 6, 8, 8, 8, 8, 8, 8], [8, 8, 8, 6, 4, 6, 6, 4, 6, 6, 4, 6, 8, 8, 8, 8, 8, 8], [8, 8, 8, 4, 6, 9, 6, 9, 6, 9, 6, 4, 8, 8, 8, 8, 8, 8], [8, 8, 8, 4, 6, 6, 8, 8, 8, 6, 6, 4, 8, 8, 8, 8, 8, 8], [8, 8, 8, 6, 4, 9, 8, 8, 8, 9, 4, 6, 8, 8, 8, 8, 8, 8], [8, 8, 8, 4, 6, 6, 8, 8, 8, 6, 6, 4, 8, 8, 8, 8, 8, 8], [8, 8, 8, 4, 6, 9, 6, 9, 6, 9, 6, 4, 8, 8, 8, 8, 8, 8], [8, 8, 8, 6, 4, 6, 6, 4, 6, 6, 4, 6, 8, 8, 8, 8, 8, 8], [8, 8, 8, 6, 6, 4, 4, 6, 4, 4, 6, 6, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8]], "output": [[9, 6, 4, 8, 8, 8, 6, 9, 6, 8, 8, 8, 4, 6, 9, 8, 8, 8], [6, 4, 6, 8, 8, 8, 6, 4, 6, 8, 8, 8, 6, 4, 6, 8, 8, 8], [4, 6, 6, 8, 8, 8, 4, 6, 4, 8, 8, 8, 6, 6, 4, 8, 8, 8], [8, 8, 8, 6, 6, 4, 4, 6, 4, 4, 6, 6, 8, 8, 8, 8, 8, 8], [8, 8, 8, 6, 4, 6, 6, 4, 6, 6, 4, 6, 8, 8, 8, 8, 8, 8], [8, 8, 8, 4, 6, 9, 6, 9, 6, 9, 6, 4, 8, 8, 8, 8, 8, 8], [6, 6, 4, 4, 6, 6, 9, 9, 9, 6, 6, 4, 4, 6, 6, 8, 8, 8], [9, 4, 6, 6, 4, 9, 9, 6, 9, 9, 4, 6, 6, 4, 9, 8, 8, 8], [6, 6, 4, 4, 6, 6, 9, 9, 9, 6, 6, 4, 4, 6, 6, 8, 8, 8], [8, 8, 8, 4, 6, 9, 6, 9, 6, 9, 6, 4, 8, 8, 8, 8, 8, 8], [8, 8, 8, 6, 4, 6, 6, 4, 6, 6, 4, 6, 8, 8, 8, 8, 8, 8], [8, 8, 8, 6, 6, 4, 4, 6, 4, 4, 6, 6, 8, 8, 8, 8, 8, 8], [4, 6, 6, 8, 8, 8, 4, 6, 4, 8, 8, 8, 6, 6, 4, 8, 8, 8], [6, 4, 6, 8, 8, 8, 6, 4, 6, 8, 8, 8, 6, 4, 6, 8, 8, 8], [9, 6, 4, 8, 8, 8, 6, 9, 6, 8, 8, 8, 4, 6, 9, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8]]}, {"input": [[8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 8, 8, 8, 8], [8, 8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 8, 8, 8, 8], [8, 8, 8, 1, 1, 7, 1, 7, 1, 7, 1, 1, 8, 8, 8, 8], [8, 8, 8, 1, 1, 1, 8, 8, 8, 1, 1, 1, 8, 8, 8, 8], [8, 8, 8, 1, 1, 7, 8, 8, 8, 7, 1, 1, 8, 8, 8, 8], [8, 8, 8, 1, 1, 1, 8, 8, 8, 1, 1, 1, 8, 8, 8, 8], [8, 8, 8, 1, 1, 7, 1, 7, 1, 7, 1, 1, 8, 8, 8, 8], [8, 8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 8, 8, 8, 8], [8, 8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8]], "output": [[8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [7, 1, 1, 8, 8, 8, 1, 7, 1, 8, 8, 8, 1, 1, 7, 8], [1, 1, 1, 8, 8, 8, 1, 1, 1, 8, 8, 8, 1, 1, 1, 8], [1, 1, 1, 8, 8, 8, 1, 1, 1, 8, 8, 8, 1, 1, 1, 8], [8, 8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 8, 8, 8, 8], [8, 8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 8, 8, 8, 8], [8, 8, 8, 1, 1, 7, 1, 7, 1, 7, 1, 1, 8, 8, 8, 8], [1, 1, 1, 1, 1, 1, 7, 7, 7, 1, 1, 1, 1, 1, 1, 8], [7, 1, 1, 1, 1, 7, 7, 1, 7, 7, 1, 1, 1, 1, 7, 8], [1, 1, 1, 1, 1, 1, 7, 7, 7, 1, 1, 1, 1, 1, 1, 8], [8, 8, 8, 1, 1, 7, 1, 7, 1, 7, 1, 1, 8, 8, 8, 8], [8, 8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 8, 8, 8, 8], [8, 8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 8, 8, 8, 8], [1, 1, 1, 8, 8, 8, 1, 1, 1, 8, 8, 8, 1, 1, 1, 8], [1, 1, 1, 8, 8, 8, 1, 1, 1, 8, 8, 8, 1, 1, 1, 8], [7, 1, 1, 8, 8, 8, 1, 7, 1, 8, 8, 8, 1, 1, 7, 8]]}, {"input": [[8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 5, 6, 5, 5, 5, 5, 5, 6, 5, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 6, 5, 5, 5, 5, 5, 5, 5, 6, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 5, 5, 3, 5, 2, 5, 3, 5, 5, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 5, 5, 5, 8, 8, 8, 5, 5, 5, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 5, 5, 2, 8, 8, 8, 2, 5, 5, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 5, 5, 5, 8, 8, 8, 5, 5, 5, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 5, 5, 3, 5, 2, 5, 3, 5, 5, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 6, 5, 5, 5, 5, 5, 5, 5, 6, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 5, 6, 5, 5, 5, 5, 5, 6, 5, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8]], "output": [[8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 3, 5, 5, 8, 8, 8, 5, 2, 5, 8, 8, 8, 5, 5, 3, 8], [8, 8, 8, 5, 5, 6, 8, 8, 8, 5, 5, 5, 8, 8, 8, 6, 5, 5, 8], [8, 8, 8, 5, 6, 5, 8, 8, 8, 5, 5, 5, 8, 8, 8, 5, 6, 5, 8], [8, 8, 8, 8, 8, 8, 5, 6, 5, 5, 5, 5, 5, 6, 5, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 6, 5, 5, 5, 5, 5, 5, 5, 6, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 5, 5, 3, 5, 2, 5, 3, 5, 5, 8, 8, 8, 8], [8, 8, 8, 5, 5, 5, 5, 5, 5, 3, 2, 3, 5, 5, 5, 5, 5, 5, 8], [8, 8, 8, 2, 5, 5, 5, 5, 2, 2, 5, 2, 2, 5, 5, 5, 5, 2, 8], [8, 8, 8, 5, 5, 5, 5, 5, 5, 3, 2, 3, 5, 5, 5, 5, 5, 5, 8], [8, 8, 8, 8, 8, 8, 5, 5, 3, 5, 2, 5, 3, 5, 5, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 6, 5, 5, 5, 5, 5, 5, 5, 6, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 5, 6, 5, 5, 5, 5, 5, 6, 5, 8, 8, 8, 8], [8, 8, 8, 5, 6, 5, 8, 8, 8, 5, 5, 5, 8, 8, 8, 5, 6, 5, 8], [8, 8, 8, 5, 5, 6, 8, 8, 8, 5, 5, 5, 8, 8, 8, 6, 5, 5, 8], [8, 8, 8, 3, 5, 5, 8, 8, 8, 5, 2, 5, 8, 8, 8, 5, 5, 3, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8]]}], "test": [{"input": [[8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 3, 7, 7, 7, 7, 7, 7, 7, 3, 8, 8, 8, 8], [8, 8, 8, 8, 7, 7, 4, 7, 7, 7, 4, 7, 7, 8, 8, 8, 8], [8, 8, 8, 8, 7, 4, 4, 7, 1, 7, 4, 4, 7, 8, 8, 8, 8], [8, 8, 8, 8, 7, 7, 7, 8, 8, 8, 7, 7, 7, 8, 8, 8, 8], [8, 8, 8, 8, 7, 7, 1, 8, 8, 8, 1, 7, 7, 8, 8, 8, 8], [8, 8, 8, 8, 7, 7, 7, 8, 8, 8, 7, 7, 7, 8, 8, 8, 8], [8, 8, 8, 8, 7, 4, 4, 7, 1, 7, 4, 4, 7, 8, 8, 8, 8], [8, 8, 8, 8, 7, 7, 4, 7, 7, 7, 4, 7, 7, 8, 8, 8, 8], [8, 8, 8, 8, 3, 7, 7, 7, 7, 7, 7, 7, 3, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8]], "output": [[8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], [8, 4, 4, 7, 8, 8, 8, 7, 1, 7, 8, 8, 8, 7, 4, 4, 8], [8, 4, 7, 7, 8, 8, 8, 7, 7, 7, 8, 8, 8, 7, 7, 4, 8], [8, 7, 7, 3, 8, 8, 8, 7, 7, 7, 8, 8, 8, 3, 7, 7, 8], [8, 8, 8, 8, 3, 7, 7, 7, 7, 7, 7, 7, 3, 8, 8, 8, 8], [8, 8, 8, 8, 7, 7, 4, 7, 7, 7, 4, 7, 7, 8, 8, 8, 8], [8, 8, 8, 8, 7, 4, 4, 7, 1, 7, 4, 4, 7, 8, 8, 8, 8], [8, 7, 7, 7, 7, 7, 7, 4, 1, 4, 7, 7, 7, 7, 7, 7, 8], [8, 1, 7, 7, 7, 7, 1, 1, 7, 1, 1, 7, 7, 7, 7, 1, 8], [8, 7, 7, 7, 7, 7, 7, 4, 1, 4, 7, 7, 7, 7, 7, 7, 8], [8, 8, 8, 8, 7, 4, 4, 7, 1, 7, 4, 4, 7, 8, 8, 8, 8], [8, 8, 8, 8, 7, 7, 4, 7, 7, 7, 4, 7, 7, 8, 8, 8, 8], [8, 8, 8, 8, 3, 7, 7, 7, 7, 7, 7, 7, 3, 8, 8, 8, 8], [8, 7, 7, 3, 8, 8, 8, 7, 7, 7, 8, 8, 8, 3, 7, 7, 8], [8, 4, 7, 7, 8, 8, 8, 7, 7, 7, 8, 8, 8, 7, 7, 4, 8], [8, 4, 4, 7, 8, 8, 8, 7, 1, 7, 8, 8, 8, 7, 4, 4, 8], [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8]]}]}
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+    r0 = min(b[0] for b in bbs)
+    c0 = min(b[1] for b in bbs)
+    r1 = max(b[2] for b in bbs)
+    c1 = max(b[3] for b in bbs)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox_h(b: BBox) -> int:
+    r0, _c0, r1, _c1 = b
+    return int(r1 - r0 + 1)
+
+
+def bbox_w(b: BBox) -> int:
+    _r0, c0, _r1, c1 = b
+    return int(c1 - c0 + 1)
+
+
+def bbox_anchor(b: BBox, *, anchor: str = "upper left") -> Coord:
+    """
+    Return an anchor point (r,c) for a bbox.
+
+codex
+我已经确认两个叠加点会同时影响 solver：外部颜色标记会把整体 `bbox` 扩到 15x15，而中心空洞改成特殊色后，中心不再能用“背景洞”来理解，只能按“中心整块特殊标记”识别并覆盖重建。下一步我直接写融合版，并把设计分析一并写进文件头注释。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/db0c5428/42' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+exec
+/bin/bash -lc "if [ -f /home/lixinyu/snap/new/ceshi/code_combo/db0c5428/42/code.py ]; then sed -n '1,220p' /home/lixinyu/snap/new/ceshi/code_combo/db0c5428/42/code.py; fi" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+codex
+我现在开始落盘代码。实现上会把“中心 3x3 特殊洞色”和“外圈单像素颜色标记”做成两个明确的视觉通道，并把 solver 的新输入假设写成显式断言，避免只是在 generator 里偷偷依赖。
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/42/code.py
+diff --git a/ceshi/code_combo/db0c5428/42/code.py b/ceshi/code_combo/db0c5428/42/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9201a10e5b17fbaf8bba5784ed397db8227916d
+--- /dev/null
++++ b/ceshi/code_combo/db0c5428/42/code.py
+@@ -0,0 +1,385 @@
++# Combo variant of db0c5428 (index 42)
++# combo_spec: D1/3+D12/0
++# Name: 颜色匹配映射+特殊标记色空洞
++
++from __future__ import annotations
++
++from collections import Counter
++import random
++
++import numpy as np
++
++from arc_utils import crop_bbox, get_bg, paste
++
++
++# Design analysis for the combo variant
++# -------------------------------------
++# a) Concrete behavior:
++#    - The visible object is still the 9x9 middle of a 5x5 block lattice, but the
++#      center 3x3 is no longer background. It is a solid special hole color 0.
++#    - The input also contains eight isolated outer marker pixels, one centered in
++#      each outer 3x3 slot. Their colors are a permutation of the eight source
++#      blocks' dominant colors.
++#    - Example trace:
++#      original task: block(0,0) always copies to outer slot(4,4) by symmetry.
++#      combo task: if block(0,0) is mostly color 6 and the marker color 6 is at
++#      outer slot(0,2), that block must go to slot(0,2) instead. Meanwhile the
++#      central 3x3 block of color 0 is not an object to copy; it is a "missing
++#      area" marker that gets replaced by the reconstructed center patch.
++# b) Complexity calibration:
++#    - To avoid ambiguous color lookup, each of the eight source blocks receives a
++#      distinct dominant color. The outer markers reuse exactly those eight colors.
++#    - The hole marker uses a ninth color (0) that never appears in any source
++#      block or outer marker, so the two marker systems are visually separable.
++# c) Hidden assumptions broken from the original solver:
++#    - `bbox(g != bg)` is no longer usable because outer markers expand the global
++#      non-background bbox to the full 15x15 frame. The solver must isolate the
++#      largest connected component, which is the 9x9 motif.
++#    - The original "center is background" assumption is invalid. The solver must
++#      now tolerate a filled center block, recognize it as a uniform special color,
++#      and overwrite it with the reconstructed patch.
++#    - The original opposite-slot formula is invalid because the outer copy rule is
++#      now driven by color equality between source-block major colors and marker
++#      pixels.
++#    - The original motif-wide majority color is unstable once all eight source
++#      blocks use distinct majors. The reconstructed center therefore uses the mode
++#      of the eight boundary samples around the hole.
++# d) Placement legality:
++#    - The motif still sits with a margin of one block, so the full 15x15 expanded
++#      region stays inside the NxN canvas.
++#    - Outer markers are placed at the centers of the outer slots, which keeps them
++#      disconnected from the motif component and prevents overlap with pasted blocks.
++#    - The center hole is a full 3x3 block, so it never collides with source data;
++#      it simply occupies the block that used to be empty.
++# e) Visual observability:
++#    - Across examples, the outer marker permutation changes, so the user can infer
++#      that outer placement depends on color matching rather than point symmetry.
++#    - The central special-color square is visually different from both background
++#      and outer markers: it is a full 3x3 region, not a single pixel.
++# f) Visual cleanliness:
++#    - There are only two annotation forms: a solid 3x3 center hole and eight
++#      centered single-pixel outer tags. They occupy disjoint regions and remain
++#      easy to parse by eye.
++# g) Color-inference guardrails:
++#    - No numeric ordering on colors is used anywhere. Matching depends only on
++#      visible equality. The special hole color is distinguished by location and
++#      shape, not by the fact that its id is 0.
++# h) Anti-degeneration metric:
++#    - The generator enforces at least 4 disagreements with the original
++#      opposite-slot mapping, measured as the number of outer slots whose marker
++#      color does not match the source block that would have gone there originally.
++#    - It also always uses a full 3x3 special-color center hole, so the D12 change
++#      is present in every sample instead of collapsing back to a background hole.
++# i) New solver assumptions guaranteed by the generator:
++#    - The largest connected non-background component is the 9x9 motif.
++#    - The center block of that motif is uniformly colored with the special hole
++#      color, distinct from background and from every source-block major color.
++#    - Each outer slot contains exactly one centered marker pixel whose color
++#      matches exactly one source block's major color.
++
++
++BLOCK = 3
++MOTIF_SIZE = BLOCK * 3
++EXPANDED_SIZE = BLOCK * 5
++
++GRID_SIZE_MIN, GRID_SIZE_MAX = 16, 19
++MOTIF_PAD = 3
++BG = 8
++HOLE_COLOR = 0
++SOURCE_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
++MAX_RETRIES = 300
++MIN_ANTI_ORIGINAL_MISMATCH = 4
++
++SOURCE_POSITIONS = (
++    (0, 0), (0, 1), (0, 2),
++    (1, 0),         (1, 2),
++    (2, 0), (2, 1), (2, 2),
++)
++OUTER_SLOTS = (
++    (0, 0), (0, 2), (0, 4),
++    (2, 0),         (2, 4),
++    (4, 0), (4, 2), (4, 4),
++)
++ORTHOGONAL_POSITIONS = {(0, 1), (1, 0), (1, 2), (2, 1)}
++INNER_SAMPLE_COORD = {
++    (0, 0): (2, 2),
++    (0, 1): (2, 1),
++    (0, 2): (2, 0),
++    (1, 0): (1, 2),
++    (1, 2): (1, 0),
++    (2, 0): (0, 2),
++    (2, 1): (0, 1),
++    (2, 2): (0, 0),
++}
++CENTER_OFFSETS = np.array([-1, 1, 3], dtype=int)
++
++
++def _major_block_color(block: np.ndarray, bg: int) -> int:
++    vals, counts = np.unique(block[block != int(bg)], return_counts=True)
++    assert vals.size, "block must contain foreground colors"
++    return int(vals[int(np.argmax(counts))])
++
++
++def _largest_component_bbox(g: np.ndarray, bg: int) -> tuple[int, int, int, int] | None:
++    mask = g != int(bg)
++    h, w = mask.shape
++    seen = np.zeros_like(mask, dtype=bool)
++    best_bbox = None
++    best_size = -1
++    for r in range(h):
++        for c in range(w):
++            if not mask[r, c] or seen[r, c]:
++                continue
++            stack = [(r, c)]
++            seen[r, c] = True
++            size = 0
++            r0 = r1 = r
++            c0 = c1 = c
++            while stack:
++                rr, cc = stack.pop()
++                size += 1
++                r0 = min(r0, rr)
++                r1 = max(r1, rr)
++                c0 = min(c0, cc)
++                c1 = max(c1, cc)
++                for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
++                    nr, nc = rr + dr, cc + dc
++                    if 0 <= nr < h and 0 <= nc < w and mask[nr, nc] and not seen[nr, nc]:
++                        seen[nr, nc] = True
++                        stack.append((nr, nc))
++            if size > best_size:
++                best_size = size
++                best_bbox = (r0, c0, r1, c1)
++    return best_bbox
++
++
++def _center_hole_color(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> int:
++    center = crop_bbox(
++        g,
++        (int(r0) + block, int(c0) + block, int(r0) + 2 * block - 1, int(c0) + 2 * block - 1),
++    )
++    vals = np.unique(center)
++    assert vals.size == 1, "center hole marker must be uniform"
++    hole = int(vals[0])
++    assert hole != int(bg), "center hole marker must differ from background"
++    return hole
++
++
++def _center_patch(g: np.ndarray, r0: int, c0: int, block: int) -> np.ndarray:
++    assert block == 3, "this variant uses 3x3 blocks"
++    hole_r = int(r0) + block
++    hole_c = int(c0) + block
++    rows = hole_r + CENTER_OFFSETS
++    cols = hole_c + CENTER_OFFSETS
++    patch = g[np.ix_(rows, cols)].copy()
++    ring_vals = [int(patch[r, c]) for r in range(block) for c in range(block) if (r, c) != (1, 1)]
++    patch[1, 1] = Counter(ring_vals).most_common(1)[0][0]
++    return patch
++
++
++def _slot_marker_color(
++    g: np.ndarray,
++    expanded_r0: int,
++    expanded_c0: int,
++    slot_br: int,
++    slot_bc: int,
++    block: int,
++    bg: int,
++    hole_color: int,
++) -> int:
++    sr = expanded_r0 + slot_br * block
++    sc = expanded_c0 + slot_bc * block
++    marker = int(g[sr + block // 2, sc + block // 2])
++    assert marker != int(bg), f"outer slot {(slot_br, slot_bc)} is missing its marker"
++    assert marker != int(hole_color), "outer marker color must differ from center hole color"
++    return marker
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand a tagged 3x3-block motif into a 5x5 block layout with two marker roles.
++
++    Input structure:
++    - Teal background contains one 9x9 motif made of eight 3x3 source blocks.
++    - The middle 3x3 block is filled with one special color that marks the hole;
++      it is not background and it is not one of the outer marker colors.
++    - Each of the eight outer 3x3 slots contains a single centered marker pixel,
++      and the pixels around the central hole still encode the missing center patch.
++
++    Rule:
++    - Keep the original 9x9 motif in place, except replace the special-color hole
++      with the reconstructed center block.
++    - Reconstruct that center block from the eight boundary pixels facing the hole;
++      the center cell takes the modal boundary color.
++    - For each outer slot, read its centered marker color and copy in the source
++      block whose dominant color matches that marker.
++
++    Key insight: two non-background markers coexist but mean different things. The
++    solid central square marks "missing area to rebuild", while the isolated outer
++    pixels act as color labels that choose which source block belongs in each slot.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = int(get_bg(g))
++    motif_bbox = _largest_component_bbox(g, bg)
++    assert motif_bbox is not None, "expected a foreground motif"
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
++    block = h // 3
++    assert block == 3, "this variant expects a 9x9 motif"
++
++    hole_color = _center_hole_color(g, int(r0), int(c0), block, bg)
++    expanded_r0 = int(r0) - block
++    expanded_c0 = int(c0) - block
++    out = g.copy()
++
++    blocks_by_color: dict[int, np.ndarray] = {}
++    for br, bc in SOURCE_POSITIONS:
++        src = crop_bbox(
++            g,
++            (
++                int(r0) + br * block,
++                int(c0) + bc * block,
++                int(r0) + (br + 1) * block - 1,
++                int(c0) + (bc + 1) * block - 1,
++            ),
++        )
++        major = _major_block_color(src, bg)
++        assert major != hole_color, "source-block major color must differ from hole marker"
++        if major in blocks_by_color:
++            assert np.array_equal(blocks_by_color[major], src), (
++                "reused marker colors require identical source blocks"
++            )
++        else:
++            blocks_by_color[major] = src
++
++    for slot_br, slot_bc in OUTER_SLOTS:
++        marker = _slot_marker_color(
++            g,
++            expanded_r0,
++            expanded_c0,
++            slot_br,
++            slot_bc,
++            block,
++            bg,
++            hole_color,
++        )
++        assert marker in blocks_by_color, f"no source block has major color {marker}"
++        paste(out, blocks_by_color[marker], expanded_r0 + slot_br * block, expanded_c0 + slot_bc * block)
++
++    paste(out, _center_patch(g, int(r0), int(c0), block), int(r0) + block, int(c0) + block)
++    return out
++
++
++def _random_block(main_color: int, ring_color: int, sample_coord: tuple[int, int]) -> np.ndarray:
++    block = np.full((BLOCK, BLOCK), main_color, dtype=int)
++    if ring_color != main_color:
++        block[sample_coord] = ring_color
++    remaining = [(r, c) for r in range(BLOCK) for c in range(BLOCK) if (r, c) != sample_coord]
++    extra_coords = random.sample(remaining, 2)
++    accent_pool = [color for color in SOURCE_COLORS if color != main_color]
++    extra_colors = random.sample(accent_pool, 2)
++    for (rr, cc), color in zip(extra_coords, extra_colors):
++        block[rr, cc] = color
++    return block
++
++
++def _assemble_input_motif(blocks: dict[tuple[int, int], np.ndarray]) -> np.ndarray:
++    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), HOLE_COLOR, dtype=int)
++    for pos, block in blocks.items():
++        br, bc = pos
++        paste(motif, block, br * BLOCK, bc * BLOCK)
++    return motif
++
++
++def _old_mapping_mismatch_count(
++    source_colors: dict[tuple[int, int], int],
++    marker_colors: dict[tuple[int, int], int],
++) -> int:
++    mismatches = 0
++    for br, bc in SOURCE_POSITIONS:
++        old_slot = (4 - 2 * br, 4 - 2 * bc)
++        if marker_colors[old_slot] != source_colors[(br, bc)]:
++            mismatches += 1
++    return mismatches
++
++
++def _expanded_output(
++    motif: np.ndarray,
++    center: np.ndarray,
++    blocks_by_color: dict[int, np.ndarray],
++    marker_colors: dict[tuple[int, int], int],
++) -> np.ndarray:
++    expanded = np.full((EXPANDED_SIZE, EXPANDED_SIZE), BG, dtype=int)
++    output_motif = motif.copy()
++    paste(output_motif, center, BLOCK, BLOCK)
++    paste(expanded, output_motif, BLOCK, BLOCK)
++    for slot_br, slot_bc in OUTER_SLOTS:
++        paste(
++            expanded,
++            blocks_by_color[marker_colors[(slot_br, slot_bc)]],
++            slot_br * BLOCK,
++            slot_bc * BLOCK,
++        )
++    return expanded
++
++
++def _gen_attempt() -> tuple[np.ndarray, int] | None:
++    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    source_color_list = random.sample(SOURCE_COLORS, len(SOURCE_POSITIONS))
++    source_colors = {pos: color for pos, color in zip(SOURCE_POSITIONS, source_color_list)}
++
++    marker_perm = random.sample(source_color_list, len(source_color_list))
++    marker_colors = {slot: color for slot, color in zip(OUTER_SLOTS, marker_perm)}
++    mismatch_count = _old_mapping_mismatch_count(source_colors, marker_colors)
++    if mismatch_count < MIN_ANTI_ORIGINAL_MISMATCH:
++        return None
++
++    center_color = random.choice(source_color_list)
++    ring_colors: dict[tuple[int, int], int] = {}
++    for pos in SOURCE_POSITIONS:
++        if pos in ORTHOGONAL_POSITIONS:
++            ring_colors[pos] = center_color
++        else:
++            candidates = [color for color in SOURCE_COLORS if color != center_color]
++            ring_colors[pos] = random.choice(candidates)
++
++    blocks = {
++        pos: _random_block(source_colors[pos], ring_colors[pos], INNER_SAMPLE_COORD[pos])
++        for pos in SOURCE_POSITIONS
++    }
++    motif = _assemble_input_motif(blocks)
++    center = _center_patch(motif, 0, 0, BLOCK)
++    if int(center[1, 1]) != center_color:
++        return None
++
++    blocks_by_color = {source_colors[pos]: blocks[pos] for pos in SOURCE_POSITIONS}
++    expanded = _expanded_output(motif, center, blocks_by_color, marker_colors)
++
++    r0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
++    c0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
++    inp = np.full((n, n), BG, dtype=int)
++    out = np.full((n, n), BG, dtype=int)
++    paste(inp, motif, r0, c0)
++    paste(out, expanded, r0 - BLOCK, c0 - BLOCK)
++
++    for slot_br, slot_bc in OUTER_SLOTS:
++        sr = r0 - BLOCK + slot_br * BLOCK
++        sc = c0 - BLOCK + slot_bc * BLOCK
++        inp[sr + 1, sc + 1] = marker_colors[(slot_br, slot_bc)]
++
++    if np.count_nonzero(inp[r0 + BLOCK:r0 + 2 * BLOCK, c0 + BLOCK:c0 + 2 * BLOCK] == HOLE_COLOR) != 9:
++        return None
++    if np.array_equal(main(inp), out):
++        return inp, mismatch_count
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            grid, _mismatch_count = result
++            return grid
++    raise AssertionError("failed to generate a valid db0c5428 combo variant input")
+
+diff --git a/ceshi/code_combo/db0c5428/42/code.py b/ceshi/code_combo/db0c5428/42/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9201a10e5b17fbaf8bba5784ed397db8227916d
+--- /dev/null
++++ b/ceshi/code_combo/db0c5428/42/code.py
+@@ -0,0 +1,385 @@
++# Combo variant of db0c5428 (index 42)
++# combo_spec: D1/3+D12/0
++# Name: 颜色匹配映射+特殊标记色空洞
++
++from __future__ import annotations
++
++from collections import Counter
++import random
++
++import numpy as np
++
++from arc_utils import crop_bbox, get_bg, paste
++
++
++# Design analysis for the combo variant
++# -------------------------------------
++# a) Concrete behavior:
++#    - The visible object is still the 9x9 middle of a 5x5 block lattice, but the
++#      center 3x3 is no longer background. It is a solid special hole color 0.
++#    - The input also contains eight isolated outer marker pixels, one centered in
++#      each outer 3x3 slot. Their colors are a permutation of the eight source
++#      blocks' dominant colors.
++#    - Example trace:
++#      original task: block(0,0) always copies to outer slot(4,4) by symmetry.
++#      combo task: if block(0,0) is mostly color 6 and the marker color 6 is at
++#      outer slot(0,2), that block must go to slot(0,2) instead. Meanwhile the
++#      central 3x3 block of color 0 is not an object to copy; it is a "missing
++#      area" marker that gets replaced by the reconstructed center patch.
++# b) Complexity calibration:
++#    - To avoid ambiguous color lookup, each of the eight source blocks receives a
++#      distinct dominant color. The outer markers reuse exactly those eight colors.
++#    - The hole marker uses a ninth color (0) that never appears in any source
++#      block or outer marker, so the two marker systems are visually separable.
++# c) Hidden assumptions broken from the original solver:
++#    - `bbox(g != bg)` is no longer usable because outer markers expand the global
++#      non-background bbox to the full 15x15 frame. The solver must isolate the
++#      largest connected component, which is the 9x9 motif.
++#    - The original "center is background" assumption is invalid. The solver must
++#      now tolerate a filled center block, recognize it as a uniform special color,
++#      and overwrite it with the reconstructed patch.
++#    - The original opposite-slot formula is invalid because the outer copy rule is
++#      now driven by color equality between source-block major colors and marker
++#      pixels.
++#    - The original motif-wide majority color is unstable once all eight source
++#      blocks use distinct majors. The reconstructed center therefore uses the mode
++#      of the eight boundary samples around the hole.
++# d) Placement legality:
++#    - The motif still sits with a margin of one block, so the full 15x15 expanded
++#      region stays inside the NxN canvas.
++#    - Outer markers are placed at the centers of the outer slots, which keeps them
++#      disconnected from the motif component and prevents overlap with pasted blocks.
++#    - The center hole is a full 3x3 block, so it never collides with source data;
++#      it simply occupies the block that used to be empty.
++# e) Visual observability:
++#    - Across examples, the outer marker permutation changes, so the user can infer
++#      that outer placement depends on color matching rather than point symmetry.
++#    - The central special-color square is visually different from both background
++#      and outer markers: it is a full 3x3 region, not a single pixel.
++# f) Visual cleanliness:
++#    - There are only two annotation forms: a solid 3x3 center hole and eight
++#      centered single-pixel outer tags. They occupy disjoint regions and remain
++#      easy to parse by eye.
++# g) Color-inference guardrails:
++#    - No numeric ordering on colors is used anywhere. Matching depends only on
++#      visible equality. The special hole color is distinguished by location and
++#      shape, not by the fact that its id is 0.
++# h) Anti-degeneration metric:
++#    - The generator enforces at least 4 disagreements with the original
++#      opposite-slot mapping, measured as the number of outer slots whose marker
++#      color does not match the source block that would have gone there originally.
++#    - It also always uses a full 3x3 special-color center hole, so the D12 change
++#      is present in every sample instead of collapsing back to a background hole.
++# i) New solver assumptions guaranteed by the generator:
++#    - The largest connected non-background component is the 9x9 motif.
++#    - The center block of that motif is uniformly colored with the special hole
++#      color, distinct from background and from every source-block major color.
++#    - Each outer slot contains exactly one centered marker pixel whose color
++#      matches exactly one source block's major color.
++
++
++BLOCK = 3
++MOTIF_SIZE = BLOCK * 3
++EXPANDED_SIZE = BLOCK * 5
++
++GRID_SIZE_MIN, GRID_SIZE_MAX = 16, 19
++MOTIF_PAD = 3
++BG = 8
++HOLE_COLOR = 0
++SOURCE_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
++MAX_RETRIES = 300
++MIN_ANTI_ORIGINAL_MISMATCH = 4
++
++SOURCE_POSITIONS = (
++    (0, 0), (0, 1), (0, 2),
++    (1, 0),         (1, 2),
++    (2, 0), (2, 1), (2, 2),
++)
++OUTER_SLOTS = (
++    (0, 0), (0, 2), (0, 4),
++    (2, 0),         (2, 4),
++    (4, 0), (4, 2), (4, 4),
++)
++ORTHOGONAL_POSITIONS = {(0, 1), (1, 0), (1, 2), (2, 1)}
++INNER_SAMPLE_COORD = {
++    (0, 0): (2, 2),
++    (0, 1): (2, 1),
++    (0, 2): (2, 0),
++    (1, 0): (1, 2),
++    (1, 2): (1, 0),
++    (2, 0): (0, 2),
++    (2, 1): (0, 1),
++    (2, 2): (0, 0),
++}
++CENTER_OFFSETS = np.array([-1, 1, 3], dtype=int)
++
++
++def _major_block_color(block: np.ndarray, bg: int) -> int:
++    vals, counts = np.unique(block[block != int(bg)], return_counts=True)
++    assert vals.size, "block must contain foreground colors"
++    return int(vals[int(np.argmax(counts))])
++
++
++def _largest_component_bbox(g: np.ndarray, bg: int) -> tuple[int, int, int, int] | None:
++    mask = g != int(bg)
++    h, w = mask.shape
++    seen = np.zeros_like(mask, dtype=bool)
++    best_bbox = None
++    best_size = -1
++    for r in range(h):
++        for c in range(w):
++            if not mask[r, c] or seen[r, c]:
++                continue
++            stack = [(r, c)]
++            seen[r, c] = True
++            size = 0
++            r0 = r1 = r
++            c0 = c1 = c
++            while stack:
++                rr, cc = stack.pop()
++                size += 1
++                r0 = min(r0, rr)
++                r1 = max(r1, rr)
++                c0 = min(c0, cc)
++                c1 = max(c1, cc)
++                for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
++                    nr, nc = rr + dr, cc + dc
++                    if 0 <= nr < h and 0 <= nc < w and mask[nr, nc] and not seen[nr, nc]:
++                        seen[nr, nc] = True
++                        stack.append((nr, nc))
++            if size > best_size:
++                best_size = size
++                best_bbox = (r0, c0, r1, c1)
++    return best_bbox
++
++
++def _center_hole_color(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> int:
++    center = crop_bbox(
++        g,
++        (int(r0) + block, int(c0) + block, int(r0) + 2 * block - 1, int(c0) + 2 * block - 1),
++    )
++    vals = np.unique(center)
++    assert vals.size == 1, "center hole marker must be uniform"
++    hole = int(vals[0])
++    assert hole != int(bg), "center hole marker must differ from background"
++    return hole
++
++
++def _center_patch(g: np.ndarray, r0: int, c0: int, block: int) -> np.ndarray:
++    assert block == 3, "this variant uses 3x3 blocks"
++    hole_r = int(r0) + block
++    hole_c = int(c0) + block
++    rows = hole_r + CENTER_OFFSETS
++    cols = hole_c + CENTER_OFFSETS
++    patch = g[np.ix_(rows, cols)].copy()
++    ring_vals = [int(patch[r, c]) for r in range(block) for c in range(block) if (r, c) != (1, 1)]
++    patch[1, 1] = Counter(ring_vals).most_common(1)[0][0]
++    return patch
++
++
++def _slot_marker_color(
++    g: np.ndarray,
++    expanded_r0: int,
++    expanded_c0: int,
++    slot_br: int,
++    slot_bc: int,
++    block: int,
++    bg: int,
++    hole_color: int,
++) -> int:
++    sr = expanded_r0 + slot_br * block
++    sc = expanded_c0 + slot_bc * block
++    marker = int(g[sr + block // 2, sc + block // 2])
++    assert marker != int(bg), f"outer slot {(slot_br, slot_bc)} is missing its marker"
++    assert marker != int(hole_color), "outer marker color must differ from center hole color"
++    return marker
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand a tagged 3x3-block motif into a 5x5 block layout with two marker roles.
++
++    Input structure:
++    - Teal background contains one 9x9 motif made of eight 3x3 source blocks.
++    - The middle 3x3 block is filled with one special color that marks the hole;
++      it is not background and it is not one of the outer marker colors.
++    - Each of the eight outer 3x3 slots contains a single centered marker pixel,
++      and the pixels around the central hole still encode the missing center patch.
++
++    Rule:
++    - Keep the original 9x9 motif in place, except replace the special-color hole
++      with the reconstructed center block.
++    - Reconstruct that center block from the eight boundary pixels facing the hole;
++      the center cell takes the modal boundary color.
++    - For each outer slot, read its centered marker color and copy in the source
++      block whose dominant color matches that marker.
++
++    Key insight: two non-background markers coexist but mean different things. The
++    solid central square marks "missing area to rebuild", while the isolated outer
++    pixels act as color labels that choose which source block belongs in each slot.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = int(get_bg(g))
++    motif_bbox = _largest_component_bbox(g, bg)
++    assert motif_bbox is not None, "expected a foreground motif"
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
++    block = h // 3
++    assert block == 3, "this variant expects a 9x9 motif"
++
++    hole_color = _center_hole_color(g, int(r0), int(c0), block, bg)
++    expanded_r0 = int(r0) - block
++    expanded_c0 = int(c0) - block
++    out = g.copy()
++
++    blocks_by_color: dict[int, np.ndarray] = {}
++    for br, bc in SOURCE_POSITIONS:
++        src = crop_bbox(
++            g,
++            (
++                int(r0) + br * block,
++                int(c0) + bc * block,
++                int(r0) + (br + 1) * block - 1,
++                int(c0) + (bc + 1) * block - 1,
++            ),
++        )
++        major = _major_block_color(src, bg)
++        assert major != hole_color, "source-block major color must differ from hole marker"
++        if major in blocks_by_color:
++            assert np.array_equal(blocks_by_color[major], src), (
++                "reused marker colors require identical source blocks"
++            )
++        else:
++            blocks_by_color[major] = src
++
++    for slot_br, slot_bc in OUTER_SLOTS:
++        marker = _slot_marker_color(
++            g,
++            expanded_r0,
++            expanded_c0,
++            slot_br,
++            slot_bc,
++            block,
++            bg,
++            hole_color,
++        )
++        assert marker in blocks_by_color, f"no source block has major color {marker}"
++        paste(out, blocks_by_color[marker], expanded_r0 + slot_br * block, expanded_c0 + slot_bc * block)
++
++    paste(out, _center_patch(g, int(r0), int(c0), block), int(r0) + block, int(c0) + block)
++    return out
++
++
++def _random_block(main_color: int, ring_color: int, sample_coord: tuple[int, int]) -> np.ndarray:
++    block = np.full((BLOCK, BLOCK), main_color, dtype=int)
++    if ring_color != main_color:
++        block[sample_coord] = ring_color
++    remaining = [(r, c) for r in range(BLOCK) for c in range(BLOCK) if (r, c) != sample_coord]
++    extra_coords = random.sample(remaining, 2)
++    accent_pool = [color for color in SOURCE_COLORS if color != main_color]
++    extra_colors = random.sample(accent_pool, 2)
++    for (rr, cc), color in zip(extra_coords, extra_colors):
++        block[rr, cc] = color
++    return block
++
++
++def _assemble_input_motif(blocks: dict[tuple[int, int], np.ndarray]) -> np.ndarray:
++    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), HOLE_COLOR, dtype=int)
++    for pos, block in blocks.items():
++        br, bc = pos
++        paste(motif, block, br * BLOCK, bc * BLOCK)
++    return motif
++
++
++def _old_mapping_mismatch_count(
++    source_colors: dict[tuple[int, int], int],
++    marker_colors: dict[tuple[int, int], int],
++) -> int:
++    mismatches = 0
++    for br, bc in SOURCE_POSITIONS:
++        old_slot = (4 - 2 * br, 4 - 2 * bc)
++        if marker_colors[old_slot] != source_colors[(br, bc)]:
++            mismatches += 1
++    return mismatches
++
++
++def _expanded_output(
++    motif: np.ndarray,
++    center: np.ndarray,
++    blocks_by_color: dict[int, np.ndarray],
++    marker_colors: dict[tuple[int, int], int],
++) -> np.ndarray:
++    expanded = np.full((EXPANDED_SIZE, EXPANDED_SIZE), BG, dtype=int)
++    output_motif = motif.copy()
++    paste(output_motif, center, BLOCK, BLOCK)
++    paste(expanded, output_motif, BLOCK, BLOCK)
++    for slot_br, slot_bc in OUTER_SLOTS:
++        paste(
++            expanded,
++            blocks_by_color[marker_colors[(slot_br, slot_bc)]],
++            slot_br * BLOCK,
++            slot_bc * BLOCK,
++        )
++    return expanded
++
++
++def _gen_attempt() -> tuple[np.ndarray, int] | None:
++    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    source_color_list = random.sample(SOURCE_COLORS, len(SOURCE_POSITIONS))
++    source_colors = {pos: color for pos, color in zip(SOURCE_POSITIONS, source_color_list)}
++
++    marker_perm = random.sample(source_color_list, len(source_color_list))
++    marker_colors = {slot: color for slot, color in zip(OUTER_SLOTS, marker_perm)}
++    mismatch_count = _old_mapping_mismatch_count(source_colors, marker_colors)
++    if mismatch_count < MIN_ANTI_ORIGINAL_MISMATCH:
++        return None
++
++    center_color = random.choice(source_color_list)
++    ring_colors: dict[tuple[int, int], int] = {}
++    for pos in SOURCE_POSITIONS:
++        if pos in ORTHOGONAL_POSITIONS:
++            ring_colors[pos] = center_color
++        else:
++            candidates = [color for color in SOURCE_COLORS if color != center_color]
++            ring_colors[pos] = random.choice(candidates)
++
++    blocks = {
++        pos: _random_block(source_colors[pos], ring_colors[pos], INNER_SAMPLE_COORD[pos])
++        for pos in SOURCE_POSITIONS
++    }
++    motif = _assemble_input_motif(blocks)
++    center = _center_patch(motif, 0, 0, BLOCK)
++    if int(center[1, 1]) != center_color:
++        return None
++
++    blocks_by_color = {source_colors[pos]: blocks[pos] for pos in SOURCE_POSITIONS}
++    expanded = _expanded_output(motif, center, blocks_by_color, marker_colors)
++
++    r0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
++    c0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
++    inp = np.full((n, n), BG, dtype=int)
++    out = np.full((n, n), BG, dtype=int)
++    paste(inp, motif, r0, c0)
++    paste(out, expanded, r0 - BLOCK, c0 - BLOCK)
++
++    for slot_br, slot_bc in OUTER_SLOTS:
++        sr = r0 - BLOCK + slot_br * BLOCK
++        sc = c0 - BLOCK + slot_bc * BLOCK
++        inp[sr + 1, sc + 1] = marker_colors[(slot_br, slot_bc)]
++
++    if np.count_nonzero(inp[r0 + BLOCK:r0 + 2 * BLOCK, c0 + BLOCK:c0 + 2 * BLOCK] == HOLE_COLOR) != 9:
++        return None
++    if np.array_equal(main(inp), out):
++        return inp, mismatch_count
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            grid, _mismatch_count = result
++            return grid
++    raise AssertionError("failed to generate a valid db0c5428 combo variant input")
+
+codex
+代码已经写入。现在先跑用户指定的 50 次 smoke test，再看是否有断言或隐式假设漏掉；如果失败，我会直接针对失败模式改 generator 或 solver。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/42/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/db0c5428/42/code.py b/ceshi/code_combo/db0c5428/42/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9201a10e5b17fbaf8bba5784ed397db8227916d
+--- /dev/null
++++ b/ceshi/code_combo/db0c5428/42/code.py
+@@ -0,0 +1,385 @@
++# Combo variant of db0c5428 (index 42)
++# combo_spec: D1/3+D12/0
++# Name: 颜色匹配映射+特殊标记色空洞
++
++from __future__ import annotations
++
++from collections import Counter
++import random
++
++import numpy as np
++
++from arc_utils import crop_bbox, get_bg, paste
++
++
++# Design analysis for the combo variant
++# -------------------------------------
++# a) Concrete behavior:
++#    - The visible object is still the 9x9 middle of a 5x5 block lattice, but the
++#      center 3x3 is no longer background. It is a solid special hole color 0.
++#    - The input also contains eight isolated outer marker pixels, one centered in
++#      each outer 3x3 slot. Their colors are a permutation of the eight source
++#      blocks' dominant colors.
++#    - Example trace:
++#      original task: block(0,0) always copies to outer slot(4,4) by symmetry.
++#      combo task: if block(0,0) is mostly color 6 and the marker color 6 is at
++#      outer slot(0,2), that block must go to slot(0,2) instead. Meanwhile the
++#      central 3x3 block of color 0 is not an object to copy; it is a "missing
++#      area" marker that gets replaced by the reconstructed center patch.
++# b) Complexity calibration:
++#    - To avoid ambiguous color lookup, each of the eight source blocks receives a
++#      distinct dominant color. The outer markers reuse exactly those eight colors.
++#    - The hole marker uses a ninth color (0) that never appears in any source
++#      block or outer marker, so the two marker systems are visually separable.
++# c) Hidden assumptions broken from the original solver:
++#    - `bbox(g != bg)` is no longer usable because outer markers expand the global
++#      non-background bbox to the full 15x15 frame. The solver must isolate the
++#      largest connected component, which is the 9x9 motif.
++#    - The original "center is background" assumption is invalid. The solver must
++#      now tolerate a filled center block, recognize it as a uniform special color,
++#      and overwrite it with the reconstructed patch.
++#    - The original opposite-slot formula is invalid because the outer copy rule is
++#      now driven by color equality between source-block major colors and marker
++#      pixels.
++#    - The original motif-wide majority color is unstable once all eight source
++#      blocks use distinct majors. The reconstructed center therefore uses the mode
++#      of the eight boundary samples around the hole.
++# d) Placement legality:
++#    - The motif still sits with a margin of one block, so the full 15x15 expanded
++#      region stays inside the NxN canvas.
++#    - Outer markers are placed at the centers of the outer slots, which keeps them
++#      disconnected from the motif component and prevents overlap with pasted blocks.
++#    - The center hole is a full 3x3 block, so it never collides with source data;
++#      it simply occupies the block that used to be empty.
++# e) Visual observability:
++#    - Across examples, the outer marker permutation changes, so the user can infer
++#      that outer placement depends on color matching rather than point symmetry.
++#    - The central special-color square is visually different from both background
++#      and outer markers: it is a full 3x3 region, not a single pixel.
++# f) Visual cleanliness:
++#    - There are only two annotation forms: a solid 3x3 center hole and eight
++#      centered single-pixel outer tags. They occupy disjoint regions and remain
++#      easy to parse by eye.
++# g) Color-inference guardrails:
++#    - No numeric ordering on colors is used anywhere. Matching depends only on
++#      visible equality. The special hole color is distinguished by location and
++#      shape, not by the fact that its id is 0.
++# h) Anti-degeneration metric:
++#    - The generator enforces at least 4 disagreements with the original
++#      opposite-slot mapping, measured as the number of outer slots whose marker
++#      color does not match the source block that would have gone there originally.
++#    - It also always uses a full 3x3 special-color center hole, so the D12 change
++#      is present in every sample instead of collapsing back to a background hole.
++# i) New solver assumptions guaranteed by the generator:
++#    - The largest connected non-background component is the 9x9 motif.
++#    - The center block of that motif is uniformly colored with the special hole
++#      color, distinct from background and from every source-block major color.
++#    - Each outer slot contains exactly one centered marker pixel whose color
++#      matches exactly one source block's major color.
++
++
++BLOCK = 3
++MOTIF_SIZE = BLOCK * 3
++EXPANDED_SIZE = BLOCK * 5
++
++GRID_SIZE_MIN, GRID_SIZE_MAX = 16, 19
++MOTIF_PAD = 3
++BG = 8
++HOLE_COLOR = 0
++SOURCE_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
++MAX_RETRIES = 300
++MIN_ANTI_ORIGINAL_MISMATCH = 4
++
++SOURCE_POSITIONS = (
++    (0, 0), (0, 1), (0, 2),
++    (1, 0),         (1, 2),
++    (2, 0), (2, 1), (2, 2),
++)
++OUTER_SLOTS = (
++    (0, 0), (0, 2), (0, 4),
++    (2, 0),         (2, 4),
++    (4, 0), (4, 2), (4, 4),
++)
++ORTHOGONAL_POSITIONS = {(0, 1), (1, 0), (1, 2), (2, 1)}
++INNER_SAMPLE_COORD = {
++    (0, 0): (2, 2),
++    (0, 1): (2, 1),
++    (0, 2): (2, 0),
++    (1, 0): (1, 2),
++    (1, 2): (1, 0),
++    (2, 0): (0, 2),
++    (2, 1): (0, 1),
++    (2, 2): (0, 0),
++}
++CENTER_OFFSETS = np.array([-1, 1, 3], dtype=int)
++
++
++def _major_block_color(block: np.ndarray, bg: int) -> int:
++    vals, counts = np.unique(block[block != int(bg)], return_counts=True)
++    assert vals.size, "block must contain foreground colors"
++    return int(vals[int(np.argmax(counts))])
++
++
++def _largest_component_bbox(g: np.ndarray, bg: int) -> tuple[int, int, int, int] | None:
++    mask = g != int(bg)
++    h, w = mask.shape
++    seen = np.zeros_like(mask, dtype=bool)
++    best_bbox = None
++    best_size = -1
++    for r in range(h):
++        for c in range(w):
++            if not mask[r, c] or seen[r, c]:
++                continue
++            stack = [(r, c)]
++            seen[r, c] = True
++            size = 0
++            r0 = r1 = r
++            c0 = c1 = c
++            while stack:
++                rr, cc = stack.pop()
++                size += 1
++                r0 = min(r0, rr)
++                r1 = max(r1, rr)
++                c0 = min(c0, cc)
++                c1 = max(c1, cc)
++                for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
++                    nr, nc = rr + dr, cc + dc
++                    if 0 <= nr < h and 0 <= nc < w and mask[nr, nc] and not seen[nr, nc]:
++                        seen[nr, nc] = True
++                        stack.append((nr, nc))
++            if size > best_size:
++                best_size = size
++                best_bbox = (r0, c0, r1, c1)
++    return best_bbox
++
++
++def _center_hole_color(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> int:
++    center = crop_bbox(
++        g,
++        (int(r0) + block, int(c0) + block, int(r0) + 2 * block - 1, int(c0) + 2 * block - 1),
++    )
++    vals = np.unique(center)
++    assert vals.size == 1, "center hole marker must be uniform"
++    hole = int(vals[0])
++    assert hole != int(bg), "center hole marker must differ from background"
++    return hole
++
++
++def _center_patch(g: np.ndarray, r0: int, c0: int, block: int) -> np.ndarray:
++    assert block == 3, "this variant uses 3x3 blocks"
++    hole_r = int(r0) + block
++    hole_c = int(c0) + block
++    rows = hole_r + CENTER_OFFSETS
++    cols = hole_c + CENTER_OFFSETS
++    patch = g[np.ix_(rows, cols)].copy()
++    ring_vals = [int(patch[r, c]) for r in range(block) for c in range(block) if (r, c) != (1, 1)]
++    patch[1, 1] = Counter(ring_vals).most_common(1)[0][0]
++    return patch
++
++
++def _slot_marker_color(
++    g: np.ndarray,
++    expanded_r0: int,
++    expanded_c0: int,
++    slot_br: int,
++    slot_bc: int,
++    block: int,
++    bg: int,
++    hole_color: int,
++) -> int:
++    sr = expanded_r0 + slot_br * block
++    sc = expanded_c0 + slot_bc * block
++    marker = int(g[sr + block // 2, sc + block // 2])
++    assert marker != int(bg), f"outer slot {(slot_br, slot_bc)} is missing its marker"
++    assert marker != int(hole_color), "outer marker color must differ from center hole color"
++    return marker
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand a tagged 3x3-block motif into a 5x5 block layout with two marker roles.
++
++    Input structure:
++    - Teal background contains one 9x9 motif made of eight 3x3 source blocks.
++    - The middle 3x3 block is filled with one special color that marks the hole;
++      it is not background and it is not one of the outer marker colors.
++    - Each of the eight outer 3x3 slots contains a single centered marker pixel,
++      and the pixels around the central hole still encode the missing center patch.
++
++    Rule:
++    - Keep the original 9x9 motif in place, except replace the special-color hole
++      with the reconstructed center block.
++    - Reconstruct that center block from the eight boundary pixels facing the hole;
++      the center cell takes the modal boundary color.
++    - For each outer slot, read its centered marker color and copy in the source
++      block whose dominant color matches that marker.
++
++    Key insight: two non-background markers coexist but mean different things. The
++    solid central square marks "missing area to rebuild", while the isolated outer
++    pixels act as color labels that choose which source block belongs in each slot.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = int(get_bg(g))
++    motif_bbox = _largest_component_bbox(g, bg)
++    assert motif_bbox is not None, "expected a foreground motif"
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
++    block = h // 3
++    assert block == 3, "this variant expects a 9x9 motif"
++
++    hole_color = _center_hole_color(g, int(r0), int(c0), block, bg)
++    expanded_r0 = int(r0) - block
++    expanded_c0 = int(c0) - block
++    out = g.copy()
++
++    blocks_by_color: dict[int, np.ndarray] = {}
++    for br, bc in SOURCE_POSITIONS:
++        src = crop_bbox(
++            g,
++            (
++                int(r0) + br * block,
++                int(c0) + bc * block,
++                int(r0) + (br + 1) * block - 1,
++                int(c0) + (bc + 1) * block - 1,
++            ),
++        )
++        major = _major_block_color(src, bg)
++        assert major != hole_color, "source-block major color must differ from hole marker"
++        if major in blocks_by_color:
++            assert np.array_equal(blocks_by_color[major], src), (
++                "reused marker colors require identical source blocks"
++            )
++        else:
++            blocks_by_color[major] = src
++
++    for slot_br, slot_bc in OUTER_SLOTS:
++        marker = _slot_marker_color(
++            g,
++            expanded_r0,
++            expanded_c0,
++            slot_br,
++            slot_bc,
++            block,
++            bg,
++            hole_color,
++        )
++        assert marker in blocks_by_color, f"no source block has major color {marker}"
++        paste(out, blocks_by_color[marker], expanded_r0 + slot_br * block, expanded_c0 + slot_bc * block)
++
++    paste(out, _center_patch(g, int(r0), int(c0), block), int(r0) + block, int(c0) + block)
++    return out
++
++
++def _random_block(main_color: int, ring_color: int, sample_coord: tuple[int, int]) -> np.ndarray:
++    block = np.full((BLOCK, BLOCK), main_color, dtype=int)
++    if ring_color != main_color:
++        block[sample_coord] = ring_color
++    remaining = [(r, c) for r in range(BLOCK) for c in range(BLOCK) if (r, c) != sample_coord]
++    extra_coords = random.sample(remaining, 2)
++    accent_pool = [color for color in SOURCE_COLORS if color != main_color]
++    extra_colors = random.sample(accent_pool, 2)
++    for (rr, cc), color in zip(extra_coords, extra_colors):
++        block[rr, cc] = color
++    return block
++
++
++def _assemble_input_motif(blocks: dict[tuple[int, int], np.ndarray]) -> np.ndarray:
++    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), HOLE_COLOR, dtype=int)
++    for pos, block in blocks.items():
++        br, bc = pos
++        paste(motif, block, br * BLOCK, bc * BLOCK)
++    return motif
++
++
++def _old_mapping_mismatch_count(
++    source_colors: dict[tuple[int, int], int],
++    marker_colors: dict[tuple[int, int], int],
++) -> int:
++    mismatches = 0
++    for br, bc in SOURCE_POSITIONS:
++        old_slot = (4 - 2 * br, 4 - 2 * bc)
++        if marker_colors[old_slot] != source_colors[(br, bc)]:
++            mismatches += 1
++    return mismatches
++
++
++def _expanded_output(
++    motif: np.ndarray,
++    center: np.ndarray,
++    blocks_by_color: dict[int, np.ndarray],
++    marker_colors: dict[tuple[int, int], int],
++) -> np.ndarray:
++    expanded = np.full((EXPANDED_SIZE, EXPANDED_SIZE), BG, dtype=int)
++    output_motif = motif.copy()
++    paste(output_motif, center, BLOCK, BLOCK)
++    paste(expanded, output_motif, BLOCK, BLOCK)
++    for slot_br, slot_bc in OUTER_SLOTS:
++        paste(
++            expanded,
++            blocks_by_color[marker_colors[(slot_br, slot_bc)]],
++            slot_br * BLOCK,
++            slot_bc * BLOCK,
++        )
++    return expanded
++
++
++def _gen_attempt() -> tuple[np.ndarray, int] | None:
++    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    source_color_list = random.sample(SOURCE_COLORS, len(SOURCE_POSITIONS))
++    source_colors = {pos: color for pos, color in zip(SOURCE_POSITIONS, source_color_list)}
++
++    marker_perm = random.sample(source_color_list, len(source_color_list))
++    marker_colors = {slot: color for slot, color in zip(OUTER_SLOTS, marker_perm)}
++    mismatch_count = _old_mapping_mismatch_count(source_colors, marker_colors)
++    if mismatch_count < MIN_ANTI_ORIGINAL_MISMATCH:
++        return None
++
++    center_color = random.choice(source_color_list)
++    ring_colors: dict[tuple[int, int], int] = {}
++    for pos in SOURCE_POSITIONS:
++        if pos in ORTHOGONAL_POSITIONS:
++            ring_colors[pos] = center_color
++        else:
++            candidates = [color for color in SOURCE_COLORS if color != center_color]
++            ring_colors[pos] = random.choice(candidates)
++
++    blocks = {
++        pos: _random_block(source_colors[pos], ring_colors[pos], INNER_SAMPLE_COORD[pos])
++        for pos in SOURCE_POSITIONS
++    }
++    motif = _assemble_input_motif(blocks)
++    center = _center_patch(motif, 0, 0, BLOCK)
++    if int(center[1, 1]) != center_color:
++        return None
++
++    blocks_by_color = {source_colors[pos]: blocks[pos] for pos in SOURCE_POSITIONS}
++    expanded = _expanded_output(motif, center, blocks_by_color, marker_colors)
++
++    r0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
++    c0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
++    inp = np.full((n, n), BG, dtype=int)
++    out = np.full((n, n), BG, dtype=int)
++    paste(inp, motif, r0, c0)
++    paste(out, expanded, r0 - BLOCK, c0 - BLOCK)
++
++    for slot_br, slot_bc in OUTER_SLOTS:
++        sr = r0 - BLOCK + slot_br * BLOCK
++        sc = c0 - BLOCK + slot_bc * BLOCK
++        inp[sr + 1, sc + 1] = marker_colors[(slot_br, slot_bc)]
++
++    if np.count_nonzero(inp[r0 + BLOCK:r0 + 2 * BLOCK, c0 + BLOCK:c0 + 2 * BLOCK] == HOLE_COLOR) != 9:
++        return None
++    if np.array_equal(main(inp), out):
++        return inp, mismatch_count
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            grid, _mismatch_count = result
++            return grid
++    raise AssertionError("failed to generate a valid db0c5428 combo variant input")
+
+ succeeded in 301ms:
+Success: 50/50, Time: 0.1s (2ms/call)
+
+codex
+稳定性测试已经通过。接下来我做退化检查，不看 `main(input)` 是否能跑通，而是统计“按颜色匹配得到的外圈放置”和“按原题点对称放置”之间相差多少个槽位，并同时确认中心始终是 3x3 的特殊洞色。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import importlib.util, numpy as np, statistics
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/42/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+metrics = []
+hole_pixels = []
+for _ in range(200):
+    inp = mod.generate_input()
+    bg = mod.get_bg(inp)
+    bbox = mod._largest_component_bbox(inp, bg)
+    r0, c0, r1, c1 = bbox
+    block = (r1 - r0 + 1) // 3
+    source_colors = {}
+    for br, bc in mod.SOURCE_POSITIONS:
+        src = mod.crop_bbox(inp, (r0 + br * block, c0 + bc * block, r0 + (br + 1) * block - 1, c0 + (bc + 1) * block - 1))
+        source_colors[(br, bc)] = mod._major_block_color(src, bg)
+    marker_colors = {}
+    expanded_r0 = r0 - block
+    expanded_c0 = c0 - block
+    hole_color = mod._center_hole_color(inp, r0, c0, block, bg)
+    for slot_br, slot_bc in mod.OUTER_SLOTS:
+        marker_colors[(slot_br, slot_bc)] = mod._slot_marker_color(inp, expanded_r0, expanded_c0, slot_br, slot_bc, block, bg, hole_color)
+    metrics.append(mod._old_mapping_mismatch_count(source_colors, marker_colors))
+    hole_pixels.append(int(np.count_nonzero(inp[r0 + block:r0 + 2 * block, c0 + block:c0 + 2 * block] == mod.HOLE_COLOR)))
+from collections import Counter
+print('mismatch_distribution', dict(sorted(Counter(metrics).items())))
+print('mismatch_min', min(metrics), 'mismatch_max', max(metrics), 'mismatch_mean', round(statistics.mean(metrics), 2))
+print('hole_pixels_distribution', dict(sorted(Counter(hole_pixels).items())))
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/db0c5428/42/code.py b/ceshi/code_combo/db0c5428/42/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9201a10e5b17fbaf8bba5784ed397db8227916d
+--- /dev/null
++++ b/ceshi/code_combo/db0c5428/42/code.py
+@@ -0,0 +1,385 @@
++# Combo variant of db0c5428 (index 42)
++# combo_spec: D1/3+D12/0
++# Name: 颜色匹配映射+特殊标记色空洞
++
++from __future__ import annotations
++
++from collections import Counter
++import random
++
++import numpy as np
++
++from arc_utils import crop_bbox, get_bg, paste
++
++
++# Design analysis for the combo variant
++# -------------------------------------
++# a) Concrete behavior:
++#    - The visible object is still the 9x9 middle of a 5x5 block lattice, but the
++#      center 3x3 is no longer background. It is a solid special hole color 0.
++#    - The input also contains eight isolated outer marker pixels, one centered in
++#      each outer 3x3 slot. Their colors are a permutation of the eight source
++#      blocks' dominant colors.
++#    - Example trace:
++#      original task: block(0,0) always copies to outer slot(4,4) by symmetry.
++#      combo task: if block(0,0) is mostly color 6 and the marker color 6 is at
++#      outer slot(0,2), that block must go to slot(0,2) instead. Meanwhile the
++#      central 3x3 block of color 0 is not an object to copy; it is a "missing
++#      area" marker that gets replaced by the reconstructed center patch.
++# b) Complexity calibration:
++#    - To avoid ambiguous color lookup, each of the eight source blocks receives a
++#      distinct dominant color. The outer markers reuse exactly those eight colors.
++#    - The hole marker uses a ninth color (0) that never appears in any source
++#      block or outer marker, so the two marker systems are visually separable.
++# c) Hidden assumptions broken from the original solver:
++#    - `bbox(g != bg)` is no longer usable because outer markers expand the global
++#      non-background bbox to the full 15x15 frame. The solver must isolate the
++#      largest connected component, which is the 9x9 motif.
++#    - The original "center is background" assumption is invalid. The solver must
++#      now tolerate a filled center block, recognize it as a uniform special color,
++#      and overwrite it with the reconstructed patch.
++#    - The original opposite-slot formula is invalid because the outer copy rule is
++#      now driven by color equality between source-block major colors and marker
++#      pixels.
++#    - The original motif-wide majority color is unstable once all eight source
++#      blocks use distinct majors. The reconstructed center therefore uses the mode
++#      of the eight boundary samples around the hole.
++# d) Placement legality:
++#    - The motif still sits with a margin of one block, so the full 15x15 expanded
++#      region stays inside the NxN canvas.
++#    - Outer markers are placed at the centers of the outer slots, which keeps them
++#      disconnected from the motif component and prevents overlap with pasted blocks.
++#    - The center hole is a full 3x3 block, so it never collides with source data;
++#      it simply occupies the block that used to be empty.
++# e) Visual observability:
++#    - Across examples, the outer marker permutation changes, so the user can infer
++#      that outer placement depends on color matching rather than point symmetry.
++#    - The central special-color square is visually different from both background
++#      and outer markers: it is a full 3x3 region, not a single pixel.
++# f) Visual cleanliness:
++#    - There are only two annotation forms: a solid 3x3 center hole and eight
++#      centered single-pixel outer tags. They occupy disjoint regions and remain
++#      easy to parse by eye.
++# g) Color-inference guardrails:
++#    - No numeric ordering on colors is used anywhere. Matching depends only on
++#      visible equality. The special hole color is distinguished by location and
++#      shape, not by the fact that its id is 0.
++# h) Anti-degeneration metric:
++#    - The generator enforces at least 4 disagreements with the original
++#      opposite-slot mapping, measured as the number of outer slots whose marker
++#      color does not match the source block that would have gone there originally.
++#    - It also always uses a full 3x3 special-color center hole, so the D12 change
++#      is present in every sample instead of collapsing back to a background hole.
++# i) New solver assumptions guaranteed by the generator:
++#    - The largest connected non-background component is the 9x9 motif.
++#    - The center block of that motif is uniformly colored with the special hole
++#      color, distinct from background and from every source-block major color.
++#    - Each outer slot contains exactly one centered marker pixel whose color
++#      matches exactly one source block's major color.
++
++
++BLOCK = 3
++MOTIF_SIZE = BLOCK * 3
++EXPANDED_SIZE = BLOCK * 5
++
++GRID_SIZE_MIN, GRID_SIZE_MAX = 16, 19
++MOTIF_PAD = 3
++BG = 8
++HOLE_COLOR = 0
++SOURCE_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
++MAX_RETRIES = 300
++MIN_ANTI_ORIGINAL_MISMATCH = 4
++
++SOURCE_POSITIONS = (
++    (0, 0), (0, 1), (0, 2),
++    (1, 0),         (1, 2),
++    (2, 0), (2, 1), (2, 2),
++)
++OUTER_SLOTS = (
++    (0, 0), (0, 2), (0, 4),
++    (2, 0),         (2, 4),
++    (4, 0), (4, 2), (4, 4),
++)
++ORTHOGONAL_POSITIONS = {(0, 1), (1, 0), (1, 2), (2, 1)}
++INNER_SAMPLE_COORD = {
++    (0, 0): (2, 2),
++    (0, 1): (2, 1),
++    (0, 2): (2, 0),
++    (1, 0): (1, 2),
++    (1, 2): (1, 0),
++    (2, 0): (0, 2),
++    (2, 1): (0, 1),
++    (2, 2): (0, 0),
++}
++CENTER_OFFSETS = np.array([-1, 1, 3], dtype=int)
++
++
++def _major_block_color(block: np.ndarray, bg: int) -> int:
++    vals, counts = np.unique(block[block != int(bg)], return_counts=True)
++    assert vals.size, "block must contain foreground colors"
++    return int(vals[int(np.argmax(counts))])
++
++
++def _largest_component_bbox(g: np.ndarray, bg: int) -> tuple[int, int, int, int] | None:
++    mask = g != int(bg)
++    h, w = mask.shape
++    seen = np.zeros_like(mask, dtype=bool)
++    best_bbox = None
++    best_size = -1
++    for r in range(h):
++        for c in range(w):
++            if not mask[r, c] or seen[r, c]:
++                continue
++            stack = [(r, c)]
++            seen[r, c] = True
++            size = 0
++            r0 = r1 = r
++            c0 = c1 = c
++            while stack:
++                rr, cc = stack.pop()
++                size += 1
++                r0 = min(r0, rr)
++                r1 = max(r1, rr)
++                c0 = min(c0, cc)
++                c1 = max(c1, cc)
++                for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
++                    nr, nc = rr + dr, cc + dc
++                    if 0 <= nr < h and 0 <= nc < w and mask[nr, nc] and not seen[nr, nc]:
++                        seen[nr, nc] = True
++                        stack.append((nr, nc))
++            if size > best_size:
++                best_size = size
++                best_bbox = (r0, c0, r1, c1)
++    return best_bbox
++
++
++def _center_hole_color(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> int:
++    center = crop_bbox(
++        g,
++        (int(r0) + block, int(c0) + block, int(r0) + 2 * block - 1, int(c0) + 2 * block - 1),
++    )
++    vals = np.unique(center)
++    assert vals.size == 1, "center hole marker must be uniform"
++    hole = int(vals[0])
++    assert hole != int(bg), "center hole marker must differ from background"
++    return hole
++
++
++def _center_patch(g: np.ndarray, r0: int, c0: int, block: int) -> np.ndarray:
++    assert block == 3, "this variant uses 3x3 blocks"
++    hole_r = int(r0) + block
++    hole_c = int(c0) + block
++    rows = hole_r + CENTER_OFFSETS
++    cols = hole_c + CENTER_OFFSETS
++    patch = g[np.ix_(rows, cols)].copy()
++    ring_vals = [int(patch[r, c]) for r in range(block) for c in range(block) if (r, c) != (1, 1)]
++    patch[1, 1] = Counter(ring_vals).most_common(1)[0][0]
++    return patch
++
++
++def _slot_marker_color(
++    g: np.ndarray,
++    expanded_r0: int,
++    expanded_c0: int,
++    slot_br: int,
++    slot_bc: int,
++    block: int,
++    bg: int,
++    hole_color: int,
++) -> int:
++    sr = expanded_r0 + slot_br * block
++    sc = expanded_c0 + slot_bc * block
++    marker = int(g[sr + block // 2, sc + block // 2])
++    assert marker != int(bg), f"outer slot {(slot_br, slot_bc)} is missing its marker"
++    assert marker != int(hole_color), "outer marker color must differ from center hole color"
++    return marker
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand a tagged 3x3-block motif into a 5x5 block layout with two marker roles.
++
++    Input structure:
++    - Teal background contains one 9x9 motif made of eight 3x3 source blocks.
++    - The middle 3x3 block is filled with one special color that marks the hole;
++      it is not background and it is not one of the outer marker colors.
++    - Each of the eight outer 3x3 slots contains a single centered marker pixel,
++      and the pixels around the central hole still encode the missing center patch.
++
++    Rule:
++    - Keep the original 9x9 motif in place, except replace the special-color hole
++      with the reconstructed center block.
++    - Reconstruct that center block from the eight boundary pixels facing the hole;
++      the center cell takes the modal boundary color.
++    - For each outer slot, read its centered marker color and copy in the source
++      block whose dominant color matches that marker.
++
++    Key insight: two non-background markers coexist but mean different things. The
++    solid central square marks "missing area to rebuild", while the isolated outer
++    pixels act as color labels that choose which source block belongs in each slot.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = int(get_bg(g))
++    motif_bbox = _largest_component_bbox(g, bg)
++    assert motif_bbox is not None, "expected a foreground motif"
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
++    block = h // 3
++    assert block == 3, "this variant expects a 9x9 motif"
++
++    hole_color = _center_hole_color(g, int(r0), int(c0), block, bg)
++    expanded_r0 = int(r0) - block
++    expanded_c0 = int(c0) - block
++    out = g.copy()
++
++    blocks_by_color: dict[int, np.ndarray] = {}
++    for br, bc in SOURCE_POSITIONS:
++        src = crop_bbox(
++            g,
++            (
++                int(r0) + br * block,
++                int(c0) + bc * block,
++                int(r0) + (br + 1) * block - 1,
++                int(c0) + (bc + 1) * block - 1,
++            ),
++        )
++        major = _major_block_color(src, bg)
++        assert major != hole_color, "source-block major color must differ from hole marker"
++        if major in blocks_by_color:
++            assert np.array_equal(blocks_by_color[major], src), (
++                "reused marker colors require identical source blocks"
++            )
++        else:
++            blocks_by_color[major] = src
++
++    for slot_br, slot_bc in OUTER_SLOTS:
++        marker = _slot_marker_color(
++            g,
++            expanded_r0,
++            expanded_c0,
++            slot_br,
++            slot_bc,
++            block,
++            bg,
++            hole_color,
++        )
++        assert marker in blocks_by_color, f"no source block has major color {marker}"
++        paste(out, blocks_by_color[marker], expanded_r0 + slot_br * block, expanded_c0 + slot_bc * block)
++
++    paste(out, _center_patch(g, int(r0), int(c0), block), int(r0) + block, int(c0) + block)
++    return out
++
++
++def _random_block(main_color: int, ring_color: int, sample_coord: tuple[int, int]) -> np.ndarray:
++    block = np.full((BLOCK, BLOCK), main_color, dtype=int)
++    if ring_color != main_color:
++        block[sample_coord] = ring_color
++    remaining = [(r, c) for r in range(BLOCK) for c in range(BLOCK) if (r, c) != sample_coord]
++    extra_coords = random.sample(remaining, 2)
++    accent_pool = [color for color in SOURCE_COLORS if color != main_color]
++    extra_colors = random.sample(accent_pool, 2)
++    for (rr, cc), color in zip(extra_coords, extra_colors):
++        block[rr, cc] = color
++    return block
++
++
++def _assemble_input_motif(blocks: dict[tuple[int, int], np.ndarray]) -> np.ndarray:
++    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), HOLE_COLOR, dtype=int)
++    for pos, block in blocks.items():
++        br, bc = pos
++        paste(motif, block, br * BLOCK, bc * BLOCK)
++    return motif
++
++
++def _old_mapping_mismatch_count(
++    source_colors: dict[tuple[int, int], int],
++    marker_colors: dict[tuple[int, int], int],
++) -> int:
++    mismatches = 0
++    for br, bc in SOURCE_POSITIONS:
++        old_slot = (4 - 2 * br, 4 - 2 * bc)
++        if marker_colors[old_slot] != source_colors[(br, bc)]:
++            mismatches += 1
++    return mismatches
++
++
++def _expanded_output(
++    motif: np.ndarray,
++    center: np.ndarray,
++    blocks_by_color: dict[int, np.ndarray],
++    marker_colors: dict[tuple[int, int], int],
++) -> np.ndarray:
++    expanded = np.full((EXPANDED_SIZE, EXPANDED_SIZE), BG, dtype=int)
++    output_motif = motif.copy()
++    paste(output_motif, center, BLOCK, BLOCK)
++    paste(expanded, output_motif, BLOCK, BLOCK)
++    for slot_br, slot_bc in OUTER_SLOTS:
++        paste(
++            expanded,
++            blocks_by_color[marker_colors[(slot_br, slot_bc)]],
++            slot_br * BLOCK,
++            slot_bc * BLOCK,
++        )
++    return expanded
++
++
++def _gen_attempt() -> tuple[np.ndarray, int] | None:
++    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    source_color_list = random.sample(SOURCE_COLORS, len(SOURCE_POSITIONS))
++    source_colors = {pos: color for pos, color in zip(SOURCE_POSITIONS, source_color_list)}
++
++    marker_perm = random.sample(source_color_list, len(source_color_list))
++    marker_colors = {slot: color for slot, color in zip(OUTER_SLOTS, marker_perm)}
++    mismatch_count = _old_mapping_mismatch_count(source_colors, marker_colors)
++    if mismatch_count < MIN_ANTI_ORIGINAL_MISMATCH:
++        return None
++
++    center_color = random.choice(source_color_list)
++    ring_colors: dict[tuple[int, int], int] = {}
++    for pos in SOURCE_POSITIONS:
++        if pos in ORTHOGONAL_POSITIONS:
++            ring_colors[pos] = center_color
++        else:
++            candidates = [color for color in SOURCE_COLORS if color != center_color]
++            ring_colors[pos] = random.choice(candidates)
++
++    blocks = {
++        pos: _random_block(source_colors[pos], ring_colors[pos], INNER_SAMPLE_COORD[pos])
++        for pos in SOURCE_POSITIONS
++    }
++    motif = _assemble_input_motif(blocks)
++    center = _center_patch(motif, 0, 0, BLOCK)
++    if int(center[1, 1]) != center_color:
++        return None
++
++    blocks_by_color = {source_colors[pos]: blocks[pos] for pos in SOURCE_POSITIONS}
++    expanded = _expanded_output(motif, center, blocks_by_color, marker_colors)
++
++    r0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
++    c0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
++    inp = np.full((n, n), BG, dtype=int)
++    out = np.full((n, n), BG, dtype=int)
++    paste(inp, motif, r0, c0)
++    paste(out, expanded, r0 - BLOCK, c0 - BLOCK)
++
++    for slot_br, slot_bc in OUTER_SLOTS:
++        sr = r0 - BLOCK + slot_br * BLOCK
++        sc = c0 - BLOCK + slot_bc * BLOCK
++        inp[sr + 1, sc + 1] = marker_colors[(slot_br, slot_bc)]
++
++    if np.count_nonzero(inp[r0 + BLOCK:r0 + 2 * BLOCK, c0 + BLOCK:c0 + 2 * BLOCK] == HOLE_COLOR) != 9:
++        return None
++    if np.array_equal(main(inp), out):
++        return inp, mismatch_count
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            grid, _mismatch_count = result
++            return grid
++    raise AssertionError("failed to generate a valid db0c5428 combo variant input")
+
+ succeeded in 545ms:
+mismatch_distribution {4: 4, 5: 11, 6: 35, 7: 68, 8: 82}
+mismatch_min 4 mismatch_max 8 mismatch_mean 7.07
+hole_pixels_distribution {9: 200}
+
+codex
+融合变体已经写入 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/42/code.py)。我把设计分析直接放进了文件头注释里，并按要求重写了 `main()` 的四段式说明，规则现在是：外圈槽位用颜色标记做块匹配映射，中心空洞改成独立的 `3x3` 特殊标记色 `0`，solver 会显式区分这两类标记。
+
+指定测试已通过：`Success: 50/50`，耗时约 `0.1s`。另外做了退化检查，量化指标用“按融合规则与按原题点对称规则相比，有多少个外圈槽位发生不同放置”。200 个样本的分布是 `4:4, 5:11, 6:35, 7:68, 8:82`，均值 `7.07`；同时中心特殊洞色像素数分布为 `{9: 200}`，说明两部分融合行为都稳定出现，没有退化回原题。
+diff --git a/ceshi/code_combo/db0c5428/42/code.py b/ceshi/code_combo/db0c5428/42/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9201a10e5b17fbaf8bba5784ed397db8227916d
+--- /dev/null
++++ b/ceshi/code_combo/db0c5428/42/code.py
+@@ -0,0 +1,385 @@
++# Combo variant of db0c5428 (index 42)
++# combo_spec: D1/3+D12/0
++# Name: 颜色匹配映射+特殊标记色空洞
++
++from __future__ import annotations
++
++from collections import Counter
++import random
++
++import numpy as np
++
++from arc_utils import crop_bbox, get_bg, paste
++
++
++# Design analysis for the combo variant
++# -------------------------------------
++# a) Concrete behavior:
++#    - The visible object is still the 9x9 middle of a 5x5 block lattice, but the
++#      center 3x3 is no longer background. It is a solid special hole color 0.
++#    - The input also contains eight isolated outer marker pixels, one centered in
++#      each outer 3x3 slot. Their colors are a permutation of the eight source
++#      blocks' dominant colors.
++#    - Example trace:
++#      original task: block(0,0) always copies to outer slot(4,4) by symmetry.
++#      combo task: if block(0,0) is mostly color 6 and the marker color 6 is at
++#      outer slot(0,2), that block must go to slot(0,2) instead. Meanwhile the
++#      central 3x3 block of color 0 is not an object to copy; it is a "missing
++#      area" marker that gets replaced by the reconstructed center patch.
++# b) Complexity calibration:
++#    - To avoid ambiguous color lookup, each of the eight source blocks receives a
++#      distinct dominant color. The outer markers reuse exactly those eight colors.
++#    - The hole marker uses a ninth color (0) that never appears in any source
++#      block or outer marker, so the two marker systems are visually separable.
++# c) Hidden assumptions broken from the original solver:
++#    - `bbox(g != bg)` is no longer usable because outer markers expand the global
++#      non-background bbox to the full 15x15 frame. The solver must isolate the
++#      largest connected component, which is the 9x9 motif.
++#    - The original "center is background" assumption is invalid. The solver must
++#      now tolerate a filled center block, recognize it as a uniform special color,
++#      and overwrite it with the reconstructed patch.
++#    - The original opposite-slot formula is invalid because the outer copy rule is
++#      now driven by color equality between source-block major colors and marker
++#      pixels.
++#    - The original motif-wide majority color is unstable once all eight source
++#      blocks use distinct majors. The reconstructed center therefore uses the mode
++#      of the eight boundary samples around the hole.
++# d) Placement legality:
++#    - The motif still sits with a margin of one block, so the full 15x15 expanded
++#      region stays inside the NxN canvas.
++#    - Outer markers are placed at the centers of the outer slots, which keeps them
++#      disconnected from the motif component and prevents overlap with pasted blocks.
++#    - The center hole is a full 3x3 block, so it never collides with source data;
++#      it simply occupies the block that used to be empty.
++# e) Visual observability:
++#    - Across examples, the outer marker permutation changes, so the user can infer
++#      that outer placement depends on color matching rather than point symmetry.
++#    - The central special-color square is visually different from both background
++#      and outer markers: it is a full 3x3 region, not a single pixel.
++# f) Visual cleanliness:
++#    - There are only two annotation forms: a solid 3x3 center hole and eight
++#      centered single-pixel outer tags. They occupy disjoint regions and remain
++#      easy to parse by eye.
++# g) Color-inference guardrails:
++#    - No numeric ordering on colors is used anywhere. Matching depends only on
++#      visible equality. The special hole color is distinguished by location and
++#      shape, not by the fact that its id is 0.
++# h) Anti-degeneration metric:
++#    - The generator enforces at least 4 disagreements with the original
++#      opposite-slot mapping, measured as the number of outer slots whose marker
++#      color does not match the source block that would have gone there originally.
++#    - It also always uses a full 3x3 special-color center hole, so the D12 change
++#      is present in every sample instead of collapsing back to a background hole.
++# i) New solver assumptions guaranteed by the generator:
++#    - The largest connected non-background component is the 9x9 motif.
++#    - The center block of that motif is uniformly colored with the special hole
++#      color, distinct from background and from every source-block major color.
++#    - Each outer slot contains exactly one centered marker pixel whose color
++#      matches exactly one source block's major color.
++
++
++BLOCK = 3
++MOTIF_SIZE = BLOCK * 3
++EXPANDED_SIZE = BLOCK * 5
++
++GRID_SIZE_MIN, GRID_SIZE_MAX = 16, 19
++MOTIF_PAD = 3
++BG = 8
++HOLE_COLOR = 0
++SOURCE_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
++MAX_RETRIES = 300
++MIN_ANTI_ORIGINAL_MISMATCH = 4
++
++SOURCE_POSITIONS = (
++    (0, 0), (0, 1), (0, 2),
++    (1, 0),         (1, 2),
++    (2, 0), (2, 1), (2, 2),
++)
++OUTER_SLOTS = (
++    (0, 0), (0, 2), (0, 4),
++    (2, 0),         (2, 4),
++    (4, 0), (4, 2), (4, 4),
++)
++ORTHOGONAL_POSITIONS = {(0, 1), (1, 0), (1, 2), (2, 1)}
++INNER_SAMPLE_COORD = {
++    (0, 0): (2, 2),
++    (0, 1): (2, 1),
++    (0, 2): (2, 0),
++    (1, 0): (1, 2),
++    (1, 2): (1, 0),
++    (2, 0): (0, 2),
++    (2, 1): (0, 1),
++    (2, 2): (0, 0),
++}
++CENTER_OFFSETS = np.array([-1, 1, 3], dtype=int)
++
++
++def _major_block_color(block: np.ndarray, bg: int) -> int:
++    vals, counts = np.unique(block[block != int(bg)], return_counts=True)
++    assert vals.size, "block must contain foreground colors"
++    return int(vals[int(np.argmax(counts))])
++
++
++def _largest_component_bbox(g: np.ndarray, bg: int) -> tuple[int, int, int, int] | None:
++    mask = g != int(bg)
++    h, w = mask.shape
++    seen = np.zeros_like(mask, dtype=bool)
++    best_bbox = None
++    best_size = -1
++    for r in range(h):
++        for c in range(w):
++            if not mask[r, c] or seen[r, c]:
++                continue
++            stack = [(r, c)]
++            seen[r, c] = True
++            size = 0
++            r0 = r1 = r
++            c0 = c1 = c
++            while stack:
++                rr, cc = stack.pop()
++                size += 1
++                r0 = min(r0, rr)
++                r1 = max(r1, rr)
++                c0 = min(c0, cc)
++                c1 = max(c1, cc)
++                for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
++                    nr, nc = rr + dr, cc + dc
++                    if 0 <= nr < h and 0 <= nc < w and mask[nr, nc] and not seen[nr, nc]:
++                        seen[nr, nc] = True
++                        stack.append((nr, nc))
++            if size > best_size:
++                best_size = size
++                best_bbox = (r0, c0, r1, c1)
++    return best_bbox
++
++
++def _center_hole_color(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> int:
++    center = crop_bbox(
++        g,
++        (int(r0) + block, int(c0) + block, int(r0) + 2 * block - 1, int(c0) + 2 * block - 1),
++    )
++    vals = np.unique(center)
++    assert vals.size == 1, "center hole marker must be uniform"
++    hole = int(vals[0])
++    assert hole != int(bg), "center hole marker must differ from background"
++    return hole
++
++
++def _center_patch(g: np.ndarray, r0: int, c0: int, block: int) -> np.ndarray:
++    assert block == 3, "this variant uses 3x3 blocks"
++    hole_r = int(r0) + block
++    hole_c = int(c0) + block
++    rows = hole_r + CENTER_OFFSETS
++    cols = hole_c + CENTER_OFFSETS
++    patch = g[np.ix_(rows, cols)].copy()
++    ring_vals = [int(patch[r, c]) for r in range(block) for c in range(block) if (r, c) != (1, 1)]
++    patch[1, 1] = Counter(ring_vals).most_common(1)[0][0]
++    return patch
++
++
++def _slot_marker_color(
++    g: np.ndarray,
++    expanded_r0: int,
++    expanded_c0: int,
++    slot_br: int,
++    slot_bc: int,
++    block: int,
++    bg: int,
++    hole_color: int,
++) -> int:
++    sr = expanded_r0 + slot_br * block
++    sc = expanded_c0 + slot_bc * block
++    marker = int(g[sr + block // 2, sc + block // 2])
++    assert marker != int(bg), f"outer slot {(slot_br, slot_bc)} is missing its marker"
++    assert marker != int(hole_color), "outer marker color must differ from center hole color"
++    return marker
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand a tagged 3x3-block motif into a 5x5 block layout with two marker roles.
++
++    Input structure:
++    - Teal background contains one 9x9 motif made of eight 3x3 source blocks.
++    - The middle 3x3 block is filled with one special color that marks the hole;
++      it is not background and it is not one of the outer marker colors.
++    - Each of the eight outer 3x3 slots contains a single centered marker pixel,
++      and the pixels around the central hole still encode the missing center patch.
++
++    Rule:
++    - Keep the original 9x9 motif in place, except replace the special-color hole
++      with the reconstructed center block.
++    - Reconstruct that center block from the eight boundary pixels facing the hole;
++      the center cell takes the modal boundary color.
++    - For each outer slot, read its centered marker color and copy in the source
++      block whose dominant color matches that marker.
++
++    Key insight: two non-background markers coexist but mean different things. The
++    solid central square marks "missing area to rebuild", while the isolated outer
++    pixels act as color labels that choose which source block belongs in each slot.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = int(get_bg(g))
++    motif_bbox = _largest_component_bbox(g, bg)
++    assert motif_bbox is not None, "expected a foreground motif"
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
++    block = h // 3
++    assert block == 3, "this variant expects a 9x9 motif"
++
++    hole_color = _center_hole_color(g, int(r0), int(c0), block, bg)
++    expanded_r0 = int(r0) - block
++    expanded_c0 = int(c0) - block
++    out = g.copy()
++
++    blocks_by_color: dict[int, np.ndarray] = {}
++    for br, bc in SOURCE_POSITIONS:
++        src = crop_bbox(
++            g,
++            (
++                int(r0) + br * block,
++                int(c0) + bc * block,
++                int(r0) + (br + 1) * block - 1,
++                int(c0) + (bc + 1) * block - 1,
++            ),
++        )
++        major = _major_block_color(src, bg)
++        assert major != hole_color, "source-block major color must differ from hole marker"
++        if major in blocks_by_color:
++            assert np.array_equal(blocks_by_color[major], src), (
++                "reused marker colors require identical source blocks"
++            )
++        else:
++            blocks_by_color[major] = src
++
++    for slot_br, slot_bc in OUTER_SLOTS:
++        marker = _slot_marker_color(
++            g,
++            expanded_r0,
++            expanded_c0,
++            slot_br,
++            slot_bc,
++            block,
++            bg,
++            hole_color,
++        )
++        assert marker in blocks_by_color, f"no source block has major color {marker}"
++        paste(out, blocks_by_color[marker], expanded_r0 + slot_br * block, expanded_c0 + slot_bc * block)
++
++    paste(out, _center_patch(g, int(r0), int(c0), block), int(r0) + block, int(c0) + block)
++    return out
++
++
++def _random_block(main_color: int, ring_color: int, sample_coord: tuple[int, int]) -> np.ndarray:
++    block = np.full((BLOCK, BLOCK), main_color, dtype=int)
++    if ring_color != main_color:
++        block[sample_coord] = ring_color
++    remaining = [(r, c) for r in range(BLOCK) for c in range(BLOCK) if (r, c) != sample_coord]
++    extra_coords = random.sample(remaining, 2)
++    accent_pool = [color for color in SOURCE_COLORS if color != main_color]
++    extra_colors = random.sample(accent_pool, 2)
++    for (rr, cc), color in zip(extra_coords, extra_colors):
++        block[rr, cc] = color
++    return block
++
++
++def _assemble_input_motif(blocks: dict[tuple[int, int], np.ndarray]) -> np.ndarray:
++    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), HOLE_COLOR, dtype=int)
++    for pos, block in blocks.items():
++        br, bc = pos
++        paste(motif, block, br * BLOCK, bc * BLOCK)
++    return motif
++
++
++def _old_mapping_mismatch_count(
++    source_colors: dict[tuple[int, int], int],
++    marker_colors: dict[tuple[int, int], int],
++) -> int:
++    mismatches = 0
++    for br, bc in SOURCE_POSITIONS:
++        old_slot = (4 - 2 * br, 4 - 2 * bc)
++        if marker_colors[old_slot] != source_colors[(br, bc)]:
++            mismatches += 1
++    return mismatches
++
++
++def _expanded_output(
++    motif: np.ndarray,
++    center: np.ndarray,
++    blocks_by_color: dict[int, np.ndarray],
++    marker_colors: dict[tuple[int, int], int],
++) -> np.ndarray:
++    expanded = np.full((EXPANDED_SIZE, EXPANDED_SIZE), BG, dtype=int)
++    output_motif = motif.copy()
++    paste(output_motif, center, BLOCK, BLOCK)
++    paste(expanded, output_motif, BLOCK, BLOCK)
++    for slot_br, slot_bc in OUTER_SLOTS:
++        paste(
++            expanded,
++            blocks_by_color[marker_colors[(slot_br, slot_bc)]],
++            slot_br * BLOCK,
++            slot_bc * BLOCK,
++        )
++    return expanded
++
++
++def _gen_attempt() -> tuple[np.ndarray, int] | None:
++    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    source_color_list = random.sample(SOURCE_COLORS, len(SOURCE_POSITIONS))
++    source_colors = {pos: color for pos, color in zip(SOURCE_POSITIONS, source_color_list)}
++
++    marker_perm = random.sample(source_color_list, len(source_color_list))
++    marker_colors = {slot: color for slot, color in zip(OUTER_SLOTS, marker_perm)}
++    mismatch_count = _old_mapping_mismatch_count(source_colors, marker_colors)
++    if mismatch_count < MIN_ANTI_ORIGINAL_MISMATCH:
++        return None
++
++    center_color = random.choice(source_color_list)
++    ring_colors: dict[tuple[int, int], int] = {}
++    for pos in SOURCE_POSITIONS:
++        if pos in ORTHOGONAL_POSITIONS:
++            ring_colors[pos] = center_color
++        else:
++            candidates = [color for color in SOURCE_COLORS if color != center_color]
++            ring_colors[pos] = random.choice(candidates)
++
++    blocks = {
++        pos: _random_block(source_colors[pos], ring_colors[pos], INNER_SAMPLE_COORD[pos])
++        for pos in SOURCE_POSITIONS
++    }
++    motif = _assemble_input_motif(blocks)
++    center = _center_patch(motif, 0, 0, BLOCK)
++    if int(center[1, 1]) != center_color:
++        return None
++
++    blocks_by_color = {source_colors[pos]: blocks[pos] for pos in SOURCE_POSITIONS}
++    expanded = _expanded_output(motif, center, blocks_by_color, marker_colors)
++
++    r0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
++    c0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
++    inp = np.full((n, n), BG, dtype=int)
++    out = np.full((n, n), BG, dtype=int)
++    paste(inp, motif, r0, c0)
++    paste(out, expanded, r0 - BLOCK, c0 - BLOCK)
++
++    for slot_br, slot_bc in OUTER_SLOTS:
++        sr = r0 - BLOCK + slot_br * BLOCK
++        sc = c0 - BLOCK + slot_bc * BLOCK
++        inp[sr + 1, sc + 1] = marker_colors[(slot_br, slot_bc)]
++
++    if np.count_nonzero(inp[r0 + BLOCK:r0 + 2 * BLOCK, c0 + BLOCK:c0 + 2 * BLOCK] == HOLE_COLOR) != 9:
++        return None
++    if np.array_equal(main(inp), out):
++        return inp, mismatch_count
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        result = _gen_attempt()
++        if result is not None:
++            grid, _mismatch_count = result
++            return grid
++    raise AssertionError("failed to generate a valid db0c5428 combo variant input")
+
+tokens used
+52,017
+融合变体已经写入 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/42/code.py)。我把设计分析直接放进了文件头注释里，并按要求重写了 `main()` 的四段式说明，规则现在是：外圈槽位用颜色标记做块匹配映射，中心空洞改成独立的 `3x3` 特殊标记色 `0`，solver 会显式区分这两类标记。
+
+指定测试已通过：`Success: 50/50`，耗时约 `0.1s`。另外做了退化检查，量化指标用“按融合规则与按原题点对称规则相比，有多少个外圈槽位发生不同放置”。200 个样本的分布是 `4:4, 5:11, 6:35, 7:68, 8:82`，均值 `7.07`；同时中心特殊洞色像素数分布为 `{9: 200}`，说明两部分融合行为都稳定出现，没有退化回原题。

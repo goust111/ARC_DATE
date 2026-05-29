@@ -1,0 +1,4634 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e25a7-2c78-7870-83fd-10764439c8f1
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个变体。
+
+    ## 原始任务: d59b0160
+    **摘要**: 左上角绿色边框(颜色3)围成的图例区域定义目标颜色集合，识别网格中所有非背景的4-连通分量，删除包含全部图例颜色的连通分量，保留不包含全部图例颜色的连通分量
+
+    ## 要实现的变体
+    - **维度**: D12 — 颜色0在分量中的角色 (`color_set_match`)
+    - **当前值**: 颜色0（黑色）是连通分量中的有效颜色，参与连通性计算，但不出现在图例中因此不参与颜色匹配
+    - **改为**: 忽略每种颜色的第一个像素进行匹配 — 在颜色匹配时，每种颜色的第一个像素（按扫描顺序）被排除，只有重复出现（>=2次）的颜色才计入颜色集合。要求图例颜色在分量中不仅存在还需要多次出现，增加了计数维度。
+    - **来源**: creative（参考任务: None）
+
+    ## 修改原则 
+    以 D12 为核心变更，不要随意改动与该创新无关的部分。但如果其他维度需要做适配性调整才能让 D12 的变化在视觉上可观察、在逻辑上可行（例如：变换规则改为旋转/翻转，但原始对象是纯色对称的导致变换不可见，则应让对象带不对称内部结构），这种配合修改是允许且必要的。
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/d59b0160.py`
+
+    ```python
+    import numpy as np
+
+from arc_utils import components_mask, paste, random_free_location
+import math
+import random
+
+
+def _bg_boundary(g: np.ndarray) -> int:
+    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
+    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
+    vals, cnts = np.unique(border, return_counts=True)
+    return int(vals[cnts.argmax()])
+
+
+def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
+    """
+    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
+    We detect the smallest size sz such that:
+      - g[sz-1, 0:sz] are all x
+      - g[0:sz, sz-1] are all x
+    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
+    excluding bg and excluding the border color x.
+    """
+    h, w = g.shape
+    for sz in range(2, min(h, w) + 1):
+        x = int(g[sz - 1, sz - 1])
+        if x == bg:
+            continue
+        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
+            inside = g[0 : sz - 1, 0 : sz - 1]
+            colors = set(map(int, np.unique(inside)))
+            colors.discard(bg)
+            colors.discard(x)
+            return int(sz), int(x), colors
+    assert False, "no legend border found in grid"
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Delete connected components whose colors match a legend swatch.
+
+    Input structure:
+    - Background (bg) fills most of the grid.
+    - Top-left corner: a small square legend region bordered on its bottom and right edges by a single color; the interior holds a set of "target" colors.
+    - Elsewhere: multicolored objects (4-connected components) on the bg.
+
+    Rule:
+    - Read the target color set from inside the legend border.
+    - For each connected component, check whether it contains **all** target colors.
+    - Erase (fill with bg) every component that does; leave all others unchanged.
+    - Output grid is the same size.
+
+    Key insight: The legend acts as a filter specification — only components carrying the full color palette shown in the legend are removed.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = _bg_boundary(g)
+
+    legend = _find_legend(g, bg)
+    _sz, _x, legend_colors = legend
+    assert legend_colors, "legend interior contains no target colors"
+
+    out = g.copy()
+    comps = components_mask(g != bg, connectivity=4)
+    for pts in comps:
+        cols = {int(g[r, c]) for r, c in pts}
+        if legend_colors.issubset(cols):
+            for r, c in pts:
+                out[r, c] = bg
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# -- Grid & legend constants --
+GRID_H, GRID_W = 16, 16
+BG = 7
+BORDER = 3
+LEGEND_SIZE = 4                       # 4x4 legend at top-left
+PALETTE = [1, 2, 4, 5, 6, 8, 9]
+NUM_TARGETS = 3                       # target colors sampled from PALETTE
+
+# -- Component shape weights: (mode, weight) --
+SHAPE_WEIGHTS = [5, 3, 2]            # medium, tall, wide
+TALL_H = (8, 16);  TALL_W = (2, 4)
+WIDE_H = (3, 5);   WIDE_W = (5, 9)
+MED_H  = (3, 7);   MED_W  = (2, 9)
+
+# -- Component fill density (fraction of non-zero pixels) --
+DENSITY_LO = 0.10
+DENSITY_HI = 0.55
+
+# -- Component count & kept/deleted split --
+COMP_COUNTS = [4, 5, 6]
+COMP_WEIGHTS = [1, 4, 25]
+NUM_KEPT = 3                          # always keep exactly 3
+
+# -- Generation retry budget --
+MAX_RETRIES = 300
+
+
+def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
+    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
+    s = LEGEND_SIZE
+    for g in (inp, out):
+        g[:s, :s] = BG
+        g[s - 1, :s] = BORDER
+        g[:s, s - 1] = BORDER
+
+    # Pick 3 positions in the 3x3 interior: one isolated corner + two non-adjacent border cells
+    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
+    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
+    side_choices = [
+        p for p in border_side
+        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
+    ]
+    positions = [isolated] + random.sample(side_choices, 2)
+    random.shuffle(positions)
+    for color, (r, c) in zip(targets, positions):
+        inp[r, c] = color
+        out[r, c] = color
+
+
+def _component_dims() -> tuple[int, int]:
+    """Sample component (h, w) according to shape-mode weights."""
+    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
+    if mode == "tall":
+        return random.randint(*TALL_H), random.randint(*TALL_W)
+    if mode == "wide":
+        return random.randint(*WIDE_H), random.randint(*WIDE_W)
+    return random.randint(*MED_H), random.randint(*MED_W)
+
+
+def _component_patch(h: int, w: int, targets: list[int], deleted: bool) -> np.ndarray:
+    """Build an h x w patch filled with color-0 base and sprinkled colored pixels."""
+    area = h * w
+    lo = max(1, math.ceil(area * DENSITY_LO))
+    hi = max(lo, math.floor(area * DENSITY_HI))
+    if deleted:
+        lo = max(lo, NUM_TARGETS)
+
+    n_colored = random.randint(lo, hi)
+    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
+    non_targets = [v for v in PALETTE if v not in targets]
+
+    if deleted:
+        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
+    else:
+        used_target_count = random.randint(0, NUM_TARGETS - 1)
+        allowed = non_targets + random.sample(targets, used_target_count)
+        colors = [random.choice(allowed) for _ in range(n_colored)]
+
+    random.shuffle(colors)
+    patch = np.zeros((h, w), dtype=int)
+    rs, cs = zip(*coords)
+    patch[rs, cs] = colors
+    return patch
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Try once to build a valid (input, output) pair; return input or None on failure."""
+    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
+    out = inp.copy()
+
+    targets = random.sample(PALETTE, NUM_TARGETS)
+    _place_legend(inp, out, targets)
+
+    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
+    roles = [True] * (component_count - NUM_KEPT) + [False] * NUM_KEPT
+    random.shuffle(roles)
+
+    for deleted in roles:
+        h, w = _component_dims()
+        patch = _component_patch(h, w, targets, deleted)
+        try:
+            r, c = random_free_location(
+                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
+            )
+        except ValueError:
+            return None
+        paste(inp, patch, r, c)
+        if not deleted:
+            paste(out, patch, r, c)
+
+    if np.array_equal(main(inp), out):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate valid input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 16x16 [observed], bg=7
+  legend:
+    position: top-left 4x4 square [observed]
+    border_color: 3 [observed], fills bottom row and right column of 4x4 region
+    interior: 3x3, contains exactly 3 target colors each placed once, rest bg
+    target_colors: 3 distinct colors chosen from {1,2,4,5,6,8,9}
+  components:
+    type: solid rectangles of non-bg cells (fill ratio = 1.0)
+    base_color: 0 fills most cells; colored pixels (from {1,2,4,5,6,8,9}) sprinkled in at 10-55% density
+    count: 4-6 non-legend components
+    dimensions: 2-9 wide x 3-16 tall
+    separation: components separated by >=1 bg cell (no 4-adjacent touching)
+    may touch grid edges
+  deletion_rule:
+    components containing ALL 3 legend target colors are erased (filled with bg)
+    deleted: 1-3 components; kept: 3 components [observed]
+    kept components must each be missing >=1 legend target color
+  output: same-size grid with deleted components replaced by bg; legend and kept components unchanged
+
+generation_strategy:
+  approach: direct construction
+  steps:
+    1. Pick 3 target colors from {1,2,4,5,6,8,9}; remaining 4 are non-target colors
+    2. Build 4x4 legend at (0,0) - border color 3 on bottom row and right column, place each target color once in the 3x3 interior, rest bg
+    3. Decide component count (4-6) and split into deleted (1-3) and kept (3)
+    4. For each component, pick random bbox dimensions (w in 2-9, h in 3-7); place on grid ensuring >=1 bg gap from legend and all other components
+    5. Fill each component's bbox with color 0
+    6. For deleted components - sprinkle colored pixels ensuring all 3 target colors appear (plus optionally non-targets)
+    7. For kept components - sprinkle colored pixels using a subset of colors that is missing >=1 target color
+    8. Colored pixel density 10-55% of component area
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须保留这一结构，并根据**新的变体规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映变体后的输入结构、规则和关键洞察。
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考任务**（如有 source_task）: 变体描述中的 source_task 是该变体的灵感来源。**必须先阅读其 solver 代码**，理解参考任务中相关机制的实现方式和复杂度，作为你设计变体的基线。不存在就跳过。
+
+    3. **设计分析（写代码前必须完成，可仿照spec书写，尽可能的详细以供下面代码生成使用）**:
+
+       YAML 中的变体描述给出了变更的大致方向，但细节不够具体。你需要自行思考并确定完整的实现细节。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断变体改动的影响范围和实现方式。在写代码之前，完成以下分析：
+
+       a) **具体化与行为追踪**: 变体在 ARC 的像素网格中具体长什么样？变更的核心行为如何体现在输入/输出的结构上？不要停留在抽象概念上，要想清楚具体的形状、颜色、空间关系等细节。然后，确定变体的变化会影响整个流程（输入构造、solver 处理、输出生成等）中的哪个环节，在这个环节上用一个具体的小例子追踪：原始逻辑在这里是怎么执行的 → 变体要求的逻辑应该是怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 变体改变了原任务的某个属性。原始代码中哪些写法依赖了旧属性的不变性？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在变体中是否仍然成立？特别注意那些在原任务中"恰好无害"但在变体中会出错的模式（例如：原任务中某个值始终相同，所以无条件赋值不会产生覆盖问题——但变体让该值可变后，无条件赋值就会破坏已有的正确结果）。
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意（例如对象之间的空间关系、对齐方式、间距等应与任务规则一致）。同时要考虑放置后的网格是否能被 solver 正确处理并产生预期的输出。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。**禁止使用颜色id等不可见因素参与任何排序或者颜色变换（例如使用黑色=0参与排序等，禁用）**。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出变体的规则？如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。若规则本身允许多个合法分支或子情况，不要在生成器中长期固定成其中一种，除非题意本来就要求固定。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果变体后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **颜色变化可推断性**: 如果变体涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个变体设计就不合格。
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 基于第 3 步的设计分析实现变体的新规则。只改需要改的部分，其他逻辑保持不变。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发新规则。生成的输入必须能被新 `main()` 正确求解。
+    6. **保证 generator 的正确性**: 原 generator 采用 output-first 模式（先构造预期输出 → 反推输入 → 用 `main(input)` 验证一致）。修改变体时，你可以沿用或调整这个模式，但必须保证：生成的每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证变体行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了变体的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量变体核心行为（如交互深度、参与对象数等），统计生成样本中该指标和关键分支的分布。少量样本与原始行为相似不为退化；只有当关键控制变量不起作用，样本按照新的变体逻辑执行与原逻辑执行在相同输入网格上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/d59b0160.json` — 原任务的 I/O 样例
+
+    只参考上述文件和原始 solver 代码。不要查看其他变体的实现代码（如 variants/ 目录下的已有文件），避免引入其他维度的改动。
+
+## 输出
+
+将完整的变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+`/home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py`
+
+代码文件开头加一段注释说明这是什么变体:
+```python
+# Variant of d59b0160
+# Dimension: D12 — 颜色0在分量中的角色 (color_set_match)
+# Change: 颜色0（黑色）是连通分量中的有效颜色，参与连通性计算，但不出现在图例中因此不参与颜色匹配... → 忽略每种颜色的第一个像素进行匹配
+```
+
+确保目录 `/home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2` 存在（如不存在则创建）。
+codex
+先核对原始 `d59b0160` 的 solver / generator 和 `arc_utils`，确认哪些逻辑直接依赖旧的“只看颜色是否出现过”匹配，再据此设计 D12 变体的最小改动方案。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/d59b0160.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+import numpy as np
+
+from arc_utils import components_mask, paste, random_free_location
+import math
+import random
+
+
+def _bg_boundary(g: np.ndarray) -> int:
+    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
+    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
+    vals, cnts = np.unique(border, return_counts=True)
+    return int(vals[cnts.argmax()])
+
+
+def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
+    """
+    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
+    We detect the smallest size sz such that:
+      - g[sz-1, 0:sz] are all x
+      - g[0:sz, sz-1] are all x
+    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
+    excluding bg and excluding the border color x.
+    """
+    h, w = g.shape
+    for sz in range(2, min(h, w) + 1):
+        x = int(g[sz - 1, sz - 1])
+        if x == bg:
+            continue
+        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
+            inside = g[0 : sz - 1, 0 : sz - 1]
+            colors = set(map(int, np.unique(inside)))
+            colors.discard(bg)
+            colors.discard(x)
+            return int(sz), int(x), colors
+    assert False, "no legend border found in grid"
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Delete connected components whose colors match a legend swatch.
+
+    Input structure:
+    - Background (bg) fills most of the grid.
+    - Top-left corner: a small square legend region bordered on its bottom and right edges by a single color; the interior holds a set of "target" colors.
+    - Elsewhere: multicolored objects (4-connected components) on the bg.
+
+    Rule:
+    - Read the target color set from inside the legend border.
+    - For each connected component, check whether it contains **all** target colors.
+    - Erase (fill with bg) every component that does; leave all others unchanged.
+    - Output grid is the same size.
+
+    Key insight: The legend acts as a filter specification — only components carrying the full color palette shown in the legend are removed.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = _bg_boundary(g)
+
+    legend = _find_legend(g, bg)
+    _sz, _x, legend_colors = legend
+    assert legend_colors, "legend interior contains no target colors"
+
+    out = g.copy()
+    comps = components_mask(g != bg, connectivity=4)
+    for pts in comps:
+        cols = {int(g[r, c]) for r, c in pts}
+        if legend_colors.issubset(cols):
+            for r, c in pts:
+                out[r, c] = bg
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# -- Grid & legend constants --
+GRID_H, GRID_W = 16, 16
+BG = 7
+BORDER = 3
+LEGEND_SIZE = 4                       # 4x4 legend at top-left
+PALETTE = [1, 2, 4, 5, 6, 8, 9]
+NUM_TARGETS = 3                       # target colors sampled from PALETTE
+
+# -- Component shape weights: (mode, weight) --
+SHAPE_WEIGHTS = [5, 3, 2]            # medium, tall, wide
+TALL_H = (8, 16);  TALL_W = (2, 4)
+WIDE_H = (3, 5);   WIDE_W = (5, 9)
+MED_H  = (3, 7);   MED_W  = (2, 9)
+
+# -- Component fill density (fraction of non-zero pixels) --
+DENSITY_LO = 0.10
+DENSITY_HI = 0.55
+
+# -- Component count & kept/deleted split --
+COMP_COUNTS = [4, 5, 6]
+COMP_WEIGHTS = [1, 4, 25]
+NUM_KEPT = 3                          # always keep exactly 3
+
+# -- Generation retry budget --
+MAX_RETRIES = 300
+
+
+def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
+    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
+    s = LEGEND_SIZE
+    for g in (inp, out):
+        g[:s, :s] = BG
+        g[s - 1, :s] = BORDER
+        g[:s, s - 1] = BORDER
+
+    # Pick 3 positions in the 3x3 interior: one isolated corner + two non-adjacent border cells
+    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
+    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
+    side_choices = [
+        p for p in border_side
+        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
+    ]
+    positions = [isolated] + random.sample(side_choices, 2)
+    random.shuffle(positions)
+    for color, (r, c) in zip(targets, positions):
+        inp[r, c] = color
+        out[r, c] = color
+
+
+def _component_dims() -> tuple[int, int]:
+    """Sample component (h, w) according to shape-mode weights."""
+    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
+    if mode == "tall":
+        return random.randint(*TALL_H), random.randint(*TALL_W)
+    if mode == "wide":
+        return random.randint(*WIDE_H), random.randint(*WIDE_W)
+    return random.randint(*MED_H), random.randint(*MED_W)
+
+
+def _component_patch(h: int, w: int, targets: list[int], deleted: bool) -> np.ndarray:
+    """Build an h x w patch filled with color-0 base and sprinkled colored pixels."""
+    area = h * w
+    lo = max(1, math.ceil(area * DENSITY_LO))
+    hi = max(lo, math.floor(area * DENSITY_HI))
+    if deleted:
+        lo = max(lo, NUM_TARGETS)
+
+    n_colored = random.randint(lo, hi)
+    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
+    non_targets = [v for v in PALETTE if v not in targets]
+
+    if deleted:
+        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
+    else:
+        used_target_count = random.randint(0, NUM_TARGETS - 1)
+        allowed = non_targets + random.sample(targets, used_target_count)
+        colors = [random.choice(allowed) for _ in range(n_colored)]
+
+    random.shuffle(colors)
+    patch = np.zeros((h, w), dtype=int)
+    rs, cs = zip(*coords)
+    patch[rs, cs] = colors
+    return patch
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Try once to build a valid (input, output) pair; return input or None on failure."""
+    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
+    out = inp.copy()
+
+    targets = random.sample(PALETTE, NUM_TARGETS)
+    _place_legend(inp, out, targets)
+
+    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
+    roles = [True] * (component_count - NUM_KEPT) + [False] * NUM_KEPT
+    random.shuffle(roles)
+
+    for deleted in roles:
+        h, w = _component_dims()
+        patch = _component_patch(h, w, targets, deleted)
+        try:
+            r, c = random_free_location(
+                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
+            )
+        except ValueError:
+            return None
+        paste(inp, patch, r, c)
+        if not deleted:
+            paste(out, patch, r, c)
+
+    if np.array_equal(main(inp), out):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate valid input")
+
+exec
+/bin/bash -lc "sed -n '1,240p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/d59b0160.json'
+obj=json.load(open(p))
+print('train', len(obj.get('train',[])), 'test', len(obj.get('test',[])))
+for split in ('train','test'):
+    for i,pair in enumerate(obj.get(split,[])):
+        inp=pair['input']; out=pair['output']
+        print(split, i, len(inp), len(inp[0]), '->', len(out), len(out[0]))
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+train 3 test 1
+train 0 16 16 -> 16 16
+train 1 16 16 -> 16 16
+train 2 16 16 -> 16 16
+test 0 16 16 -> 16 16
+
+codex
+原题生成器实际是“矩形底板填 0，再撒彩色点”，所以 D12 的核心变化会直接落在“如何从分量中提取用于匹配的颜色集合”以及“如何构造会/不会被删的分量”这两处。接下来补读 `components_mask` / `random_free_location`，然后把设计分析写进新文件头部注释。
+exec
+/bin/bash -lc 'rg -n "def components_mask|def random_free_location|def paste" /home/lixinyu/snap/new/solvers/arc_utils.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+308:def paste(
+398:def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+854:def random_free_location(
+
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2 && ls -ld /home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+drwxrwxr-x+ 2 lixinyu lixinyu 4096 May 14 04:43 /home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2
+
+exec
+/bin/bash -lc "sed -n '300,470p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+    return grid[r0 : r1 + 1, c0 : c1 + 1].copy()
+
+
+# =============================================================================
+# Paste (single canonical placement primitive)
+# =============================================================================
+
+
+def paste(
+    dst: np.ndarray,
+    patch: np.ndarray,
+    r0: int,
+    c0: int,
+    *,
+    transparent: int | None = None,
+    mask: np.ndarray | None = None,
+    overwrite: bool = True,
+    clip: bool = False,
+) -> np.ndarray:
+    """
+    Paste `patch` into `dst` at top-left (r0,c0).
+
+    This is the ONE placement primitive solver examples should use.
+
+    - Opaque paste: `paste(dst, patch, r0, c0)`
+    - Transparent overlay: `paste(dst, patch, r0, c0, transparent=bg)`
+    - Masked paste: `paste(dst, patch, r0, c0, mask=m)`
+    - Non-overwriting overlay: `paste(dst, patch, r0, c0, transparent=bg, overwrite=False)`
+    - Strict vs clip: default `clip=False` (fail fast); set `clip=True` to clip out-of-bounds.
+    """
+    H, W = dst.shape
+    r0 = int(r0)
+    c0 = int(c0)
+    h, w = map(int, patch.shape)
+
+    if not clip:
+        if r0 < 0 or c0 < 0 or r0 + h > H or c0 + w > W:
+            raise ValueError("paste: patch out of bounds (set clip=True to allow clipping)")
+        rr0, cc0 = r0, c0
+        rr1, cc1 = r0 + h, c0 + w
+        pr0, pc0 = 0, 0
+    else:
+        rr0 = max(0, r0)
+        cc0 = max(0, c0)
+        rr1 = min(H, r0 + h)
+        cc1 = min(W, c0 + w)
+        if rr0 >= rr1 or cc0 >= cc1:
+            return dst
+        pr0 = rr0 - r0
+        pc0 = cc0 - c0
+
+    pr1 = pr0 + (rr1 - rr0)
+    pc1 = pc0 + (cc1 - cc0)
+
+    dst_view = dst[rr0:rr1, cc0:cc1]
+    patch_view = patch[pr0:pr1, pc0:pc1]
+
+    m = np.ones(patch_view.shape, dtype=bool)
+    if mask is not None:
+        m &= mask[pr0:pr1, pc0:pc1].astype(bool)
+    if transparent is not None:
+        m &= (patch_view != int(transparent))
+        if not overwrite:
+            m &= (dst_view == int(transparent))
+    else:
+        if not overwrite:
+            raise ValueError("paste: overwrite=False requires transparent to be set")
+
+    dst_view[m] = patch_view[m]
+    return dst
+
+
+def paint_coords(out: np.ndarray, coords: Iterable[Coord], color: int) -> None:
+    """Set out[r,c]=color for each coord (in-bounds only)."""
+    H, W = out.shape
+    v = int(color)
+    for r, c in coords:
+        rr = int(r)
+        cc = int(c)
+        if 0 <= rr < H and 0 <= cc < W:
+            out[rr, cc] = v
+
+
+# =============================================================================
+# Connected components (single unified entrypoint: find_components)
+# =============================================================================
+
+STRUCT4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=int)
+STRUCT8 = np.ones((3, 3), dtype=int)
+
+
+def label_mask(mask: np.ndarray, connectivity: int = 4) -> tuple[np.ndarray, int]:
+    """Connected-components labeling for a boolean mask."""
+    struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+    lab, n = label(mask.astype(bool), structure=struct)
+    return lab, int(n)
+
+
+def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+    """List of components from a boolean mask, each as an (N,2) coords array."""
+    lab, n = label_mask(mask, connectivity=connectivity)
+    return [np.argwhere(lab == k) for k in range(1, n + 1)]
+
+
+def find_components(
+    grid: np.ndarray,
+    *,
+    bg: int | None = None,
+    connectivity: int = 4,
+    monochromatic: bool = True,
+    colors: Sequence[int] | None = None,
+    min_area: int = 1,
+    return_format: str = "dict",
+) -> list[dict] | list[np.ndarray]:
+    """
+    Find connected components in a grid (unified API for ARC-2 + migrated seeds).
+
+    return_format:
+      - \"dict\": list of dicts {color, coords, bbox, area}
+      - \"objects\": list of full-grid arrays containing exactly one component
+    """
+    if bg is None:
+        bg = get_bg(grid)
+    bg = int(bg)
+
+    return_format = str(return_format).lower().strip()
+    if return_format not in {"dict", "objects"}:
+        raise ValueError("find_components: return_format must be 'dict' or 'objects'")
+
+    if colors is None:
+        colors_set = None
+        colors_iter = sorted(set(map(int, grid.flatten())) - {bg})
+    else:
+        colors_set = {int(c) for c in colors}
+        colors_iter = [int(c) for c in colors_set if int(c) != bg]
+
+    # Monochromatic = label per-color
+    if monochromatic:
+        if return_format == "dict":
+            out: list[dict] = []
+            for col in colors_iter:
+                mask = (grid == col)
+                if not mask.any():
+                    continue
+                comps = components_mask(mask, connectivity=connectivity)
+                for coords in comps:
+                    if int(coords.shape[0]) < int(min_area):
+                        continue
+                    out.append(
+                        {
+                            "color": int(col),
+                            "coords": coords,
+                            "bbox": bbox_coords(coords),
+                            "area": int(coords.shape[0]),
+                        }
+                    )
+            return out
+
+        objs: list[np.ndarray] = []
+        struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+        for col in colors_iter:
+            lab, n = label(grid == int(col), structure=struct)
+            for k in range(1, int(n) + 1):
+                m = (lab == k)
+                if int(m.sum()) < int(min_area):
+                    continue
+                obj = np.full_like(grid, bg)
+                obj[m] = int(col)
+                objs.append(obj)
+        return objs
+
+
+exec
+/bin/bash -lc "sed -n '854,980p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def random_free_location(
+    canvas: np.ndarray,
+    patch: np.ndarray,
+    *,
+    transparent: int,
+    border: int = 0,
+    padding: int = 0,
+    padding_connectivity: int = 8,
+) -> Coord:
+    """
+    Return a random (r,c) top-left location where `patch` fits without overlap.
+
+    This is the generator-friendly counterpart of `first_free_location` and mirrors the
+    legacy seeds' `random_free_location_for_sprite` behavior.
+
+    Raises:
+        ValueError: if no free location exists.
+    """
+    H, W = canvas.shape
+    h, w = patch.shape
+    border = int(border)
+    padding = int(padding)
+    pad_conn = int(padding_connectivity)
+    bg = int(transparent)
+
+    if h <= 0 or w <= 0:
+        raise ValueError("random_free_location: patch must be non-empty")
+    if H <= 0 or W <= 0:
+        raise ValueError("random_free_location: canvas must be non-empty")
+
+    if border < 0:
+        raise ValueError("random_free_location: border must be >= 0")
+    if padding < 0:
+        raise ValueError("random_free_location: padding must be >= 0")
+    if pad_conn not in (4, 8):
+        raise ValueError("random_free_location: padding_connectivity must be 4 or 8")
+
+    r_min = border
+    c_min = border
+    r_max = H - border - h
+    c_max = W - border - w
+    if r_max < r_min or c_max < c_min:
+        raise ValueError("random_free_location: patch cannot fit (border too large or patch too big)")
+
+    occ = (canvas != bg)
+    if padding > 0:
+        struct = STRUCT4 if pad_conn == 4 else STRUCT8
+        occ = ndimage.binary_dilation(occ, structure=struct, iterations=padding)
+
+    m = (patch != bg)
+
+    candidates: list[Coord] = []
+    for r0 in range(r_min, r_max + 1):
+        for c0 in range(c_min, c_max + 1):
+            if not bool((occ[r0 : r0 + h, c0 : c0 + w] & m).any()):
+                candidates.append((int(r0), int(c0)))
+
+    if not candidates:
+        raise ValueError("random_free_location: no free location")
+    return random.choice(candidates)
+
+
+def randomly_scatter_points(
+    grid: np.ndarray,
+    color: int,
+    *,
+    density: float = 0.5,
+    background: int = Color.BLACK,
+) -> np.ndarray:
+    """Randomly scatter points of `color` into `background` cells until reaching density."""
+    bg = int(background)
+    col = int(color)
+    colored = 0
+    H, W = grid.shape
+    target = int(round(float(density) * H * W))
+    while colored < target:
+        r = np.random.randint(0, H)
+        c = np.random.randint(0, W)
+        if int(grid[r, c]) == bg:
+            grid[r, c] = col
+            colored += 1
+    return grid
+
+
+def randomly_spaced_indices(max_len: int, n_indices: int, border_size: int = 1, padding: int = 1) -> np.ndarray:
+    """Generate randomly-spaced indices guaranteed to not be adjacent."""
+    max_len = int(max_len)
+    n_indices = int(n_indices)
+    border_size = int(border_size)
+    padding = int(padding)
+
+    if border_size > 0:
+        return (
+            randomly_spaced_indices(max_len - border_size - 2, n_indices, border_size=0, padding=padding) + border_size
+        )
+
+    indices = [0 for _ in range(max_len)]
+    while sum(indices) < n_indices:
+        possible = [
+            i
+            for i in range(max_len)
+            if sum(indices[max(0, i - padding) : min(i + 1 + padding, max_len)]) == 0
+        ]
+        if not possible:
+            raise ValueError("randomly_spaced_indices: no feasible placement")
+        indices[random.choice(possible)] = 1
+    return np.argwhere(indices).flatten()
+
+# =============================================================================
+# Misc 
+# =============================================================================
+# These are useful for some seed-style solvers, but they are
+# still part of the *canonical* API surface (no duplicate synonyms like blit vs paste).
+
+def check_between_objects(
+    obj1: np.ndarray,
+    obj2: np.ndarray,
+    r: int | None = None,
+    c: int | None = None,
+    padding: int = 0,
+    background: int = Color.BLACK,
+    **kwargs,
+) -> bool:
+    """Check if a pixel (r,c) lies between two objects, horizontally or vertically."""
+    xr, used_x = _consume_alias(kwargs, "r", ["x"])
+    yc, used_y = _consume_alias(kwargs, "c", ["y"])
+    if r is None and xr is not None:
+
+codex
+设计已经收敛了：solver 只需要把“颜色是否出现过”改成“颜色是否出现了第二次”，但 generator 必须更主动，至少稳定生成一种“看起来含有全部图例色、却因为某个图例色只出现一次而不被删除”的保留分量，否则样本会退化得和原题几乎一样。下面开始写新文件。
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py
+diff --git a/ceshi/code/d59b0160/D12/2/code.py b/ceshi/code/d59b0160/D12/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a55a4350ebd52ab24038b110e2936da7af7c7be
+--- /dev/null
++++ b/ceshi/code/d59b0160/D12/2/code.py
+@@ -0,0 +1,330 @@
++# Variant of d59b0160
++# Dimension: D12 — 颜色0在分量中的角色 (color_set_match)
++# Change: 颜色0（黑色）是连通分量中的有效颜色，参与连通性计算，但不出现在图例中因此不参与颜色匹配... → 忽略每种颜色的第一个像素进行匹配
++#
++# Design analysis
++# ===============
++# variant_spec:
++#   core_change:
++#     original_match: a component is deleted when every legend color appears at least once.
++#     new_match:
++#       - scan each 4-connected component in row-major order
++#       - ignore the first pixel of every color encountered in that component
++#       - a color enters the matching set only when its second pixel is seen
++#       - equivalently, only colors with multiplicity >= 2 count toward legend matching
++#     effect:
++#       - legend colors must be repeated inside a component, not merely present
++#       - color 0 still participates in connectivity because components are found on (grid != bg)
++#         exactly as before, but color 0 never appears in the legend and therefore never helps match it
++#   concretization:
++#     grid: unchanged 16x16 orange background (7)
++#     legend:
++#       - unchanged top-left 4x4 corner box
++#       - bottom row and right column are green border color 3
++#       - interior still shows exactly 3 distinct target colors once each
++#     components:
++#       - unchanged rectangular 0-filled bodies with sprinkled non-zero colors
++#       - deleted components now contain each legend color at least twice
++#       - at least one kept component intentionally contains all legend colors visibly, but one of
++#         those colors appears only once, so it survives in the new rule and would have been removed before
++#   behavior_trace:
++#     example_component_scan:
++#       legend = {1,4,8}
++#       component pixels in scan order carry colors [0,1,4,8,1,4,5]
++#       original_logic:
++#         present colors = {0,1,4,5,8} -> legend subset satisfied -> delete
++#       new_logic:
++#         first 0 ignored, first 1 ignored, first 4 ignored, first 8 ignored,
++#         second 1 adds 1, second 4 adds 4, 5 seen only once
++#         effective matching set = {1,4}
++#         legend color 8 never repeats -> keep
++#       difference:
++#         the component still visibly shows all three legend colors, but only repeated colors count
++#   complexity_calibration:
++#     - if kept components merely omitted target colors, many samples would still look compatible with the original task
++#     - to make D12 visible, generation always includes >= 1 "near miss" kept component that shows all 3
++#       legend colors while failing the repetition test
++#     - other kept components may miss colors entirely, which provides contrast without adding extra rule branches
++#   implicit_assumptions_from_original_main:
++#     - _bg_boundary and _find_legend remain valid because the legend geometry is unchanged
++#     - components_mask(g != bg, connectivity=4) must stay unchanged so color 0 still glues a rectangle together
++#     - the original line collecting {g[r,c] for pts} is no longer valid because singleton target pixels would
++#       incorrectly count; it is replaced with a scan-order repeated-color extractor
++#     - deletion still writes bg over the whole component, so generator must keep components disjoint and non-overlapping
++#   placement_legality:
++#     - legend stays in the top-left corner
++#     - every generated component is placed by random_free_location on its full rectangular bbox (all 0s count as occupied),
++#       with padding=1, so components do not overlap or touch
++#     - deleted components require at least 6 colored cells (2 copies x 3 targets); kept near-miss components require
++#       at least 5 colored cells (2,2,1 across the three targets); the sampled bbox ranges support that
++#   visual_observability:
++#     - humans can compare deleted objects versus near-miss kept objects by counting repeated legend colors inside each box
++#     - no hidden ordering by color id is used; scan order only implements "ignore first occurrence", which is visually
++#       equivalent to requiring duplicates, a directly observable property
++#   cleanliness:
++#     - no new overlays or markers are introduced
++#     - the same sparse colored-dot rectangles are preserved, avoiding extra visual clutter
++#   generator_guarantees_for_new_solver:
++#     - every puzzle has at least one deleted component and at least one kept near-miss component
++#     - kept near-miss components contain all legend colors, but exactly one chosen target remains singleton
++#     - kept missing components omit at least one legend color entirely
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _repeated_match_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """
++    Colors that survive the variant's matching rule.
++
++    We scan the component in row-major order and ignore the first pixel of each color.
++    A color is admitted only when its second occurrence is encountered.
++    """
++    seen_once: set[int] = set()
++    repeated: set[int] = set()
++    for r, c in sorted((int(r), int(c)) for r, c in pts):
++        col = int(g[r, c])
++        if col in seen_once:
++            repeated.add(col)
++        else:
++            seen_once.add(col)
++    return repeated
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Remove connected components only when every legend color repeats inside that component.
++
++    Input structure:
++    - Most of the board is a single background color.
++    - The top-left corner contains a small square legend with a uniform border on its bottom and right edges.
++    - Away from the legend, the foreground is split into 4-connected multicolor components carried by color-0 rectangles with colored speckles.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each foreground component, scan its pixels in row-major order and ignore the first pixel of every color.
++    - Treat only colors that appear again later in the same component as part of that component's matching set.
++    - Erase the component iff that repeated-color set contains all legend colors; otherwise leave it unchanged.
++
++    Key insight: The legend still specifies which colors matter, but now each target color must recur within a component, not merely appear once.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        match_colors = _repeated_match_colors(g, pts)
++        if legend_colors.issubset(match_colors):
++            for r, c in pts:
++                out[r, c] = bg
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of non-zero pixels) --
++DENSITY_LO = 0.12
++DENSITY_HI = 0.55
++
++# -- Component count & kept/deleted split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims() -> tuple[int, int]:
++    """Sample component (h, w) according to shape-mode weights."""
++    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _sample_colored_count(h: int, w: int, minimum: int) -> int:
++    area = h * w
++    lo = max(minimum, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    hi = min(hi, area)
++    lo = min(lo, hi)
++    return random.randint(lo, hi)
++
++
++def _deleted_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    colors = [color for color in targets for _ in range(2)]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(targets + non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _near_miss_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    weak = random.choice(targets)
++    strong = [color for color in targets if color != weak]
++    colors = [weak] + [strong[0], strong[0], strong[1], strong[1]]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _missing_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    used_target_count = random.randint(0, NUM_TARGETS - 1)
++    used_targets = random.sample(targets, used_target_count)
++    colors: list[int] = []
++    for color in used_targets:
++        colors.extend([color] * random.randint(1, 2))
++    while len(colors) > n_colored:
++        colors.pop()
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _component_patch(h: int, w: int, targets: list[int], style: str) -> np.ndarray:
++    """Build an h x w patch filled with color-0 base and colored pixels meeting the requested style."""
++    non_targets = [v for v in PALETTE if v not in targets]
++    if style == "deleted":
++        n_colored = _sample_colored_count(h, w, minimum=2 * NUM_TARGETS)
++        colors = _deleted_colors(targets, non_targets, n_colored)
++    elif style == "near_miss":
++        n_colored = _sample_colored_count(h, w, minimum=5)
++        colors = _near_miss_colors(targets, non_targets, n_colored)
++    elif style == "missing":
++        n_colored = _sample_colored_count(h, w, minimum=1)
++        colors = _missing_colors(targets, non_targets, n_colored)
++    else:
++        raise ValueError(f"unknown component style: {style}")
++
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_styles(component_count: int) -> list[str]:
++    deleted_count = component_count - NUM_KEPT
++    near_miss_count = random.randint(1, 2)
++    missing_count = NUM_KEPT - near_miss_count
++    styles = ["deleted"] * deleted_count + ["near_miss"] * near_miss_count + ["missing"] * missing_count
++    random.shuffle(styles)
++    return styles
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input whose solver output matches the intended keep/delete split."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    styles = _component_styles(component_count)
++
++    for style in styles:
++        h, w = _component_dims()
++        patch = _component_patch(h, w, targets, style)
++        try:
++            r, c = random_free_location(
++                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++        paste(inp, patch, r, c)
++        if style != "deleted":
++            paste(out, patch, r, c)
++
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+diff --git a/ceshi/code/d59b0160/D12/2/code.py b/ceshi/code/d59b0160/D12/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a55a4350ebd52ab24038b110e2936da7af7c7be
+--- /dev/null
++++ b/ceshi/code/d59b0160/D12/2/code.py
+@@ -0,0 +1,330 @@
++# Variant of d59b0160
++# Dimension: D12 — 颜色0在分量中的角色 (color_set_match)
++# Change: 颜色0（黑色）是连通分量中的有效颜色，参与连通性计算，但不出现在图例中因此不参与颜色匹配... → 忽略每种颜色的第一个像素进行匹配
++#
++# Design analysis
++# ===============
++# variant_spec:
++#   core_change:
++#     original_match: a component is deleted when every legend color appears at least once.
++#     new_match:
++#       - scan each 4-connected component in row-major order
++#       - ignore the first pixel of every color encountered in that component
++#       - a color enters the matching set only when its second pixel is seen
++#       - equivalently, only colors with multiplicity >= 2 count toward legend matching
++#     effect:
++#       - legend colors must be repeated inside a component, not merely present
++#       - color 0 still participates in connectivity because components are found on (grid != bg)
++#         exactly as before, but color 0 never appears in the legend and therefore never helps match it
++#   concretization:
++#     grid: unchanged 16x16 orange background (7)
++#     legend:
++#       - unchanged top-left 4x4 corner box
++#       - bottom row and right column are green border color 3
++#       - interior still shows exactly 3 distinct target colors once each
++#     components:
++#       - unchanged rectangular 0-filled bodies with sprinkled non-zero colors
++#       - deleted components now contain each legend color at least twice
++#       - at least one kept component intentionally contains all legend colors visibly, but one of
++#         those colors appears only once, so it survives in the new rule and would have been removed before
++#   behavior_trace:
++#     example_component_scan:
++#       legend = {1,4,8}
++#       component pixels in scan order carry colors [0,1,4,8,1,4,5]
++#       original_logic:
++#         present colors = {0,1,4,5,8} -> legend subset satisfied -> delete
++#       new_logic:
++#         first 0 ignored, first 1 ignored, first 4 ignored, first 8 ignored,
++#         second 1 adds 1, second 4 adds 4, 5 seen only once
++#         effective matching set = {1,4}
++#         legend color 8 never repeats -> keep
++#       difference:
++#         the component still visibly shows all three legend colors, but only repeated colors count
++#   complexity_calibration:
++#     - if kept components merely omitted target colors, many samples would still look compatible with the original task
++#     - to make D12 visible, generation always includes >= 1 "near miss" kept component that shows all 3
++#       legend colors while failing the repetition test
++#     - other kept components may miss colors entirely, which provides contrast without adding extra rule branches
++#   implicit_assumptions_from_original_main:
++#     - _bg_boundary and _find_legend remain valid because the legend geometry is unchanged
++#     - components_mask(g != bg, connectivity=4) must stay unchanged so color 0 still glues a rectangle together
++#     - the original line collecting {g[r,c] for pts} is no longer valid because singleton target pixels would
++#       incorrectly count; it is replaced with a scan-order repeated-color extractor
++#     - deletion still writes bg over the whole component, so generator must keep components disjoint and non-overlapping
++#   placement_legality:
++#     - legend stays in the top-left corner
++#     - every generated component is placed by random_free_location on its full rectangular bbox (all 0s count as occupied),
++#       with padding=1, so components do not overlap or touch
++#     - deleted components require at least 6 colored cells (2 copies x 3 targets); kept near-miss components require
++#       at least 5 colored cells (2,2,1 across the three targets); the sampled bbox ranges support that
++#   visual_observability:
++#     - humans can compare deleted objects versus near-miss kept objects by counting repeated legend colors inside each box
++#     - no hidden ordering by color id is used; scan order only implements "ignore first occurrence", which is visually
++#       equivalent to requiring duplicates, a directly observable property
++#   cleanliness:
++#     - no new overlays or markers are introduced
++#     - the same sparse colored-dot rectangles are preserved, avoiding extra visual clutter
++#   generator_guarantees_for_new_solver:
++#     - every puzzle has at least one deleted component and at least one kept near-miss component
++#     - kept near-miss components contain all legend colors, but exactly one chosen target remains singleton
++#     - kept missing components omit at least one legend color entirely
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _repeated_match_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """
++    Colors that survive the variant's matching rule.
++
++    We scan the component in row-major order and ignore the first pixel of each color.
++    A color is admitted only when its second occurrence is encountered.
++    """
++    seen_once: set[int] = set()
++    repeated: set[int] = set()
++    for r, c in sorted((int(r), int(c)) for r, c in pts):
++        col = int(g[r, c])
++        if col in seen_once:
++            repeated.add(col)
++        else:
++            seen_once.add(col)
++    return repeated
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Remove connected components only when every legend color repeats inside that component.
++
++    Input structure:
++    - Most of the board is a single background color.
++    - The top-left corner contains a small square legend with a uniform border on its bottom and right edges.
++    - Away from the legend, the foreground is split into 4-connected multicolor components carried by color-0 rectangles with colored speckles.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each foreground component, scan its pixels in row-major order and ignore the first pixel of every color.
++    - Treat only colors that appear again later in the same component as part of that component's matching set.
++    - Erase the component iff that repeated-color set contains all legend colors; otherwise leave it unchanged.
++
++    Key insight: The legend still specifies which colors matter, but now each target color must recur within a component, not merely appear once.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        match_colors = _repeated_match_colors(g, pts)
++        if legend_colors.issubset(match_colors):
++            for r, c in pts:
++                out[r, c] = bg
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of non-zero pixels) --
++DENSITY_LO = 0.12
++DENSITY_HI = 0.55
++
++# -- Component count & kept/deleted split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims() -> tuple[int, int]:
++    """Sample component (h, w) according to shape-mode weights."""
++    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _sample_colored_count(h: int, w: int, minimum: int) -> int:
++    area = h * w
++    lo = max(minimum, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    hi = min(hi, area)
++    lo = min(lo, hi)
++    return random.randint(lo, hi)
++
++
++def _deleted_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    colors = [color for color in targets for _ in range(2)]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(targets + non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _near_miss_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    weak = random.choice(targets)
++    strong = [color for color in targets if color != weak]
++    colors = [weak] + [strong[0], strong[0], strong[1], strong[1]]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _missing_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    used_target_count = random.randint(0, NUM_TARGETS - 1)
++    used_targets = random.sample(targets, used_target_count)
++    colors: list[int] = []
++    for color in used_targets:
++        colors.extend([color] * random.randint(1, 2))
++    while len(colors) > n_colored:
++        colors.pop()
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _component_patch(h: int, w: int, targets: list[int], style: str) -> np.ndarray:
++    """Build an h x w patch filled with color-0 base and colored pixels meeting the requested style."""
++    non_targets = [v for v in PALETTE if v not in targets]
++    if style == "deleted":
++        n_colored = _sample_colored_count(h, w, minimum=2 * NUM_TARGETS)
++        colors = _deleted_colors(targets, non_targets, n_colored)
++    elif style == "near_miss":
++        n_colored = _sample_colored_count(h, w, minimum=5)
++        colors = _near_miss_colors(targets, non_targets, n_colored)
++    elif style == "missing":
++        n_colored = _sample_colored_count(h, w, minimum=1)
++        colors = _missing_colors(targets, non_targets, n_colored)
++    else:
++        raise ValueError(f"unknown component style: {style}")
++
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_styles(component_count: int) -> list[str]:
++    deleted_count = component_count - NUM_KEPT
++    near_miss_count = random.randint(1, 2)
++    missing_count = NUM_KEPT - near_miss_count
++    styles = ["deleted"] * deleted_count + ["near_miss"] * near_miss_count + ["missing"] * missing_count
++    random.shuffle(styles)
++    return styles
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input whose solver output matches the intended keep/delete split."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    styles = _component_styles(component_count)
++
++    for style in styles:
++        h, w = _component_dims()
++        patch = _component_patch(h, w, targets, style)
++        try:
++            r, c = random_free_location(
++                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++        paste(inp, patch, r, c)
++        if style != "deleted":
++            paste(out, patch, r, c)
++
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+codex
+代码已经落盘。现在先跑题目要求的 50 次生成/求解稳定性测试，再看是否有生成退化或放置失败偏高的问题。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code/d59b0160/D12/2/code.py b/ceshi/code/d59b0160/D12/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a55a4350ebd52ab24038b110e2936da7af7c7be
+--- /dev/null
++++ b/ceshi/code/d59b0160/D12/2/code.py
+@@ -0,0 +1,330 @@
++# Variant of d59b0160
++# Dimension: D12 — 颜色0在分量中的角色 (color_set_match)
++# Change: 颜色0（黑色）是连通分量中的有效颜色，参与连通性计算，但不出现在图例中因此不参与颜色匹配... → 忽略每种颜色的第一个像素进行匹配
++#
++# Design analysis
++# ===============
++# variant_spec:
++#   core_change:
++#     original_match: a component is deleted when every legend color appears at least once.
++#     new_match:
++#       - scan each 4-connected component in row-major order
++#       - ignore the first pixel of every color encountered in that component
++#       - a color enters the matching set only when its second pixel is seen
++#       - equivalently, only colors with multiplicity >= 2 count toward legend matching
++#     effect:
++#       - legend colors must be repeated inside a component, not merely present
++#       - color 0 still participates in connectivity because components are found on (grid != bg)
++#         exactly as before, but color 0 never appears in the legend and therefore never helps match it
++#   concretization:
++#     grid: unchanged 16x16 orange background (7)
++#     legend:
++#       - unchanged top-left 4x4 corner box
++#       - bottom row and right column are green border color 3
++#       - interior still shows exactly 3 distinct target colors once each
++#     components:
++#       - unchanged rectangular 0-filled bodies with sprinkled non-zero colors
++#       - deleted components now contain each legend color at least twice
++#       - at least one kept component intentionally contains all legend colors visibly, but one of
++#         those colors appears only once, so it survives in the new rule and would have been removed before
++#   behavior_trace:
++#     example_component_scan:
++#       legend = {1,4,8}
++#       component pixels in scan order carry colors [0,1,4,8,1,4,5]
++#       original_logic:
++#         present colors = {0,1,4,5,8} -> legend subset satisfied -> delete
++#       new_logic:
++#         first 0 ignored, first 1 ignored, first 4 ignored, first 8 ignored,
++#         second 1 adds 1, second 4 adds 4, 5 seen only once
++#         effective matching set = {1,4}
++#         legend color 8 never repeats -> keep
++#       difference:
++#         the component still visibly shows all three legend colors, but only repeated colors count
++#   complexity_calibration:
++#     - if kept components merely omitted target colors, many samples would still look compatible with the original task
++#     - to make D12 visible, generation always includes >= 1 "near miss" kept component that shows all 3
++#       legend colors while failing the repetition test
++#     - other kept components may miss colors entirely, which provides contrast without adding extra rule branches
++#   implicit_assumptions_from_original_main:
++#     - _bg_boundary and _find_legend remain valid because the legend geometry is unchanged
++#     - components_mask(g != bg, connectivity=4) must stay unchanged so color 0 still glues a rectangle together
++#     - the original line collecting {g[r,c] for pts} is no longer valid because singleton target pixels would
++#       incorrectly count; it is replaced with a scan-order repeated-color extractor
++#     - deletion still writes bg over the whole component, so generator must keep components disjoint and non-overlapping
++#   placement_legality:
++#     - legend stays in the top-left corner
++#     - every generated component is placed by random_free_location on its full rectangular bbox (all 0s count as occupied),
++#       with padding=1, so components do not overlap or touch
++#     - deleted components require at least 6 colored cells (2 copies x 3 targets); kept near-miss components require
++#       at least 5 colored cells (2,2,1 across the three targets); the sampled bbox ranges support that
++#   visual_observability:
++#     - humans can compare deleted objects versus near-miss kept objects by counting repeated legend colors inside each box
++#     - no hidden ordering by color id is used; scan order only implements "ignore first occurrence", which is visually
++#       equivalent to requiring duplicates, a directly observable property
++#   cleanliness:
++#     - no new overlays or markers are introduced
++#     - the same sparse colored-dot rectangles are preserved, avoiding extra visual clutter
++#   generator_guarantees_for_new_solver:
++#     - every puzzle has at least one deleted component and at least one kept near-miss component
++#     - kept near-miss components contain all legend colors, but exactly one chosen target remains singleton
++#     - kept missing components omit at least one legend color entirely
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _repeated_match_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """
++    Colors that survive the variant's matching rule.
++
++    We scan the component in row-major order and ignore the first pixel of each color.
++    A color is admitted only when its second occurrence is encountered.
++    """
++    seen_once: set[int] = set()
++    repeated: set[int] = set()
++    for r, c in sorted((int(r), int(c)) for r, c in pts):
++        col = int(g[r, c])
++        if col in seen_once:
++            repeated.add(col)
++        else:
++            seen_once.add(col)
++    return repeated
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Remove connected components only when every legend color repeats inside that component.
++
++    Input structure:
++    - Most of the board is a single background color.
++    - The top-left corner contains a small square legend with a uniform border on its bottom and right edges.
++    - Away from the legend, the foreground is split into 4-connected multicolor components carried by color-0 rectangles with colored speckles.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each foreground component, scan its pixels in row-major order and ignore the first pixel of every color.
++    - Treat only colors that appear again later in the same component as part of that component's matching set.
++    - Erase the component iff that repeated-color set contains all legend colors; otherwise leave it unchanged.
++
++    Key insight: The legend still specifies which colors matter, but now each target color must recur within a component, not merely appear once.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        match_colors = _repeated_match_colors(g, pts)
++        if legend_colors.issubset(match_colors):
++            for r, c in pts:
++                out[r, c] = bg
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of non-zero pixels) --
++DENSITY_LO = 0.12
++DENSITY_HI = 0.55
++
++# -- Component count & kept/deleted split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims() -> tuple[int, int]:
++    """Sample component (h, w) according to shape-mode weights."""
++    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _sample_colored_count(h: int, w: int, minimum: int) -> int:
++    area = h * w
++    lo = max(minimum, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    hi = min(hi, area)
++    lo = min(lo, hi)
++    return random.randint(lo, hi)
++
++
++def _deleted_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    colors = [color for color in targets for _ in range(2)]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(targets + non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _near_miss_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    weak = random.choice(targets)
++    strong = [color for color in targets if color != weak]
++    colors = [weak] + [strong[0], strong[0], strong[1], strong[1]]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _missing_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    used_target_count = random.randint(0, NUM_TARGETS - 1)
++    used_targets = random.sample(targets, used_target_count)
++    colors: list[int] = []
++    for color in used_targets:
++        colors.extend([color] * random.randint(1, 2))
++    while len(colors) > n_colored:
++        colors.pop()
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _component_patch(h: int, w: int, targets: list[int], style: str) -> np.ndarray:
++    """Build an h x w patch filled with color-0 base and colored pixels meeting the requested style."""
++    non_targets = [v for v in PALETTE if v not in targets]
++    if style == "deleted":
++        n_colored = _sample_colored_count(h, w, minimum=2 * NUM_TARGETS)
++        colors = _deleted_colors(targets, non_targets, n_colored)
++    elif style == "near_miss":
++        n_colored = _sample_colored_count(h, w, minimum=5)
++        colors = _near_miss_colors(targets, non_targets, n_colored)
++    elif style == "missing":
++        n_colored = _sample_colored_count(h, w, minimum=1)
++        colors = _missing_colors(targets, non_targets, n_colored)
++    else:
++        raise ValueError(f"unknown component style: {style}")
++
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_styles(component_count: int) -> list[str]:
++    deleted_count = component_count - NUM_KEPT
++    near_miss_count = random.randint(1, 2)
++    missing_count = NUM_KEPT - near_miss_count
++    styles = ["deleted"] * deleted_count + ["near_miss"] * near_miss_count + ["missing"] * missing_count
++    random.shuffle(styles)
++    return styles
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input whose solver output matches the intended keep/delete split."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    styles = _component_styles(component_count)
++
++    for style in styles:
++        h, w = _component_dims()
++        patch = _component_patch(h, w, targets, style)
++        try:
++            r, c = random_free_location(
++                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++        paste(inp, patch, r, c)
++        if style != "deleted":
++            paste(out, patch, r, c)
++
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+codex
+稳定性测试还在跑；如果通过，下一步会直接做“和原题输出差异”的量化验证，确认样本里确实存在“颜色都看见了但因单次出现而保留”的新行为。
+diff --git a/ceshi/code/d59b0160/D12/2/code.py b/ceshi/code/d59b0160/D12/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a55a4350ebd52ab24038b110e2936da7af7c7be
+--- /dev/null
++++ b/ceshi/code/d59b0160/D12/2/code.py
+@@ -0,0 +1,330 @@
++# Variant of d59b0160
++# Dimension: D12 — 颜色0在分量中的角色 (color_set_match)
++# Change: 颜色0（黑色）是连通分量中的有效颜色，参与连通性计算，但不出现在图例中因此不参与颜色匹配... → 忽略每种颜色的第一个像素进行匹配
++#
++# Design analysis
++# ===============
++# variant_spec:
++#   core_change:
++#     original_match: a component is deleted when every legend color appears at least once.
++#     new_match:
++#       - scan each 4-connected component in row-major order
++#       - ignore the first pixel of every color encountered in that component
++#       - a color enters the matching set only when its second pixel is seen
++#       - equivalently, only colors with multiplicity >= 2 count toward legend matching
++#     effect:
++#       - legend colors must be repeated inside a component, not merely present
++#       - color 0 still participates in connectivity because components are found on (grid != bg)
++#         exactly as before, but color 0 never appears in the legend and therefore never helps match it
++#   concretization:
++#     grid: unchanged 16x16 orange background (7)
++#     legend:
++#       - unchanged top-left 4x4 corner box
++#       - bottom row and right column are green border color 3
++#       - interior still shows exactly 3 distinct target colors once each
++#     components:
++#       - unchanged rectangular 0-filled bodies with sprinkled non-zero colors
++#       - deleted components now contain each legend color at least twice
++#       - at least one kept component intentionally contains all legend colors visibly, but one of
++#         those colors appears only once, so it survives in the new rule and would have been removed before
++#   behavior_trace:
++#     example_component_scan:
++#       legend = {1,4,8}
++#       component pixels in scan order carry colors [0,1,4,8,1,4,5]
++#       original_logic:
++#         present colors = {0,1,4,5,8} -> legend subset satisfied -> delete
++#       new_logic:
++#         first 0 ignored, first 1 ignored, first 4 ignored, first 8 ignored,
++#         second 1 adds 1, second 4 adds 4, 5 seen only once
++#         effective matching set = {1,4}
++#         legend color 8 never repeats -> keep
++#       difference:
++#         the component still visibly shows all three legend colors, but only repeated colors count
++#   complexity_calibration:
++#     - if kept components merely omitted target colors, many samples would still look compatible with the original task
++#     - to make D12 visible, generation always includes >= 1 "near miss" kept component that shows all 3
++#       legend colors while failing the repetition test
++#     - other kept components may miss colors entirely, which provides contrast without adding extra rule branches
++#   implicit_assumptions_from_original_main:
++#     - _bg_boundary and _find_legend remain valid because the legend geometry is unchanged
++#     - components_mask(g != bg, connectivity=4) must stay unchanged so color 0 still glues a rectangle together
++#     - the original line collecting {g[r,c] for pts} is no longer valid because singleton target pixels would
++#       incorrectly count; it is replaced with a scan-order repeated-color extractor
++#     - deletion still writes bg over the whole component, so generator must keep components disjoint and non-overlapping
++#   placement_legality:
++#     - legend stays in the top-left corner
++#     - every generated component is placed by random_free_location on its full rectangular bbox (all 0s count as occupied),
++#       with padding=1, so components do not overlap or touch
++#     - deleted components require at least 6 colored cells (2 copies x 3 targets); kept near-miss components require
++#       at least 5 colored cells (2,2,1 across the three targets); the sampled bbox ranges support that
++#   visual_observability:
++#     - humans can compare deleted objects versus near-miss kept objects by counting repeated legend colors inside each box
++#     - no hidden ordering by color id is used; scan order only implements "ignore first occurrence", which is visually
++#       equivalent to requiring duplicates, a directly observable property
++#   cleanliness:
++#     - no new overlays or markers are introduced
++#     - the same sparse colored-dot rectangles are preserved, avoiding extra visual clutter
++#   generator_guarantees_for_new_solver:
++#     - every puzzle has at least one deleted component and at least one kept near-miss component
++#     - kept near-miss components contain all legend colors, but exactly one chosen target remains singleton
++#     - kept missing components omit at least one legend color entirely
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _repeated_match_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """
++    Colors that survive the variant's matching rule.
++
++    We scan the component in row-major order and ignore the first pixel of each color.
++    A color is admitted only when its second occurrence is encountered.
++    """
++    seen_once: set[int] = set()
++    repeated: set[int] = set()
++    for r, c in sorted((int(r), int(c)) for r, c in pts):
++        col = int(g[r, c])
++        if col in seen_once:
++            repeated.add(col)
++        else:
++            seen_once.add(col)
++    return repeated
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Remove connected components only when every legend color repeats inside that component.
++
++    Input structure:
++    - Most of the board is a single background color.
++    - The top-left corner contains a small square legend with a uniform border on its bottom and right edges.
++    - Away from the legend, the foreground is split into 4-connected multicolor components carried by color-0 rectangles with colored speckles.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each foreground component, scan its pixels in row-major order and ignore the first pixel of every color.
++    - Treat only colors that appear again later in the same component as part of that component's matching set.
++    - Erase the component iff that repeated-color set contains all legend colors; otherwise leave it unchanged.
++
++    Key insight: The legend still specifies which colors matter, but now each target color must recur within a component, not merely appear once.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        match_colors = _repeated_match_colors(g, pts)
++        if legend_colors.issubset(match_colors):
++            for r, c in pts:
++                out[r, c] = bg
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of non-zero pixels) --
++DENSITY_LO = 0.12
++DENSITY_HI = 0.55
++
++# -- Component count & kept/deleted split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims() -> tuple[int, int]:
++    """Sample component (h, w) according to shape-mode weights."""
++    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _sample_colored_count(h: int, w: int, minimum: int) -> int:
++    area = h * w
++    lo = max(minimum, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    hi = min(hi, area)
++    lo = min(lo, hi)
++    return random.randint(lo, hi)
++
++
++def _deleted_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    colors = [color for color in targets for _ in range(2)]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(targets + non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _near_miss_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    weak = random.choice(targets)
++    strong = [color for color in targets if color != weak]
++    colors = [weak] + [strong[0], strong[0], strong[1], strong[1]]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _missing_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    used_target_count = random.randint(0, NUM_TARGETS - 1)
++    used_targets = random.sample(targets, used_target_count)
++    colors: list[int] = []
++    for color in used_targets:
++        colors.extend([color] * random.randint(1, 2))
++    while len(colors) > n_colored:
++        colors.pop()
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _component_patch(h: int, w: int, targets: list[int], style: str) -> np.ndarray:
++    """Build an h x w patch filled with color-0 base and colored pixels meeting the requested style."""
++    non_targets = [v for v in PALETTE if v not in targets]
++    if style == "deleted":
++        n_colored = _sample_colored_count(h, w, minimum=2 * NUM_TARGETS)
++        colors = _deleted_colors(targets, non_targets, n_colored)
++    elif style == "near_miss":
++        n_colored = _sample_colored_count(h, w, minimum=5)
++        colors = _near_miss_colors(targets, non_targets, n_colored)
++    elif style == "missing":
++        n_colored = _sample_colored_count(h, w, minimum=1)
++        colors = _missing_colors(targets, non_targets, n_colored)
++    else:
++        raise ValueError(f"unknown component style: {style}")
++
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_styles(component_count: int) -> list[str]:
++    deleted_count = component_count - NUM_KEPT
++    near_miss_count = random.randint(1, 2)
++    missing_count = NUM_KEPT - near_miss_count
++    styles = ["deleted"] * deleted_count + ["near_miss"] * near_miss_count + ["missing"] * missing_count
++    random.shuffle(styles)
++    return styles
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input whose solver output matches the intended keep/delete split."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    styles = _component_styles(component_count)
++
++    for style in styles:
++        h, w = _component_dims()
++        patch = _component_patch(h, w, targets, style)
++        try:
++            r, c = random_free_location(
++                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++        paste(inp, patch, r, c)
++        if style != "deleted":
++            paste(out, patch, r, c)
++
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+ succeeded in 5103ms:
+Success: 50/50, Time: 4.8s (96ms/call)
+
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util
+import numpy as np
+from arc_utils import components_mask
+
+variant_path='/home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py'
+orig_path='/home/lixinyu/snap/new/arc2_solver_select/d59b0160.py'
+
+def load(path,name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+variant = load(variant_path, 'variant')
+orig = load(orig_path, 'orig')
+
+def repeated_colors(g, pts):
+    seen=set(); rep=set()
+    for r,c in sorted((int(r), int(c)) for r,c in pts):
+        col=int(g[r,c])
+        if col in seen:
+            rep.add(col)
+        else:
+            seen.add(col)
+    return rep
+
+samples = 100
+diff_outputs = 0
+near_miss_puzzles = 0
+near_miss_components = []
+deleted_counts = []
+for _ in range(samples):
+    inp = variant.generate_input()
+    vout = variant.main(inp)
+    oout = orig.main(inp)
+    if not np.array_equal(vout, oout):
+        diff_outputs += 1
+    bg = variant._bg_boundary(inp)
+    _, _, legend = variant._find_legend(inp, bg)
+    comps = components_mask(inp "'!= bg, connectivity=4)
+    nm = 0
+    deleted = 0
+    for pts in comps:
+        cols = {int(inp[r,c]) for r,c in pts}
+        rep = repeated_colors(inp, pts)
+        if legend.issubset(cols) and not legend.issubset(rep):
+            nm += 1
+        if legend.issubset(rep):
+            deleted += 1
+    if nm > 0:
+        near_miss_puzzles += 1
+    near_miss_components.append(nm)
+    deleted_counts.append(deleted)
+
+print('"'samples', samples)
+print('outputs_differ_from_original', diff_outputs)
+print('puzzles_with_near_miss', near_miss_puzzles)
+print('near_miss_component_counts', {k: near_miss_components.count(k) for k in sorted(set(near_miss_components))})
+print('deleted_component_counts', {k: deleted_counts.count(k) for k in sorted(set(deleted_counts))})
+print('avg_near_miss_components', sum(near_miss_components)/samples)
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code/d59b0160/D12/2/code.py b/ceshi/code/d59b0160/D12/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a55a4350ebd52ab24038b110e2936da7af7c7be
+--- /dev/null
++++ b/ceshi/code/d59b0160/D12/2/code.py
+@@ -0,0 +1,330 @@
++# Variant of d59b0160
++# Dimension: D12 — 颜色0在分量中的角色 (color_set_match)
++# Change: 颜色0（黑色）是连通分量中的有效颜色，参与连通性计算，但不出现在图例中因此不参与颜色匹配... → 忽略每种颜色的第一个像素进行匹配
++#
++# Design analysis
++# ===============
++# variant_spec:
++#   core_change:
++#     original_match: a component is deleted when every legend color appears at least once.
++#     new_match:
++#       - scan each 4-connected component in row-major order
++#       - ignore the first pixel of every color encountered in that component
++#       - a color enters the matching set only when its second pixel is seen
++#       - equivalently, only colors with multiplicity >= 2 count toward legend matching
++#     effect:
++#       - legend colors must be repeated inside a component, not merely present
++#       - color 0 still participates in connectivity because components are found on (grid != bg)
++#         exactly as before, but color 0 never appears in the legend and therefore never helps match it
++#   concretization:
++#     grid: unchanged 16x16 orange background (7)
++#     legend:
++#       - unchanged top-left 4x4 corner box
++#       - bottom row and right column are green border color 3
++#       - interior still shows exactly 3 distinct target colors once each
++#     components:
++#       - unchanged rectangular 0-filled bodies with sprinkled non-zero colors
++#       - deleted components now contain each legend color at least twice
++#       - at least one kept component intentionally contains all legend colors visibly, but one of
++#         those colors appears only once, so it survives in the new rule and would have been removed before
++#   behavior_trace:
++#     example_component_scan:
++#       legend = {1,4,8}
++#       component pixels in scan order carry colors [0,1,4,8,1,4,5]
++#       original_logic:
++#         present colors = {0,1,4,5,8} -> legend subset satisfied -> delete
++#       new_logic:
++#         first 0 ignored, first 1 ignored, first 4 ignored, first 8 ignored,
++#         second 1 adds 1, second 4 adds 4, 5 seen only once
++#         effective matching set = {1,4}
++#         legend color 8 never repeats -> keep
++#       difference:
++#         the component still visibly shows all three legend colors, but only repeated colors count
++#   complexity_calibration:
++#     - if kept components merely omitted target colors, many samples would still look compatible with the original task
++#     - to make D12 visible, generation always includes >= 1 "near miss" kept component that shows all 3
++#       legend colors while failing the repetition test
++#     - other kept components may miss colors entirely, which provides contrast without adding extra rule branches
++#   implicit_assumptions_from_original_main:
++#     - _bg_boundary and _find_legend remain valid because the legend geometry is unchanged
++#     - components_mask(g != bg, connectivity=4) must stay unchanged so color 0 still glues a rectangle together
++#     - the original line collecting {g[r,c] for pts} is no longer valid because singleton target pixels would
++#       incorrectly count; it is replaced with a scan-order repeated-color extractor
++#     - deletion still writes bg over the whole component, so generator must keep components disjoint and non-overlapping
++#   placement_legality:
++#     - legend stays in the top-left corner
++#     - every generated component is placed by random_free_location on its full rectangular bbox (all 0s count as occupied),
++#       with padding=1, so components do not overlap or touch
++#     - deleted components require at least 6 colored cells (2 copies x 3 targets); kept near-miss components require
++#       at least 5 colored cells (2,2,1 across the three targets); the sampled bbox ranges support that
++#   visual_observability:
++#     - humans can compare deleted objects versus near-miss kept objects by counting repeated legend colors inside each box
++#     - no hidden ordering by color id is used; scan order only implements "ignore first occurrence", which is visually
++#       equivalent to requiring duplicates, a directly observable property
++#   cleanliness:
++#     - no new overlays or markers are introduced
++#     - the same sparse colored-dot rectangles are preserved, avoiding extra visual clutter
++#   generator_guarantees_for_new_solver:
++#     - every puzzle has at least one deleted component and at least one kept near-miss component
++#     - kept near-miss components contain all legend colors, but exactly one chosen target remains singleton
++#     - kept missing components omit at least one legend color entirely
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _repeated_match_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """
++    Colors that survive the variant's matching rule.
++
++    We scan the component in row-major order and ignore the first pixel of each color.
++    A color is admitted only when its second occurrence is encountered.
++    """
++    seen_once: set[int] = set()
++    repeated: set[int] = set()
++    for r, c in sorted((int(r), int(c)) for r, c in pts):
++        col = int(g[r, c])
++        if col in seen_once:
++            repeated.add(col)
++        else:
++            seen_once.add(col)
++    return repeated
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Remove connected components only when every legend color repeats inside that component.
++
++    Input structure:
++    - Most of the board is a single background color.
++    - The top-left corner contains a small square legend with a uniform border on its bottom and right edges.
++    - Away from the legend, the foreground is split into 4-connected multicolor components carried by color-0 rectangles with colored speckles.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each foreground component, scan its pixels in row-major order and ignore the first pixel of every color.
++    - Treat only colors that appear again later in the same component as part of that component's matching set.
++    - Erase the component iff that repeated-color set contains all legend colors; otherwise leave it unchanged.
++
++    Key insight: The legend still specifies which colors matter, but now each target color must recur within a component, not merely appear once.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        match_colors = _repeated_match_colors(g, pts)
++        if legend_colors.issubset(match_colors):
++            for r, c in pts:
++                out[r, c] = bg
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of non-zero pixels) --
++DENSITY_LO = 0.12
++DENSITY_HI = 0.55
++
++# -- Component count & kept/deleted split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims() -> tuple[int, int]:
++    """Sample component (h, w) according to shape-mode weights."""
++    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _sample_colored_count(h: int, w: int, minimum: int) -> int:
++    area = h * w
++    lo = max(minimum, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    hi = min(hi, area)
++    lo = min(lo, hi)
++    return random.randint(lo, hi)
++
++
++def _deleted_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    colors = [color for color in targets for _ in range(2)]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(targets + non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _near_miss_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    weak = random.choice(targets)
++    strong = [color for color in targets if color != weak]
++    colors = [weak] + [strong[0], strong[0], strong[1], strong[1]]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _missing_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    used_target_count = random.randint(0, NUM_TARGETS - 1)
++    used_targets = random.sample(targets, used_target_count)
++    colors: list[int] = []
++    for color in used_targets:
++        colors.extend([color] * random.randint(1, 2))
++    while len(colors) > n_colored:
++        colors.pop()
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _component_patch(h: int, w: int, targets: list[int], style: str) -> np.ndarray:
++    """Build an h x w patch filled with color-0 base and colored pixels meeting the requested style."""
++    non_targets = [v for v in PALETTE if v not in targets]
++    if style == "deleted":
++        n_colored = _sample_colored_count(h, w, minimum=2 * NUM_TARGETS)
++        colors = _deleted_colors(targets, non_targets, n_colored)
++    elif style == "near_miss":
++        n_colored = _sample_colored_count(h, w, minimum=5)
++        colors = _near_miss_colors(targets, non_targets, n_colored)
++    elif style == "missing":
++        n_colored = _sample_colored_count(h, w, minimum=1)
++        colors = _missing_colors(targets, non_targets, n_colored)
++    else:
++        raise ValueError(f"unknown component style: {style}")
++
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_styles(component_count: int) -> list[str]:
++    deleted_count = component_count - NUM_KEPT
++    near_miss_count = random.randint(1, 2)
++    missing_count = NUM_KEPT - near_miss_count
++    styles = ["deleted"] * deleted_count + ["near_miss"] * near_miss_count + ["missing"] * missing_count
++    random.shuffle(styles)
++    return styles
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input whose solver output matches the intended keep/delete split."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    styles = _component_styles(component_count)
++
++    for style in styles:
++        h, w = _component_dims()
++        patch = _component_patch(h, w, targets, style)
++        try:
++            r, c = random_free_location(
++                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++        paste(inp, patch, r, c)
++        if style != "deleted":
++            paste(out, patch, r, c)
++
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+diff --git a/ceshi/code/d59b0160/D12/2/code.py b/ceshi/code/d59b0160/D12/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a55a4350ebd52ab24038b110e2936da7af7c7be
+--- /dev/null
++++ b/ceshi/code/d59b0160/D12/2/code.py
+@@ -0,0 +1,330 @@
++# Variant of d59b0160
++# Dimension: D12 — 颜色0在分量中的角色 (color_set_match)
++# Change: 颜色0（黑色）是连通分量中的有效颜色，参与连通性计算，但不出现在图例中因此不参与颜色匹配... → 忽略每种颜色的第一个像素进行匹配
++#
++# Design analysis
++# ===============
++# variant_spec:
++#   core_change:
++#     original_match: a component is deleted when every legend color appears at least once.
++#     new_match:
++#       - scan each 4-connected component in row-major order
++#       - ignore the first pixel of every color encountered in that component
++#       - a color enters the matching set only when its second pixel is seen
++#       - equivalently, only colors with multiplicity >= 2 count toward legend matching
++#     effect:
++#       - legend colors must be repeated inside a component, not merely present
++#       - color 0 still participates in connectivity because components are found on (grid != bg)
++#         exactly as before, but color 0 never appears in the legend and therefore never helps match it
++#   concretization:
++#     grid: unchanged 16x16 orange background (7)
++#     legend:
++#       - unchanged top-left 4x4 corner box
++#       - bottom row and right column are green border color 3
++#       - interior still shows exactly 3 distinct target colors once each
++#     components:
++#       - unchanged rectangular 0-filled bodies with sprinkled non-zero colors
++#       - deleted components now contain each legend color at least twice
++#       - at least one kept component intentionally contains all legend colors visibly, but one of
++#         those colors appears only once, so it survives in the new rule and would have been removed before
++#   behavior_trace:
++#     example_component_scan:
++#       legend = {1,4,8}
++#       component pixels in scan order carry colors [0,1,4,8,1,4,5]
++#       original_logic:
++#         present colors = {0,1,4,5,8} -> legend subset satisfied -> delete
++#       new_logic:
++#         first 0 ignored, first 1 ignored, first 4 ignored, first 8 ignored,
++#         second 1 adds 1, second 4 adds 4, 5 seen only once
++#         effective matching set = {1,4}
++#         legend color 8 never repeats -> keep
++#       difference:
++#         the component still visibly shows all three legend colors, but only repeated colors count
++#   complexity_calibration:
++#     - if kept components merely omitted target colors, many samples would still look compatible with the original task
++#     - to make D12 visible, generation always includes >= 1 "near miss" kept component that shows all 3
++#       legend colors while failing the repetition test
++#     - other kept components may miss colors entirely, which provides contrast without adding extra rule branches
++#   implicit_assumptions_from_original_main:
++#     - _bg_boundary and _find_legend remain valid because the legend geometry is unchanged
++#     - components_mask(g != bg, connectivity=4) must stay unchanged so color 0 still glues a rectangle together
++#     - the original line collecting {g[r,c] for pts} is no longer valid because singleton target pixels would
++#       incorrectly count; it is replaced with a scan-order repeated-color extractor
++#     - deletion still writes bg over the whole component, so generator must keep components disjoint and non-overlapping
++#   placement_legality:
++#     - legend stays in the top-left corner
++#     - every generated component is placed by random_free_location on its full rectangular bbox (all 0s count as occupied),
++#       with padding=1, so components do not overlap or touch
++#     - deleted components require at least 6 colored cells (2 copies x 3 targets); kept near-miss components require
++#       at least 5 colored cells (2,2,1 across the three targets); the sampled bbox ranges support that
++#   visual_observability:
++#     - humans can compare deleted objects versus near-miss kept objects by counting repeated legend colors inside each box
++#     - no hidden ordering by color id is used; scan order only implements "ignore first occurrence", which is visually
++#       equivalent to requiring duplicates, a directly observable property
++#   cleanliness:
++#     - no new overlays or markers are introduced
++#     - the same sparse colored-dot rectangles are preserved, avoiding extra visual clutter
++#   generator_guarantees_for_new_solver:
++#     - every puzzle has at least one deleted component and at least one kept near-miss component
++#     - kept near-miss components contain all legend colors, but exactly one chosen target remains singleton
++#     - kept missing components omit at least one legend color entirely
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _repeated_match_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """
++    Colors that survive the variant's matching rule.
++
++    We scan the component in row-major order and ignore the first pixel of each color.
++    A color is admitted only when its second occurrence is encountered.
++    """
++    seen_once: set[int] = set()
++    repeated: set[int] = set()
++    for r, c in sorted((int(r), int(c)) for r, c in pts):
++        col = int(g[r, c])
++        if col in seen_once:
++            repeated.add(col)
++        else:
++            seen_once.add(col)
++    return repeated
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Remove connected components only when every legend color repeats inside that component.
++
++    Input structure:
++    - Most of the board is a single background color.
++    - The top-left corner contains a small square legend with a uniform border on its bottom and right edges.
++    - Away from the legend, the foreground is split into 4-connected multicolor components carried by color-0 rectangles with colored speckles.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each foreground component, scan its pixels in row-major order and ignore the first pixel of every color.
++    - Treat only colors that appear again later in the same component as part of that component's matching set.
++    - Erase the component iff that repeated-color set contains all legend colors; otherwise leave it unchanged.
++
++    Key insight: The legend still specifies which colors matter, but now each target color must recur within a component, not merely appear once.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        match_colors = _repeated_match_colors(g, pts)
++        if legend_colors.issubset(match_colors):
++            for r, c in pts:
++                out[r, c] = bg
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of non-zero pixels) --
++DENSITY_LO = 0.12
++DENSITY_HI = 0.55
++
++# -- Component count & kept/deleted split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims() -> tuple[int, int]:
++    """Sample component (h, w) according to shape-mode weights."""
++    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _sample_colored_count(h: int, w: int, minimum: int) -> int:
++    area = h * w
++    lo = max(minimum, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    hi = min(hi, area)
++    lo = min(lo, hi)
++    return random.randint(lo, hi)
++
++
++def _deleted_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    colors = [color for color in targets for _ in range(2)]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(targets + non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _near_miss_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    weak = random.choice(targets)
++    strong = [color for color in targets if color != weak]
++    colors = [weak] + [strong[0], strong[0], strong[1], strong[1]]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _missing_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    used_target_count = random.randint(0, NUM_TARGETS - 1)
++    used_targets = random.sample(targets, used_target_count)
++    colors: list[int] = []
++    for color in used_targets:
++        colors.extend([color] * random.randint(1, 2))
++    while len(colors) > n_colored:
++        colors.pop()
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _component_patch(h: int, w: int, targets: list[int], style: str) -> np.ndarray:
++    """Build an h x w patch filled with color-0 base and colored pixels meeting the requested style."""
++    non_targets = [v for v in PALETTE if v not in targets]
++    if style == "deleted":
++        n_colored = _sample_colored_count(h, w, minimum=2 * NUM_TARGETS)
++        colors = _deleted_colors(targets, non_targets, n_colored)
++    elif style == "near_miss":
++        n_colored = _sample_colored_count(h, w, minimum=5)
++        colors = _near_miss_colors(targets, non_targets, n_colored)
++    elif style == "missing":
++        n_colored = _sample_colored_count(h, w, minimum=1)
++        colors = _missing_colors(targets, non_targets, n_colored)
++    else:
++        raise ValueError(f"unknown component style: {style}")
++
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_styles(component_count: int) -> list[str]:
++    deleted_count = component_count - NUM_KEPT
++    near_miss_count = random.randint(1, 2)
++    missing_count = NUM_KEPT - near_miss_count
++    styles = ["deleted"] * deleted_count + ["near_miss"] * near_miss_count + ["missing"] * missing_count
++    random.shuffle(styles)
++    return styles
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input whose solver output matches the intended keep/delete split."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    styles = _component_styles(component_count)
++
++    for style in styles:
++        h, w = _component_dims()
++        patch = _component_patch(h, w, targets, style)
++        try:
++            r, c = random_free_location(
++                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++        paste(inp, patch, r, c)
++        if style != "deleted":
++            paste(out, patch, r, c)
++
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+ succeeded in 7801ms:
+samples 100
+outputs_differ_from_original 100
+puzzles_with_near_miss 100
+near_miss_component_counts {1: 45, 2: 55}
+deleted_component_counts {1: 38, 2: 31, 3: 31}
+avg_near_miss_components 1.55
+
+codex
+稳定性和行为分布都对：50/50 通过；另外抽样 100 个输入里，100 个都和原 solver 产生不同输出，且每个样本至少含 1 个 near-miss 保留分量，说明变体没有退化回原题。最后再看一下成品文件的关键行号，方便给你交代改动点。
+exec
+/bin/bash -lc "nl -ba /home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py | sed -n '1,260p'" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+     1	# Variant of d59b0160
+     2	# Dimension: D12 — 颜色0在分量中的角色 (color_set_match)
+     3	# Change: 颜色0（黑色）是连通分量中的有效颜色，参与连通性计算，但不出现在图例中因此不参与颜色匹配... → 忽略每种颜色的第一个像素进行匹配
+     4	#
+     5	# Design analysis
+     6	# ===============
+     7	# variant_spec:
+     8	#   core_change:
+     9	#     original_match: a component is deleted when every legend color appears at least once.
+    10	#     new_match:
+    11	#       - scan each 4-connected component in row-major order
+    12	#       - ignore the first pixel of every color encountered in that component
+    13	#       - a color enters the matching set only when its second pixel is seen
+    14	#       - equivalently, only colors with multiplicity >= 2 count toward legend matching
+    15	#     effect:
+    16	#       - legend colors must be repeated inside a component, not merely present
+    17	#       - color 0 still participates in connectivity because components are found on (grid != bg)
+    18	#         exactly as before, but color 0 never appears in the legend and therefore never helps match it
+    19	#   concretization:
+    20	#     grid: unchanged 16x16 orange background (7)
+    21	#     legend:
+    22	#       - unchanged top-left 4x4 corner box
+    23	#       - bottom row and right column are green border color 3
+    24	#       - interior still shows exactly 3 distinct target colors once each
+    25	#     components:
+    26	#       - unchanged rectangular 0-filled bodies with sprinkled non-zero colors
+    27	#       - deleted components now contain each legend color at least twice
+    28	#       - at least one kept component intentionally contains all legend colors visibly, but one of
+    29	#         those colors appears only once, so it survives in the new rule and would have been removed before
+    30	#   behavior_trace:
+    31	#     example_component_scan:
+    32	#       legend = {1,4,8}
+    33	#       component pixels in scan order carry colors [0,1,4,8,1,4,5]
+    34	#       original_logic:
+    35	#         present colors = {0,1,4,5,8} -> legend subset satisfied -> delete
+    36	#       new_logic:
+    37	#         first 0 ignored, first 1 ignored, first 4 ignored, first 8 ignored,
+    38	#         second 1 adds 1, second 4 adds 4, 5 seen only once
+    39	#         effective matching set = {1,4}
+    40	#         legend color 8 never repeats -> keep
+    41	#       difference:
+    42	#         the component still visibly shows all three legend colors, but only repeated colors count
+    43	#   complexity_calibration:
+    44	#     - if kept components merely omitted target colors, many samples would still look compatible with the original task
+    45	#     - to make D12 visible, generation always includes >= 1 "near miss" kept component that shows all 3
+    46	#       legend colors while failing the repetition test
+    47	#     - other kept components may miss colors entirely, which provides contrast without adding extra rule branches
+    48	#   implicit_assumptions_from_original_main:
+    49	#     - _bg_boundary and _find_legend remain valid because the legend geometry is unchanged
+    50	#     - components_mask(g != bg, connectivity=4) must stay unchanged so color 0 still glues a rectangle together
+    51	#     - the original line collecting {g[r,c] for pts} is no longer valid because singleton target pixels would
+    52	#       incorrectly count; it is replaced with a scan-order repeated-color extractor
+    53	#     - deletion still writes bg over the whole component, so generator must keep components disjoint and non-overlapping
+    54	#   placement_legality:
+    55	#     - legend stays in the top-left corner
+    56	#     - every generated component is placed by random_free_location on its full rectangular bbox (all 0s count as occupied),
+    57	#       with padding=1, so components do not overlap or touch
+    58	#     - deleted components require at least 6 colored cells (2 copies x 3 targets); kept near-miss components require
+    59	#       at least 5 colored cells (2,2,1 across the three targets); the sampled bbox ranges support that
+    60	#   visual_observability:
+    61	#     - humans can compare deleted objects versus near-miss kept objects by counting repeated legend colors inside each box
+    62	#     - no hidden ordering by color id is used; scan order only implements "ignore first occurrence", which is visually
+    63	#       equivalent to requiring duplicates, a directly observable property
+    64	#   cleanliness:
+    65	#     - no new overlays or markers are introduced
+    66	#     - the same sparse colored-dot rectangles are preserved, avoiding extra visual clutter
+    67	#   generator_guarantees_for_new_solver:
+    68	#     - every puzzle has at least one deleted component and at least one kept near-miss component
+    69	#     - kept near-miss components contain all legend colors, but exactly one chosen target remains singleton
+    70	#     - kept missing components omit at least one legend color entirely
+    71	
+    72	import math
+    73	import random
+    74	
+    75	import numpy as np
+    76	
+    77	from arc_utils import components_mask, paste, random_free_location
+    78	
+    79	
+    80	def _bg_boundary(g: np.ndarray) -> int:
+    81	    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
+    82	    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
+    83	    vals, cnts = np.unique(border, return_counts=True)
+    84	    return int(vals[cnts.argmax()])
+    85	
+    86	
+    87	def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
+    88	    """
+    89	    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
+    90	    We detect the smallest size sz such that:
+    91	      - g[sz-1, 0:sz] are all x
+    92	      - g[0:sz, sz-1] are all x
+    93	    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
+    94	    excluding bg and excluding the border color x.
+    95	    """
+    96	    h, w = g.shape
+    97	    for sz in range(2, min(h, w) + 1):
+    98	        x = int(g[sz - 1, sz - 1])
+    99	        if x == bg:
+   100	            continue
+   101	        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
+   102	            inside = g[0 : sz - 1, 0 : sz - 1]
+   103	            colors = set(map(int, np.unique(inside)))
+   104	            colors.discard(bg)
+   105	            colors.discard(x)
+   106	            return int(sz), int(x), colors
+   107	    assert False, "no legend border found in grid"
+   108	
+   109	
+   110	def _repeated_match_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
+   111	    """
+   112	    Colors that survive the variant's matching rule.
+   113	
+   114	    We scan the component in row-major order and ignore the first pixel of each color.
+   115	    A color is admitted only when its second occurrence is encountered.
+   116	    """
+   117	    seen_once: set[int] = set()
+   118	    repeated: set[int] = set()
+   119	    for r, c in sorted((int(r), int(c)) for r, c in pts):
+   120	        col = int(g[r, c])
+   121	        if col in seen_once:
+   122	            repeated.add(col)
+   123	        else:
+   124	            seen_once.add(col)
+   125	    return repeated
+   126	
+   127	
+   128	def main(grid: np.ndarray) -> np.ndarray:
+   129	    """
+   130	    Remove connected components only when every legend color repeats inside that component.
+   131	
+   132	    Input structure:
+   133	    - Most of the board is a single background color.
+   134	    - The top-left corner contains a small square legend with a uniform border on its bottom and right edges.
+   135	    - Away from the legend, the foreground is split into 4-connected multicolor components carried by color-0 rectangles with colored speckles.
+   136	
+   137	    Rule:
+   138	    - Read the target color set from the legend interior.
+   139	    - For each foreground component, scan its pixels in row-major order and ignore the first pixel of every color.
+   140	    - Treat only colors that appear again later in the same component as part of that component's matching set.
+   141	    - Erase the component iff that repeated-color set contains all legend colors; otherwise leave it unchanged.
+   142	
+   143	    Key insight: The legend still specifies which colors matter, but now each target color must recur within a component, not merely appear once.
+   144	    """
+   145	    g = np.asarray(grid, dtype=int)
+   146	    bg = _bg_boundary(g)
+   147	
+   148	    _sz, _x, legend_colors = _find_legend(g, bg)
+   149	    assert legend_colors, "legend interior contains no target colors"
+   150	
+   151	    out = g.copy()
+   152	    comps = components_mask(g != bg, connectivity=4)
+   153	    for pts in comps:
+   154	        match_colors = _repeated_match_colors(g, pts)
+   155	        if legend_colors.issubset(match_colors):
+   156	            for r, c in pts:
+   157	                out[r, c] = bg
+   158	    return out
+   159	
+   160	
+   161	# --------------- generator (o5x) ---------------
+   162	
+   163	# -- Grid & legend constants --
+   164	GRID_H, GRID_W = 16, 16
+   165	BG = 7
+   166	BORDER = 3
+   167	LEGEND_SIZE = 4
+   168	PALETTE = [1, 2, 4, 5, 6, 8, 9]
+   169	NUM_TARGETS = 3
+   170	
+   171	# -- Component shape weights: (mode, weight) --
+   172	SHAPE_WEIGHTS = [5, 3, 2]
+   173	TALL_H = (8, 16)
+   174	TALL_W = (2, 4)
+   175	WIDE_H = (3, 5)
+   176	WIDE_W = (5, 9)
+   177	MED_H = (3, 7)
+   178	MED_W = (2, 9)
+   179	
+   180	# -- Component fill density (fraction of non-zero pixels) --
+   181	DENSITY_LO = 0.12
+   182	DENSITY_HI = 0.55
+   183	
+   184	# -- Component count & kept/deleted split --
+   185	COMP_COUNTS = [4, 5, 6]
+   186	COMP_WEIGHTS = [1, 4, 25]
+   187	NUM_KEPT = 3
+   188	
+   189	# -- Generation retry budget --
+   190	MAX_RETRIES = 400
+   191	
+   192	
+   193	def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
+   194	    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
+   195	    s = LEGEND_SIZE
+   196	    for g in (inp, out):
+   197	        g[:s, :s] = BG
+   198	        g[s - 1, :s] = BORDER
+   199	        g[:s, s - 1] = BORDER
+   200	
+   201	    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
+   202	    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
+   203	    side_choices = [
+   204	        p for p in border_side
+   205	        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
+   206	    ]
+   207	    positions = [isolated] + random.sample(side_choices, 2)
+   208	    random.shuffle(positions)
+   209	    for color, (r, c) in zip(targets, positions):
+   210	        inp[r, c] = color
+   211	        out[r, c] = color
+   212	
+   213	
+   214	def _component_dims() -> tuple[int, int]:
+   215	    """Sample component (h, w) according to shape-mode weights."""
+   216	    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
+   217	    if mode == "tall":
+   218	        return random.randint(*TALL_H), random.randint(*TALL_W)
+   219	    if mode == "wide":
+   220	        return random.randint(*WIDE_H), random.randint(*WIDE_W)
+   221	    return random.randint(*MED_H), random.randint(*MED_W)
+   222	
+   223	
+   224	def _sample_colored_count(h: int, w: int, minimum: int) -> int:
+   225	    area = h * w
+   226	    lo = max(minimum, math.ceil(area * DENSITY_LO))
+   227	    hi = max(lo, math.floor(area * DENSITY_HI))
+   228	    hi = min(hi, area)
+   229	    lo = min(lo, hi)
+   230	    return random.randint(lo, hi)
+   231	
+   232	
+   233	def _deleted_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
+   234	    colors = [color for color in targets for _ in range(2)]
+   235	    extras = n_colored - len(colors)
+   236	    colors.extend(random.choice(targets + non_targets) for _ in range(extras))
+   237	    random.shuffle(colors)
+   238	    return colors
+   239	
+   240	
+   241	def _near_miss_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
+   242	    weak = random.choice(targets)
+   243	    strong = [color for color in targets if color != weak]
+   244	    colors = [weak] + [strong[0], strong[0], strong[1], strong[1]]
+   245	    extras = n_colored - len(colors)
+   246	    colors.extend(random.choice(non_targets) for _ in range(extras))
+   247	    random.shuffle(colors)
+   248	    return colors
+   249	
+   250	
+   251	def _missing_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
+   252	    used_target_count = random.randint(0, NUM_TARGETS - 1)
+   253	    used_targets = random.sample(targets, used_target_count)
+   254	    colors: list[int] = []
+   255	    for color in used_targets:
+   256	        colors.extend([color] * random.randint(1, 2))
+   257	    while len(colors) > n_colored:
+   258	        colors.pop()
+   259	    extras = n_colored - len(colors)
+   260	    colors.extend(random.choice(non_targets) for _ in range(extras))
+
+diff --git a/ceshi/code/d59b0160/D12/2/code.py b/ceshi/code/d59b0160/D12/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a55a4350ebd52ab24038b110e2936da7af7c7be
+--- /dev/null
++++ b/ceshi/code/d59b0160/D12/2/code.py
+@@ -0,0 +1,330 @@
++# Variant of d59b0160
++# Dimension: D12 — 颜色0在分量中的角色 (color_set_match)
++# Change: 颜色0（黑色）是连通分量中的有效颜色，参与连通性计算，但不出现在图例中因此不参与颜色匹配... → 忽略每种颜色的第一个像素进行匹配
++#
++# Design analysis
++# ===============
++# variant_spec:
++#   core_change:
++#     original_match: a component is deleted when every legend color appears at least once.
++#     new_match:
++#       - scan each 4-connected component in row-major order
++#       - ignore the first pixel of every color encountered in that component
++#       - a color enters the matching set only when its second pixel is seen
++#       - equivalently, only colors with multiplicity >= 2 count toward legend matching
++#     effect:
++#       - legend colors must be repeated inside a component, not merely present
++#       - color 0 still participates in connectivity because components are found on (grid != bg)
++#         exactly as before, but color 0 never appears in the legend and therefore never helps match it
++#   concretization:
++#     grid: unchanged 16x16 orange background (7)
++#     legend:
++#       - unchanged top-left 4x4 corner box
++#       - bottom row and right column are green border color 3
++#       - interior still shows exactly 3 distinct target colors once each
++#     components:
++#       - unchanged rectangular 0-filled bodies with sprinkled non-zero colors
++#       - deleted components now contain each legend color at least twice
++#       - at least one kept component intentionally contains all legend colors visibly, but one of
++#         those colors appears only once, so it survives in the new rule and would have been removed before
++#   behavior_trace:
++#     example_component_scan:
++#       legend = {1,4,8}
++#       component pixels in scan order carry colors [0,1,4,8,1,4,5]
++#       original_logic:
++#         present colors = {0,1,4,5,8} -> legend subset satisfied -> delete
++#       new_logic:
++#         first 0 ignored, first 1 ignored, first 4 ignored, first 8 ignored,
++#         second 1 adds 1, second 4 adds 4, 5 seen only once
++#         effective matching set = {1,4}
++#         legend color 8 never repeats -> keep
++#       difference:
++#         the component still visibly shows all three legend colors, but only repeated colors count
++#   complexity_calibration:
++#     - if kept components merely omitted target colors, many samples would still look compatible with the original task
++#     - to make D12 visible, generation always includes >= 1 "near miss" kept component that shows all 3
++#       legend colors while failing the repetition test
++#     - other kept components may miss colors entirely, which provides contrast without adding extra rule branches
++#   implicit_assumptions_from_original_main:
++#     - _bg_boundary and _find_legend remain valid because the legend geometry is unchanged
++#     - components_mask(g != bg, connectivity=4) must stay unchanged so color 0 still glues a rectangle together
++#     - the original line collecting {g[r,c] for pts} is no longer valid because singleton target pixels would
++#       incorrectly count; it is replaced with a scan-order repeated-color extractor
++#     - deletion still writes bg over the whole component, so generator must keep components disjoint and non-overlapping
++#   placement_legality:
++#     - legend stays in the top-left corner
++#     - every generated component is placed by random_free_location on its full rectangular bbox (all 0s count as occupied),
++#       with padding=1, so components do not overlap or touch
++#     - deleted components require at least 6 colored cells (2 copies x 3 targets); kept near-miss components require
++#       at least 5 colored cells (2,2,1 across the three targets); the sampled bbox ranges support that
++#   visual_observability:
++#     - humans can compare deleted objects versus near-miss kept objects by counting repeated legend colors inside each box
++#     - no hidden ordering by color id is used; scan order only implements "ignore first occurrence", which is visually
++#       equivalent to requiring duplicates, a directly observable property
++#   cleanliness:
++#     - no new overlays or markers are introduced
++#     - the same sparse colored-dot rectangles are preserved, avoiding extra visual clutter
++#   generator_guarantees_for_new_solver:
++#     - every puzzle has at least one deleted component and at least one kept near-miss component
++#     - kept near-miss components contain all legend colors, but exactly one chosen target remains singleton
++#     - kept missing components omit at least one legend color entirely
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _repeated_match_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """
++    Colors that survive the variant's matching rule.
++
++    We scan the component in row-major order and ignore the first pixel of each color.
++    A color is admitted only when its second occurrence is encountered.
++    """
++    seen_once: set[int] = set()
++    repeated: set[int] = set()
++    for r, c in sorted((int(r), int(c)) for r, c in pts):
++        col = int(g[r, c])
++        if col in seen_once:
++            repeated.add(col)
++        else:
++            seen_once.add(col)
++    return repeated
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Remove connected components only when every legend color repeats inside that component.
++
++    Input structure:
++    - Most of the board is a single background color.
++    - The top-left corner contains a small square legend with a uniform border on its bottom and right edges.
++    - Away from the legend, the foreground is split into 4-connected multicolor components carried by color-0 rectangles with colored speckles.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each foreground component, scan its pixels in row-major order and ignore the first pixel of every color.
++    - Treat only colors that appear again later in the same component as part of that component's matching set.
++    - Erase the component iff that repeated-color set contains all legend colors; otherwise leave it unchanged.
++
++    Key insight: The legend still specifies which colors matter, but now each target color must recur within a component, not merely appear once.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        match_colors = _repeated_match_colors(g, pts)
++        if legend_colors.issubset(match_colors):
++            for r, c in pts:
++                out[r, c] = bg
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of non-zero pixels) --
++DENSITY_LO = 0.12
++DENSITY_HI = 0.55
++
++# -- Component count & kept/deleted split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims() -> tuple[int, int]:
++    """Sample component (h, w) according to shape-mode weights."""
++    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _sample_colored_count(h: int, w: int, minimum: int) -> int:
++    area = h * w
++    lo = max(minimum, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    hi = min(hi, area)
++    lo = min(lo, hi)
++    return random.randint(lo, hi)
++
++
++def _deleted_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    colors = [color for color in targets for _ in range(2)]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(targets + non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _near_miss_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    weak = random.choice(targets)
++    strong = [color for color in targets if color != weak]
++    colors = [weak] + [strong[0], strong[0], strong[1], strong[1]]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _missing_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    used_target_count = random.randint(0, NUM_TARGETS - 1)
++    used_targets = random.sample(targets, used_target_count)
++    colors: list[int] = []
++    for color in used_targets:
++        colors.extend([color] * random.randint(1, 2))
++    while len(colors) > n_colored:
++        colors.pop()
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _component_patch(h: int, w: int, targets: list[int], style: str) -> np.ndarray:
++    """Build an h x w patch filled with color-0 base and colored pixels meeting the requested style."""
++    non_targets = [v for v in PALETTE if v not in targets]
++    if style == "deleted":
++        n_colored = _sample_colored_count(h, w, minimum=2 * NUM_TARGETS)
++        colors = _deleted_colors(targets, non_targets, n_colored)
++    elif style == "near_miss":
++        n_colored = _sample_colored_count(h, w, minimum=5)
++        colors = _near_miss_colors(targets, non_targets, n_colored)
++    elif style == "missing":
++        n_colored = _sample_colored_count(h, w, minimum=1)
++        colors = _missing_colors(targets, non_targets, n_colored)
++    else:
++        raise ValueError(f"unknown component style: {style}")
++
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_styles(component_count: int) -> list[str]:
++    deleted_count = component_count - NUM_KEPT
++    near_miss_count = random.randint(1, 2)
++    missing_count = NUM_KEPT - near_miss_count
++    styles = ["deleted"] * deleted_count + ["near_miss"] * near_miss_count + ["missing"] * missing_count
++    random.shuffle(styles)
++    return styles
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input whose solver output matches the intended keep/delete split."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    styles = _component_styles(component_count)
++
++    for style in styles:
++        h, w = _component_dims()
++        patch = _component_patch(h, w, targets, style)
++        try:
++            r, c = random_free_location(
++                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++        paste(inp, patch, r, c)
++        if style != "deleted":
++            paste(out, patch, r, c)
++
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+exec
+/bin/bash -lc "nl -ba /home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py | sed -n '261,360p'" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+   261	    random.shuffle(colors)
+   262	    return colors
+   263	
+   264	
+   265	def _component_patch(h: int, w: int, targets: list[int], style: str) -> np.ndarray:
+   266	    """Build an h x w patch filled with color-0 base and colored pixels meeting the requested style."""
+   267	    non_targets = [v for v in PALETTE if v not in targets]
+   268	    if style == "deleted":
+   269	        n_colored = _sample_colored_count(h, w, minimum=2 * NUM_TARGETS)
+   270	        colors = _deleted_colors(targets, non_targets, n_colored)
+   271	    elif style == "near_miss":
+   272	        n_colored = _sample_colored_count(h, w, minimum=5)
+   273	        colors = _near_miss_colors(targets, non_targets, n_colored)
+   274	    elif style == "missing":
+   275	        n_colored = _sample_colored_count(h, w, minimum=1)
+   276	        colors = _missing_colors(targets, non_targets, n_colored)
+   277	    else:
+   278	        raise ValueError(f"unknown component style: {style}")
+   279	
+   280	    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
+   281	    patch = np.zeros((h, w), dtype=int)
+   282	    rs, cs = zip(*coords)
+   283	    patch[rs, cs] = colors
+   284	    return patch
+   285	
+   286	
+   287	def _component_styles(component_count: int) -> list[str]:
+   288	    deleted_count = component_count - NUM_KEPT
+   289	    near_miss_count = random.randint(1, 2)
+   290	    missing_count = NUM_KEPT - near_miss_count
+   291	    styles = ["deleted"] * deleted_count + ["near_miss"] * near_miss_count + ["missing"] * missing_count
+   292	    random.shuffle(styles)
+   293	    return styles
+   294	
+   295	
+   296	def _gen_attempt() -> np.ndarray | None:
+   297	    """Try once to build a valid input whose solver output matches the intended keep/delete split."""
+   298	    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
+   299	    out = inp.copy()
+   300	
+   301	    targets = random.sample(PALETTE, NUM_TARGETS)
+   302	    _place_legend(inp, out, targets)
+   303	
+   304	    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
+   305	    styles = _component_styles(component_count)
+   306	
+   307	    for style in styles:
+   308	        h, w = _component_dims()
+   309	        patch = _component_patch(h, w, targets, style)
+   310	        try:
+   311	            r, c = random_free_location(
+   312	                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
+   313	            )
+   314	        except ValueError:
+   315	            return None
+   316	        paste(inp, patch, r, c)
+   317	        if style != "deleted":
+   318	            paste(out, patch, r, c)
+   319	
+   320	    if np.array_equal(main(inp), out):
+   321	        return inp
+   322	    return None
+   323	
+   324	
+   325	def generate_input() -> np.ndarray:
+   326	    for _ in range(MAX_RETRIES):
+   327	        grid = _gen_attempt()
+   328	        if grid is not None:
+   329	            return grid
+   330	    raise RuntimeError("failed to generate valid input")
+
+diff --git a/ceshi/code/d59b0160/D12/2/code.py b/ceshi/code/d59b0160/D12/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a55a4350ebd52ab24038b110e2936da7af7c7be
+--- /dev/null
++++ b/ceshi/code/d59b0160/D12/2/code.py
+@@ -0,0 +1,330 @@
++# Variant of d59b0160
++# Dimension: D12 — 颜色0在分量中的角色 (color_set_match)
++# Change: 颜色0（黑色）是连通分量中的有效颜色，参与连通性计算，但不出现在图例中因此不参与颜色匹配... → 忽略每种颜色的第一个像素进行匹配
++#
++# Design analysis
++# ===============
++# variant_spec:
++#   core_change:
++#     original_match: a component is deleted when every legend color appears at least once.
++#     new_match:
++#       - scan each 4-connected component in row-major order
++#       - ignore the first pixel of every color encountered in that component
++#       - a color enters the matching set only when its second pixel is seen
++#       - equivalently, only colors with multiplicity >= 2 count toward legend matching
++#     effect:
++#       - legend colors must be repeated inside a component, not merely present
++#       - color 0 still participates in connectivity because components are found on (grid != bg)
++#         exactly as before, but color 0 never appears in the legend and therefore never helps match it
++#   concretization:
++#     grid: unchanged 16x16 orange background (7)
++#     legend:
++#       - unchanged top-left 4x4 corner box
++#       - bottom row and right column are green border color 3
++#       - interior still shows exactly 3 distinct target colors once each
++#     components:
++#       - unchanged rectangular 0-filled bodies with sprinkled non-zero colors
++#       - deleted components now contain each legend color at least twice
++#       - at least one kept component intentionally contains all legend colors visibly, but one of
++#         those colors appears only once, so it survives in the new rule and would have been removed before
++#   behavior_trace:
++#     example_component_scan:
++#       legend = {1,4,8}
++#       component pixels in scan order carry colors [0,1,4,8,1,4,5]
++#       original_logic:
++#         present colors = {0,1,4,5,8} -> legend subset satisfied -> delete
++#       new_logic:
++#         first 0 ignored, first 1 ignored, first 4 ignored, first 8 ignored,
++#         second 1 adds 1, second 4 adds 4, 5 seen only once
++#         effective matching set = {1,4}
++#         legend color 8 never repeats -> keep
++#       difference:
++#         the component still visibly shows all three legend colors, but only repeated colors count
++#   complexity_calibration:
++#     - if kept components merely omitted target colors, many samples would still look compatible with the original task
++#     - to make D12 visible, generation always includes >= 1 "near miss" kept component that shows all 3
++#       legend colors while failing the repetition test
++#     - other kept components may miss colors entirely, which provides contrast without adding extra rule branches
++#   implicit_assumptions_from_original_main:
++#     - _bg_boundary and _find_legend remain valid because the legend geometry is unchanged
++#     - components_mask(g != bg, connectivity=4) must stay unchanged so color 0 still glues a rectangle together
++#     - the original line collecting {g[r,c] for pts} is no longer valid because singleton target pixels would
++#       incorrectly count; it is replaced with a scan-order repeated-color extractor
++#     - deletion still writes bg over the whole component, so generator must keep components disjoint and non-overlapping
++#   placement_legality:
++#     - legend stays in the top-left corner
++#     - every generated component is placed by random_free_location on its full rectangular bbox (all 0s count as occupied),
++#       with padding=1, so components do not overlap or touch
++#     - deleted components require at least 6 colored cells (2 copies x 3 targets); kept near-miss components require
++#       at least 5 colored cells (2,2,1 across the three targets); the sampled bbox ranges support that
++#   visual_observability:
++#     - humans can compare deleted objects versus near-miss kept objects by counting repeated legend colors inside each box
++#     - no hidden ordering by color id is used; scan order only implements "ignore first occurrence", which is visually
++#       equivalent to requiring duplicates, a directly observable property
++#   cleanliness:
++#     - no new overlays or markers are introduced
++#     - the same sparse colored-dot rectangles are preserved, avoiding extra visual clutter
++#   generator_guarantees_for_new_solver:
++#     - every puzzle has at least one deleted component and at least one kept near-miss component
++#     - kept near-miss components contain all legend colors, but exactly one chosen target remains singleton
++#     - kept missing components omit at least one legend color entirely
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _repeated_match_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """
++    Colors that survive the variant's matching rule.
++
++    We scan the component in row-major order and ignore the first pixel of each color.
++    A color is admitted only when its second occurrence is encountered.
++    """
++    seen_once: set[int] = set()
++    repeated: set[int] = set()
++    for r, c in sorted((int(r), int(c)) for r, c in pts):
++        col = int(g[r, c])
++        if col in seen_once:
++            repeated.add(col)
++        else:
++            seen_once.add(col)
++    return repeated
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Remove connected components only when every legend color repeats inside that component.
++
++    Input structure:
++    - Most of the board is a single background color.
++    - The top-left corner contains a small square legend with a uniform border on its bottom and right edges.
++    - Away from the legend, the foreground is split into 4-connected multicolor components carried by color-0 rectangles with colored speckles.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each foreground component, scan its pixels in row-major order and ignore the first pixel of every color.
++    - Treat only colors that appear again later in the same component as part of that component's matching set.
++    - Erase the component iff that repeated-color set contains all legend colors; otherwise leave it unchanged.
++
++    Key insight: The legend still specifies which colors matter, but now each target color must recur within a component, not merely appear once.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        match_colors = _repeated_match_colors(g, pts)
++        if legend_colors.issubset(match_colors):
++            for r, c in pts:
++                out[r, c] = bg
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of non-zero pixels) --
++DENSITY_LO = 0.12
++DENSITY_HI = 0.55
++
++# -- Component count & kept/deleted split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims() -> tuple[int, int]:
++    """Sample component (h, w) according to shape-mode weights."""
++    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _sample_colored_count(h: int, w: int, minimum: int) -> int:
++    area = h * w
++    lo = max(minimum, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    hi = min(hi, area)
++    lo = min(lo, hi)
++    return random.randint(lo, hi)
++
++
++def _deleted_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    colors = [color for color in targets for _ in range(2)]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(targets + non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _near_miss_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    weak = random.choice(targets)
++    strong = [color for color in targets if color != weak]
++    colors = [weak] + [strong[0], strong[0], strong[1], strong[1]]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _missing_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    used_target_count = random.randint(0, NUM_TARGETS - 1)
++    used_targets = random.sample(targets, used_target_count)
++    colors: list[int] = []
++    for color in used_targets:
++        colors.extend([color] * random.randint(1, 2))
++    while len(colors) > n_colored:
++        colors.pop()
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _component_patch(h: int, w: int, targets: list[int], style: str) -> np.ndarray:
++    """Build an h x w patch filled with color-0 base and colored pixels meeting the requested style."""
++    non_targets = [v for v in PALETTE if v not in targets]
++    if style == "deleted":
++        n_colored = _sample_colored_count(h, w, minimum=2 * NUM_TARGETS)
++        colors = _deleted_colors(targets, non_targets, n_colored)
++    elif style == "near_miss":
++        n_colored = _sample_colored_count(h, w, minimum=5)
++        colors = _near_miss_colors(targets, non_targets, n_colored)
++    elif style == "missing":
++        n_colored = _sample_colored_count(h, w, minimum=1)
++        colors = _missing_colors(targets, non_targets, n_colored)
++    else:
++        raise ValueError(f"unknown component style: {style}")
++
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_styles(component_count: int) -> list[str]:
++    deleted_count = component_count - NUM_KEPT
++    near_miss_count = random.randint(1, 2)
++    missing_count = NUM_KEPT - near_miss_count
++    styles = ["deleted"] * deleted_count + ["near_miss"] * near_miss_count + ["missing"] * missing_count
++    random.shuffle(styles)
++    return styles
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input whose solver output matches the intended keep/delete split."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    styles = _component_styles(component_count)
++
++    for style in styles:
++        h, w = _component_dims()
++        patch = _component_patch(h, w, targets, style)
++        try:
++            r, c = random_free_location(
++                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++        paste(inp, patch, r, c)
++        if style != "deleted":
++            paste(out, patch, r, c)
++
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+codex
+已将变体代码保存到 [code.py](/home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py)。
+
+`main()` 的核心改动在 [_repeated_match_colors` 和匹配分支`](/home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py:110)：现在按行优先扫描每个 4-连通分量，忽略每种颜色第一次出现的像素，只有出现到第二次时该颜色才计入匹配集合。`main()` 的四段式说明也已重写为符合新规则的版本。[generator 部分](/home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py:163) 保持原题布局，但强制生成两类关键对象：会被删除的“每个图例色至少重复两次”的分量，以及会被保留的 near-miss 分量，它们肉眼上含有全部图例色，但至少一个图例色只出现一次，因此不会匹配新规则。
+
+验证结果：
+- 题目要求测试：`Success: 50/50, Time: 4.8s (96ms/call)`
+- 变体行为抽样 100 次：
+  - 与原 solver 输出不同：`100/100`
+  - 含 near-miss 保留分量的样本：`100/100`
+  - near-miss 分量数分布：`{1: 45, 2: 55}`
+  - 被删除分量数分布：`{1: 38, 2: 31, 3: 31}`
+
+这说明新规则稳定生效，没有退化回原题。
+diff --git a/ceshi/code/d59b0160/D12/2/code.py b/ceshi/code/d59b0160/D12/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a55a4350ebd52ab24038b110e2936da7af7c7be
+--- /dev/null
++++ b/ceshi/code/d59b0160/D12/2/code.py
+@@ -0,0 +1,330 @@
++# Variant of d59b0160
++# Dimension: D12 — 颜色0在分量中的角色 (color_set_match)
++# Change: 颜色0（黑色）是连通分量中的有效颜色，参与连通性计算，但不出现在图例中因此不参与颜色匹配... → 忽略每种颜色的第一个像素进行匹配
++#
++# Design analysis
++# ===============
++# variant_spec:
++#   core_change:
++#     original_match: a component is deleted when every legend color appears at least once.
++#     new_match:
++#       - scan each 4-connected component in row-major order
++#       - ignore the first pixel of every color encountered in that component
++#       - a color enters the matching set only when its second pixel is seen
++#       - equivalently, only colors with multiplicity >= 2 count toward legend matching
++#     effect:
++#       - legend colors must be repeated inside a component, not merely present
++#       - color 0 still participates in connectivity because components are found on (grid != bg)
++#         exactly as before, but color 0 never appears in the legend and therefore never helps match it
++#   concretization:
++#     grid: unchanged 16x16 orange background (7)
++#     legend:
++#       - unchanged top-left 4x4 corner box
++#       - bottom row and right column are green border color 3
++#       - interior still shows exactly 3 distinct target colors once each
++#     components:
++#       - unchanged rectangular 0-filled bodies with sprinkled non-zero colors
++#       - deleted components now contain each legend color at least twice
++#       - at least one kept component intentionally contains all legend colors visibly, but one of
++#         those colors appears only once, so it survives in the new rule and would have been removed before
++#   behavior_trace:
++#     example_component_scan:
++#       legend = {1,4,8}
++#       component pixels in scan order carry colors [0,1,4,8,1,4,5]
++#       original_logic:
++#         present colors = {0,1,4,5,8} -> legend subset satisfied -> delete
++#       new_logic:
++#         first 0 ignored, first 1 ignored, first 4 ignored, first 8 ignored,
++#         second 1 adds 1, second 4 adds 4, 5 seen only once
++#         effective matching set = {1,4}
++#         legend color 8 never repeats -> keep
++#       difference:
++#         the component still visibly shows all three legend colors, but only repeated colors count
++#   complexity_calibration:
++#     - if kept components merely omitted target colors, many samples would still look compatible with the original task
++#     - to make D12 visible, generation always includes >= 1 "near miss" kept component that shows all 3
++#       legend colors while failing the repetition test
++#     - other kept components may miss colors entirely, which provides contrast without adding extra rule branches
++#   implicit_assumptions_from_original_main:
++#     - _bg_boundary and _find_legend remain valid because the legend geometry is unchanged
++#     - components_mask(g != bg, connectivity=4) must stay unchanged so color 0 still glues a rectangle together
++#     - the original line collecting {g[r,c] for pts} is no longer valid because singleton target pixels would
++#       incorrectly count; it is replaced with a scan-order repeated-color extractor
++#     - deletion still writes bg over the whole component, so generator must keep components disjoint and non-overlapping
++#   placement_legality:
++#     - legend stays in the top-left corner
++#     - every generated component is placed by random_free_location on its full rectangular bbox (all 0s count as occupied),
++#       with padding=1, so components do not overlap or touch
++#     - deleted components require at least 6 colored cells (2 copies x 3 targets); kept near-miss components require
++#       at least 5 colored cells (2,2,1 across the three targets); the sampled bbox ranges support that
++#   visual_observability:
++#     - humans can compare deleted objects versus near-miss kept objects by counting repeated legend colors inside each box
++#     - no hidden ordering by color id is used; scan order only implements "ignore first occurrence", which is visually
++#       equivalent to requiring duplicates, a directly observable property
++#   cleanliness:
++#     - no new overlays or markers are introduced
++#     - the same sparse colored-dot rectangles are preserved, avoiding extra visual clutter
++#   generator_guarantees_for_new_solver:
++#     - every puzzle has at least one deleted component and at least one kept near-miss component
++#     - kept near-miss components contain all legend colors, but exactly one chosen target remains singleton
++#     - kept missing components omit at least one legend color entirely
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _repeated_match_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """
++    Colors that survive the variant's matching rule.
++
++    We scan the component in row-major order and ignore the first pixel of each color.
++    A color is admitted only when its second occurrence is encountered.
++    """
++    seen_once: set[int] = set()
++    repeated: set[int] = set()
++    for r, c in sorted((int(r), int(c)) for r, c in pts):
++        col = int(g[r, c])
++        if col in seen_once:
++            repeated.add(col)
++        else:
++            seen_once.add(col)
++    return repeated
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Remove connected components only when every legend color repeats inside that component.
++
++    Input structure:
++    - Most of the board is a single background color.
++    - The top-left corner contains a small square legend with a uniform border on its bottom and right edges.
++    - Away from the legend, the foreground is split into 4-connected multicolor components carried by color-0 rectangles with colored speckles.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each foreground component, scan its pixels in row-major order and ignore the first pixel of every color.
++    - Treat only colors that appear again later in the same component as part of that component's matching set.
++    - Erase the component iff that repeated-color set contains all legend colors; otherwise leave it unchanged.
++
++    Key insight: The legend still specifies which colors matter, but now each target color must recur within a component, not merely appear once.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        match_colors = _repeated_match_colors(g, pts)
++        if legend_colors.issubset(match_colors):
++            for r, c in pts:
++                out[r, c] = bg
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of non-zero pixels) --
++DENSITY_LO = 0.12
++DENSITY_HI = 0.55
++
++# -- Component count & kept/deleted split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims() -> tuple[int, int]:
++    """Sample component (h, w) according to shape-mode weights."""
++    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _sample_colored_count(h: int, w: int, minimum: int) -> int:
++    area = h * w
++    lo = max(minimum, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    hi = min(hi, area)
++    lo = min(lo, hi)
++    return random.randint(lo, hi)
++
++
++def _deleted_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    colors = [color for color in targets for _ in range(2)]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(targets + non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _near_miss_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    weak = random.choice(targets)
++    strong = [color for color in targets if color != weak]
++    colors = [weak] + [strong[0], strong[0], strong[1], strong[1]]
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _missing_colors(targets: list[int], non_targets: list[int], n_colored: int) -> list[int]:
++    used_target_count = random.randint(0, NUM_TARGETS - 1)
++    used_targets = random.sample(targets, used_target_count)
++    colors: list[int] = []
++    for color in used_targets:
++        colors.extend([color] * random.randint(1, 2))
++    while len(colors) > n_colored:
++        colors.pop()
++    extras = n_colored - len(colors)
++    colors.extend(random.choice(non_targets) for _ in range(extras))
++    random.shuffle(colors)
++    return colors
++
++
++def _component_patch(h: int, w: int, targets: list[int], style: str) -> np.ndarray:
++    """Build an h x w patch filled with color-0 base and colored pixels meeting the requested style."""
++    non_targets = [v for v in PALETTE if v not in targets]
++    if style == "deleted":
++        n_colored = _sample_colored_count(h, w, minimum=2 * NUM_TARGETS)
++        colors = _deleted_colors(targets, non_targets, n_colored)
++    elif style == "near_miss":
++        n_colored = _sample_colored_count(h, w, minimum=5)
++        colors = _near_miss_colors(targets, non_targets, n_colored)
++    elif style == "missing":
++        n_colored = _sample_colored_count(h, w, minimum=1)
++        colors = _missing_colors(targets, non_targets, n_colored)
++    else:
++        raise ValueError(f"unknown component style: {style}")
++
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_styles(component_count: int) -> list[str]:
++    deleted_count = component_count - NUM_KEPT
++    near_miss_count = random.randint(1, 2)
++    missing_count = NUM_KEPT - near_miss_count
++    styles = ["deleted"] * deleted_count + ["near_miss"] * near_miss_count + ["missing"] * missing_count
++    random.shuffle(styles)
++    return styles
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input whose solver output matches the intended keep/delete split."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    styles = _component_styles(component_count)
++
++    for style in styles:
++        h, w = _component_dims()
++        patch = _component_patch(h, w, targets, style)
++        try:
++            r, c = random_free_location(
++                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++        paste(inp, patch, r, c)
++        if style != "deleted":
++            paste(out, patch, r, c)
++
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+tokens used
+75,923
+已将变体代码保存到 [code.py](/home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py)。
+
+`main()` 的核心改动在 [_repeated_match_colors` 和匹配分支`](/home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py:110)：现在按行优先扫描每个 4-连通分量，忽略每种颜色第一次出现的像素，只有出现到第二次时该颜色才计入匹配集合。`main()` 的四段式说明也已重写为符合新规则的版本。[generator 部分](/home/lixinyu/snap/new/ceshi/code/d59b0160/D12/2/code.py:163) 保持原题布局，但强制生成两类关键对象：会被删除的“每个图例色至少重复两次”的分量，以及会被保留的 near-miss 分量，它们肉眼上含有全部图例色，但至少一个图例色只出现一次，因此不会匹配新规则。
+
+验证结果：
+- 题目要求测试：`Success: 50/50, Time: 4.8s (96ms/call)`
+- 变体行为抽样 100 次：
+  - 与原 solver 输出不同：`100/100`
+  - 含 near-miss 保留分量的样本：`100/100`
+  - near-miss 分量数分布：`{1: 45, 2: 55}`
+  - 被删除分量数分布：`{1: 38, 2: 31, 3: 31}`
+
+这说明新规则稳定生效，没有退化回原题。

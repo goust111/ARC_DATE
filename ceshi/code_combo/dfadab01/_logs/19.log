@@ -1,0 +1,4923 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e2baf-ff00-7c23-a3ab-a14032509707
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: dfadab01
+    **摘要**: 输入中的单像素标记按固定字形字典被替换为对应的4x4图案（标记色->图案色），样本字形及其右下标签在输出中消失，超出网格边缘的部分被裁剪
+
+    ## 要实现的融合组合
+    - **组合名称**: 调色板条+边缘隐藏样本
+    - **combo_spec**: D4/2+D11/1
+
+    ### 融合描述（实现规格）
+
+    样本信息不以4x4图案形式展示，而是编码在网格边缘的调色板条中。 顶部或左侧边缘行/列用颜色序列编码字形图案的展开形式和标记色→字形色映射。 解题者需要先解码边缘的压缩信息，还原字形图案和颜色映射，再处理网格中的标记。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D4/2** — 样本字形展示与消失 (`symbol_instructions`)
+  - 当前值: 输入中可能包含一个样本字形（完整4x4图案）及其右下角一格处的单像素标签（标签颜色=该字形对应的标记色），样本和标签在输出中消失
+  - 改为: 样本字形编码为调色板条 — 样本不以4x4图案形式展示，而是压缩为网格边缘的2xN调色板条，每行一对颜色表示'标记色->字形色'的映射。解题者需要解读调色板条并结合固定字形形状推断输出。
+  - 来源: symbol_instructions（参考任务: dbff022c）
+- **D11/1** — 样本字形的数量与位置 (`symbol_instructions`)
+  - 当前值: 0或1个样本字形出现在输入中，位置不固定（可能在角落或中间区域），部分示例无样本
+  - 改为: 样本隐藏在网格边缘 — 样本字形不占用网格内部空间，而是编码在网格边缘的一行/列中（如顶部一行用颜色序列编码字形图案的展开形式）。解题者需要先解码边缘信息再还原字形图案。
+  - 来源: symbol_instructions（参考任务: dbff022c）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/dfadab01.py`
+
+    ```python
+    from __future__ import annotations
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding fixed 4x4 glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show a sample 4x4 glyph in the output color, with a same-rule marker just below-right of the sample.
+
+    Rule:
+    - Replace each marker color by its learned 4x4 glyph: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping at the grid boundary.
+    - Remove the sample glyphs and skip their below-right label markers.
+
+    Key insight:
+    - The colored pixels are control pixels for a fixed glyph alphabet; non-control sample glyphs are only legend entries, not preserved scene objects.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            # Legend labels appear one cell below-right of the sample glyph bbox.
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 10x10 or 20x20 [observed]; must accommodate marker_grid_rows * row_spacing + glyph_size(4)
+  glyph_alphabet:
+    fixed 4x4 patterns, each 8 filled pixels out of 16:
+      marker 2 (red) -> color 4 (yellow) solid frame
+      marker 3 (green) -> color 1 (blue) open ring
+      marker 5 (gray) -> color 6 (magenta) diagonal blocks
+      marker 8 (azure) -> color 7 (orange) X-shape
+  marker_grid:
+    markers placed on a regular grid of positions (rows x cols)
+    shape: 2x2 to 5x5; rows and cols chosen independently
+    row_spacing: 4-6, uniform within example [observed]
+    col_spacing: 4-6, may be non-uniform across columns
+    fill_rate: 60-100% of grid cells contain a marker; unfilled cells are empty (black)
+    marker_types_used: 1-4 distinct types from {2,3,5,8}; each cell assigned one type
+  legend:
+    0 or 1 legend entry per input [observed]; shows one glyph type's mapping
+    structure: the 4x4 glyph drawn in output color + a label marker of matching type at (glyph_row+4, glyph_col+4)
+    legend glyph may overlap a grid cell position (the marker pixel sits where glyph mask has 0)
+    label marker is skipped in output (not expanded)
+  output:
+    black background; each real marker replaced by its 4x4 glyph in the mapped output color
+    glyph top-left at marker position; clipped at grid boundary
+    legend glyph and label removed; no glyph painted for label markers
+    glyphs never overlap (guaranteed by spacing >= 4)
+
+generation_strategy:
+  approach: direct construction (constraints are easy to satisfy constructively)
+  steps:
+    1. Pick grid dimensions ensuring rows * row_spacing and cols * col_spacing fit (with room for 4-cell glyph); e.g. for 5x5 grid with spacing 4, need >= 20.
+    2. Choose 1-4 marker types from {2,3,5,8}. Choose grid shape (R x C, each 2-5). Choose row_spacing and col_spacing (4-6 each).
+    3. Compute marker row/col positions; first row/col >= 0, last row + 3 <= H, last col + 3 <= W (or allow clipping for edge markers).
+    4. Fill grid cells: assign a random marker type to each cell; optionally leave some cells empty (fill_rate >= 60%).
+    5. Optionally add one legend entry: pick a used marker type, find a location where the 4x4 glyph + label at (+4,+4) fits without conflicting with real markers. Draw glyph in output color; place label marker pixel.
+    6. Build input grid: black background + single marker pixels at filled grid cells + legend if present.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+## 已有单变体参考代码
+
+以下组成项已有单变体实现，可作为融合时的参考：
+
+            ### 参考代码: D4/2
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/dfadab01/D4/2/code.py`
+
+            ```python
+            # Variant of dfadab01
+# Dimension: D4 — 样本字形展示与消失 (symbol_instructions)
+# Change: 输入中可能包含一个样本字形（完整4x4图案）及其右下角一格处的单像素标签（标签颜色=该字形对应的标记色），样本和标签在输出中消失 → 样本字形编码为调色板条
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+
+# Design analysis
+# ---------------
+# spec:
+#   unchanged_core:
+#     - Single-pixel markers still expand into fixed 4x4 glyph SHAPES.
+#     - Glyphs are still anchored at the marker pixel and clipped by the grid edge.
+#     - The scene is still a sparse marker lattice on a black background.
+#   D4 change concretized:
+#     - The old 4x4 sample glyph + below-right label is removed entirely.
+#     - Instead, the input always contains one vertical N x 2 palette strip on the left or right edge.
+#     - Each strip row is [marker_color, glyph_color], so the strip teaches color mapping only.
+#     - The glyph shape must therefore remain fixed per marker color; only the output color is instance-specific.
+#   behavior trace:
+#     - Original: seeing marker 2 was enough to paint the yellow frame because color and shape were both hardcoded.
+#     - Variant: seeing marker 2 still selects the frame SHAPE, but the output COLOR is read from the edge strip row [2, ?].
+#     - Difference: the solver must now detect and erase the palette strip before expanding scene markers.
+#   complexity calibration:
+#     - Output colors are chosen as a permutation/subset of {1,4,6,7}, not fixed to the original per-marker colors.
+#     - This makes the palette strip necessary while keeping the alphabet small and visually learnable.
+#     - Each used marker type appears at least once in the scene, and 2-4 marker types are used, so the strip has repeated support.
+#   hidden assumptions invalidated from the original main():
+#     - Bundling marker->(output_color, mask) no longer works because output colors are not fixed.
+#     - Looking for a 4x4 sample glyph near a marker no longer works because the legend is now a 1-pixel-thick strip.
+#     - Any marker-colored pixel used to be a scene marker unless it matched the old legend-label pattern; now edge-strip cells must be masked out.
+#   placement legality:
+#     - The strip occupies exactly two edge columns and generator keeps the adjacent inner column empty as padding.
+#     - Scene markers are placed on a lattice with row/col spacing 4-6, so expanded glyphs never overlap each other.
+#     - When the strip is on the left, scene columns start at col 3; when on the right, the last scene column is at most w-4.
+#   visual observability:
+#     - The strip is contiguous and isolated, so it reads clearly as an instruction panel rather than scene content.
+#     - Because at least one used marker gets a non-canonical output color every time, the variant never degenerates back to the old fixed-color rule.
+#   cleanliness:
+#     - Input uses only marker dots plus a compact edge strip; there is no stacked overlap between legend pixels and 4x4 glyph samples.
+#   new solver assumptions and generator guarantees:
+#     - Assumption: there is exactly one contiguous left/right edge strip whose first column contains unique marker colors.
+#     - Guarantee: generator always creates exactly one such strip, keeps its rows contiguous, and leaves one empty inner padding column beside it.
+
+
+MARKER_GLYPHS: dict[int, np.ndarray] = {
+    2: np.array(
+        [
+            [1, 1, 1, 1],
+            [1, 0, 0, 1],
+            [1, 0, 0, 1],
+            [1, 1, 1, 1],
+        ],
+        dtype=bool,
+    ),
+    3: np.array(
+        [
+            [0, 1, 1, 0],
+            [1, 0, 0, 1],
+            [1, 0, 0, 1],
+            [0, 1, 1, 0],
+        ],
+        dtype=bool,
+    ),
+    5: np.array(
+        [
+            [1, 1, 0, 0],
+            [1, 1, 0, 0],
+            [0, 0, 1, 1],
+            [0, 0, 1, 1],
+        ],
+        dtype=bool,
+    ),
+    8: np.array(
+        [
+            [1, 0, 0, 1],
+            [0, 1, 1, 0],
+            [0, 1, 1, 0],
+            [1, 0, 0, 1],
+        ],
+        dtype=bool,
+    ),
+}
+
+MARKER_COLORS = tuple(MARKER_GLYPHS.keys())
+GLYPH_COLORS = (1, 4, 6, 7)
+CANONICAL_COLORS = {2: 4, 3: 1, 5: 6, 8: 7}
+
+GRID_SIZES = (10, 20)
+SPACING_RANGE = (4, 6)
+MAX_RETRIES = 400
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def _edge_runs(valid_rows: list[bool]) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    r0: int | None = None
+    for r, ok in enumerate(valid_rows):
+        if ok and r0 is None:
+            r0 = r
+        elif not ok and r0 is not None:
+            runs.append((r0, r - 1))
+            r0 = None
+    if r0 is not None:
+        runs.append((r0, len(valid_rows) - 1))
+    return runs
+
+
+def _extract_palette_mapping(g: np.ndarray) -> tuple[dict[int, int], np.ndarray]:
+    h, w = g.shape
+    assert w >= 3, "grid must be wide enough for a 2-column strip plus padding"
+
+    best: tuple[int, str, int, int] | None = None
+    for side, c0 in (("left", 0), ("right", w - 2)):
+        c1 = c0 + 1
+        pad_col = 2 if side == "left" else w - 3
+        valid_rows = [
+            int(g[r, c0]) in MARKER_GLYPHS and int(g[r, c1]) in GLYPH_COLORS for r in range(h)
+        ]
+        for r0, r1 in _edge_runs(valid_rows):
+            keys = [int(g[r, c0]) for r in range(r0, r1 + 1)]
+            vals = [int(g[r, c1]) for r in range(r0, r1 + 1)]
+            if len(set(keys)) != len(keys) or len(set(vals)) != len(vals):
+                continue
+            if any(int(g[r, pad_col]) != 0 for r in range(r0, r1 + 1)):
+                continue
+            if r0 > 0 and np.any(g[r0 - 1, c0 : c1 + 1] != 0):
+                continue
+            if r1 + 1 < h and np.any(g[r1 + 1, c0 : c1 + 1] != 0):
+                continue
+            score = (r1 - r0 + 1, side, r0, r1)
+            if best is None or score > best:
+                best = score
+
+    assert best is not None, "palette strip not found"
+    _, side, r0, r1 = best
+    c0 = 0 if side == "left" else w - 2
+
+    pal_mask = np.zeros_like(g, dtype=bool)
+    pal_mask[r0 : r1 + 1, c0 : c0 + 2] = True
+    mapping = {int(g[r, c0]): int(g[r, c0 + 1]) for r in range(r0, r1 + 1)}
+    return mapping, pal_mask
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each scene marker into a fixed 4x4 glyph, using an edge palette strip to choose the glyph color.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - One left-edge or right-edge N×2 palette strip, where each row is [marker_color, glyph_color].
+
+    Rule:
+    - Read the edge strip as a marker→glyph-color mapping, then erase the strip itself.
+    - Replace every remaining marker pixel by its fixed 4x4 glyph shape, anchored at that pixel and clipped by the grid boundary.
+    - Marker color still selects the glyph shape; only the glyph color comes from the strip.
+
+    Key insight:
+    - The edge strip is a compressed legend: it no longer shows a 4x4 sample glyph, so the solver must combine strip-read colors with a fixed glyph dictionary.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
+
+    mapping, pal_mask = _extract_palette_mapping(g)
+    assert mapping, "palette mapping must be non-empty"
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, mask in MARKER_GLYPHS.items():
+        coords = np.argwhere((g == marker_color) & (~pal_mask))
+        if coords.size:
+            seen_marker = True
+            assert marker_color in mapping, f"missing palette row for marker {marker_color}"
+        for r, c in coords:
+            _paint_clipped(out, int(r), int(c), int(mapping[marker_color]), mask)
+
+    assert seen_marker
+    return out
+
+
+def _sample_positions(rng: random.Random, lo: int, hi: int, count: int) -> list[int]:
+    assert lo <= hi and count >= 1
+    if count == 1:
+        return [rng.randint(lo, hi)]
+
+    min_gap, max_gap = SPACING_RANGE
+    for _ in range(200):
+        gaps = [rng.randint(min_gap, max_gap) for _ in range(count - 1)]
+        span = sum(gaps)
+        if span <= hi - lo:
+            start = rng.randint(lo, hi - span)
+            vals = [start]
+            for gap in gaps:
+                vals.append(vals[-1] + gap)
+            return vals
+
+    span = min_gap * (count - 1)
+    assert span <= hi - lo
+    start = rng.randint(lo, hi - span)
+    return [start + i * min_gap for i in range(count)]
+
+
+def _feasible_count(span: int) -> int:
+    return 1 + span // SPACING_RANGE[0]
+
+
+def _choose_marker_mapping(rng: random.Random, used_markers: list[int]) -> dict[int, int]:
+    for _ in range(100):
+        colors = rng.sample(GLYPH_COLORS, len(used_markers))
+        mapping = {marker: color for marker, color in zip(used_markers, colors, strict=False)}
+        if any(mapping[m] != CANONICAL_COLORS[m] for m in used_markers):
+            return mapping
+    raise RuntimeError("failed to sample a non-canonical palette mapping")
+
+
+def _render_scene(h: int, w: int, placed: list[tuple[int, int, int]], mapping: dict[int, int]) -> np.ndarray:
+    out = np.zeros((h, w), dtype=int)
+    for r, c, marker in placed:
+        _paint_clipped(out, r, c, mapping[marker], MARKER_GLYPHS[marker])
+    return out
+
+
+def _gen_attempt() -> np.ndarray | None:
+    rng = random.Random()
+    h = rng.choice(GRID_SIZES)
+    w = h
+    side = rng.choice(("left", "right"))
+
+    scene_c_lo = 3 if side == "left" else 0
+    scene_c_hi = w - 1 if side == "left" else w - 4
+    row_span = h - 1
+    col_span = scene_c_hi - scene_c_lo
+    max_rows = min(5, _feasible_count(row_span))
+    max_cols = min(5, _feasible_count(col_span))
+    if max_rows < 2 or max_cols < 2:
+        return None
+
+    rows = rng.randint(2, max_rows)
+    cols = rng.randint(2, max_cols)
+    row_pos = _sample_positions(rng, 0, h - 1, rows)
+    col_pos = _sample_positions(rng, scene_c_lo, scene_c_hi, cols)
+
+    all_cells = [(r, c) for r in row_pos for c in col_pos]
+    min_fill = max(2, (6 * len(all_cells) + 9) // 10)
+    fill_count = rng.randint(min_fill, len(all_cells))
+    used_count = rng.randint(2, min(4, fill_count, len(MARKER_COLORS)))
+    used_markers = rng.sample(list(MARKER_COLORS), used_count)
+    mapping = _choose_marker_mapping(rng, used_markers)
+
+    chosen_cells = rng.sample(all_cells, fill_count)
+    assigned_markers = used_markers.copy()
+    assigned_markers.extend(rng.choice(used_markers) for _ in range(fill_count - used_count))
+    rng.shuffle(assigned_markers)
+
+    inp = np.zeros((h, w), dtype=int)
+    placed: list[tuple[int, int, int]] = []
+    for (r, c), marker in zip(chosen_cells, assigned_markers, strict=False):
+        inp[r, c] = marker
+        placed.append((r, c, marker))
+
+    pal_rows = used_markers.copy()
+    rng.shuffle(pal_rows)
+    pal_r0 = rng.randint(0, h - len(pal_rows))
+    pal_c0 = 0 if side == "left" else w - 2
+    for i, marker in enumerate(pal_rows):
+        inp[pal_r0 + i, pal_c0] = marker
+        inp[pal_r0 + i, pal_c0 + 1] = mapping[marker]
+
+    expected = _render_scene(h, w, placed, mapping)
+
+    try:
+        actual = main(inp)
+    except Exception:
+        return None
+    if np.array_equal(actual, expected):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError(f"failed to generate input after {MAX_RETRIES} attempts")
+
+            ```
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/19/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/19/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of dfadab01 (index 19)
+    # combo_spec: D4/2+D11/1
+    # Name: 调色板条+边缘隐藏样本
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/19` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/dbff022c.py` — 参考任务 dbff022c 的 solver（D4/2 的灵感来源）
+    - `/home/lixinyu/snap/new/arc2_solver_select/dbff022c.py` — 参考任务 dbff022c 的 solver（D11/1 的灵感来源）
+codex
+我先读原始 solver、单变体参考和评测样例，确认原规则、边缘编码形式和生成约束，再设计融合版的 solver 与 generator。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/dfadab01.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding fixed 4x4 glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show a sample 4x4 glyph in the output color, with a same-rule marker just below-right of the sample.
+
+    Rule:
+    - Replace each marker color by its learned 4x4 glyph: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping at the grid boundary.
+    - Remove the sample glyphs and skip their below-right label markers.
+
+    Key insight:
+    - The colored pixels are control pixels for a fixed glyph alphabet; non-control sample glyphs are only legend entries, not preserved scene objects.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            # Legend labels appear one cell below-right of the sample glyph bbox.
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+exec
+/bin/bash -lc "sed -n '1,320p' /home/lixinyu/snap/new/ceshi/code/dfadab01/D4/2/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Variant of dfadab01
+# Dimension: D4 — 样本字形展示与消失 (symbol_instructions)
+# Change: 输入中可能包含一个样本字形（完整4x4图案）及其右下角一格处的单像素标签（标签颜色=该字形对应的标记色），样本和标签在输出中消失 → 样本字形编码为调色板条
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+
+# Design analysis
+# ---------------
+# spec:
+#   unchanged_core:
+#     - Single-pixel markers still expand into fixed 4x4 glyph SHAPES.
+#     - Glyphs are still anchored at the marker pixel and clipped by the grid edge.
+#     - The scene is still a sparse marker lattice on a black background.
+#   D4 change concretized:
+#     - The old 4x4 sample glyph + below-right label is removed entirely.
+#     - Instead, the input always contains one vertical N x 2 palette strip on the left or right edge.
+#     - Each strip row is [marker_color, glyph_color], so the strip teaches color mapping only.
+#     - The glyph shape must therefore remain fixed per marker color; only the output color is instance-specific.
+#   behavior trace:
+#     - Original: seeing marker 2 was enough to paint the yellow frame because color and shape were both hardcoded.
+#     - Variant: seeing marker 2 still selects the frame SHAPE, but the output COLOR is read from the edge strip row [2, ?].
+#     - Difference: the solver must now detect and erase the palette strip before expanding scene markers.
+#   complexity calibration:
+#     - Output colors are chosen as a permutation/subset of {1,4,6,7}, not fixed to the original per-marker colors.
+#     - This makes the palette strip necessary while keeping the alphabet small and visually learnable.
+#     - Each used marker type appears at least once in the scene, and 2-4 marker types are used, so the strip has repeated support.
+#   hidden assumptions invalidated from the original main():
+#     - Bundling marker->(output_color, mask) no longer works because output colors are not fixed.
+#     - Looking for a 4x4 sample glyph near a marker no longer works because the legend is now a 1-pixel-thick strip.
+#     - Any marker-colored pixel used to be a scene marker unless it matched the old legend-label pattern; now edge-strip cells must be masked out.
+#   placement legality:
+#     - The strip occupies exactly two edge columns and generator keeps the adjacent inner column empty as padding.
+#     - Scene markers are placed on a lattice with row/col spacing 4-6, so expanded glyphs never overlap each other.
+#     - When the strip is on the left, scene columns start at col 3; when on the right, the last scene column is at most w-4.
+#   visual observability:
+#     - The strip is contiguous and isolated, so it reads clearly as an instruction panel rather than scene content.
+#     - Because at least one used marker gets a non-canonical output color every time, the variant never degenerates back to the old fixed-color rule.
+#   cleanliness:
+#     - Input uses only marker dots plus a compact edge strip; there is no stacked overlap between legend pixels and 4x4 glyph samples.
+#   new solver assumptions and generator guarantees:
+#     - Assumption: there is exactly one contiguous left/right edge strip whose first column contains unique marker colors.
+#     - Guarantee: generator always creates exactly one such strip, keeps its rows contiguous, and leaves one empty inner padding column beside it.
+
+
+MARKER_GLYPHS: dict[int, np.ndarray] = {
+    2: np.array(
+        [
+            [1, 1, 1, 1],
+            [1, 0, 0, 1],
+            [1, 0, 0, 1],
+            [1, 1, 1, 1],
+        ],
+        dtype=bool,
+    ),
+    3: np.array(
+        [
+            [0, 1, 1, 0],
+            [1, 0, 0, 1],
+            [1, 0, 0, 1],
+            [0, 1, 1, 0],
+        ],
+        dtype=bool,
+    ),
+    5: np.array(
+        [
+            [1, 1, 0, 0],
+            [1, 1, 0, 0],
+            [0, 0, 1, 1],
+            [0, 0, 1, 1],
+        ],
+        dtype=bool,
+    ),
+    8: np.array(
+        [
+            [1, 0, 0, 1],
+            [0, 1, 1, 0],
+            [0, 1, 1, 0],
+            [1, 0, 0, 1],
+        ],
+        dtype=bool,
+    ),
+}
+
+MARKER_COLORS = tuple(MARKER_GLYPHS.keys())
+GLYPH_COLORS = (1, 4, 6, 7)
+CANONICAL_COLORS = {2: 4, 3: 1, 5: 6, 8: 7}
+
+GRID_SIZES = (10, 20)
+SPACING_RANGE = (4, 6)
+MAX_RETRIES = 400
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def _edge_runs(valid_rows: list[bool]) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    r0: int | None = None
+    for r, ok in enumerate(valid_rows):
+        if ok and r0 is None:
+            r0 = r
+        elif not ok and r0 is not None:
+            runs.append((r0, r - 1))
+            r0 = None
+    if r0 is not None:
+        runs.append((r0, len(valid_rows) - 1))
+    return runs
+
+
+def _extract_palette_mapping(g: np.ndarray) -> tuple[dict[int, int], np.ndarray]:
+    h, w = g.shape
+    assert w >= 3, "grid must be wide enough for a 2-column strip plus padding"
+
+    best: tuple[int, str, int, int] | None = None
+    for side, c0 in (("left", 0), ("right", w - 2)):
+        c1 = c0 + 1
+        pad_col = 2 if side == "left" else w - 3
+        valid_rows = [
+            int(g[r, c0]) in MARKER_GLYPHS and int(g[r, c1]) in GLYPH_COLORS for r in range(h)
+        ]
+        for r0, r1 in _edge_runs(valid_rows):
+            keys = [int(g[r, c0]) for r in range(r0, r1 + 1)]
+            vals = [int(g[r, c1]) for r in range(r0, r1 + 1)]
+            if len(set(keys)) != len(keys) or len(set(vals)) != len(vals):
+                continue
+            if any(int(g[r, pad_col]) != 0 for r in range(r0, r1 + 1)):
+                continue
+            if r0 > 0 and np.any(g[r0 - 1, c0 : c1 + 1] != 0):
+                continue
+            if r1 + 1 < h and np.any(g[r1 + 1, c0 : c1 + 1] != 0):
+                continue
+            score = (r1 - r0 + 1, side, r0, r1)
+            if best is None or score > best:
+                best = score
+
+    assert best is not None, "palette strip not found"
+    _, side, r0, r1 = best
+    c0 = 0 if side == "left" else w - 2
+
+    pal_mask = np.zeros_like(g, dtype=bool)
+    pal_mask[r0 : r1 + 1, c0 : c0 + 2] = True
+    mapping = {int(g[r, c0]): int(g[r, c0 + 1]) for r in range(r0, r1 + 1)}
+    return mapping, pal_mask
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each scene marker into a fixed 4x4 glyph, using an edge palette strip to choose the glyph color.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - One left-edge or right-edge N×2 palette strip, where each row is [marker_color, glyph_color].
+
+    Rule:
+    - Read the edge strip as a marker→glyph-color mapping, then erase the strip itself.
+    - Replace every remaining marker pixel by its fixed 4x4 glyph shape, anchored at that pixel and clipped by the grid boundary.
+    - Marker color still selects the glyph shape; only the glyph color comes from the strip.
+
+    Key insight:
+    - The edge strip is a compressed legend: it no longer shows a 4x4 sample glyph, so the solver must combine strip-read colors with a fixed glyph dictionary.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
+
+    mapping, pal_mask = _extract_palette_mapping(g)
+    assert mapping, "palette mapping must be non-empty"
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, mask in MARKER_GLYPHS.items():
+        coords = np.argwhere((g == marker_color) & (~pal_mask))
+        if coords.size:
+            seen_marker = True
+            assert marker_color in mapping, f"missing palette row for marker {marker_color}"
+        for r, c in coords:
+            _paint_clipped(out, int(r), int(c), int(mapping[marker_color]), mask)
+
+    assert seen_marker
+    return out
+
+
+def _sample_positions(rng: random.Random, lo: int, hi: int, count: int) -> list[int]:
+    assert lo <= hi and count >= 1
+    if count == 1:
+        return [rng.randint(lo, hi)]
+
+    min_gap, max_gap = SPACING_RANGE
+    for _ in range(200):
+        gaps = [rng.randint(min_gap, max_gap) for _ in range(count - 1)]
+        span = sum(gaps)
+        if span <= hi - lo:
+            start = rng.randint(lo, hi - span)
+            vals = [start]
+            for gap in gaps:
+                vals.append(vals[-1] + gap)
+            return vals
+
+    span = min_gap * (count - 1)
+    assert span <= hi - lo
+    start = rng.randint(lo, hi - span)
+    return [start + i * min_gap for i in range(count)]
+
+
+def _feasible_count(span: int) -> int:
+    return 1 + span // SPACING_RANGE[0]
+
+
+def _choose_marker_mapping(rng: random.Random, used_markers: list[int]) -> dict[int, int]:
+    for _ in range(100):
+        colors = rng.sample(GLYPH_COLORS, len(used_markers))
+        mapping = {marker: color for marker, color in zip(used_markers, colors, strict=False)}
+        if any(mapping[m] != CANONICAL_COLORS[m] for m in used_markers):
+            return mapping
+    raise RuntimeError("failed to sample a non-canonical palette mapping")
+
+
+def _render_scene(h: int, w: int, placed: list[tuple[int, int, int]], mapping: dict[int, int]) -> np.ndarray:
+    out = np.zeros((h, w), dtype=int)
+    for r, c, marker in placed:
+        _paint_clipped(out, r, c, mapping[marker], MARKER_GLYPHS[marker])
+    return out
+
+
+def _gen_attempt() -> np.ndarray | None:
+    rng = random.Random()
+    h = rng.choice(GRID_SIZES)
+    w = h
+    side = rng.choice(("left", "right"))
+
+    scene_c_lo = 3 if side == "left" else 0
+    scene_c_hi = w - 1 if side == "left" else w - 4
+    row_span = h - 1
+    col_span = scene_c_hi - scene_c_lo
+    max_rows = min(5, _feasible_count(row_span))
+    max_cols = min(5, _feasible_count(col_span))
+    if max_rows < 2 or max_cols < 2:
+        return None
+
+    rows = rng.randint(2, max_rows)
+    cols = rng.randint(2, max_cols)
+    row_pos = _sample_positions(rng, 0, h - 1, rows)
+    col_pos = _sample_positions(rng, scene_c_lo, scene_c_hi, cols)
+
+    all_cells = [(r, c) for r in row_pos for c in col_pos]
+    min_fill = max(2, (6 * len(all_cells) + 9) // 10)
+    fill_count = rng.randint(min_fill, len(all_cells))
+    used_count = rng.randint(2, min(4, fill_count, len(MARKER_COLORS)))
+    used_markers = rng.sample(list(MARKER_COLORS), used_count)
+    mapping = _choose_marker_mapping(rng, used_markers)
+
+    chosen_cells = rng.sample(all_cells, fill_count)
+    assigned_markers = used_markers.copy()
+    assigned_markers.extend(rng.choice(used_markers) for _ in range(fill_count - used_count))
+    rng.shuffle(assigned_markers)
+
+    inp = np.zeros((h, w), dtype=int)
+    placed: list[tuple[int, int, int]] = []
+    for (r, c), marker in zip(chosen_cells, assigned_markers, strict=False):
+        inp[r, c] = marker
+        placed.append((r, c, marker))
+
+    pal_rows = used_markers.copy()
+    rng.shuffle(pal_rows)
+    pal_r0 = rng.randint(0, h - len(pal_rows))
+    pal_c0 = 0 if side == "left" else w - 2
+    for i, marker in enumerate(pal_rows):
+        inp[pal_r0 + i, pal_c0] = marker
+        inp[pal_r0 + i, pal_c0 + 1] = mapping[marker]
+
+    expected = _render_scene(h, w, placed, mapping)
+
+    try:
+        actual = main(inp)
+    except Exception:
+        return None
+    if np.array_equal(actual, expected):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError(f"failed to generate input after {MAX_RETRIES} attempts")
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/dbff022c.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+import numpy as np
+
+from arc_utils import components_mask, neighbors4
+import random
+
+
+def _bg_boundary(g: np.ndarray) -> int:
+    """Most common color along the 1-cell outer border."""
+    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
+    vals, cnts = np.unique(border, return_counts=True)
+    return int(vals[cnts.argmax()])
+
+
+def _best_palette(g: np.ndarray, bg: int) -> tuple[str, int, int]:
+    """
+    Find the 2xN or Nx2 palette block on a grid edge.
+
+    Returns (side, start, end) where:
+      - side in {"top","bottom","left","right"}
+      - for top/bottom: start/end are column indices [start,end)
+      - for left/right: start/end are row indices [start,end)
+    """
+    h, w = g.shape
+    best = None  # (score_tuple, side, start, end)
+
+    def isolated(side: str, start: int, end: int) -> bool:
+        """
+        Palette cells (excluding bg) should not be 4-neigh adjacent to same-colored cells
+        outside the palette region; this prevents accidentally absorbing parts of large sprites
+        that touch the grid edge.
+        """
+        h2, w2 = g.shape
+        pal = np.zeros((h2, w2), dtype=bool)
+        if side == "top":
+            pal[0:2, start:end] = True
+        elif side == "bottom":
+            pal[h2 - 2 : h2, start:end] = True
+        elif side == "left":
+            pal[start:end, 0:2] = True
+        else:
+            pal[start:end, w2 - 2 : w2] = True
+
+        for r, c in zip(*np.where(pal), strict=False):
+            r = int(r)
+            c = int(c)
+            v = int(g[r, c])
+            if v == bg:
+                continue
+            for rr, cc in neighbors4(r, c):
+                if 0 <= rr < h2 and 0 <= cc < w2 and not pal[rr, cc]:
+                    if int(g[rr, cc]) == v:
+                        return False
+        return True
+
+    def consider_top():
+        nonlocal best
+        if h < 2:
+            return
+        a = g[0, :]
+        b = g[1, :]
+        for c0 in range(w):
+            for c1 in range(c0 + 2, w + 1):
+                seg_a = a[c0:c1]
+                seg_b = b[c0:c1]
+                da = set(map(int, np.unique(seg_a)))
+                db = set(map(int, np.unique(seg_b)))
+                da.discard(bg)
+                db.discard(bg)
+                if len(da) < 2 or len(db) < 2:
+                    continue
+                d = da | db
+                if len(d) < 3:
+                    continue
+                # Border keys should be unique (excluding bg) to form a well-defined mapping.
+                border_keys = [int(x) for x in seg_a.tolist() if int(x) != bg]
+                if len(border_keys) == 0:
+                    continue
+                if len(border_keys) != len(set(border_keys)):
+                    continue
+                if not isolated("top", c0, c1):
+                    continue
+                nonbg = int(np.sum(seg_a != bg) + np.sum(seg_b != bg))
+                score = (len(set(border_keys)), len(d), -(c1 - c0), nonbg)
+                cand = (score, "top", c0, c1)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    def consider_bottom():
+        nonlocal best
+        if h < 2:
+            return
+        a = g[h - 1, :]
+        b = g[h - 2, :]
+        for c0 in range(w):
+            for c1 in range(c0 + 2, w + 1):
+                seg_a = a[c0:c1]
+                seg_b = b[c0:c1]
+                da = set(map(int, np.unique(seg_a)))
+                db = set(map(int, np.unique(seg_b)))
+                da.discard(bg)
+                db.discard(bg)
+                if len(da) < 2 or len(db) < 2:
+                    continue
+                d = da | db
+                if len(d) < 3:
+                    continue
+                border_keys = [int(x) for x in seg_a.tolist() if int(x) != bg]
+                if len(border_keys) == 0:
+                    continue
+                if len(border_keys) != len(set(border_keys)):
+                    continue
+                if not isolated("bottom", c0, c1):
+                    continue
+                nonbg = int(np.sum(seg_a != bg) + np.sum(seg_b != bg))
+                score = (len(set(border_keys)), len(d), -(c1 - c0), nonbg)
+                cand = (score, "bottom", c0, c1)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    def consider_left():
+        nonlocal best
+        if w < 2:
+            return
+        a = g[:, 0]
+        b = g[:, 1]
+        for r0 in range(h):
+            for r1 in range(r0 + 2, h + 1):
+                seg_a = a[r0:r1]
+                seg_b = b[r0:r1]
+                da = set(map(int, np.unique(seg_a)))
+                db = set(map(int, np.unique(seg_b)))
+                da.discard(bg)
+                db.discard(bg)
+                if len(da) < 2 or len(db) < 2:
+                    continue
+                d = da | db
+                if len(d) < 3:
+                    continue
+                border_keys = [int(x) for x in seg_a.tolist() if int(x) != bg]
+                if len(border_keys) == 0:
+                    continue
+                if len(border_keys) != len(set(border_keys)):
+                    continue
+                if not isolated("left", r0, r1):
+                    continue
+                nonbg = int(np.sum(seg_a != bg) + np.sum(seg_b != bg))
+                score = (len(set(border_keys)), len(d), -(r1 - r0), nonbg)
+                cand = (score, "left", r0, r1)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    def consider_right():
+        nonlocal best
+        if w < 2:
+            return
+        a = g[:, w - 1]
+        b = g[:, w - 2]
+        for r0 in range(h):
+            for r1 in range(r0 + 2, h + 1):
+                seg_a = a[r0:r1]
+                seg_b = b[r0:r1]
+                da = set(map(int, np.unique(seg_a)))
+                db = set(map(int, np.unique(seg_b)))
+                da.discard(bg)
+                db.discard(bg)
+                if len(da) < 2 or len(db) < 2:
+                    continue
+                d = da | db
+                if len(d) < 3:
+                    continue
+                border_keys = [int(x) for x in seg_a.tolist() if int(x) != bg]
+                if len(border_keys) == 0:
+                    continue
+                if len(border_keys) != len(set(border_keys)):
+                    continue
+                if not isolated("right", r0, r1):
+                    continue
+                nonbg = int(np.sum(seg_a != bg) + np.sum(seg_b != bg))
+                score = (len(set(border_keys)), len(d), -(r1 - r0), nonbg)
+                cand = (score, "right", r0, r1)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    consider_top()
+    consider_bottom()
+    consider_left()
+    consider_right()
+
+    assert best is not None, "_best_palette must find a valid palette region"
+    _, side, start, end = best
+    return side, int(start), int(end)
+
+
+def _palette_mapping(g: np.ndarray, bg: int) -> tuple[dict[int, int], np.ndarray]:
+    """
+    Returns (mapping border->fill, palette_mask).
+    """
+    h, w = g.shape
+    info = _best_palette(g, bg)
+    side, start, end = info
+    pal_mask = np.zeros((h, w), dtype=bool)
+    mapping: dict[int, int] = {}
+
+    if side == "top":
+        pal_mask[0:2, start:end] = True
+        border_line = g[0, start:end]
+        fill_line = g[1, start:end]
+    elif side == "bottom":
+        pal_mask[h - 2 : h, start:end] = True
+        border_line = g[h - 1, start:end]
+        fill_line = g[h - 2, start:end]
+    elif side == "left":
+        pal_mask[start:end, 0:2] = True
+        border_line = g[start:end, 0]
+        fill_line = g[start:end, 1]
+    else:  # right
+        pal_mask[start:end, w - 2 : w] = True
+        border_line = g[start:end, w - 1]
+        fill_line = g[start:end, w - 2]
+
+    for b, f in zip(border_line.tolist(), fill_line.tolist(), strict=False):
+        b = int(b)
+        f = int(f)
+        if b == bg:
+            continue
+        mapping[b] = f
+
+    return mapping, pal_mask
+
+
+def _fill_enclosed_bg_regions(out: np.ndarray, bg: int, mapping: dict[int, int], pal_mask: np.ndarray) -> None:
+    """
+    Find background regions (excluding the palette area) that do NOT touch the grid boundary,
+    and fill each region based on the most common adjacent border color (mapped via palette).
+    """
+    h, w = out.shape
+    bg_mask = (out == bg) & (~pal_mask)
+    comps = components_mask(bg_mask, connectivity=4)
+    for pts in comps:
+        touches_boundary = any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts)
+        if touches_boundary:
+            continue
+
+        adj_counts: dict[int, int] = {}
+        for r, c in pts:
+            for rr, cc in neighbors4(int(r), int(c)):
+                if 0 <= rr < h and 0 <= cc < w:
+                    if pal_mask[rr, cc]:
+                        continue
+                    v = int(out[rr, cc])
+                    if v == bg:
+                        continue
+                    adj_counts[v] = adj_counts.get(v, 0) + 1
+        if not adj_counts:
+            continue
+
+        # Prefer an adjacent color that exists in the mapping; pick the most frequent border.
+        border = None
+        best = -1
+        for col, cnt in adj_counts.items():
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json'
+obj=json.load(open(p))
+print('train', len(obj.get('train',[])), 'test', len(obj.get('test',[])))
+for split in ('train','test'):
+    for i,pair in enumerate(obj.get(split,[])):
+        inp=pair['input']; out=pair['output']
+        print(split, i, 'in', len(inp), len(inp[0]), 'out', len(out), len(out[0]))
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+train 4 test 1
+train 0 in 20 20 out 20 20
+train 1 in 10 10 out 10 10
+train 2 in 10 10 out 10 10
+train 3 in 20 20 out 20 20
+test 0 in 20 20 out 20 20
+
+codex
+我已经确认原题只靠固定字形字典扩展 marker，而单变体 D4/2 只是把颜色映射挪到边缘。接下来我会看原始样例和参考任务的边缘编码风格，然后把“隐藏样本”具体化成一个可稳定解码、且人眼能看出的压缩表示。
+exec
+/bin/bash -lc 'rg -n "palette|edge|strip|glyph" /home/lixinyu/snap/new/arc2_solver_select/dbff022c.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+14:def _best_palette(g: np.ndarray, bg: int) -> tuple[str, int, int]:
+16:    Find the 2xN or Nx2 palette block on a grid edge.
+29:        outside the palette region; this prevents accidentally absorbing parts of large sprites
+30:        that touch the grid edge.
+189:    assert best is not None, "_best_palette must find a valid palette region"
+194:def _palette_mapping(g: np.ndarray, bg: int) -> tuple[dict[int, int], np.ndarray]:
+196:    Returns (mapping border->fill, palette_mask).
+199:    info = _best_palette(g, bg)
+233:    Find background regions (excluding the palette area) that do NOT touch the grid boundary,
+234:    and fill each region based on the most common adjacent border color (mapped via palette).
+276:    Fill hollow sprites' interiors using a color-palette legend on the grid edge.
+280:    - A small 2×N or N×2 palette block sits on one grid edge; one row/column lists border colors, the other lists corresponding fill colors.
+283:    - Locate the palette legend on a grid edge and read it as a border→fill color mapping.
+285:    - For each hole, identify the most common adjacent border color, look it up in the palette, and fill the hole with the mapped fill color.
+287:    Key insight: The palette's edge position and orientation determine reading direction; border colors in the palette uniquely key into fill colors.
+292:    mapping, pal_mask = _palette_mapping(g, bg)
+293:    assert mapping, "main: palette mapping must be non-empty"
+306:_SMALL_H_THRESHOLD = 6        # below this, prefer left/right palette
+378:    """Pick palette border/fill colors, distractor color, and filled-sprite keys."""
+391:def _build_palette(side, border_keys, fill_values):
+392:    """Construct the 2xN or Nx2 palette array for the given edge side."""
+407:def _place_palette(grid, occ, pal, side, rng):
+408:    """Place palette on the chosen edge and mark its occupancy (with 1-cell padding)."""
+453:    # Grid size and palette side
+488:    # Colors and palette
+491:    pal = _build_palette(side, border_keys, fill_values)
+495:    _place_palette(grid, occ, pal, side, rng)
+497:    # Assign colors to sprites: filled sprites use palette keys, last one is distractor
+
+exec
+/bin/bash -lc "sed -n '260,520p' /home/lixinyu/snap/new/arc2_solver_select/dbff022c.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+        for col, cnt in adj_counts.items():
+            if col not in mapping:
+                continue
+            if cnt > best:
+                best = cnt
+                border = col
+        if border is None:
+            continue
+
+        fill = int(mapping[border])
+        for r, c in pts:
+            out[r, c] = fill
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Fill hollow sprites' interiors using a color-palette legend on the grid edge.
+
+    Input structure:
+    - bg = most common color. Several hollow sprites with distinct border colors.
+    - A small 2×N or N×2 palette block sits on one grid edge; one row/column lists border colors, the other lists corresponding fill colors.
+
+    Rule:
+    - Locate the palette legend on a grid edge and read it as a border→fill color mapping.
+    - Find enclosed bg regions (holes) inside sprites that don't touch the grid boundary.
+    - For each hole, identify the most common adjacent border color, look it up in the palette, and fill the hole with the mapped fill color.
+
+    Key insight: The palette's edge position and orientation determine reading direction; border colors in the palette uniquely key into fill colors.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = _bg_boundary(g)
+
+    mapping, pal_mask = _palette_mapping(g, bg)
+    assert mapping, "main: palette mapping must be non-empty"
+
+    out = g.copy()
+    _fill_enclosed_bg_regions(out, bg, mapping, pal_mask)
+
+    return out
+
+# --------------- generator (c) ---------------
+
+# -- Configuration constants --------------------------------------------------
+# Grid dimensions
+_GRID_H_MIN, _GRID_H_MAX = 4, 13
+_GRID_W_MIN, _GRID_W_MAX = 10, 15
+_SMALL_H_THRESHOLD = 6        # below this, prefer left/right palette
+_SMALL_H_PALETTE_FLIP = 0.7   # probability of flipping top/bottom -> left/right
+_TINY_H_THRESHOLD = 5         # below this, cap sprite height at 3
+
+# Palette
+_PALETTE_N_MIN, _PALETTE_N_MAX = 2, 5
+
+# Sprite geometry
+_SPRITE_H_MAX = 7
+_SPRITE_W_MAX = 6
+_SPRITE_DIM_SUM_CAP = 10      # if sh + sw exceeds this, clamp sw
+_SPRITE_CELL_MAX = 16
+_FILLED_SPRITE_MAX = 3
+
+# Sprite mutation probabilities
+_P_HORIZ_WALL = 0.3           # add horizontal internal wall
+_P_VERT_WALL = 0.3            # add vertical internal wall
+_P_BORDER_REMOVAL = 0.4       # remove border cells for irregular shapes
+_P_DIAMOND = 0.2              # use diamond shape for 3x3
+
+# Generation
+_MAX_RETRIES = 300
+# -- End configuration --------------------------------------------------------
+
+
+def _get_enclosed_holes(sprite):
+    """Return list of point-arrays for bg components not touching sprite boundary."""
+    h, w = sprite.shape
+    return [pts for pts in components_mask(~sprite, connectivity=4)
+            if not any(r == 0 or c == 0 or r == h - 1 or c == w - 1 for r, c in pts)]
+
+
+def _make_diamond():
+    """Return a 3x3 diamond-shaped boolean mask."""
+    s = np.zeros((3, 3), dtype=bool)
+    s[0, 1] = s[1, 0] = s[1, 2] = s[2, 1] = True
+    return s
+
+
+def _make_hollow_sprite(h, w, rng):
+    """Create hollow sprite (h x w) with at least 1 enclosed bg hole, cell count <= _SPRITE_CELL_MAX."""
+    sprite = np.ones((h, w), dtype=bool)
+    if h >= 3 and w >= 3:
+        sprite[1:-1, 1:-1] = False
+    # Optionally add internal horizontal wall
+    if h >= 5 and w >= 4 and rng.random() < _P_HORIZ_WALL:
+        br = rng.randint(2, h - 2)
+        n = rng.randint(1, w - 2)
+        s = rng.randint(1, w - 1 - n + 1)
+        sprite[br, s:s + n] = True
+    # Optionally add internal vertical wall
+    if h >= 4 and w >= 5 and rng.random() < _P_VERT_WALL:
+        bc = rng.randint(2, w - 2)
+        n = rng.randint(1, h - 2)
+        s = rng.randint(1, h - 1 - n + 1)
+        sprite[s:s + n, bc] = True
+    # Optionally remove border cells for irregularity
+    if rng.random() < _P_BORDER_REMOVAL:
+        bcells = [(r, c) for r in range(h) for c in range(w)
+                  if sprite[r, c] and (r in (0, h - 1) or c in (0, w - 1))]
+        rng.shuffle(bcells)
+        for cr, cc in bcells[:rng.randint(1, min(4, len(bcells)))]:
+            test = sprite.copy()
+            test[cr, cc] = False
+            if _get_enclosed_holes(test):
+                sprite = test
+    if not _get_enclosed_holes(sprite) or int(sprite.sum()) > _SPRITE_CELL_MAX:
+        return None
+    return sprite
+
+
+def _choose_colors(rng, N, num_filled):
+    """Pick palette border/fill colors, distractor color, and filled-sprite keys."""
+    all_c = list(range(1, 10))
+    rng.shuffle(all_c)
+    border_keys = all_c[:N]
+    rng.shuffle(all_c)
+    fill_values = all_c[:N]
+    dist_cands = [c for c in range(1, 10) if c not in border_keys]
+    distractor_color = rng.choice(dist_cands)
+    mapping = dict(zip(border_keys, fill_values))
+    filled_keys = rng.sample(border_keys, num_filled)
+    return border_keys, fill_values, distractor_color, mapping, filled_keys
+
+
+def _build_palette(side, border_keys, fill_values):
+    """Construct the 2xN or Nx2 palette array for the given edge side."""
+    N = len(border_keys)
+    if side in ('top', 'bottom'):
+        pal = np.zeros((2, N), dtype=int)
+        outer, inner = (0, 1) if side == 'top' else (1, 0)
+        pal[outer] = border_keys
+        pal[inner] = fill_values
+    else:
+        pal = np.zeros((N, 2), dtype=int)
+        outer, inner = (0, 1) if side == 'left' else (1, 0)
+        pal[:, outer] = border_keys
+        pal[:, inner] = fill_values
+    return pal
+
+
+def _place_palette(grid, occ, pal, side, rng):
+    """Place palette on the chosen edge and mark its occupancy (with 1-cell padding)."""
+    H, W = grid.shape
+    pal_h, pal_w = pal.shape
+    if side == 'top':
+        pr0, pc0 = 0, rng.randint(0, W - pal_w)
+    elif side == 'bottom':
+        pr0, pc0 = H - pal_h, rng.randint(0, W - pal_w)
+    elif side == 'left':
+        pr0, pc0 = rng.randint(0, H - pal_h), 0
+    else:
+        pr0, pc0 = rng.randint(0, H - pal_h), W - pal_w
+    grid[pr0:pr0 + pal_h, pc0:pc0 + pal_w] = pal
+    occ[max(0, pr0 - 1):min(H, pr0 + pal_h + 1),
+        max(0, pc0 - 1):min(W, pc0 + pal_w + 1)] = True
+
+
+def _find_valid_positions(H, W, occ, mask, holes):
+    """Find all (r0, c0) where mask fits without overlap and holes don't touch grid boundary."""
+    sh, sw = mask.shape
+    positions = []
+    for r0 in range(H - sh + 1):
+        for c0 in range(W - sw + 1):
+            if occ[max(0, r0 - 1):min(H, r0 + sh + 1),
+                   max(0, c0 - 1):min(W, c0 + sw + 1)].any():
+                continue
+            if any(r0 + hr == 0 or c0 + hc == 0 or r0 + hr == H - 1 or c0 + hc == W - 1
+                   for hpts in holes for hr, hc in hpts):
+                continue
+            positions.append((r0, c0))
+    return positions
+
+
+def _paint_sprite(grid, r0, c0, mask, color, fill, holes):
+    """Render a sprite onto the grid: border cells in color, hole cells in fill (if given)."""
+    grid[r0:r0 + mask.shape[0], c0:c0 + mask.shape[1]][mask] = color
+    if fill is not None:
+        for hpts in holes:
+            for hr, hc in hpts:
+                grid[r0 + hr, c0 + hc] = fill
+
+
+def _gen_attempt():
+    rng = random.Random()
+    bg = 0
+
+    # Grid size and palette side
+    H = rng.randint(_GRID_H_MIN, _GRID_H_MAX)
+    W = rng.randint(_GRID_W_MIN, _GRID_W_MAX)
+    side = rng.choice(['top', 'bottom', 'left', 'right'])
+    if H <= _SMALL_H_THRESHOLD and side in ('top', 'bottom') and rng.random() < _SMALL_H_PALETTE_FLIP:
+        side = rng.choice(['left', 'right'])
+
+    max_N = H if side in ('left', 'right') else W
+    N = rng.randint(_PALETTE_N_MIN, min(_PALETTE_N_MAX, max_N))
+
+    # Sprite dimension bounds
+    max_sh = min(_SPRITE_H_MAX, H)
+    max_sw = min(_SPRITE_W_MAX, W)
+    if H <= _TINY_H_THRESHOLD:
+        max_sh = 3
+
+    # Sprite counts
+    num_filled = rng.randint(1, min(_FILLED_SPRITE_MAX, N))
+    total_sprites = num_filled + 1
+
+    # Generate sprite shapes
+    shapes = []
+    for _ in range(total_sprites):
+        sh = rng.randint(3, max_sh)
+        sw = rng.randint(3, max_sw)
+        if sh + sw > _SPRITE_DIM_SUM_CAP:
+            sw = max(3, _SPRITE_DIM_SUM_CAP - sh)
+        if sh == 3 and sw == 3 and rng.random() < _P_DIAMOND:
+            mask = _make_diamond()
+        else:
+            mask = _make_hollow_sprite(sh, sw, rng)
+        if mask is None:
+            return None
+        shapes.append(mask)
+
+    # Colors and palette
+    border_keys, fill_values, distractor_color, mapping, filled_keys = \
+        _choose_colors(rng, N, num_filled)
+    pal = _build_palette(side, border_keys, fill_values)
+
+    grid = np.full((H, W), bg, dtype=int)
+    occ = np.zeros((H, W), dtype=bool)
+    _place_palette(grid, occ, pal, side, rng)
+
+    # Assign colors to sprites: filled sprites use palette keys, last one is distractor
+    infos = []
+    for i, mask in enumerate(shapes):
+        if i < num_filled:
+            c, f = filled_keys[i], mapping[filled_keys[i]]
+        else:
+            c, f = distractor_color, None
+        infos.append((mask, c, f))
+
+    # Place sprites
+    placed = []
+    for mask, color, fill in infos:
+        holes = _get_enclosed_holes(mask)
+        positions = _find_valid_positions(H, W, occ, mask, holes)
+        if not positions:
+            return None
+        r0, c0 = rng.choice(positions)
+        _paint_sprite(grid, r0, c0, mask, color, fill, holes)
+        placed.append((r0, c0, mask, fill))
+        sh, sw = mask.shape
+        occ[max(0, r0 - 1):min(H, r0 + sh + 1),
+            max(0, c0 - 1):min(W, c0 + sw + 1)] = True
+
+    # Derive input from output by clearing filled holes
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json, numpy as np
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json'
+obj=json.load(open(p))
+for i,pair in enumerate(obj['train']):
+    print('TRAIN', i)
+    print('input')
+    for row in pair['input']:
+        print(' '.join(map(str,row)))
+    print('output')
+    for row in pair['output']:
+        print(' '.join(map(str,row)))
+    print()
+PY" in /home/lixinyu/snap/new
+ succeeded in 278ms:
+TRAIN 0
+input
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 6 6 0 0 0 0 0 2 0 0 0 0 2 0 0 0 0 0 0
+0 6 6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 6 6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 6 6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 5 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 2 0 0 0 0 2 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 3 0 0 0 0 0 5 0 0 0 0 5 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 3 0 0 0 0 0 3 0 0 0 0 3 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+output
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 4 4 4 4 0 4 4 4 4 0 0 0
+0 0 0 0 0 0 0 0 4 0 0 4 0 4 0 0 4 0 0 0
+0 0 0 0 0 0 0 0 4 0 0 4 0 4 0 0 4 0 0 0
+0 0 0 0 0 0 0 0 4 4 4 4 0 4 4 4 4 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 4 4 4 4 0 4 4 4 4 0 0 0
+0 0 0 0 0 0 0 0 4 0 0 4 0 4 0 0 4 0 0 0
+0 0 0 0 0 0 0 0 4 0 0 4 0 4 0 0 4 0 0 0
+0 0 0 0 0 0 0 0 4 4 4 4 0 4 4 4 4 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 1 1 0 0 0 6 6 0 0 0 6 6 0 0 0 0 0
+0 0 1 0 0 1 0 0 6 6 0 0 0 6 6 0 0 0 0 0
+0 0 1 0 0 1 0 0 0 0 6 6 0 0 0 6 6 0 0 0
+0 0 0 1 1 0 0 0 0 0 6 6 0 0 0 6 6 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 1 1 0 0 0 0 1 1 0 0 0 1 1 0 0 0 0
+0 0 1 0 0 1 0 0 1 0 0 1 0 1 0 0 1 0 0 0
+0 0 1 0 0 1 0 0 1 0 0 1 0 1 0 0 1 0 0 0
+0 0 0 1 1 0 0 0 0 1 1 0 0 0 1 1 0 0 0 0
+
+TRAIN 1
+input
+0 0 0 0 0 0 0 0 0 0
+0 3 0 0 0 2 0 0 0 0
+0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0
+0 2 0 0 0 3 1 1 0 0
+0 0 0 0 0 1 0 0 1 0
+0 0 0 0 0 1 0 0 1 0
+0 0 0 0 0 0 1 1 0 0
+0 0 0 0 0 0 0 0 0 3
+output
+0 0 0 0 0 0 0 0 0 0
+0 0 1 1 0 4 4 4 4 0
+0 1 0 0 1 4 0 0 4 0
+0 1 0 0 1 4 0 0 4 0
+0 0 1 1 0 4 4 4 4 0
+0 4 4 4 4 0 1 1 0 0
+0 4 0 0 4 1 0 0 1 0
+0 4 0 0 4 1 0 0 1 0
+0 4 4 4 4 0 1 1 0 0
+0 0 0 0 0 0 0 0 0 0
+
+TRAIN 2
+input
+4 4 4 4 0 0 2 0 0 0
+4 0 0 4 0 0 0 0 0 0
+4 0 0 4 0 0 0 0 0 0
+4 4 4 4 0 0 0 0 0 0
+0 0 0 0 2 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0
+2 0 0 0 0 0 2 0 0 0
+0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0
+output
+0 0 0 0 0 0 4 4 4 4
+0 0 0 0 0 0 4 0 0 4
+0 0 0 0 0 0 4 0 0 4
+0 0 0 0 0 0 4 4 4 4
+0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0
+4 4 4 4 0 0 4 4 4 4
+4 0 0 4 0 0 4 0 0 4
+4 0 0 4 0 0 4 0 0 4
+4 4 4 4 0 0 4 4 4 4
+
+TRAIN 3
+input
+2 0 0 0 2 0 0 0 5 0 0 0 8 0 0 0 8 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+2 0 0 0 3 0 0 0 2 0 0 0 3 0 0 0 8 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+5 0 0 0 3 0 0 0 5 0 0 0 2 0 0 0 5 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+8 0 0 0 3 0 0 0 2 0 0 0 3 0 0 0 2 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+8 0 0 0 8 0 0 0 5 0 0 0 2 0 0 0 2 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+output
+4 4 4 4 4 4 4 4 6 6 0 0 7 0 0 7 7 0 0 7
+4 0 0 4 4 0 0 4 6 6 0 0 0 7 7 0 0 7 7 0
+4 0 0 4 4 0 0 4 0 0 6 6 0 7 7 0 0 7 7 0
+4 4 4 4 4 4 4 4 0 0 6 6 7 0 0 7 7 0 0 7
+4 4 4 4 0 1 1 0 4 4 4 4 0 1 1 0 7 0 0 7
+4 0 0 4 1 0 0 1 4 0 0 4 1 0 0 1 0 7 7 0
+4 0 0 4 1 0 0 1 4 0 0 4 1 0 0 1 0 7 7 0
+4 4 4 4 0 1 1 0 4 4 4 4 0 1 1 0 7 0 0 7
+6 6 0 0 0 1 1 0 6 6 0 0 4 4 4 4 6 6 0 0
+6 6 0 0 1 0 0 1 6 6 0 0 4 0 0 4 6 6 0 0
+0 0 6 6 1 0 0 1 0 0 6 6 4 0 0 4 0 0 6 6
+0 0 6 6 0 1 1 0 0 0 6 6 4 4 4 4 0 0 6 6
+7 0 0 7 0 1 1 0 4 4 4 4 0 1 1 0 4 4 4 4
+0 7 7 0 1 0 0 1 4 0 0 4 1 0 0 1 4 0 0 4
+0 7 7 0 1 0 0 1 4 0 0 4 1 0 0 1 4 0 0 4
+7 0 0 7 0 1 1 0 4 4 4 4 0 1 1 0 4 4 4 4
+7 0 0 7 7 0 0 7 6 6 0 0 4 4 4 4 4 4 4 4
+0 7 7 0 0 7 7 0 6 6 0 0 4 0 0 4 4 0 0 4
+0 7 7 0 0 7 7 0 0 0 6 6 4 0 0 4 4 0 0 4
+7 0 0 7 7 0 0 7 0 0 6 6 4 4 4 4 4 4 4 4
+
+
+codex
+设计已经收敛了：我会把每个“marker→隐藏样本”编码成一个整条顶边或左边的 2×20 / 20×2 频带，外侧恒为 marker 色，内侧用“marker 色=0位、glyph 色=1位”按 4 组 4 格编码 4×4 字形。这样形状和颜色都由边缘条给出，marker 本身不再绑定固定输出字形或固定输出色。
+实现融合版需要先落定边缘编码协议，再写 solver/generator 并做成功率与退化性验证。
+  → 实现融合版 code.py，包括设计分析注释、边缘解码 solver 和对应 generator
+  • 运行 50 次成功率测试，修复生成或解码问题直到通过
+  • 统计融合行为指标，确认未退化为原题或单变体
+codex
+现在开始落盘：我会新建融合版 `code.py`，把设计分析写进注释，并实现“边缘隐藏样本频带”的解码和对应 generator。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/19' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/19/code.py
+diff --git a/ceshi/code_combo/dfadab01/19/code.py b/ceshi/code_combo/dfadab01/19/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d42deeb9da4dcd0f5f5e7b8789c9f411962df5bc
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/19/code.py
+@@ -0,0 +1,423 @@
++# Combo variant of dfadab01 (index 19)
++# combo_spec: D4/2+D11/1
++# Name: 调色板条+边缘隐藏样本
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++# Design analysis
++# ---------------
++# spec:
++#   unchanged_core:
++#     - Single-pixel scene markers still expand into 4x4 glyphs whose top-left corner is the marker pixel.
++#     - Expansion is still clipped by the grid boundary.
++#     - The visible scene is still a sparse lattice of marker dots on a black background.
++#   fusion concretized:
++#     - The old in-grid 4x4 sample glyph and its below-right label disappear completely.
++#     - Each used marker type now has one hidden edge band: either a 2x20 strip stacked on the top edge,
++#       or a 20x2 strip stacked on the left edge.
++#     - Every fifth slot is a black separator, so the remaining 16 slots are read as 4 groups of 4 and
++#       therefore as a row-major flattening of a 4x4 glyph.
++#     - The outer lane of a band is constant marker color on data slots; the inner lane uses marker color
++#       for 0-bits and glyph color for 1-bits. Decoding one band therefore yields both the marker key and
++#       the glyph's output color/pattern.
++#   behavior trace:
++#     - Original: a marker color directly implied one fixed mask and one fixed output color, and an optional
++#       interior sample merely reminded the solver of that fact.
++#     - Fusion: a marker color is only a key. Example: if a top-edge band has outer row = all 2 on data slots
++#       and inner row grouped as [2 4 4 2 | 4 2 2 4 | 4 2 2 4 | 2 4 4 2], marker 2 now means "paint the
++#       blue-ring mask in color 4", even though that is not its canonical assignment.
++#     - Difference: the solver must first decode compressed edge legends, then use the recovered per-instance
++#       shape/color dictionary on the interior markers.
++#   complexity calibration:
++#     - Each instance uses 2-3 marker types, and every used type appears at least once in the scene.
++#     - Shapes are sampled injectively from the original 4-glyph alphabet and colors are sampled injectively
++#       from {1,4,6,7}; this keeps the legend small and human-trackable.
++#     - At least one marker gets a non-canonical shape or non-canonical color, so the variant cannot collapse
++#       back to the original fixed dictionary.
++#   hidden assumptions invalidated from the original main():
++#     - Hardcoding marker->(glyph_color, mask) is no longer valid.
++#     - Searching for a visible 4x4 sample near a marker is no longer valid because the sample is edge-encoded.
++#     - Marker-colored pixels on the top/left edge are no longer necessarily scene markers; whole legend bands
++#       must be detected and masked out before expansion.
++#   placement legality:
++#     - A hidden sample needs 16 data slots plus 4 separators, so the generator fixes the grid to 20x20.
++#     - Top legends occupy rows [0, 2k) and reserve row 2k as blank padding; left legends occupy cols
++#       [0, 2k) and reserve col 2k as blank padding.
++#     - Scene markers are placed on a 4-6 spaced lattice inside the remaining rectangle, so expanded glyphs
++#       never overlap each other or the hidden-sample area.
++#   visual observability:
++#     - The 4+1+4+1+4+1+4 grouping makes the flattened 4x4 structure visible to a human instead of hiding it
++#       in arithmetic or ordering tricks.
++#     - The constant outer lane announces the controlling marker color, while the inner lane makes the output
++#       color and filled cells visible at the same time.
++#     - Repeated use of every decoded marker in the scene gives direct support for the inferred legend.
++#   cleanliness:
++#     - Legends live on one dedicated edge with one empty separator row/column; the interior remains a clean
++#       sparse marker field.
++#   generator guarantees for the new solver assumptions:
++#     - Exactly one orientation is used per instance: stacked top bands or stacked left bands.
++#     - Bands use unique marker keys, unique glyph colors, and unique glyph masks.
++#     - The decoded mask always belongs to the original 4-glyph alphabet, and every legend band has at least
++#       one matching scene marker.
++
++
++CANONICAL_GLYPHS: dict[int, np.ndarray] = {
++    2: np.array(
++        [
++            [1, 1, 1, 1],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [1, 1, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    3: np.array(
++        [
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++        ],
++        dtype=bool,
++    ),
++    5: np.array(
++        [
++            [1, 1, 0, 0],
++            [1, 1, 0, 0],
++            [0, 0, 1, 1],
++            [0, 0, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    8: np.array(
++        [
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++MARKER_COLORS = tuple(CANONICAL_GLYPHS.keys())
++GLYPH_COLORS = (1, 4, 6, 7)
++CANONICAL_COLORS = {2: 4, 3: 1, 5: 6, 8: 7}
++
++GRID_SIZE = 20
++DATA_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 != 4)
++SEP_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 == 4)
++SPACING_RANGE = (4, 6)
++MAX_RETRIES = 400
++
++
++def _shape_key(mask: np.ndarray) -> tuple[int, ...]:
++    return tuple(int(v) for v in mask.astype(int).reshape(-1).tolist())
++
++
++VALID_SHAPE_KEYS = {_shape_key(mask) for mask in CANONICAL_GLYPHS.values()}
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _decode_band(outer: np.ndarray, inner: np.ndarray) -> tuple[int, int, np.ndarray] | None:
++    if outer.shape != (GRID_SIZE,) or inner.shape != (GRID_SIZE,):
++        return None
++    if any(int(outer[i]) != 0 or int(inner[i]) != 0 for i in SEP_IDXS):
++        return None
++
++    outer_vals = [int(outer[i]) for i in DATA_IDXS]
++    marker_set = set(outer_vals)
++    if len(marker_set) != 1:
++        return None
++    marker = outer_vals[0]
++    if marker not in MARKER_COLORS:
++        return None
++
++    inner_vals = [int(inner[i]) for i in DATA_IDXS]
++    if any(v == 0 for v in inner_vals):
++        return None
++    glyph_candidates = set(inner_vals) - {marker}
++    if len(glyph_candidates) != 1:
++        return None
++    glyph_color = next(iter(glyph_candidates))
++    if glyph_color not in GLYPH_COLORS:
++        return None
++    if any(v not in {marker, glyph_color} for v in inner_vals):
++        return None
++
++    mask = np.array([v == glyph_color for v in inner_vals], dtype=bool).reshape(4, 4)
++    if _shape_key(mask) not in VALID_SHAPE_KEYS:
++        return None
++    return marker, glyph_color, mask
++
++
++def _try_decode_top(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if w != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    r = 0
++    while r + 1 < h:
++        decoded = _decode_band(g[r, :], g[r + 1, :])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[r : r + 2, :] = True
++        r += 2
++
++    if not mapping or r >= h or np.any(g[r, :] != 0):
++        return None
++    legend_mask[r, :] = True
++    return mapping, legend_mask
++
++
++def _try_decode_left(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if h != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    c = 0
++    while c + 1 < w:
++        decoded = _decode_band(g[:, c], g[:, c + 1])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[:, c : c + 2] = True
++        c += 2
++
++    if not mapping or c >= w or np.any(g[:, c] != 0):
++        return None
++    legend_mask[:, c] = True
++    return mapping, legend_mask
++
++
++def _extract_hidden_legend(
++    g: np.ndarray,
++) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray]:
++    candidates = []
++    top = _try_decode_top(g)
++    if top is not None:
++        candidates.append(top)
++    left = _try_decode_left(g)
++    if left is not None:
++        candidates.append(left)
++    assert len(candidates) == 1, "hidden edge legend not found uniquely"
++    return candidates[0]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each scene marker using the glyph pattern and glyph color decoded from hidden edge bands.
++
++    Input structure:
++    - A 20x20 black-background grid contains scene markers in colors 2, 3, 5, and/or 8.
++    - On exactly one edge, stacked 2x20 top bands or 20x2 left bands hide the sample legends.
++    - In each band, the outer lane is the marker color and the inner lane is a separator-grouped 16-cell flattening of the 4x4 glyph, using marker color for empty cells and glyph color for filled cells.
++
++    Rule:
++    - Detect the hidden edge bands, decode each one into a marker -> (glyph color, 4x4 mask) entry, and ignore the legend area itself.
++    - Replace every remaining marker dot by its decoded 4x4 glyph, anchored at the marker and clipped at the grid border.
++    - The output contains only the painted scene glyphs; the hidden legend disappears.
++
++    Key insight:
++    - The edge strip is both a palette and a compressed sample: the constant outer lane tells which marker is being defined, while the grouped inner lane reveals the glyph shape and its paint color.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    mapping, legend_mask = _extract_hidden_legend(g)
++    scene = g.copy()
++    scene[legend_mask] = 0
++
++    present_markers = {int(v) for v in np.unique(scene) if int(v) in MARKER_COLORS}
++    assert present_markers
++    assert present_markers == set(mapping.keys())
++
++    out = np.zeros_like(g)
++    for marker in sorted(present_markers):
++        glyph_color, mask = mapping[marker]
++        for r, c in np.argwhere(scene == marker):
++            _paint_clipped(out, int(r), int(c), int(glyph_color), mask)
++
++    return out
++
++
++def _sample_positions(rng: random.Random, lo: int, hi: int, count: int) -> list[int]:
++    assert lo <= hi and count >= 1
++    if count == 1:
++        return [rng.randint(lo, hi)]
++
++    min_gap, max_gap = SPACING_RANGE
++    for _ in range(200):
++        gaps = [rng.randint(min_gap, max_gap) for _ in range(count - 1)]
++        span = sum(gaps)
++        if span <= hi - lo:
++            start = rng.randint(lo, hi - span)
++            vals = [start]
++            for gap in gaps:
++                vals.append(vals[-1] + gap)
++            return vals
++
++    span = min_gap * (count - 1)
++    assert span <= hi - lo
++    start = rng.randint(lo, hi - span)
++    return [start + i * min_gap for i in range(count)]
++
++
++def _feasible_count(span: int) -> int:
++    return 1 + span // SPACING_RANGE[0]
++
++
++def _choose_mapping(
++    rng: random.Random, used_markers: list[int]
++) -> dict[int, tuple[int, np.ndarray]]:
++    shape_sources_all = list(MARKER_COLORS)
++    for _ in range(200):
++        shape_sources = rng.sample(shape_sources_all, len(used_markers))
++        glyph_colors = rng.sample(list(GLYPH_COLORS), len(used_markers))
++        mapping = {
++            marker: (glyph_color, CANONICAL_GLYPHS[src])
++            for marker, glyph_color, src in zip(
++                used_markers, glyph_colors, shape_sources, strict=False
++            )
++        }
++        if any(
++            glyph_color != CANONICAL_COLORS[marker]
++            or _shape_key(mask) != _shape_key(CANONICAL_GLYPHS[marker])
++            for marker, (glyph_color, mask) in mapping.items()
++        ):
++            return mapping
++    raise RuntimeError("failed to sample a non-canonical hidden legend")
++
++
++def _build_top_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((2, GRID_SIZE), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[0, idx] = marker
++        band[1, idx] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _build_left_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((GRID_SIZE, 2), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[idx, 0] = marker
++        band[idx, 1] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _render_scene(
++    placed: list[tuple[int, int, int]], mapping: dict[int, tuple[int, np.ndarray]]
++) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker in placed:
++        glyph_color, mask = mapping[marker]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    side = rng.choice(("top", "left"))
++    used_count = rng.randint(2, 3)
++    used_markers = rng.sample(list(MARKER_COLORS), used_count)
++    mapping = _choose_mapping(rng, used_markers)
++
++    scene_r_lo = 2 * used_count + 1 if side == "top" else 0
++    scene_c_lo = 2 * used_count + 1 if side == "left" else 0
++    scene_r_hi = GRID_SIZE - 1
++    scene_c_hi = GRID_SIZE - 1
++
++    row_span = scene_r_hi - scene_r_lo
++    col_span = scene_c_hi - scene_c_lo
++    max_rows = min(4, _feasible_count(row_span))
++    max_cols = min(4, _feasible_count(col_span))
++    if max_rows < 2 or max_cols < 2:
++        return None
++
++    rows = rng.randint(2, max_rows)
++    cols = rng.randint(2, max_cols)
++    row_pos = _sample_positions(rng, scene_r_lo, scene_r_hi, rows)
++    col_pos = _sample_positions(rng, scene_c_lo, scene_c_hi, cols)
++
++    all_cells = [(r, c) for r in row_pos for c in col_pos]
++    min_fill = max(used_count, (6 * len(all_cells) + 9) // 10)
++    fill_count = rng.randint(min_fill, len(all_cells))
++
++    chosen_cells = rng.sample(all_cells, fill_count)
++    assigned_markers = used_markers.copy()
++    assigned_markers.extend(rng.choice(used_markers) for _ in range(fill_count - used_count))
++    rng.shuffle(assigned_markers)
++
++    inp = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    placed: list[tuple[int, int, int]] = []
++    for (r, c), marker in zip(chosen_cells, assigned_markers, strict=False):
++        inp[r, c] = marker
++        placed.append((r, c, marker))
++
++    legend_order = used_markers.copy()
++    rng.shuffle(legend_order)
++    if side == "top":
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[2 * i : 2 * i + 2, :] = _build_top_band(marker, glyph_color, mask)
++    else:
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[:, 2 * i : 2 * i + 2] = _build_left_band(marker, glyph_color, mask)
++
++    expected = _render_scene(placed, mapping)
++    try:
++        actual = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(actual, expected):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"failed to generate input after {MAX_RETRIES} attempts")
+
+diff --git a/ceshi/code_combo/dfadab01/19/code.py b/ceshi/code_combo/dfadab01/19/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d42deeb9da4dcd0f5f5e7b8789c9f411962df5bc
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/19/code.py
+@@ -0,0 +1,423 @@
++# Combo variant of dfadab01 (index 19)
++# combo_spec: D4/2+D11/1
++# Name: 调色板条+边缘隐藏样本
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++# Design analysis
++# ---------------
++# spec:
++#   unchanged_core:
++#     - Single-pixel scene markers still expand into 4x4 glyphs whose top-left corner is the marker pixel.
++#     - Expansion is still clipped by the grid boundary.
++#     - The visible scene is still a sparse lattice of marker dots on a black background.
++#   fusion concretized:
++#     - The old in-grid 4x4 sample glyph and its below-right label disappear completely.
++#     - Each used marker type now has one hidden edge band: either a 2x20 strip stacked on the top edge,
++#       or a 20x2 strip stacked on the left edge.
++#     - Every fifth slot is a black separator, so the remaining 16 slots are read as 4 groups of 4 and
++#       therefore as a row-major flattening of a 4x4 glyph.
++#     - The outer lane of a band is constant marker color on data slots; the inner lane uses marker color
++#       for 0-bits and glyph color for 1-bits. Decoding one band therefore yields both the marker key and
++#       the glyph's output color/pattern.
++#   behavior trace:
++#     - Original: a marker color directly implied one fixed mask and one fixed output color, and an optional
++#       interior sample merely reminded the solver of that fact.
++#     - Fusion: a marker color is only a key. Example: if a top-edge band has outer row = all 2 on data slots
++#       and inner row grouped as [2 4 4 2 | 4 2 2 4 | 4 2 2 4 | 2 4 4 2], marker 2 now means "paint the
++#       blue-ring mask in color 4", even though that is not its canonical assignment.
++#     - Difference: the solver must first decode compressed edge legends, then use the recovered per-instance
++#       shape/color dictionary on the interior markers.
++#   complexity calibration:
++#     - Each instance uses 2-3 marker types, and every used type appears at least once in the scene.
++#     - Shapes are sampled injectively from the original 4-glyph alphabet and colors are sampled injectively
++#       from {1,4,6,7}; this keeps the legend small and human-trackable.
++#     - At least one marker gets a non-canonical shape or non-canonical color, so the variant cannot collapse
++#       back to the original fixed dictionary.
++#   hidden assumptions invalidated from the original main():
++#     - Hardcoding marker->(glyph_color, mask) is no longer valid.
++#     - Searching for a visible 4x4 sample near a marker is no longer valid because the sample is edge-encoded.
++#     - Marker-colored pixels on the top/left edge are no longer necessarily scene markers; whole legend bands
++#       must be detected and masked out before expansion.
++#   placement legality:
++#     - A hidden sample needs 16 data slots plus 4 separators, so the generator fixes the grid to 20x20.
++#     - Top legends occupy rows [0, 2k) and reserve row 2k as blank padding; left legends occupy cols
++#       [0, 2k) and reserve col 2k as blank padding.
++#     - Scene markers are placed on a 4-6 spaced lattice inside the remaining rectangle, so expanded glyphs
++#       never overlap each other or the hidden-sample area.
++#   visual observability:
++#     - The 4+1+4+1+4+1+4 grouping makes the flattened 4x4 structure visible to a human instead of hiding it
++#       in arithmetic or ordering tricks.
++#     - The constant outer lane announces the controlling marker color, while the inner lane makes the output
++#       color and filled cells visible at the same time.
++#     - Repeated use of every decoded marker in the scene gives direct support for the inferred legend.
++#   cleanliness:
++#     - Legends live on one dedicated edge with one empty separator row/column; the interior remains a clean
++#       sparse marker field.
++#   generator guarantees for the new solver assumptions:
++#     - Exactly one orientation is used per instance: stacked top bands or stacked left bands.
++#     - Bands use unique marker keys, unique glyph colors, and unique glyph masks.
++#     - The decoded mask always belongs to the original 4-glyph alphabet, and every legend band has at least
++#       one matching scene marker.
++
++
++CANONICAL_GLYPHS: dict[int, np.ndarray] = {
++    2: np.array(
++        [
++            [1, 1, 1, 1],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [1, 1, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    3: np.array(
++        [
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++        ],
++        dtype=bool,
++    ),
++    5: np.array(
++        [
++            [1, 1, 0, 0],
++            [1, 1, 0, 0],
++            [0, 0, 1, 1],
++            [0, 0, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    8: np.array(
++        [
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++MARKER_COLORS = tuple(CANONICAL_GLYPHS.keys())
++GLYPH_COLORS = (1, 4, 6, 7)
++CANONICAL_COLORS = {2: 4, 3: 1, 5: 6, 8: 7}
++
++GRID_SIZE = 20
++DATA_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 != 4)
++SEP_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 == 4)
++SPACING_RANGE = (4, 6)
++MAX_RETRIES = 400
++
++
++def _shape_key(mask: np.ndarray) -> tuple[int, ...]:
++    return tuple(int(v) for v in mask.astype(int).reshape(-1).tolist())
++
++
++VALID_SHAPE_KEYS = {_shape_key(mask) for mask in CANONICAL_GLYPHS.values()}
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _decode_band(outer: np.ndarray, inner: np.ndarray) -> tuple[int, int, np.ndarray] | None:
++    if outer.shape != (GRID_SIZE,) or inner.shape != (GRID_SIZE,):
++        return None
++    if any(int(outer[i]) != 0 or int(inner[i]) != 0 for i in SEP_IDXS):
++        return None
++
++    outer_vals = [int(outer[i]) for i in DATA_IDXS]
++    marker_set = set(outer_vals)
++    if len(marker_set) != 1:
++        return None
++    marker = outer_vals[0]
++    if marker not in MARKER_COLORS:
++        return None
++
++    inner_vals = [int(inner[i]) for i in DATA_IDXS]
++    if any(v == 0 for v in inner_vals):
++        return None
++    glyph_candidates = set(inner_vals) - {marker}
++    if len(glyph_candidates) != 1:
++        return None
++    glyph_color = next(iter(glyph_candidates))
++    if glyph_color not in GLYPH_COLORS:
++        return None
++    if any(v not in {marker, glyph_color} for v in inner_vals):
++        return None
++
++    mask = np.array([v == glyph_color for v in inner_vals], dtype=bool).reshape(4, 4)
++    if _shape_key(mask) not in VALID_SHAPE_KEYS:
++        return None
++    return marker, glyph_color, mask
++
++
++def _try_decode_top(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if w != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    r = 0
++    while r + 1 < h:
++        decoded = _decode_band(g[r, :], g[r + 1, :])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[r : r + 2, :] = True
++        r += 2
++
++    if not mapping or r >= h or np.any(g[r, :] != 0):
++        return None
++    legend_mask[r, :] = True
++    return mapping, legend_mask
++
++
++def _try_decode_left(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if h != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    c = 0
++    while c + 1 < w:
++        decoded = _decode_band(g[:, c], g[:, c + 1])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[:, c : c + 2] = True
++        c += 2
++
++    if not mapping or c >= w or np.any(g[:, c] != 0):
++        return None
++    legend_mask[:, c] = True
++    return mapping, legend_mask
++
++
++def _extract_hidden_legend(
++    g: np.ndarray,
++) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray]:
++    candidates = []
++    top = _try_decode_top(g)
++    if top is not None:
++        candidates.append(top)
++    left = _try_decode_left(g)
++    if left is not None:
++        candidates.append(left)
++    assert len(candidates) == 1, "hidden edge legend not found uniquely"
++    return candidates[0]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each scene marker using the glyph pattern and glyph color decoded from hidden edge bands.
++
++    Input structure:
++    - A 20x20 black-background grid contains scene markers in colors 2, 3, 5, and/or 8.
++    - On exactly one edge, stacked 2x20 top bands or 20x2 left bands hide the sample legends.
++    - In each band, the outer lane is the marker color and the inner lane is a separator-grouped 16-cell flattening of the 4x4 glyph, using marker color for empty cells and glyph color for filled cells.
++
++    Rule:
++    - Detect the hidden edge bands, decode each one into a marker -> (glyph color, 4x4 mask) entry, and ignore the legend area itself.
++    - Replace every remaining marker dot by its decoded 4x4 glyph, anchored at the marker and clipped at the grid border.
++    - The output contains only the painted scene glyphs; the hidden legend disappears.
++
++    Key insight:
++    - The edge strip is both a palette and a compressed sample: the constant outer lane tells which marker is being defined, while the grouped inner lane reveals the glyph shape and its paint color.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    mapping, legend_mask = _extract_hidden_legend(g)
++    scene = g.copy()
++    scene[legend_mask] = 0
++
++    present_markers = {int(v) for v in np.unique(scene) if int(v) in MARKER_COLORS}
++    assert present_markers
++    assert present_markers == set(mapping.keys())
++
++    out = np.zeros_like(g)
++    for marker in sorted(present_markers):
++        glyph_color, mask = mapping[marker]
++        for r, c in np.argwhere(scene == marker):
++            _paint_clipped(out, int(r), int(c), int(glyph_color), mask)
++
++    return out
++
++
++def _sample_positions(rng: random.Random, lo: int, hi: int, count: int) -> list[int]:
++    assert lo <= hi and count >= 1
++    if count == 1:
++        return [rng.randint(lo, hi)]
++
++    min_gap, max_gap = SPACING_RANGE
++    for _ in range(200):
++        gaps = [rng.randint(min_gap, max_gap) for _ in range(count - 1)]
++        span = sum(gaps)
++        if span <= hi - lo:
++            start = rng.randint(lo, hi - span)
++            vals = [start]
++            for gap in gaps:
++                vals.append(vals[-1] + gap)
++            return vals
++
++    span = min_gap * (count - 1)
++    assert span <= hi - lo
++    start = rng.randint(lo, hi - span)
++    return [start + i * min_gap for i in range(count)]
++
++
++def _feasible_count(span: int) -> int:
++    return 1 + span // SPACING_RANGE[0]
++
++
++def _choose_mapping(
++    rng: random.Random, used_markers: list[int]
++) -> dict[int, tuple[int, np.ndarray]]:
++    shape_sources_all = list(MARKER_COLORS)
++    for _ in range(200):
++        shape_sources = rng.sample(shape_sources_all, len(used_markers))
++        glyph_colors = rng.sample(list(GLYPH_COLORS), len(used_markers))
++        mapping = {
++            marker: (glyph_color, CANONICAL_GLYPHS[src])
++            for marker, glyph_color, src in zip(
++                used_markers, glyph_colors, shape_sources, strict=False
++            )
++        }
++        if any(
++            glyph_color != CANONICAL_COLORS[marker]
++            or _shape_key(mask) != _shape_key(CANONICAL_GLYPHS[marker])
++            for marker, (glyph_color, mask) in mapping.items()
++        ):
++            return mapping
++    raise RuntimeError("failed to sample a non-canonical hidden legend")
++
++
++def _build_top_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((2, GRID_SIZE), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[0, idx] = marker
++        band[1, idx] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _build_left_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((GRID_SIZE, 2), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[idx, 0] = marker
++        band[idx, 1] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _render_scene(
++    placed: list[tuple[int, int, int]], mapping: dict[int, tuple[int, np.ndarray]]
++) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker in placed:
++        glyph_color, mask = mapping[marker]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    side = rng.choice(("top", "left"))
++    used_count = rng.randint(2, 3)
++    used_markers = rng.sample(list(MARKER_COLORS), used_count)
++    mapping = _choose_mapping(rng, used_markers)
++
++    scene_r_lo = 2 * used_count + 1 if side == "top" else 0
++    scene_c_lo = 2 * used_count + 1 if side == "left" else 0
++    scene_r_hi = GRID_SIZE - 1
++    scene_c_hi = GRID_SIZE - 1
++
++    row_span = scene_r_hi - scene_r_lo
++    col_span = scene_c_hi - scene_c_lo
++    max_rows = min(4, _feasible_count(row_span))
++    max_cols = min(4, _feasible_count(col_span))
++    if max_rows < 2 or max_cols < 2:
++        return None
++
++    rows = rng.randint(2, max_rows)
++    cols = rng.randint(2, max_cols)
++    row_pos = _sample_positions(rng, scene_r_lo, scene_r_hi, rows)
++    col_pos = _sample_positions(rng, scene_c_lo, scene_c_hi, cols)
++
++    all_cells = [(r, c) for r in row_pos for c in col_pos]
++    min_fill = max(used_count, (6 * len(all_cells) + 9) // 10)
++    fill_count = rng.randint(min_fill, len(all_cells))
++
++    chosen_cells = rng.sample(all_cells, fill_count)
++    assigned_markers = used_markers.copy()
++    assigned_markers.extend(rng.choice(used_markers) for _ in range(fill_count - used_count))
++    rng.shuffle(assigned_markers)
++
++    inp = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    placed: list[tuple[int, int, int]] = []
++    for (r, c), marker in zip(chosen_cells, assigned_markers, strict=False):
++        inp[r, c] = marker
++        placed.append((r, c, marker))
++
++    legend_order = used_markers.copy()
++    rng.shuffle(legend_order)
++    if side == "top":
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[2 * i : 2 * i + 2, :] = _build_top_band(marker, glyph_color, mask)
++    else:
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[:, 2 * i : 2 * i + 2] = _build_left_band(marker, glyph_color, mask)
++
++    expected = _render_scene(placed, mapping)
++    try:
++        actual = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(actual, expected):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"failed to generate input after {MAX_RETRIES} attempts")
+
+codex
+代码已写好，先跑 50 次成功率测试看解码和生成是否稳定，再根据失败类型收紧约束或修正带状 legend 的解析。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/19/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/19/code.py b/ceshi/code_combo/dfadab01/19/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d42deeb9da4dcd0f5f5e7b8789c9f411962df5bc
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/19/code.py
+@@ -0,0 +1,423 @@
++# Combo variant of dfadab01 (index 19)
++# combo_spec: D4/2+D11/1
++# Name: 调色板条+边缘隐藏样本
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++# Design analysis
++# ---------------
++# spec:
++#   unchanged_core:
++#     - Single-pixel scene markers still expand into 4x4 glyphs whose top-left corner is the marker pixel.
++#     - Expansion is still clipped by the grid boundary.
++#     - The visible scene is still a sparse lattice of marker dots on a black background.
++#   fusion concretized:
++#     - The old in-grid 4x4 sample glyph and its below-right label disappear completely.
++#     - Each used marker type now has one hidden edge band: either a 2x20 strip stacked on the top edge,
++#       or a 20x2 strip stacked on the left edge.
++#     - Every fifth slot is a black separator, so the remaining 16 slots are read as 4 groups of 4 and
++#       therefore as a row-major flattening of a 4x4 glyph.
++#     - The outer lane of a band is constant marker color on data slots; the inner lane uses marker color
++#       for 0-bits and glyph color for 1-bits. Decoding one band therefore yields both the marker key and
++#       the glyph's output color/pattern.
++#   behavior trace:
++#     - Original: a marker color directly implied one fixed mask and one fixed output color, and an optional
++#       interior sample merely reminded the solver of that fact.
++#     - Fusion: a marker color is only a key. Example: if a top-edge band has outer row = all 2 on data slots
++#       and inner row grouped as [2 4 4 2 | 4 2 2 4 | 4 2 2 4 | 2 4 4 2], marker 2 now means "paint the
++#       blue-ring mask in color 4", even though that is not its canonical assignment.
++#     - Difference: the solver must first decode compressed edge legends, then use the recovered per-instance
++#       shape/color dictionary on the interior markers.
++#   complexity calibration:
++#     - Each instance uses 2-3 marker types, and every used type appears at least once in the scene.
++#     - Shapes are sampled injectively from the original 4-glyph alphabet and colors are sampled injectively
++#       from {1,4,6,7}; this keeps the legend small and human-trackable.
++#     - At least one marker gets a non-canonical shape or non-canonical color, so the variant cannot collapse
++#       back to the original fixed dictionary.
++#   hidden assumptions invalidated from the original main():
++#     - Hardcoding marker->(glyph_color, mask) is no longer valid.
++#     - Searching for a visible 4x4 sample near a marker is no longer valid because the sample is edge-encoded.
++#     - Marker-colored pixels on the top/left edge are no longer necessarily scene markers; whole legend bands
++#       must be detected and masked out before expansion.
++#   placement legality:
++#     - A hidden sample needs 16 data slots plus 4 separators, so the generator fixes the grid to 20x20.
++#     - Top legends occupy rows [0, 2k) and reserve row 2k as blank padding; left legends occupy cols
++#       [0, 2k) and reserve col 2k as blank padding.
++#     - Scene markers are placed on a 4-6 spaced lattice inside the remaining rectangle, so expanded glyphs
++#       never overlap each other or the hidden-sample area.
++#   visual observability:
++#     - The 4+1+4+1+4+1+4 grouping makes the flattened 4x4 structure visible to a human instead of hiding it
++#       in arithmetic or ordering tricks.
++#     - The constant outer lane announces the controlling marker color, while the inner lane makes the output
++#       color and filled cells visible at the same time.
++#     - Repeated use of every decoded marker in the scene gives direct support for the inferred legend.
++#   cleanliness:
++#     - Legends live on one dedicated edge with one empty separator row/column; the interior remains a clean
++#       sparse marker field.
++#   generator guarantees for the new solver assumptions:
++#     - Exactly one orientation is used per instance: stacked top bands or stacked left bands.
++#     - Bands use unique marker keys, unique glyph colors, and unique glyph masks.
++#     - The decoded mask always belongs to the original 4-glyph alphabet, and every legend band has at least
++#       one matching scene marker.
++
++
++CANONICAL_GLYPHS: dict[int, np.ndarray] = {
++    2: np.array(
++        [
++            [1, 1, 1, 1],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [1, 1, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    3: np.array(
++        [
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++        ],
++        dtype=bool,
++    ),
++    5: np.array(
++        [
++            [1, 1, 0, 0],
++            [1, 1, 0, 0],
++            [0, 0, 1, 1],
++            [0, 0, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    8: np.array(
++        [
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++MARKER_COLORS = tuple(CANONICAL_GLYPHS.keys())
++GLYPH_COLORS = (1, 4, 6, 7)
++CANONICAL_COLORS = {2: 4, 3: 1, 5: 6, 8: 7}
++
++GRID_SIZE = 20
++DATA_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 != 4)
++SEP_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 == 4)
++SPACING_RANGE = (4, 6)
++MAX_RETRIES = 400
++
++
++def _shape_key(mask: np.ndarray) -> tuple[int, ...]:
++    return tuple(int(v) for v in mask.astype(int).reshape(-1).tolist())
++
++
++VALID_SHAPE_KEYS = {_shape_key(mask) for mask in CANONICAL_GLYPHS.values()}
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _decode_band(outer: np.ndarray, inner: np.ndarray) -> tuple[int, int, np.ndarray] | None:
++    if outer.shape != (GRID_SIZE,) or inner.shape != (GRID_SIZE,):
++        return None
++    if any(int(outer[i]) != 0 or int(inner[i]) != 0 for i in SEP_IDXS):
++        return None
++
++    outer_vals = [int(outer[i]) for i in DATA_IDXS]
++    marker_set = set(outer_vals)
++    if len(marker_set) != 1:
++        return None
++    marker = outer_vals[0]
++    if marker not in MARKER_COLORS:
++        return None
++
++    inner_vals = [int(inner[i]) for i in DATA_IDXS]
++    if any(v == 0 for v in inner_vals):
++        return None
++    glyph_candidates = set(inner_vals) - {marker}
++    if len(glyph_candidates) != 1:
++        return None
++    glyph_color = next(iter(glyph_candidates))
++    if glyph_color not in GLYPH_COLORS:
++        return None
++    if any(v not in {marker, glyph_color} for v in inner_vals):
++        return None
++
++    mask = np.array([v == glyph_color for v in inner_vals], dtype=bool).reshape(4, 4)
++    if _shape_key(mask) not in VALID_SHAPE_KEYS:
++        return None
++    return marker, glyph_color, mask
++
++
++def _try_decode_top(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if w != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    r = 0
++    while r + 1 < h:
++        decoded = _decode_band(g[r, :], g[r + 1, :])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[r : r + 2, :] = True
++        r += 2
++
++    if not mapping or r >= h or np.any(g[r, :] != 0):
++        return None
++    legend_mask[r, :] = True
++    return mapping, legend_mask
++
++
++def _try_decode_left(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if h != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    c = 0
++    while c + 1 < w:
++        decoded = _decode_band(g[:, c], g[:, c + 1])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[:, c : c + 2] = True
++        c += 2
++
++    if not mapping or c >= w or np.any(g[:, c] != 0):
++        return None
++    legend_mask[:, c] = True
++    return mapping, legend_mask
++
++
++def _extract_hidden_legend(
++    g: np.ndarray,
++) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray]:
++    candidates = []
++    top = _try_decode_top(g)
++    if top is not None:
++        candidates.append(top)
++    left = _try_decode_left(g)
++    if left is not None:
++        candidates.append(left)
++    assert len(candidates) == 1, "hidden edge legend not found uniquely"
++    return candidates[0]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each scene marker using the glyph pattern and glyph color decoded from hidden edge bands.
++
++    Input structure:
++    - A 20x20 black-background grid contains scene markers in colors 2, 3, 5, and/or 8.
++    - On exactly one edge, stacked 2x20 top bands or 20x2 left bands hide the sample legends.
++    - In each band, the outer lane is the marker color and the inner lane is a separator-grouped 16-cell flattening of the 4x4 glyph, using marker color for empty cells and glyph color for filled cells.
++
++    Rule:
++    - Detect the hidden edge bands, decode each one into a marker -> (glyph color, 4x4 mask) entry, and ignore the legend area itself.
++    - Replace every remaining marker dot by its decoded 4x4 glyph, anchored at the marker and clipped at the grid border.
++    - The output contains only the painted scene glyphs; the hidden legend disappears.
++
++    Key insight:
++    - The edge strip is both a palette and a compressed sample: the constant outer lane tells which marker is being defined, while the grouped inner lane reveals the glyph shape and its paint color.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    mapping, legend_mask = _extract_hidden_legend(g)
++    scene = g.copy()
++    scene[legend_mask] = 0
++
++    present_markers = {int(v) for v in np.unique(scene) if int(v) in MARKER_COLORS}
++    assert present_markers
++    assert present_markers == set(mapping.keys())
++
++    out = np.zeros_like(g)
++    for marker in sorted(present_markers):
++        glyph_color, mask = mapping[marker]
++        for r, c in np.argwhere(scene == marker):
++            _paint_clipped(out, int(r), int(c), int(glyph_color), mask)
++
++    return out
++
++
++def _sample_positions(rng: random.Random, lo: int, hi: int, count: int) -> list[int]:
++    assert lo <= hi and count >= 1
++    if count == 1:
++        return [rng.randint(lo, hi)]
++
++    min_gap, max_gap = SPACING_RANGE
++    for _ in range(200):
++        gaps = [rng.randint(min_gap, max_gap) for _ in range(count - 1)]
++        span = sum(gaps)
++        if span <= hi - lo:
++            start = rng.randint(lo, hi - span)
++            vals = [start]
++            for gap in gaps:
++                vals.append(vals[-1] + gap)
++            return vals
++
++    span = min_gap * (count - 1)
++    assert span <= hi - lo
++    start = rng.randint(lo, hi - span)
++    return [start + i * min_gap for i in range(count)]
++
++
++def _feasible_count(span: int) -> int:
++    return 1 + span // SPACING_RANGE[0]
++
++
++def _choose_mapping(
++    rng: random.Random, used_markers: list[int]
++) -> dict[int, tuple[int, np.ndarray]]:
++    shape_sources_all = list(MARKER_COLORS)
++    for _ in range(200):
++        shape_sources = rng.sample(shape_sources_all, len(used_markers))
++        glyph_colors = rng.sample(list(GLYPH_COLORS), len(used_markers))
++        mapping = {
++            marker: (glyph_color, CANONICAL_GLYPHS[src])
++            for marker, glyph_color, src in zip(
++                used_markers, glyph_colors, shape_sources, strict=False
++            )
++        }
++        if any(
++            glyph_color != CANONICAL_COLORS[marker]
++            or _shape_key(mask) != _shape_key(CANONICAL_GLYPHS[marker])
++            for marker, (glyph_color, mask) in mapping.items()
++        ):
++            return mapping
++    raise RuntimeError("failed to sample a non-canonical hidden legend")
++
++
++def _build_top_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((2, GRID_SIZE), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[0, idx] = marker
++        band[1, idx] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _build_left_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((GRID_SIZE, 2), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[idx, 0] = marker
++        band[idx, 1] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _render_scene(
++    placed: list[tuple[int, int, int]], mapping: dict[int, tuple[int, np.ndarray]]
++) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker in placed:
++        glyph_color, mask = mapping[marker]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    side = rng.choice(("top", "left"))
++    used_count = rng.randint(2, 3)
++    used_markers = rng.sample(list(MARKER_COLORS), used_count)
++    mapping = _choose_mapping(rng, used_markers)
++
++    scene_r_lo = 2 * used_count + 1 if side == "top" else 0
++    scene_c_lo = 2 * used_count + 1 if side == "left" else 0
++    scene_r_hi = GRID_SIZE - 1
++    scene_c_hi = GRID_SIZE - 1
++
++    row_span = scene_r_hi - scene_r_lo
++    col_span = scene_c_hi - scene_c_lo
++    max_rows = min(4, _feasible_count(row_span))
++    max_cols = min(4, _feasible_count(col_span))
++    if max_rows < 2 or max_cols < 2:
++        return None
++
++    rows = rng.randint(2, max_rows)
++    cols = rng.randint(2, max_cols)
++    row_pos = _sample_positions(rng, scene_r_lo, scene_r_hi, rows)
++    col_pos = _sample_positions(rng, scene_c_lo, scene_c_hi, cols)
++
++    all_cells = [(r, c) for r in row_pos for c in col_pos]
++    min_fill = max(used_count, (6 * len(all_cells) + 9) // 10)
++    fill_count = rng.randint(min_fill, len(all_cells))
++
++    chosen_cells = rng.sample(all_cells, fill_count)
++    assigned_markers = used_markers.copy()
++    assigned_markers.extend(rng.choice(used_markers) for _ in range(fill_count - used_count))
++    rng.shuffle(assigned_markers)
++
++    inp = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    placed: list[tuple[int, int, int]] = []
++    for (r, c), marker in zip(chosen_cells, assigned_markers, strict=False):
++        inp[r, c] = marker
++        placed.append((r, c, marker))
++
++    legend_order = used_markers.copy()
++    rng.shuffle(legend_order)
++    if side == "top":
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[2 * i : 2 * i + 2, :] = _build_top_band(marker, glyph_color, mask)
++    else:
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[:, 2 * i : 2 * i + 2] = _build_left_band(marker, glyph_color, mask)
++
++    expected = _render_scene(placed, mapping)
++    try:
++        actual = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(actual, expected):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"failed to generate input after {MAX_RETRIES} attempts")
+
+ succeeded in 277ms:
+Success: 50/50, Time: 0.0s (1ms/call)
+
+codex
+成功率已经达标。现在做退化性检查：统计隐藏 legend 的方向、条数，以及“与原题固定字典输出是否相同”的比例，确认这批样本确实依赖融合规则而不是偶然还能按原题解释。
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util
+import numpy as np
+from collections import Counter
+
+combo_path = '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/19/code.py'
+orig_path = '/home/lixinyu/snap/new/arc2_solver_select/dfadab01.py'
+
+def load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+combo = load(combo_path, 'combo')
+orig = load(orig_path, 'orig')
+
+orient = Counter()
+used_counts = Counter()
+changed_counts = Counter()
+orig_same = 0
+orig_assert = 0
+samples = 100
+
+for _ in range(samples):
+    inp = combo.generate_input()
+    mapping, legend_mask = combo._extract_hidden_legend(inp)
+    used_counts[len(mapping)] += 1
+    if legend_mask[0].any():
+        orient['top'] += 1
+    else:
+        orient['left'] += 1
+    changed = 0
+    for marker, (glyph_color, mask) in mapping.items():
+        if glyph_color "'!= combo.CANONICAL_COLORS[marker] or combo._shape_key(mask) != combo._shape_key(combo.CANONICAL_GLYPHS[marker]):
+            changed += 1
+    changed_counts[changed] += 1
+    out = combo.main(inp)
+    try:
+        orig_out = orig.main(inp)
+    except Exception:
+        orig_assert += 1
+        continue
+    if np.array_equal(out, orig_out):
+        orig_same += 1
+
+print('"'orientation', dict(orient))
+print('used_counts', dict(used_counts))
+print('changed_counts', dict(changed_counts))
+print('orig_same', orig_same)
+print('orig_assert', orig_assert)
+print('orig_diff_rate', (samples - orig_same) / samples)
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/19/code.py b/ceshi/code_combo/dfadab01/19/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d42deeb9da4dcd0f5f5e7b8789c9f411962df5bc
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/19/code.py
+@@ -0,0 +1,423 @@
++# Combo variant of dfadab01 (index 19)
++# combo_spec: D4/2+D11/1
++# Name: 调色板条+边缘隐藏样本
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++# Design analysis
++# ---------------
++# spec:
++#   unchanged_core:
++#     - Single-pixel scene markers still expand into 4x4 glyphs whose top-left corner is the marker pixel.
++#     - Expansion is still clipped by the grid boundary.
++#     - The visible scene is still a sparse lattice of marker dots on a black background.
++#   fusion concretized:
++#     - The old in-grid 4x4 sample glyph and its below-right label disappear completely.
++#     - Each used marker type now has one hidden edge band: either a 2x20 strip stacked on the top edge,
++#       or a 20x2 strip stacked on the left edge.
++#     - Every fifth slot is a black separator, so the remaining 16 slots are read as 4 groups of 4 and
++#       therefore as a row-major flattening of a 4x4 glyph.
++#     - The outer lane of a band is constant marker color on data slots; the inner lane uses marker color
++#       for 0-bits and glyph color for 1-bits. Decoding one band therefore yields both the marker key and
++#       the glyph's output color/pattern.
++#   behavior trace:
++#     - Original: a marker color directly implied one fixed mask and one fixed output color, and an optional
++#       interior sample merely reminded the solver of that fact.
++#     - Fusion: a marker color is only a key. Example: if a top-edge band has outer row = all 2 on data slots
++#       and inner row grouped as [2 4 4 2 | 4 2 2 4 | 4 2 2 4 | 2 4 4 2], marker 2 now means "paint the
++#       blue-ring mask in color 4", even though that is not its canonical assignment.
++#     - Difference: the solver must first decode compressed edge legends, then use the recovered per-instance
++#       shape/color dictionary on the interior markers.
++#   complexity calibration:
++#     - Each instance uses 2-3 marker types, and every used type appears at least once in the scene.
++#     - Shapes are sampled injectively from the original 4-glyph alphabet and colors are sampled injectively
++#       from {1,4,6,7}; this keeps the legend small and human-trackable.
++#     - At least one marker gets a non-canonical shape or non-canonical color, so the variant cannot collapse
++#       back to the original fixed dictionary.
++#   hidden assumptions invalidated from the original main():
++#     - Hardcoding marker->(glyph_color, mask) is no longer valid.
++#     - Searching for a visible 4x4 sample near a marker is no longer valid because the sample is edge-encoded.
++#     - Marker-colored pixels on the top/left edge are no longer necessarily scene markers; whole legend bands
++#       must be detected and masked out before expansion.
++#   placement legality:
++#     - A hidden sample needs 16 data slots plus 4 separators, so the generator fixes the grid to 20x20.
++#     - Top legends occupy rows [0, 2k) and reserve row 2k as blank padding; left legends occupy cols
++#       [0, 2k) and reserve col 2k as blank padding.
++#     - Scene markers are placed on a 4-6 spaced lattice inside the remaining rectangle, so expanded glyphs
++#       never overlap each other or the hidden-sample area.
++#   visual observability:
++#     - The 4+1+4+1+4+1+4 grouping makes the flattened 4x4 structure visible to a human instead of hiding it
++#       in arithmetic or ordering tricks.
++#     - The constant outer lane announces the controlling marker color, while the inner lane makes the output
++#       color and filled cells visible at the same time.
++#     - Repeated use of every decoded marker in the scene gives direct support for the inferred legend.
++#   cleanliness:
++#     - Legends live on one dedicated edge with one empty separator row/column; the interior remains a clean
++#       sparse marker field.
++#   generator guarantees for the new solver assumptions:
++#     - Exactly one orientation is used per instance: stacked top bands or stacked left bands.
++#     - Bands use unique marker keys, unique glyph colors, and unique glyph masks.
++#     - The decoded mask always belongs to the original 4-glyph alphabet, and every legend band has at least
++#       one matching scene marker.
++
++
++CANONICAL_GLYPHS: dict[int, np.ndarray] = {
++    2: np.array(
++        [
++            [1, 1, 1, 1],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [1, 1, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    3: np.array(
++        [
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++        ],
++        dtype=bool,
++    ),
++    5: np.array(
++        [
++            [1, 1, 0, 0],
++            [1, 1, 0, 0],
++            [0, 0, 1, 1],
++            [0, 0, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    8: np.array(
++        [
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++MARKER_COLORS = tuple(CANONICAL_GLYPHS.keys())
++GLYPH_COLORS = (1, 4, 6, 7)
++CANONICAL_COLORS = {2: 4, 3: 1, 5: 6, 8: 7}
++
++GRID_SIZE = 20
++DATA_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 != 4)
++SEP_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 == 4)
++SPACING_RANGE = (4, 6)
++MAX_RETRIES = 400
++
++
++def _shape_key(mask: np.ndarray) -> tuple[int, ...]:
++    return tuple(int(v) for v in mask.astype(int).reshape(-1).tolist())
++
++
++VALID_SHAPE_KEYS = {_shape_key(mask) for mask in CANONICAL_GLYPHS.values()}
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _decode_band(outer: np.ndarray, inner: np.ndarray) -> tuple[int, int, np.ndarray] | None:
++    if outer.shape != (GRID_SIZE,) or inner.shape != (GRID_SIZE,):
++        return None
++    if any(int(outer[i]) != 0 or int(inner[i]) != 0 for i in SEP_IDXS):
++        return None
++
++    outer_vals = [int(outer[i]) for i in DATA_IDXS]
++    marker_set = set(outer_vals)
++    if len(marker_set) != 1:
++        return None
++    marker = outer_vals[0]
++    if marker not in MARKER_COLORS:
++        return None
++
++    inner_vals = [int(inner[i]) for i in DATA_IDXS]
++    if any(v == 0 for v in inner_vals):
++        return None
++    glyph_candidates = set(inner_vals) - {marker}
++    if len(glyph_candidates) != 1:
++        return None
++    glyph_color = next(iter(glyph_candidates))
++    if glyph_color not in GLYPH_COLORS:
++        return None
++    if any(v not in {marker, glyph_color} for v in inner_vals):
++        return None
++
++    mask = np.array([v == glyph_color for v in inner_vals], dtype=bool).reshape(4, 4)
++    if _shape_key(mask) not in VALID_SHAPE_KEYS:
++        return None
++    return marker, glyph_color, mask
++
++
++def _try_decode_top(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if w != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    r = 0
++    while r + 1 < h:
++        decoded = _decode_band(g[r, :], g[r + 1, :])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[r : r + 2, :] = True
++        r += 2
++
++    if not mapping or r >= h or np.any(g[r, :] != 0):
++        return None
++    legend_mask[r, :] = True
++    return mapping, legend_mask
++
++
++def _try_decode_left(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if h != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    c = 0
++    while c + 1 < w:
++        decoded = _decode_band(g[:, c], g[:, c + 1])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[:, c : c + 2] = True
++        c += 2
++
++    if not mapping or c >= w or np.any(g[:, c] != 0):
++        return None
++    legend_mask[:, c] = True
++    return mapping, legend_mask
++
++
++def _extract_hidden_legend(
++    g: np.ndarray,
++) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray]:
++    candidates = []
++    top = _try_decode_top(g)
++    if top is not None:
++        candidates.append(top)
++    left = _try_decode_left(g)
++    if left is not None:
++        candidates.append(left)
++    assert len(candidates) == 1, "hidden edge legend not found uniquely"
++    return candidates[0]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each scene marker using the glyph pattern and glyph color decoded from hidden edge bands.
++
++    Input structure:
++    - A 20x20 black-background grid contains scene markers in colors 2, 3, 5, and/or 8.
++    - On exactly one edge, stacked 2x20 top bands or 20x2 left bands hide the sample legends.
++    - In each band, the outer lane is the marker color and the inner lane is a separator-grouped 16-cell flattening of the 4x4 glyph, using marker color for empty cells and glyph color for filled cells.
++
++    Rule:
++    - Detect the hidden edge bands, decode each one into a marker -> (glyph color, 4x4 mask) entry, and ignore the legend area itself.
++    - Replace every remaining marker dot by its decoded 4x4 glyph, anchored at the marker and clipped at the grid border.
++    - The output contains only the painted scene glyphs; the hidden legend disappears.
++
++    Key insight:
++    - The edge strip is both a palette and a compressed sample: the constant outer lane tells which marker is being defined, while the grouped inner lane reveals the glyph shape and its paint color.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    mapping, legend_mask = _extract_hidden_legend(g)
++    scene = g.copy()
++    scene[legend_mask] = 0
++
++    present_markers = {int(v) for v in np.unique(scene) if int(v) in MARKER_COLORS}
++    assert present_markers
++    assert present_markers == set(mapping.keys())
++
++    out = np.zeros_like(g)
++    for marker in sorted(present_markers):
++        glyph_color, mask = mapping[marker]
++        for r, c in np.argwhere(scene == marker):
++            _paint_clipped(out, int(r), int(c), int(glyph_color), mask)
++
++    return out
++
++
++def _sample_positions(rng: random.Random, lo: int, hi: int, count: int) -> list[int]:
++    assert lo <= hi and count >= 1
++    if count == 1:
++        return [rng.randint(lo, hi)]
++
++    min_gap, max_gap = SPACING_RANGE
++    for _ in range(200):
++        gaps = [rng.randint(min_gap, max_gap) for _ in range(count - 1)]
++        span = sum(gaps)
++        if span <= hi - lo:
++            start = rng.randint(lo, hi - span)
++            vals = [start]
++            for gap in gaps:
++                vals.append(vals[-1] + gap)
++            return vals
++
++    span = min_gap * (count - 1)
++    assert span <= hi - lo
++    start = rng.randint(lo, hi - span)
++    return [start + i * min_gap for i in range(count)]
++
++
++def _feasible_count(span: int) -> int:
++    return 1 + span // SPACING_RANGE[0]
++
++
++def _choose_mapping(
++    rng: random.Random, used_markers: list[int]
++) -> dict[int, tuple[int, np.ndarray]]:
++    shape_sources_all = list(MARKER_COLORS)
++    for _ in range(200):
++        shape_sources = rng.sample(shape_sources_all, len(used_markers))
++        glyph_colors = rng.sample(list(GLYPH_COLORS), len(used_markers))
++        mapping = {
++            marker: (glyph_color, CANONICAL_GLYPHS[src])
++            for marker, glyph_color, src in zip(
++                used_markers, glyph_colors, shape_sources, strict=False
++            )
++        }
++        if any(
++            glyph_color != CANONICAL_COLORS[marker]
++            or _shape_key(mask) != _shape_key(CANONICAL_GLYPHS[marker])
++            for marker, (glyph_color, mask) in mapping.items()
++        ):
++            return mapping
++    raise RuntimeError("failed to sample a non-canonical hidden legend")
++
++
++def _build_top_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((2, GRID_SIZE), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[0, idx] = marker
++        band[1, idx] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _build_left_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((GRID_SIZE, 2), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[idx, 0] = marker
++        band[idx, 1] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _render_scene(
++    placed: list[tuple[int, int, int]], mapping: dict[int, tuple[int, np.ndarray]]
++) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker in placed:
++        glyph_color, mask = mapping[marker]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    side = rng.choice(("top", "left"))
++    used_count = rng.randint(2, 3)
++    used_markers = rng.sample(list(MARKER_COLORS), used_count)
++    mapping = _choose_mapping(rng, used_markers)
++
++    scene_r_lo = 2 * used_count + 1 if side == "top" else 0
++    scene_c_lo = 2 * used_count + 1 if side == "left" else 0
++    scene_r_hi = GRID_SIZE - 1
++    scene_c_hi = GRID_SIZE - 1
++
++    row_span = scene_r_hi - scene_r_lo
++    col_span = scene_c_hi - scene_c_lo
++    max_rows = min(4, _feasible_count(row_span))
++    max_cols = min(4, _feasible_count(col_span))
++    if max_rows < 2 or max_cols < 2:
++        return None
++
++    rows = rng.randint(2, max_rows)
++    cols = rng.randint(2, max_cols)
++    row_pos = _sample_positions(rng, scene_r_lo, scene_r_hi, rows)
++    col_pos = _sample_positions(rng, scene_c_lo, scene_c_hi, cols)
++
++    all_cells = [(r, c) for r in row_pos for c in col_pos]
++    min_fill = max(used_count, (6 * len(all_cells) + 9) // 10)
++    fill_count = rng.randint(min_fill, len(all_cells))
++
++    chosen_cells = rng.sample(all_cells, fill_count)
++    assigned_markers = used_markers.copy()
++    assigned_markers.extend(rng.choice(used_markers) for _ in range(fill_count - used_count))
++    rng.shuffle(assigned_markers)
++
++    inp = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    placed: list[tuple[int, int, int]] = []
++    for (r, c), marker in zip(chosen_cells, assigned_markers, strict=False):
++        inp[r, c] = marker
++        placed.append((r, c, marker))
++
++    legend_order = used_markers.copy()
++    rng.shuffle(legend_order)
++    if side == "top":
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[2 * i : 2 * i + 2, :] = _build_top_band(marker, glyph_color, mask)
++    else:
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[:, 2 * i : 2 * i + 2] = _build_left_band(marker, glyph_color, mask)
++
++    expected = _render_scene(placed, mapping)
++    try:
++        actual = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(actual, expected):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"failed to generate input after {MAX_RETRIES} attempts")
+
+ succeeded in 331ms:
+orientation {'top': 100}
+used_counts {3: 49, 2: 51}
+changed_counts {3: 40, 2: 52, 1: 8}
+orig_same 0
+orig_assert 0
+orig_diff_rate 1.0
+
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util
+from collections import Counter
+
+combo_path = '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/19/code.py'
+spec = importlib.util.spec_from_file_location('combo', combo_path)
+combo = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(combo)
+
+orient = Counter()
+for _ in range(100):
+    inp = combo.generate_input()
+    orient['top' if combo._try_decode_top(inp) is not None else 'left'] += 1
+print(dict(orient))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/19/code.py b/ceshi/code_combo/dfadab01/19/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d42deeb9da4dcd0f5f5e7b8789c9f411962df5bc
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/19/code.py
+@@ -0,0 +1,423 @@
++# Combo variant of dfadab01 (index 19)
++# combo_spec: D4/2+D11/1
++# Name: 调色板条+边缘隐藏样本
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++# Design analysis
++# ---------------
++# spec:
++#   unchanged_core:
++#     - Single-pixel scene markers still expand into 4x4 glyphs whose top-left corner is the marker pixel.
++#     - Expansion is still clipped by the grid boundary.
++#     - The visible scene is still a sparse lattice of marker dots on a black background.
++#   fusion concretized:
++#     - The old in-grid 4x4 sample glyph and its below-right label disappear completely.
++#     - Each used marker type now has one hidden edge band: either a 2x20 strip stacked on the top edge,
++#       or a 20x2 strip stacked on the left edge.
++#     - Every fifth slot is a black separator, so the remaining 16 slots are read as 4 groups of 4 and
++#       therefore as a row-major flattening of a 4x4 glyph.
++#     - The outer lane of a band is constant marker color on data slots; the inner lane uses marker color
++#       for 0-bits and glyph color for 1-bits. Decoding one band therefore yields both the marker key and
++#       the glyph's output color/pattern.
++#   behavior trace:
++#     - Original: a marker color directly implied one fixed mask and one fixed output color, and an optional
++#       interior sample merely reminded the solver of that fact.
++#     - Fusion: a marker color is only a key. Example: if a top-edge band has outer row = all 2 on data slots
++#       and inner row grouped as [2 4 4 2 | 4 2 2 4 | 4 2 2 4 | 2 4 4 2], marker 2 now means "paint the
++#       blue-ring mask in color 4", even though that is not its canonical assignment.
++#     - Difference: the solver must first decode compressed edge legends, then use the recovered per-instance
++#       shape/color dictionary on the interior markers.
++#   complexity calibration:
++#     - Each instance uses 2-3 marker types, and every used type appears at least once in the scene.
++#     - Shapes are sampled injectively from the original 4-glyph alphabet and colors are sampled injectively
++#       from {1,4,6,7}; this keeps the legend small and human-trackable.
++#     - At least one marker gets a non-canonical shape or non-canonical color, so the variant cannot collapse
++#       back to the original fixed dictionary.
++#   hidden assumptions invalidated from the original main():
++#     - Hardcoding marker->(glyph_color, mask) is no longer valid.
++#     - Searching for a visible 4x4 sample near a marker is no longer valid because the sample is edge-encoded.
++#     - Marker-colored pixels on the top/left edge are no longer necessarily scene markers; whole legend bands
++#       must be detected and masked out before expansion.
++#   placement legality:
++#     - A hidden sample needs 16 data slots plus 4 separators, so the generator fixes the grid to 20x20.
++#     - Top legends occupy rows [0, 2k) and reserve row 2k as blank padding; left legends occupy cols
++#       [0, 2k) and reserve col 2k as blank padding.
++#     - Scene markers are placed on a 4-6 spaced lattice inside the remaining rectangle, so expanded glyphs
++#       never overlap each other or the hidden-sample area.
++#   visual observability:
++#     - The 4+1+4+1+4+1+4 grouping makes the flattened 4x4 structure visible to a human instead of hiding it
++#       in arithmetic or ordering tricks.
++#     - The constant outer lane announces the controlling marker color, while the inner lane makes the output
++#       color and filled cells visible at the same time.
++#     - Repeated use of every decoded marker in the scene gives direct support for the inferred legend.
++#   cleanliness:
++#     - Legends live on one dedicated edge with one empty separator row/column; the interior remains a clean
++#       sparse marker field.
++#   generator guarantees for the new solver assumptions:
++#     - Exactly one orientation is used per instance: stacked top bands or stacked left bands.
++#     - Bands use unique marker keys, unique glyph colors, and unique glyph masks.
++#     - The decoded mask always belongs to the original 4-glyph alphabet, and every legend band has at least
++#       one matching scene marker.
++
++
++CANONICAL_GLYPHS: dict[int, np.ndarray] = {
++    2: np.array(
++        [
++            [1, 1, 1, 1],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [1, 1, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    3: np.array(
++        [
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++        ],
++        dtype=bool,
++    ),
++    5: np.array(
++        [
++            [1, 1, 0, 0],
++            [1, 1, 0, 0],
++            [0, 0, 1, 1],
++            [0, 0, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    8: np.array(
++        [
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++MARKER_COLORS = tuple(CANONICAL_GLYPHS.keys())
++GLYPH_COLORS = (1, 4, 6, 7)
++CANONICAL_COLORS = {2: 4, 3: 1, 5: 6, 8: 7}
++
++GRID_SIZE = 20
++DATA_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 != 4)
++SEP_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 == 4)
++SPACING_RANGE = (4, 6)
++MAX_RETRIES = 400
++
++
++def _shape_key(mask: np.ndarray) -> tuple[int, ...]:
++    return tuple(int(v) for v in mask.astype(int).reshape(-1).tolist())
++
++
++VALID_SHAPE_KEYS = {_shape_key(mask) for mask in CANONICAL_GLYPHS.values()}
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _decode_band(outer: np.ndarray, inner: np.ndarray) -> tuple[int, int, np.ndarray] | None:
++    if outer.shape != (GRID_SIZE,) or inner.shape != (GRID_SIZE,):
++        return None
++    if any(int(outer[i]) != 0 or int(inner[i]) != 0 for i in SEP_IDXS):
++        return None
++
++    outer_vals = [int(outer[i]) for i in DATA_IDXS]
++    marker_set = set(outer_vals)
++    if len(marker_set) != 1:
++        return None
++    marker = outer_vals[0]
++    if marker not in MARKER_COLORS:
++        return None
++
++    inner_vals = [int(inner[i]) for i in DATA_IDXS]
++    if any(v == 0 for v in inner_vals):
++        return None
++    glyph_candidates = set(inner_vals) - {marker}
++    if len(glyph_candidates) != 1:
++        return None
++    glyph_color = next(iter(glyph_candidates))
++    if glyph_color not in GLYPH_COLORS:
++        return None
++    if any(v not in {marker, glyph_color} for v in inner_vals):
++        return None
++
++    mask = np.array([v == glyph_color for v in inner_vals], dtype=bool).reshape(4, 4)
++    if _shape_key(mask) not in VALID_SHAPE_KEYS:
++        return None
++    return marker, glyph_color, mask
++
++
++def _try_decode_top(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if w != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    r = 0
++    while r + 1 < h:
++        decoded = _decode_band(g[r, :], g[r + 1, :])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[r : r + 2, :] = True
++        r += 2
++
++    if not mapping or r >= h or np.any(g[r, :] != 0):
++        return None
++    legend_mask[r, :] = True
++    return mapping, legend_mask
++
++
++def _try_decode_left(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if h != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    c = 0
++    while c + 1 < w:
++        decoded = _decode_band(g[:, c], g[:, c + 1])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[:, c : c + 2] = True
++        c += 2
++
++    if not mapping or c >= w or np.any(g[:, c] != 0):
++        return None
++    legend_mask[:, c] = True
++    return mapping, legend_mask
++
++
++def _extract_hidden_legend(
++    g: np.ndarray,
++) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray]:
++    candidates = []
++    top = _try_decode_top(g)
++    if top is not None:
++        candidates.append(top)
++    left = _try_decode_left(g)
++    if left is not None:
++        candidates.append(left)
++    assert len(candidates) == 1, "hidden edge legend not found uniquely"
++    return candidates[0]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each scene marker using the glyph pattern and glyph color decoded from hidden edge bands.
++
++    Input structure:
++    - A 20x20 black-background grid contains scene markers in colors 2, 3, 5, and/or 8.
++    - On exactly one edge, stacked 2x20 top bands or 20x2 left bands hide the sample legends.
++    - In each band, the outer lane is the marker color and the inner lane is a separator-grouped 16-cell flattening of the 4x4 glyph, using marker color for empty cells and glyph color for filled cells.
++
++    Rule:
++    - Detect the hidden edge bands, decode each one into a marker -> (glyph color, 4x4 mask) entry, and ignore the legend area itself.
++    - Replace every remaining marker dot by its decoded 4x4 glyph, anchored at the marker and clipped at the grid border.
++    - The output contains only the painted scene glyphs; the hidden legend disappears.
++
++    Key insight:
++    - The edge strip is both a palette and a compressed sample: the constant outer lane tells which marker is being defined, while the grouped inner lane reveals the glyph shape and its paint color.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    mapping, legend_mask = _extract_hidden_legend(g)
++    scene = g.copy()
++    scene[legend_mask] = 0
++
++    present_markers = {int(v) for v in np.unique(scene) if int(v) in MARKER_COLORS}
++    assert present_markers
++    assert present_markers == set(mapping.keys())
++
++    out = np.zeros_like(g)
++    for marker in sorted(present_markers):
++        glyph_color, mask = mapping[marker]
++        for r, c in np.argwhere(scene == marker):
++            _paint_clipped(out, int(r), int(c), int(glyph_color), mask)
++
++    return out
++
++
++def _sample_positions(rng: random.Random, lo: int, hi: int, count: int) -> list[int]:
++    assert lo <= hi and count >= 1
++    if count == 1:
++        return [rng.randint(lo, hi)]
++
++    min_gap, max_gap = SPACING_RANGE
++    for _ in range(200):
++        gaps = [rng.randint(min_gap, max_gap) for _ in range(count - 1)]
++        span = sum(gaps)
++        if span <= hi - lo:
++            start = rng.randint(lo, hi - span)
++            vals = [start]
++            for gap in gaps:
++                vals.append(vals[-1] + gap)
++            return vals
++
++    span = min_gap * (count - 1)
++    assert span <= hi - lo
++    start = rng.randint(lo, hi - span)
++    return [start + i * min_gap for i in range(count)]
++
++
++def _feasible_count(span: int) -> int:
++    return 1 + span // SPACING_RANGE[0]
++
++
++def _choose_mapping(
++    rng: random.Random, used_markers: list[int]
++) -> dict[int, tuple[int, np.ndarray]]:
++    shape_sources_all = list(MARKER_COLORS)
++    for _ in range(200):
++        shape_sources = rng.sample(shape_sources_all, len(used_markers))
++        glyph_colors = rng.sample(list(GLYPH_COLORS), len(used_markers))
++        mapping = {
++            marker: (glyph_color, CANONICAL_GLYPHS[src])
++            for marker, glyph_color, src in zip(
++                used_markers, glyph_colors, shape_sources, strict=False
++            )
++        }
++        if any(
++            glyph_color != CANONICAL_COLORS[marker]
++            or _shape_key(mask) != _shape_key(CANONICAL_GLYPHS[marker])
++            for marker, (glyph_color, mask) in mapping.items()
++        ):
++            return mapping
++    raise RuntimeError("failed to sample a non-canonical hidden legend")
++
++
++def _build_top_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((2, GRID_SIZE), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[0, idx] = marker
++        band[1, idx] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _build_left_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((GRID_SIZE, 2), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[idx, 0] = marker
++        band[idx, 1] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _render_scene(
++    placed: list[tuple[int, int, int]], mapping: dict[int, tuple[int, np.ndarray]]
++) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker in placed:
++        glyph_color, mask = mapping[marker]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    side = rng.choice(("top", "left"))
++    used_count = rng.randint(2, 3)
++    used_markers = rng.sample(list(MARKER_COLORS), used_count)
++    mapping = _choose_mapping(rng, used_markers)
++
++    scene_r_lo = 2 * used_count + 1 if side == "top" else 0
++    scene_c_lo = 2 * used_count + 1 if side == "left" else 0
++    scene_r_hi = GRID_SIZE - 1
++    scene_c_hi = GRID_SIZE - 1
++
++    row_span = scene_r_hi - scene_r_lo
++    col_span = scene_c_hi - scene_c_lo
++    max_rows = min(4, _feasible_count(row_span))
++    max_cols = min(4, _feasible_count(col_span))
++    if max_rows < 2 or max_cols < 2:
++        return None
++
++    rows = rng.randint(2, max_rows)
++    cols = rng.randint(2, max_cols)
++    row_pos = _sample_positions(rng, scene_r_lo, scene_r_hi, rows)
++    col_pos = _sample_positions(rng, scene_c_lo, scene_c_hi, cols)
++
++    all_cells = [(r, c) for r in row_pos for c in col_pos]
++    min_fill = max(used_count, (6 * len(all_cells) + 9) // 10)
++    fill_count = rng.randint(min_fill, len(all_cells))
++
++    chosen_cells = rng.sample(all_cells, fill_count)
++    assigned_markers = used_markers.copy()
++    assigned_markers.extend(rng.choice(used_markers) for _ in range(fill_count - used_count))
++    rng.shuffle(assigned_markers)
++
++    inp = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    placed: list[tuple[int, int, int]] = []
++    for (r, c), marker in zip(chosen_cells, assigned_markers, strict=False):
++        inp[r, c] = marker
++        placed.append((r, c, marker))
++
++    legend_order = used_markers.copy()
++    rng.shuffle(legend_order)
++    if side == "top":
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[2 * i : 2 * i + 2, :] = _build_top_band(marker, glyph_color, mask)
++    else:
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[:, 2 * i : 2 * i + 2] = _build_left_band(marker, glyph_color, mask)
++
++    expected = _render_scene(placed, mapping)
++    try:
++        actual = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(actual, expected):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"failed to generate input after {MAX_RETRIES} attempts")
+
+ succeeded in 231ms:
+{'left': 61, 'top': 39}
+
+融合版已实现并通过成功率与退化性验证。
+  ✓ 实现融合版 code.py，包括设计分析注释、边缘解码 solver 和对应 generator
+  ✓ 运行 50 次成功率测试，修复生成或解码问题直到通过
+  ✓ 统计融合行为指标，确认未退化为原题或单变体
+diff --git a/ceshi/code_combo/dfadab01/19/code.py b/ceshi/code_combo/dfadab01/19/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d42deeb9da4dcd0f5f5e7b8789c9f411962df5bc
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/19/code.py
+@@ -0,0 +1,423 @@
++# Combo variant of dfadab01 (index 19)
++# combo_spec: D4/2+D11/1
++# Name: 调色板条+边缘隐藏样本
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++# Design analysis
++# ---------------
++# spec:
++#   unchanged_core:
++#     - Single-pixel scene markers still expand into 4x4 glyphs whose top-left corner is the marker pixel.
++#     - Expansion is still clipped by the grid boundary.
++#     - The visible scene is still a sparse lattice of marker dots on a black background.
++#   fusion concretized:
++#     - The old in-grid 4x4 sample glyph and its below-right label disappear completely.
++#     - Each used marker type now has one hidden edge band: either a 2x20 strip stacked on the top edge,
++#       or a 20x2 strip stacked on the left edge.
++#     - Every fifth slot is a black separator, so the remaining 16 slots are read as 4 groups of 4 and
++#       therefore as a row-major flattening of a 4x4 glyph.
++#     - The outer lane of a band is constant marker color on data slots; the inner lane uses marker color
++#       for 0-bits and glyph color for 1-bits. Decoding one band therefore yields both the marker key and
++#       the glyph's output color/pattern.
++#   behavior trace:
++#     - Original: a marker color directly implied one fixed mask and one fixed output color, and an optional
++#       interior sample merely reminded the solver of that fact.
++#     - Fusion: a marker color is only a key. Example: if a top-edge band has outer row = all 2 on data slots
++#       and inner row grouped as [2 4 4 2 | 4 2 2 4 | 4 2 2 4 | 2 4 4 2], marker 2 now means "paint the
++#       blue-ring mask in color 4", even though that is not its canonical assignment.
++#     - Difference: the solver must first decode compressed edge legends, then use the recovered per-instance
++#       shape/color dictionary on the interior markers.
++#   complexity calibration:
++#     - Each instance uses 2-3 marker types, and every used type appears at least once in the scene.
++#     - Shapes are sampled injectively from the original 4-glyph alphabet and colors are sampled injectively
++#       from {1,4,6,7}; this keeps the legend small and human-trackable.
++#     - At least one marker gets a non-canonical shape or non-canonical color, so the variant cannot collapse
++#       back to the original fixed dictionary.
++#   hidden assumptions invalidated from the original main():
++#     - Hardcoding marker->(glyph_color, mask) is no longer valid.
++#     - Searching for a visible 4x4 sample near a marker is no longer valid because the sample is edge-encoded.
++#     - Marker-colored pixels on the top/left edge are no longer necessarily scene markers; whole legend bands
++#       must be detected and masked out before expansion.
++#   placement legality:
++#     - A hidden sample needs 16 data slots plus 4 separators, so the generator fixes the grid to 20x20.
++#     - Top legends occupy rows [0, 2k) and reserve row 2k as blank padding; left legends occupy cols
++#       [0, 2k) and reserve col 2k as blank padding.
++#     - Scene markers are placed on a 4-6 spaced lattice inside the remaining rectangle, so expanded glyphs
++#       never overlap each other or the hidden-sample area.
++#   visual observability:
++#     - The 4+1+4+1+4+1+4 grouping makes the flattened 4x4 structure visible to a human instead of hiding it
++#       in arithmetic or ordering tricks.
++#     - The constant outer lane announces the controlling marker color, while the inner lane makes the output
++#       color and filled cells visible at the same time.
++#     - Repeated use of every decoded marker in the scene gives direct support for the inferred legend.
++#   cleanliness:
++#     - Legends live on one dedicated edge with one empty separator row/column; the interior remains a clean
++#       sparse marker field.
++#   generator guarantees for the new solver assumptions:
++#     - Exactly one orientation is used per instance: stacked top bands or stacked left bands.
++#     - Bands use unique marker keys, unique glyph colors, and unique glyph masks.
++#     - The decoded mask always belongs to the original 4-glyph alphabet, and every legend band has at least
++#       one matching scene marker.
++
++
++CANONICAL_GLYPHS: dict[int, np.ndarray] = {
++    2: np.array(
++        [
++            [1, 1, 1, 1],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [1, 1, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    3: np.array(
++        [
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++        ],
++        dtype=bool,
++    ),
++    5: np.array(
++        [
++            [1, 1, 0, 0],
++            [1, 1, 0, 0],
++            [0, 0, 1, 1],
++            [0, 0, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    8: np.array(
++        [
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++MARKER_COLORS = tuple(CANONICAL_GLYPHS.keys())
++GLYPH_COLORS = (1, 4, 6, 7)
++CANONICAL_COLORS = {2: 4, 3: 1, 5: 6, 8: 7}
++
++GRID_SIZE = 20
++DATA_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 != 4)
++SEP_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 == 4)
++SPACING_RANGE = (4, 6)
++MAX_RETRIES = 400
++
++
++def _shape_key(mask: np.ndarray) -> tuple[int, ...]:
++    return tuple(int(v) for v in mask.astype(int).reshape(-1).tolist())
++
++
++VALID_SHAPE_KEYS = {_shape_key(mask) for mask in CANONICAL_GLYPHS.values()}
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _decode_band(outer: np.ndarray, inner: np.ndarray) -> tuple[int, int, np.ndarray] | None:
++    if outer.shape != (GRID_SIZE,) or inner.shape != (GRID_SIZE,):
++        return None
++    if any(int(outer[i]) != 0 or int(inner[i]) != 0 for i in SEP_IDXS):
++        return None
++
++    outer_vals = [int(outer[i]) for i in DATA_IDXS]
++    marker_set = set(outer_vals)
++    if len(marker_set) != 1:
++        return None
++    marker = outer_vals[0]
++    if marker not in MARKER_COLORS:
++        return None
++
++    inner_vals = [int(inner[i]) for i in DATA_IDXS]
++    if any(v == 0 for v in inner_vals):
++        return None
++    glyph_candidates = set(inner_vals) - {marker}
++    if len(glyph_candidates) != 1:
++        return None
++    glyph_color = next(iter(glyph_candidates))
++    if glyph_color not in GLYPH_COLORS:
++        return None
++    if any(v not in {marker, glyph_color} for v in inner_vals):
++        return None
++
++    mask = np.array([v == glyph_color for v in inner_vals], dtype=bool).reshape(4, 4)
++    if _shape_key(mask) not in VALID_SHAPE_KEYS:
++        return None
++    return marker, glyph_color, mask
++
++
++def _try_decode_top(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if w != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    r = 0
++    while r + 1 < h:
++        decoded = _decode_band(g[r, :], g[r + 1, :])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[r : r + 2, :] = True
++        r += 2
++
++    if not mapping or r >= h or np.any(g[r, :] != 0):
++        return None
++    legend_mask[r, :] = True
++    return mapping, legend_mask
++
++
++def _try_decode_left(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if h != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    c = 0
++    while c + 1 < w:
++        decoded = _decode_band(g[:, c], g[:, c + 1])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[:, c : c + 2] = True
++        c += 2
++
++    if not mapping or c >= w or np.any(g[:, c] != 0):
++        return None
++    legend_mask[:, c] = True
++    return mapping, legend_mask
++
++
++def _extract_hidden_legend(
++    g: np.ndarray,
++) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray]:
++    candidates = []
++    top = _try_decode_top(g)
++    if top is not None:
++        candidates.append(top)
++    left = _try_decode_left(g)
++    if left is not None:
++        candidates.append(left)
++    assert len(candidates) == 1, "hidden edge legend not found uniquely"
++    return candidates[0]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each scene marker using the glyph pattern and glyph color decoded from hidden edge bands.
++
++    Input structure:
++    - A 20x20 black-background grid contains scene markers in colors 2, 3, 5, and/or 8.
++    - On exactly one edge, stacked 2x20 top bands or 20x2 left bands hide the sample legends.
++    - In each band, the outer lane is the marker color and the inner lane is a separator-grouped 16-cell flattening of the 4x4 glyph, using marker color for empty cells and glyph color for filled cells.
++
++    Rule:
++    - Detect the hidden edge bands, decode each one into a marker -> (glyph color, 4x4 mask) entry, and ignore the legend area itself.
++    - Replace every remaining marker dot by its decoded 4x4 glyph, anchored at the marker and clipped at the grid border.
++    - The output contains only the painted scene glyphs; the hidden legend disappears.
++
++    Key insight:
++    - The edge strip is both a palette and a compressed sample: the constant outer lane tells which marker is being defined, while the grouped inner lane reveals the glyph shape and its paint color.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    mapping, legend_mask = _extract_hidden_legend(g)
++    scene = g.copy()
++    scene[legend_mask] = 0
++
++    present_markers = {int(v) for v in np.unique(scene) if int(v) in MARKER_COLORS}
++    assert present_markers
++    assert present_markers == set(mapping.keys())
++
++    out = np.zeros_like(g)
++    for marker in sorted(present_markers):
++        glyph_color, mask = mapping[marker]
++        for r, c in np.argwhere(scene == marker):
++            _paint_clipped(out, int(r), int(c), int(glyph_color), mask)
++
++    return out
++
++
++def _sample_positions(rng: random.Random, lo: int, hi: int, count: int) -> list[int]:
++    assert lo <= hi and count >= 1
++    if count == 1:
++        return [rng.randint(lo, hi)]
++
++    min_gap, max_gap = SPACING_RANGE
++    for _ in range(200):
++        gaps = [rng.randint(min_gap, max_gap) for _ in range(count - 1)]
++        span = sum(gaps)
++        if span <= hi - lo:
++            start = rng.randint(lo, hi - span)
++            vals = [start]
++            for gap in gaps:
++                vals.append(vals[-1] + gap)
++            return vals
++
++    span = min_gap * (count - 1)
++    assert span <= hi - lo
++    start = rng.randint(lo, hi - span)
++    return [start + i * min_gap for i in range(count)]
++
++
++def _feasible_count(span: int) -> int:
++    return 1 + span // SPACING_RANGE[0]
++
++
++def _choose_mapping(
++    rng: random.Random, used_markers: list[int]
++) -> dict[int, tuple[int, np.ndarray]]:
++    shape_sources_all = list(MARKER_COLORS)
++    for _ in range(200):
++        shape_sources = rng.sample(shape_sources_all, len(used_markers))
++        glyph_colors = rng.sample(list(GLYPH_COLORS), len(used_markers))
++        mapping = {
++            marker: (glyph_color, CANONICAL_GLYPHS[src])
++            for marker, glyph_color, src in zip(
++                used_markers, glyph_colors, shape_sources, strict=False
++            )
++        }
++        if any(
++            glyph_color != CANONICAL_COLORS[marker]
++            or _shape_key(mask) != _shape_key(CANONICAL_GLYPHS[marker])
++            for marker, (glyph_color, mask) in mapping.items()
++        ):
++            return mapping
++    raise RuntimeError("failed to sample a non-canonical hidden legend")
++
++
++def _build_top_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((2, GRID_SIZE), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[0, idx] = marker
++        band[1, idx] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _build_left_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((GRID_SIZE, 2), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[idx, 0] = marker
++        band[idx, 1] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _render_scene(
++    placed: list[tuple[int, int, int]], mapping: dict[int, tuple[int, np.ndarray]]
++) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker in placed:
++        glyph_color, mask = mapping[marker]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    side = rng.choice(("top", "left"))
++    used_count = rng.randint(2, 3)
++    used_markers = rng.sample(list(MARKER_COLORS), used_count)
++    mapping = _choose_mapping(rng, used_markers)
++
++    scene_r_lo = 2 * used_count + 1 if side == "top" else 0
++    scene_c_lo = 2 * used_count + 1 if side == "left" else 0
++    scene_r_hi = GRID_SIZE - 1
++    scene_c_hi = GRID_SIZE - 1
++
++    row_span = scene_r_hi - scene_r_lo
++    col_span = scene_c_hi - scene_c_lo
++    max_rows = min(4, _feasible_count(row_span))
++    max_cols = min(4, _feasible_count(col_span))
++    if max_rows < 2 or max_cols < 2:
++        return None
++
++    rows = rng.randint(2, max_rows)
++    cols = rng.randint(2, max_cols)
++    row_pos = _sample_positions(rng, scene_r_lo, scene_r_hi, rows)
++    col_pos = _sample_positions(rng, scene_c_lo, scene_c_hi, cols)
++
++    all_cells = [(r, c) for r in row_pos for c in col_pos]
++    min_fill = max(used_count, (6 * len(all_cells) + 9) // 10)
++    fill_count = rng.randint(min_fill, len(all_cells))
++
++    chosen_cells = rng.sample(all_cells, fill_count)
++    assigned_markers = used_markers.copy()
++    assigned_markers.extend(rng.choice(used_markers) for _ in range(fill_count - used_count))
++    rng.shuffle(assigned_markers)
++
++    inp = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    placed: list[tuple[int, int, int]] = []
++    for (r, c), marker in zip(chosen_cells, assigned_markers, strict=False):
++        inp[r, c] = marker
++        placed.append((r, c, marker))
++
++    legend_order = used_markers.copy()
++    rng.shuffle(legend_order)
++    if side == "top":
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[2 * i : 2 * i + 2, :] = _build_top_band(marker, glyph_color, mask)
++    else:
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[:, 2 * i : 2 * i + 2] = _build_left_band(marker, glyph_color, mask)
++
++    expected = _render_scene(placed, mapping)
++    try:
++        actual = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(actual, expected):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"failed to generate input after {MAX_RETRIES} attempts")
+
+codex
+融合版代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/19/code.py)。`main()` 上方保留了四段式说明，并在文件开头写入了组合注释；文件内还包含了按要求整理的设计分析注释。实现上我把隐藏样本具体化为 `top` 或 `left` 的整条频带：每个已用 marker 对应一个 `2x20` 或 `20x2` band，外侧恒为 marker 色，内侧用 `marker 色=0位 / glyph 色=1位` 按 `4+sep+4+sep+4+sep+4` 编码 4x4 字形，因此 solver 必须先从边缘同时解出形状和颜色，再扩展内部 marker。
+
+验证结果：
+- 50 次生成/求解测试：`Success: 50/50`
+- 额外 100 样本退化性统计：
+  - 方向分布：`left 61 / top 39`
+  - 隐藏 band 数：`2种 marker: 51`，`3种 marker: 49`
+  - 非 canonical 赋值个数：`1: 8`，`2: 52`，`3: 40`
+  - 与原始 `dfadab01` solver 在同一输入上的输出相同次数：`0/100`
+  - `orig_diff_rate = 1.0`
+
+这说明生成样本确实触发了“调色板条+边缘隐藏样本”的融合行为，没有退化回原题固定字典规则。
+diff --git a/ceshi/code_combo/dfadab01/19/code.py b/ceshi/code_combo/dfadab01/19/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d42deeb9da4dcd0f5f5e7b8789c9f411962df5bc
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/19/code.py
+@@ -0,0 +1,423 @@
++# Combo variant of dfadab01 (index 19)
++# combo_spec: D4/2+D11/1
++# Name: 调色板条+边缘隐藏样本
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++# Design analysis
++# ---------------
++# spec:
++#   unchanged_core:
++#     - Single-pixel scene markers still expand into 4x4 glyphs whose top-left corner is the marker pixel.
++#     - Expansion is still clipped by the grid boundary.
++#     - The visible scene is still a sparse lattice of marker dots on a black background.
++#   fusion concretized:
++#     - The old in-grid 4x4 sample glyph and its below-right label disappear completely.
++#     - Each used marker type now has one hidden edge band: either a 2x20 strip stacked on the top edge,
++#       or a 20x2 strip stacked on the left edge.
++#     - Every fifth slot is a black separator, so the remaining 16 slots are read as 4 groups of 4 and
++#       therefore as a row-major flattening of a 4x4 glyph.
++#     - The outer lane of a band is constant marker color on data slots; the inner lane uses marker color
++#       for 0-bits and glyph color for 1-bits. Decoding one band therefore yields both the marker key and
++#       the glyph's output color/pattern.
++#   behavior trace:
++#     - Original: a marker color directly implied one fixed mask and one fixed output color, and an optional
++#       interior sample merely reminded the solver of that fact.
++#     - Fusion: a marker color is only a key. Example: if a top-edge band has outer row = all 2 on data slots
++#       and inner row grouped as [2 4 4 2 | 4 2 2 4 | 4 2 2 4 | 2 4 4 2], marker 2 now means "paint the
++#       blue-ring mask in color 4", even though that is not its canonical assignment.
++#     - Difference: the solver must first decode compressed edge legends, then use the recovered per-instance
++#       shape/color dictionary on the interior markers.
++#   complexity calibration:
++#     - Each instance uses 2-3 marker types, and every used type appears at least once in the scene.
++#     - Shapes are sampled injectively from the original 4-glyph alphabet and colors are sampled injectively
++#       from {1,4,6,7}; this keeps the legend small and human-trackable.
++#     - At least one marker gets a non-canonical shape or non-canonical color, so the variant cannot collapse
++#       back to the original fixed dictionary.
++#   hidden assumptions invalidated from the original main():
++#     - Hardcoding marker->(glyph_color, mask) is no longer valid.
++#     - Searching for a visible 4x4 sample near a marker is no longer valid because the sample is edge-encoded.
++#     - Marker-colored pixels on the top/left edge are no longer necessarily scene markers; whole legend bands
++#       must be detected and masked out before expansion.
++#   placement legality:
++#     - A hidden sample needs 16 data slots plus 4 separators, so the generator fixes the grid to 20x20.
++#     - Top legends occupy rows [0, 2k) and reserve row 2k as blank padding; left legends occupy cols
++#       [0, 2k) and reserve col 2k as blank padding.
++#     - Scene markers are placed on a 4-6 spaced lattice inside the remaining rectangle, so expanded glyphs
++#       never overlap each other or the hidden-sample area.
++#   visual observability:
++#     - The 4+1+4+1+4+1+4 grouping makes the flattened 4x4 structure visible to a human instead of hiding it
++#       in arithmetic or ordering tricks.
++#     - The constant outer lane announces the controlling marker color, while the inner lane makes the output
++#       color and filled cells visible at the same time.
++#     - Repeated use of every decoded marker in the scene gives direct support for the inferred legend.
++#   cleanliness:
++#     - Legends live on one dedicated edge with one empty separator row/column; the interior remains a clean
++#       sparse marker field.
++#   generator guarantees for the new solver assumptions:
++#     - Exactly one orientation is used per instance: stacked top bands or stacked left bands.
++#     - Bands use unique marker keys, unique glyph colors, and unique glyph masks.
++#     - The decoded mask always belongs to the original 4-glyph alphabet, and every legend band has at least
++#       one matching scene marker.
++
++
++CANONICAL_GLYPHS: dict[int, np.ndarray] = {
++    2: np.array(
++        [
++            [1, 1, 1, 1],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [1, 1, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    3: np.array(
++        [
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++        ],
++        dtype=bool,
++    ),
++    5: np.array(
++        [
++            [1, 1, 0, 0],
++            [1, 1, 0, 0],
++            [0, 0, 1, 1],
++            [0, 0, 1, 1],
++        ],
++        dtype=bool,
++    ),
++    8: np.array(
++        [
++            [1, 0, 0, 1],
++            [0, 1, 1, 0],
++            [0, 1, 1, 0],
++            [1, 0, 0, 1],
++        ],
++        dtype=bool,
++    ),
++}
++
++MARKER_COLORS = tuple(CANONICAL_GLYPHS.keys())
++GLYPH_COLORS = (1, 4, 6, 7)
++CANONICAL_COLORS = {2: 4, 3: 1, 5: 6, 8: 7}
++
++GRID_SIZE = 20
++DATA_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 != 4)
++SEP_IDXS = tuple(i for i in range(GRID_SIZE) if i % 5 == 4)
++SPACING_RANGE = (4, 6)
++MAX_RETRIES = 400
++
++
++def _shape_key(mask: np.ndarray) -> tuple[int, ...]:
++    return tuple(int(v) for v in mask.astype(int).reshape(-1).tolist())
++
++
++VALID_SHAPE_KEYS = {_shape_key(mask) for mask in CANONICAL_GLYPHS.values()}
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(4):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(4):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _decode_band(outer: np.ndarray, inner: np.ndarray) -> tuple[int, int, np.ndarray] | None:
++    if outer.shape != (GRID_SIZE,) or inner.shape != (GRID_SIZE,):
++        return None
++    if any(int(outer[i]) != 0 or int(inner[i]) != 0 for i in SEP_IDXS):
++        return None
++
++    outer_vals = [int(outer[i]) for i in DATA_IDXS]
++    marker_set = set(outer_vals)
++    if len(marker_set) != 1:
++        return None
++    marker = outer_vals[0]
++    if marker not in MARKER_COLORS:
++        return None
++
++    inner_vals = [int(inner[i]) for i in DATA_IDXS]
++    if any(v == 0 for v in inner_vals):
++        return None
++    glyph_candidates = set(inner_vals) - {marker}
++    if len(glyph_candidates) != 1:
++        return None
++    glyph_color = next(iter(glyph_candidates))
++    if glyph_color not in GLYPH_COLORS:
++        return None
++    if any(v not in {marker, glyph_color} for v in inner_vals):
++        return None
++
++    mask = np.array([v == glyph_color for v in inner_vals], dtype=bool).reshape(4, 4)
++    if _shape_key(mask) not in VALID_SHAPE_KEYS:
++        return None
++    return marker, glyph_color, mask
++
++
++def _try_decode_top(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if w != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    r = 0
++    while r + 1 < h:
++        decoded = _decode_band(g[r, :], g[r + 1, :])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[r : r + 2, :] = True
++        r += 2
++
++    if not mapping or r >= h or np.any(g[r, :] != 0):
++        return None
++    legend_mask[r, :] = True
++    return mapping, legend_mask
++
++
++def _try_decode_left(g: np.ndarray) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray] | None:
++    h, w = g.shape
++    if h != GRID_SIZE:
++        return None
++
++    legend_mask = np.zeros_like(g, dtype=bool)
++    mapping: dict[int, tuple[int, np.ndarray]] = {}
++    seen_shapes: set[tuple[int, ...]] = set()
++    seen_colors: set[int] = set()
++    c = 0
++    while c + 1 < w:
++        decoded = _decode_band(g[:, c], g[:, c + 1])
++        if decoded is None:
++            break
++        marker, glyph_color, mask = decoded
++        shape_key = _shape_key(mask)
++        if marker in mapping or glyph_color in seen_colors or shape_key in seen_shapes:
++            return None
++        mapping[marker] = (glyph_color, mask)
++        seen_colors.add(glyph_color)
++        seen_shapes.add(shape_key)
++        legend_mask[:, c : c + 2] = True
++        c += 2
++
++    if not mapping or c >= w or np.any(g[:, c] != 0):
++        return None
++    legend_mask[:, c] = True
++    return mapping, legend_mask
++
++
++def _extract_hidden_legend(
++    g: np.ndarray,
++) -> tuple[dict[int, tuple[int, np.ndarray]], np.ndarray]:
++    candidates = []
++    top = _try_decode_top(g)
++    if top is not None:
++        candidates.append(top)
++    left = _try_decode_left(g)
++    if left is not None:
++        candidates.append(left)
++    assert len(candidates) == 1, "hidden edge legend not found uniquely"
++    return candidates[0]
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand each scene marker using the glyph pattern and glyph color decoded from hidden edge bands.
++
++    Input structure:
++    - A 20x20 black-background grid contains scene markers in colors 2, 3, 5, and/or 8.
++    - On exactly one edge, stacked 2x20 top bands or 20x2 left bands hide the sample legends.
++    - In each band, the outer lane is the marker color and the inner lane is a separator-grouped 16-cell flattening of the 4x4 glyph, using marker color for empty cells and glyph color for filled cells.
++
++    Rule:
++    - Detect the hidden edge bands, decode each one into a marker -> (glyph color, 4x4 mask) entry, and ignore the legend area itself.
++    - Replace every remaining marker dot by its decoded 4x4 glyph, anchored at the marker and clipped at the grid border.
++    - The output contains only the painted scene glyphs; the hidden legend disappears.
++
++    Key insight:
++    - The edge strip is both a palette and a compressed sample: the constant outer lane tells which marker is being defined, while the grouped inner lane reveals the glyph shape and its paint color.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    mapping, legend_mask = _extract_hidden_legend(g)
++    scene = g.copy()
++    scene[legend_mask] = 0
++
++    present_markers = {int(v) for v in np.unique(scene) if int(v) in MARKER_COLORS}
++    assert present_markers
++    assert present_markers == set(mapping.keys())
++
++    out = np.zeros_like(g)
++    for marker in sorted(present_markers):
++        glyph_color, mask = mapping[marker]
++        for r, c in np.argwhere(scene == marker):
++            _paint_clipped(out, int(r), int(c), int(glyph_color), mask)
++
++    return out
++
++
++def _sample_positions(rng: random.Random, lo: int, hi: int, count: int) -> list[int]:
++    assert lo <= hi and count >= 1
++    if count == 1:
++        return [rng.randint(lo, hi)]
++
++    min_gap, max_gap = SPACING_RANGE
++    for _ in range(200):
++        gaps = [rng.randint(min_gap, max_gap) for _ in range(count - 1)]
++        span = sum(gaps)
++        if span <= hi - lo:
++            start = rng.randint(lo, hi - span)
++            vals = [start]
++            for gap in gaps:
++                vals.append(vals[-1] + gap)
++            return vals
++
++    span = min_gap * (count - 1)
++    assert span <= hi - lo
++    start = rng.randint(lo, hi - span)
++    return [start + i * min_gap for i in range(count)]
++
++
++def _feasible_count(span: int) -> int:
++    return 1 + span // SPACING_RANGE[0]
++
++
++def _choose_mapping(
++    rng: random.Random, used_markers: list[int]
++) -> dict[int, tuple[int, np.ndarray]]:
++    shape_sources_all = list(MARKER_COLORS)
++    for _ in range(200):
++        shape_sources = rng.sample(shape_sources_all, len(used_markers))
++        glyph_colors = rng.sample(list(GLYPH_COLORS), len(used_markers))
++        mapping = {
++            marker: (glyph_color, CANONICAL_GLYPHS[src])
++            for marker, glyph_color, src in zip(
++                used_markers, glyph_colors, shape_sources, strict=False
++            )
++        }
++        if any(
++            glyph_color != CANONICAL_COLORS[marker]
++            or _shape_key(mask) != _shape_key(CANONICAL_GLYPHS[marker])
++            for marker, (glyph_color, mask) in mapping.items()
++        ):
++            return mapping
++    raise RuntimeError("failed to sample a non-canonical hidden legend")
++
++
++def _build_top_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((2, GRID_SIZE), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[0, idx] = marker
++        band[1, idx] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _build_left_band(marker: int, glyph_color: int, mask: np.ndarray) -> np.ndarray:
++    band = np.zeros((GRID_SIZE, 2), dtype=int)
++    flat = mask.reshape(-1)
++    for idx, bit in zip(DATA_IDXS, flat.tolist(), strict=False):
++        band[idx, 0] = marker
++        band[idx, 1] = glyph_color if bool(bit) else marker
++    return band
++
++
++def _render_scene(
++    placed: list[tuple[int, int, int]], mapping: dict[int, tuple[int, np.ndarray]]
++) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker in placed:
++        glyph_color, mask = mapping[marker]
++        _paint_clipped(out, r, c, glyph_color, mask)
++    return out
++
++
++def _gen_attempt() -> np.ndarray | None:
++    rng = random.Random()
++    side = rng.choice(("top", "left"))
++    used_count = rng.randint(2, 3)
++    used_markers = rng.sample(list(MARKER_COLORS), used_count)
++    mapping = _choose_mapping(rng, used_markers)
++
++    scene_r_lo = 2 * used_count + 1 if side == "top" else 0
++    scene_c_lo = 2 * used_count + 1 if side == "left" else 0
++    scene_r_hi = GRID_SIZE - 1
++    scene_c_hi = GRID_SIZE - 1
++
++    row_span = scene_r_hi - scene_r_lo
++    col_span = scene_c_hi - scene_c_lo
++    max_rows = min(4, _feasible_count(row_span))
++    max_cols = min(4, _feasible_count(col_span))
++    if max_rows < 2 or max_cols < 2:
++        return None
++
++    rows = rng.randint(2, max_rows)
++    cols = rng.randint(2, max_cols)
++    row_pos = _sample_positions(rng, scene_r_lo, scene_r_hi, rows)
++    col_pos = _sample_positions(rng, scene_c_lo, scene_c_hi, cols)
++
++    all_cells = [(r, c) for r in row_pos for c in col_pos]
++    min_fill = max(used_count, (6 * len(all_cells) + 9) // 10)
++    fill_count = rng.randint(min_fill, len(all_cells))
++
++    chosen_cells = rng.sample(all_cells, fill_count)
++    assigned_markers = used_markers.copy()
++    assigned_markers.extend(rng.choice(used_markers) for _ in range(fill_count - used_count))
++    rng.shuffle(assigned_markers)
++
++    inp = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    placed: list[tuple[int, int, int]] = []
++    for (r, c), marker in zip(chosen_cells, assigned_markers, strict=False):
++        inp[r, c] = marker
++        placed.append((r, c, marker))
++
++    legend_order = used_markers.copy()
++    rng.shuffle(legend_order)
++    if side == "top":
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[2 * i : 2 * i + 2, :] = _build_top_band(marker, glyph_color, mask)
++    else:
++        for i, marker in enumerate(legend_order):
++            glyph_color, mask = mapping[marker]
++            inp[:, 2 * i : 2 * i + 2] = _build_left_band(marker, glyph_color, mask)
++
++    expected = _render_scene(placed, mapping)
++    try:
++        actual = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(actual, expected):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError(f"failed to generate input after {MAX_RETRIES} attempts")
+
+tokens used
+87,039
+融合版代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/19/code.py)。`main()` 上方保留了四段式说明，并在文件开头写入了组合注释；文件内还包含了按要求整理的设计分析注释。实现上我把隐藏样本具体化为 `top` 或 `left` 的整条频带：每个已用 marker 对应一个 `2x20` 或 `20x2` band，外侧恒为 marker 色，内侧用 `marker 色=0位 / glyph 色=1位` 按 `4+sep+4+sep+4+sep+4` 编码 4x4 字形，因此 solver 必须先从边缘同时解出形状和颜色，再扩展内部 marker。
+
+验证结果：
+- 50 次生成/求解测试：`Success: 50/50`
+- 额外 100 样本退化性统计：
+  - 方向分布：`left 61 / top 39`
+  - 隐藏 band 数：`2种 marker: 51`，`3种 marker: 49`
+  - 非 canonical 赋值个数：`1: 8`，`2: 52`，`3: 40`
+  - 与原始 `dfadab01` solver 在同一输入上的输出相同次数：`0/100`
+  - `orig_diff_rate = 1.0`
+
+这说明生成样本确实触发了“调色板条+边缘隐藏样本”的融合行为，没有退化回原题固定字典规则。
