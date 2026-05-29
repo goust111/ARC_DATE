@@ -1,0 +1,3906 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e25a7-2c7b-7e10-9d0e-94c448da27de
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个变体。
+
+    ## 原始任务: d59b0160
+    **摘要**: 左上角绿色边框(颜色3)围成的图例区域定义目标颜色集合，识别网格中所有非背景的4-连通分量，删除包含全部图例颜色的连通分量，保留不包含全部图例颜色的连通分量
+
+    ## 要实现的变体
+    - **维度**: D17 — 分量面积对匹配的影响 (`meta`)
+    - **当前值**: 不考虑分量面积，任何大小的匹配分量都被删除
+    - **改为**: 面积最小的匹配分量被保留为'种子' — 面积最小的匹配分量不被删除，而是被保留并用特殊颜色标记作为'种子'。其余匹配分量正常删除。解题者需要找到最小的匹配分量并理解其特殊角色。
+    - **来源**: anomaly_detection（参考任务: b99e7126）
+
+    ## 修改原则 
+    以 D17 为核心变更，不要随意改动与该创新无关的部分。但如果其他维度需要做适配性调整才能让 D17 的变化在视觉上可观察、在逻辑上可行（例如：变换规则改为旋转/翻转，但原始对象是纯色对称的导致变换不可见，则应让对象带不对称内部结构），这种配合修改是允许且必要的。
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/d59b0160.py`
+
+    ```python
+    import numpy as np
+
+from arc_utils import components_mask, paste, random_free_location
+import math
+import random
+
+
+def _bg_boundary(g: np.ndarray) -> int:
+    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
+    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
+    vals, cnts = np.unique(border, return_counts=True)
+    return int(vals[cnts.argmax()])
+
+
+def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
+    """
+    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
+    We detect the smallest size sz such that:
+      - g[sz-1, 0:sz] are all x
+      - g[0:sz, sz-1] are all x
+    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
+    excluding bg and excluding the border color x.
+    """
+    h, w = g.shape
+    for sz in range(2, min(h, w) + 1):
+        x = int(g[sz - 1, sz - 1])
+        if x == bg:
+            continue
+        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
+            inside = g[0 : sz - 1, 0 : sz - 1]
+            colors = set(map(int, np.unique(inside)))
+            colors.discard(bg)
+            colors.discard(x)
+            return int(sz), int(x), colors
+    assert False, "no legend border found in grid"
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Delete connected components whose colors match a legend swatch.
+
+    Input structure:
+    - Background (bg) fills most of the grid.
+    - Top-left corner: a small square legend region bordered on its bottom and right edges by a single color; the interior holds a set of "target" colors.
+    - Elsewhere: multicolored objects (4-connected components) on the bg.
+
+    Rule:
+    - Read the target color set from inside the legend border.
+    - For each connected component, check whether it contains **all** target colors.
+    - Erase (fill with bg) every component that does; leave all others unchanged.
+    - Output grid is the same size.
+
+    Key insight: The legend acts as a filter specification — only components carrying the full color palette shown in the legend are removed.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = _bg_boundary(g)
+
+    legend = _find_legend(g, bg)
+    _sz, _x, legend_colors = legend
+    assert legend_colors, "legend interior contains no target colors"
+
+    out = g.copy()
+    comps = components_mask(g != bg, connectivity=4)
+    for pts in comps:
+        cols = {int(g[r, c]) for r, c in pts}
+        if legend_colors.issubset(cols):
+            for r, c in pts:
+                out[r, c] = bg
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# -- Grid & legend constants --
+GRID_H, GRID_W = 16, 16
+BG = 7
+BORDER = 3
+LEGEND_SIZE = 4                       # 4x4 legend at top-left
+PALETTE = [1, 2, 4, 5, 6, 8, 9]
+NUM_TARGETS = 3                       # target colors sampled from PALETTE
+
+# -- Component shape weights: (mode, weight) --
+SHAPE_WEIGHTS = [5, 3, 2]            # medium, tall, wide
+TALL_H = (8, 16);  TALL_W = (2, 4)
+WIDE_H = (3, 5);   WIDE_W = (5, 9)
+MED_H  = (3, 7);   MED_W  = (2, 9)
+
+# -- Component fill density (fraction of non-zero pixels) --
+DENSITY_LO = 0.10
+DENSITY_HI = 0.55
+
+# -- Component count & kept/deleted split --
+COMP_COUNTS = [4, 5, 6]
+COMP_WEIGHTS = [1, 4, 25]
+NUM_KEPT = 3                          # always keep exactly 3
+
+# -- Generation retry budget --
+MAX_RETRIES = 300
+
+
+def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
+    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
+    s = LEGEND_SIZE
+    for g in (inp, out):
+        g[:s, :s] = BG
+        g[s - 1, :s] = BORDER
+        g[:s, s - 1] = BORDER
+
+    # Pick 3 positions in the 3x3 interior: one isolated corner + two non-adjacent border cells
+    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
+    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
+    side_choices = [
+        p for p in border_side
+        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
+    ]
+    positions = [isolated] + random.sample(side_choices, 2)
+    random.shuffle(positions)
+    for color, (r, c) in zip(targets, positions):
+        inp[r, c] = color
+        out[r, c] = color
+
+
+def _component_dims() -> tuple[int, int]:
+    """Sample component (h, w) according to shape-mode weights."""
+    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
+    if mode == "tall":
+        return random.randint(*TALL_H), random.randint(*TALL_W)
+    if mode == "wide":
+        return random.randint(*WIDE_H), random.randint(*WIDE_W)
+    return random.randint(*MED_H), random.randint(*MED_W)
+
+
+def _component_patch(h: int, w: int, targets: list[int], deleted: bool) -> np.ndarray:
+    """Build an h x w patch filled with color-0 base and sprinkled colored pixels."""
+    area = h * w
+    lo = max(1, math.ceil(area * DENSITY_LO))
+    hi = max(lo, math.floor(area * DENSITY_HI))
+    if deleted:
+        lo = max(lo, NUM_TARGETS)
+
+    n_colored = random.randint(lo, hi)
+    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
+    non_targets = [v for v in PALETTE if v not in targets]
+
+    if deleted:
+        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
+    else:
+        used_target_count = random.randint(0, NUM_TARGETS - 1)
+        allowed = non_targets + random.sample(targets, used_target_count)
+        colors = [random.choice(allowed) for _ in range(n_colored)]
+
+    random.shuffle(colors)
+    patch = np.zeros((h, w), dtype=int)
+    rs, cs = zip(*coords)
+    patch[rs, cs] = colors
+    return patch
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Try once to build a valid (input, output) pair; return input or None on failure."""
+    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
+    out = inp.copy()
+
+    targets = random.sample(PALETTE, NUM_TARGETS)
+    _place_legend(inp, out, targets)
+
+    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
+    roles = [True] * (component_count - NUM_KEPT) + [False] * NUM_KEPT
+    random.shuffle(roles)
+
+    for deleted in roles:
+        h, w = _component_dims()
+        patch = _component_patch(h, w, targets, deleted)
+        try:
+            r, c = random_free_location(
+                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
+            )
+        except ValueError:
+            return None
+        paste(inp, patch, r, c)
+        if not deleted:
+            paste(out, patch, r, c)
+
+    if np.array_equal(main(inp), out):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate valid input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 16x16 [observed], bg=7
+  legend:
+    position: top-left 4x4 square [observed]
+    border_color: 3 [observed], fills bottom row and right column of 4x4 region
+    interior: 3x3, contains exactly 3 target colors each placed once, rest bg
+    target_colors: 3 distinct colors chosen from {1,2,4,5,6,8,9}
+  components:
+    type: solid rectangles of non-bg cells (fill ratio = 1.0)
+    base_color: 0 fills most cells; colored pixels (from {1,2,4,5,6,8,9}) sprinkled in at 10-55% density
+    count: 4-6 non-legend components
+    dimensions: 2-9 wide x 3-16 tall
+    separation: components separated by >=1 bg cell (no 4-adjacent touching)
+    may touch grid edges
+  deletion_rule:
+    components containing ALL 3 legend target colors are erased (filled with bg)
+    deleted: 1-3 components; kept: 3 components [observed]
+    kept components must each be missing >=1 legend target color
+  output: same-size grid with deleted components replaced by bg; legend and kept components unchanged
+
+generation_strategy:
+  approach: direct construction
+  steps:
+    1. Pick 3 target colors from {1,2,4,5,6,8,9}; remaining 4 are non-target colors
+    2. Build 4x4 legend at (0,0) - border color 3 on bottom row and right column, place each target color once in the 3x3 interior, rest bg
+    3. Decide component count (4-6) and split into deleted (1-3) and kept (3)
+    4. For each component, pick random bbox dimensions (w in 2-9, h in 3-7); place on grid ensuring >=1 bg gap from legend and all other components
+    5. Fill each component's bbox with color 0
+    6. For deleted components - sprinkle colored pixels ensuring all 3 target colors appear (plus optionally non-targets)
+    7. For kept components - sprinkle colored pixels using a subset of colors that is missing >=1 target color
+    8. Colored pixel density 10-55% of component area
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须保留这一结构，并根据**新的变体规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映变体后的输入结构、规则和关键洞察。
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考任务**（如有 source_task）: 变体描述中的 source_task 是该变体的灵感来源。**必须先阅读其 solver 代码**，理解参考任务中相关机制的实现方式和复杂度，作为你设计变体的基线。不存在就跳过。
+
+    3. **设计分析（写代码前必须完成，可仿照spec书写，尽可能的详细以供下面代码生成使用）**:
+
+       YAML 中的变体描述给出了变更的大致方向，但细节不够具体。你需要自行思考并确定完整的实现细节。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断变体改动的影响范围和实现方式。在写代码之前，完成以下分析：
+
+       a) **具体化与行为追踪**: 变体在 ARC 的像素网格中具体长什么样？变更的核心行为如何体现在输入/输出的结构上？不要停留在抽象概念上，要想清楚具体的形状、颜色、空间关系等细节。然后，确定变体的变化会影响整个流程（输入构造、solver 处理、输出生成等）中的哪个环节，在这个环节上用一个具体的小例子追踪：原始逻辑在这里是怎么执行的 → 变体要求的逻辑应该是怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 变体改变了原任务的某个属性。原始代码中哪些写法依赖了旧属性的不变性？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在变体中是否仍然成立？特别注意那些在原任务中"恰好无害"但在变体中会出错的模式（例如：原任务中某个值始终相同，所以无条件赋值不会产生覆盖问题——但变体让该值可变后，无条件赋值就会破坏已有的正确结果）。
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意（例如对象之间的空间关系、对齐方式、间距等应与任务规则一致）。同时要考虑放置后的网格是否能被 solver 正确处理并产生预期的输出。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。**禁止使用颜色id等不可见因素参与任何排序或者颜色变换（例如使用黑色=0参与排序等，禁用）**。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出变体的规则？如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。若规则本身允许多个合法分支或子情况，不要在生成器中长期固定成其中一种，除非题意本来就要求固定。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果变体后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **颜色变化可推断性**: 如果变体涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个变体设计就不合格。
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 基于第 3 步的设计分析实现变体的新规则。只改需要改的部分，其他逻辑保持不变。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发新规则。生成的输入必须能被新 `main()` 正确求解。
+    6. **保证 generator 的正确性**: 原 generator 采用 output-first 模式（先构造预期输出 → 反推输入 → 用 `main(input)` 验证一致）。修改变体时，你可以沿用或调整这个模式，但必须保证：生成的每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证变体行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了变体的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量变体核心行为（如交互深度、参与对象数等），统计生成样本中该指标和关键分支的分布。少量样本与原始行为相似不为退化；只有当关键控制变量不起作用，样本按照新的变体逻辑执行与原逻辑执行在相同输入网格上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/d59b0160.json` — 原任务的 I/O 样例
+
+    只参考上述文件和原始 solver 代码。不要查看其他变体的实现代码（如 variants/ 目录下的已有文件），避免引入其他维度的改动。
+    - `/home/lixinyu/snap/new/arc2_solver_select/b99e7126.py` — **必读**：参考任务 b99e7126 的 solver（变体灵感来源，用于校准实现复杂度）
+
+## 输出
+
+将完整的变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+`/home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2/code.py`
+
+代码文件开头加一段注释说明这是什么变体:
+```python
+# Variant of d59b0160
+# Dimension: D17 — 分量面积对匹配的影响 (meta)
+# Change: 不考虑分量面积，任何大小的匹配分量都被删除... → 面积最小的匹配分量被保留为'种子'
+```
+
+确保目录 `/home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2` 存在（如不存在则创建）。
+codex
+我先读原始 solver/generator、参考任务 `b99e7126.py`、以及必要的工具文件，确认原题机制和这次 D17 变体该落在哪一层。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/b99e7126.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from functools import reduce
+from math import gcd
+
+import numpy as np
+import random
+from itertools import combinations
+from arc_utils import paste
+
+def _infer_cell_grid_params(g: np.ndarray) -> tuple[int, list[int], list[int]]:
+    """
+    Infer a regular cell grid separated by full rows/cols of the same line color.
+    Returns (step, row_divs, col_divs) where:
+      - row_divs/col_divs are divider indices
+      - step is the spacing between dividers (cell size including divider).
+    """
+    h, w = g.shape
+    line = int(g[0, 0])
+    row_divs = [r for r in range(h) if np.all(g[r, :] == line)]
+    col_divs = [c for c in range(w) if np.all(g[:, c] == line)]
+    assert len(row_divs) >= 2 and len(col_divs) >= 2, "need at least 2 row and 2 col dividers"
+    row_divs.sort()
+    col_divs.sort()
+    drs = [row_divs[i + 1] - row_divs[i] for i in range(len(row_divs) - 1) if row_divs[i + 1] > row_divs[i]]
+    dcs = [col_divs[i + 1] - col_divs[i] for i in range(len(col_divs) - 1) if col_divs[i + 1] > col_divs[i]]
+    step = reduce(gcd, drs + dcs)
+    assert step > 1, "divider step must be > 1"
+    assert row_divs[0] == 0 and col_divs[0] == 0, "first divider must be at index 0"
+    assert (h - 1) % step == 0 and (w - 1) % step == 0, "grid dimensions must be (k*step + 1)"
+    assert row_divs[-1] == h - 1 and col_divs[-1] == w - 1, "last divider must be at boundary"
+    return int(step), row_divs, col_divs
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Scale a minority cell's inner pattern up to the cell-grid level, completing a fractal overlay.
+
+    Input structure:
+    - Grid divided into NxN cells by separator lines of a single color.
+    - Most cells share an identical interior pattern (majority); a few have a distinct pattern (minority).
+
+    Rule:
+    - Extract the inner pixel pattern from the minority cell.
+    - Treat each pixel as a cell-sized stamp: active pixels → minority pattern, inactive → majority pattern.
+    - Position this scaled-up pattern on the cell grid so existing minority cells align with active pixels.
+    - Fill in all remaining active positions with the minority pattern.
+
+    Key insight: The minority cell's interior is a miniature blueprint of where minority cells should appear at the grid scale — fractal self-similarity.
+    """
+    g = np.asarray(grid, dtype=int)
+    step, _, _ = _infer_cell_grid_params(g)
+    n = (g.shape[0] - 1) // step
+    inner = step - 1
+
+    # Extract interior patterns per cell.
+    patterns: dict[tuple[int, ...], np.ndarray] = {}
+    cell_pat: list[list[tuple[int, ...]]] = []
+    for i in range(n):
+        row: list[tuple[int, ...]] = []
+        for j in range(n):
+            r0 = i * step + 1
+            c0 = j * step + 1
+            pat_arr = g[r0 : r0 + inner, c0 : c0 + inner].copy()
+            pat = tuple(pat_arr.ravel().tolist())
+            if pat not in patterns:
+                patterns[pat] = pat_arr
+            row.append(pat)
+        cell_pat.append(row)
+
+    # Find minority/majority cell patterns.
+    counts: dict[tuple[int, ...], int] = {}
+    for i in range(n):
+        for j in range(n):
+            p = cell_pat[i][j]
+            counts[p] = counts.get(p, 0) + 1
+    assert len(counts) >= 2, "must have at least 2 distinct cell patterns (minority + majority)"
+
+    minority_pat = min(counts.items(), key=lambda kv: kv[1])[0]
+    majority_pat = max(counts.items(), key=lambda kv: kv[1])[0]
+    minority_arr = patterns[minority_pat]
+
+    # Mask derived from the minority cell's inner pattern:
+    # active color is the most frequent color within the minority pattern.
+    _vals, _cnts = np.unique(minority_arr, return_counts=True)
+    active_color = int(_vals[_cnts.argmax()])
+    mask = (minority_arr == active_color)
+    mh, mw = mask.shape
+
+    existing = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        for j in range(n):
+            existing[i, j] = cell_pat[i][j] == minority_pat
+
+    # Find the unique placement of the m×m mask in the cell grid such that:
+    # - all existing minority cells lie within the block
+    # - within the block, existing minority cells only occur where mask is True
+    candidates: list[tuple[int, int]] = []
+    for top in range(0, n - mh + 1):
+        for left in range(0, n - mw + 1):
+            block = np.zeros_like(existing)
+            block[top : top + mh, left : left + mw] = True
+            if np.any(existing & ~block):
+                continue
+            ex_block = existing[top : top + mh, left : left + mw]
+            if np.any(ex_block & ~mask):
+                continue
+            candidates.append((int(top), int(left)))
+    assert len(candidates) == 1, "must have a unique mask placement aligning existing minority cells"
+    top, left = candidates[0]
+
+    out = g.copy()
+    for i in range(mh):
+        for j in range(mw):
+            target_pat = minority_arr if mask[i, j] else patterns[majority_pat]
+            r0 = (top + i) * step + 1
+            c0 = (left + j) * step + 1
+            out[r0 : r0 + inner, c0 : c0 + inner] = target_pat
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# --- CFG: tunable generation parameters ---
+CELL_GRID_N = 7           # number of cells per row/col in the 7x7 cell grid
+CELL_INNER = 3            # interior size of each cell (3x3)
+CELL_STEP = 4             # stride between cell origins (inner + 1 divider)
+GRID_SIZE = 29            # full pixel grid: N*STEP+1
+MASK_SIZE = 3             # minority mask dimensions (same as CELL_INNER)
+PLACEMENT_RANGE = CELL_GRID_N - MASK_SIZE + 1  # valid offset range: 0..4
+ACTIVE_PIXEL_COUNTS = (6, 7)   # active pixels in minority mask
+GIVEN_CELL_SIZES = [3, 4]      # number of minority cells shown in input
+COLOR_POOL = 10           # sample 4 distinct colors from 0..9
+MAX_RETRIES = 300         # generate_input retry budget
+
+# LR-symmetric pixel groups: pairs share left/right, singletons sit on center col
+_LR_GROUPS = [
+    ((0, 0), (0, 2)),
+    ((1, 0), (1, 2)),
+    ((2, 0), (2, 2)),
+    ((0, 1),),
+    ((1, 1),),
+    ((2, 1),),
+]
+
+# Pre-compute all valid minority masks (grouped by active count) at module load.
+# Each mask is LR-symmetric with active pixels spanning all 4 edges.
+def _precompute_masks():
+    """Enumerate all valid LR-symmetric 3x3 masks, keyed by active pixel count."""
+    weights = [len(g) for g in _LR_GROUPS]
+    by_count = {}
+    for active_count in ACTIVE_PIXEL_COUNTS:
+        inactive_count = MASK_SIZE * MASK_SIZE - active_count
+        masks = []
+        for k in range(1, len(_LR_GROUPS) + 1):
+            for combo in combinations(range(len(_LR_GROUPS)), k):
+                if sum(weights[i] for i in combo) != inactive_count:
+                    continue
+                mask = np.ones((MASK_SIZE, MASK_SIZE), dtype=bool)
+                for i in combo:
+                    for r, c in _LR_GROUPS[i]:
+                        mask[r, c] = False
+                if mask[0, :].any() and mask[2, :].any() and mask[:, 0].any() and mask[:, 2].any():
+                    masks.append(mask)
+        by_count[active_count] = masks
+    return by_count
+
+_MASKS_BY_COUNT = _precompute_masks()
+
+
+def _random_lr_pattern(color_a, color_b):
+    """Generate a random LR-symmetric 3x3 pattern using two colors (guaranteed non-uniform)."""
+    arr = np.empty((MASK_SIZE, MASK_SIZE), dtype=int)
+    choices = [random.choice((color_a, color_b)) for _ in _LR_GROUPS]
+    if all(v == choices[0] for v in choices):
+        choices[random.randrange(len(choices))] = color_b if choices[0] == color_a else color_a
+    for group, color in zip(_LR_GROUPS, choices):
+        for r, c in group:
+            arr[r, c] = color
+    return arr
+
+
+def _random_minority_mask():
+    """Pick a random valid minority mask (uniform over active count, then uniform within count)."""
+    active_count = random.choice(ACTIVE_PIXEL_COUNTS)
+    return random.choice(_MASKS_BY_COUNT[active_count])
+
+
+def _placement_candidates(mask, subset, top, left):
+    """Find all (t, l) offsets where the given subset of active cells is consistent with mask."""
+    existing = np.zeros((CELL_GRID_N, CELL_GRID_N), dtype=bool)
+    for r, c in subset:
+        existing[top + r, left + c] = True
+
+    candidates = []
+    for t in range(PLACEMENT_RANGE):
+        for l in range(PLACEMENT_RANGE):
+            block = np.zeros((CELL_GRID_N, CELL_GRID_N), dtype=bool)
+            block[t : t + MASK_SIZE, l : l + MASK_SIZE] = True
+            if np.any(existing & ~block):
+                continue
+            if np.any(existing[t : t + MASK_SIZE, l : l + MASK_SIZE] & ~mask):
+                continue
+            candidates.append((t, l))
+    return candidates
+
+
+def _choose_given_subset(mask, top, left):
+    """Choose a subset of active mask positions that uniquely determines the placement."""
+    active = [tuple(coord) for coord in np.argwhere(mask)]
+    sizes = list(GIVEN_CELL_SIZES)
+    random.shuffle(sizes)
+    for size in sizes:
+        valid = [
+            subset
+            for subset in combinations(active, size)
+            if _placement_candidates(mask, subset, top, left) == [(top, left)]
+        ]
+        if valid:
+            return random.choice(valid)
+    return None
+
+
+def _cell_origin(i, j):
+    """Pixel origin of cell (i, j) interior within the full grid."""
+    return i * CELL_STEP + 1, j * CELL_STEP + 1
+
+
+def _build_grid(separator, majority, minority, active_cells):
+    """Construct a 29x29 grid: fill all cells with majority, then overwrite active_cells."""
+    grid = np.full((GRID_SIZE, GRID_SIZE), separator, dtype=int)
+    for i in range(CELL_GRID_N):
+        for j in range(CELL_GRID_N):
+            paste(grid, majority, *_cell_origin(i, j))
+    for i, j in active_cells:
+        paste(grid, minority, *_cell_origin(i, j))
+    return grid
+
+
+def _gen_attempt():
+    """Single generation attempt: build output, choose input subset, verify with solver."""
+    separator, maj_exclusive, shared, min_exclusive = random.sample(range(COLOR_POOL), 4)
+    majority = _random_lr_pattern(shared, maj_exclusive)
+    mask = _random_minority_mask()
+    minority = np.where(mask, min_exclusive, shared).astype(int)
+
+    top = random.randrange(PLACEMENT_RANGE)
+    left = random.randrange(PLACEMENT_RANGE)
+    active_cells = [(top + r, left + c) for r, c in np.argwhere(mask)]
+    out = _build_grid(separator, majority, minority, active_cells)
+
+    subset = _choose_given_subset(mask, top, left)
+    if subset is None:
+        return None
+    given_cells = [(top + r, left + c) for r, c in subset]
+    inp = _build_grid(separator, majority, minority, given_cells)
+
+    try:
+        solved = main(inp)
+    except Exception:
+        return None
+    if not np.array_equal(solved, out):
+        return None
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/d59b0160.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+import numpy as np
+
+from arc_utils import components_mask, paste, random_free_location
+import math
+import random
+
+
+def _bg_boundary(g: np.ndarray) -> int:
+    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
+    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
+    vals, cnts = np.unique(border, return_counts=True)
+    return int(vals[cnts.argmax()])
+
+
+def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
+    """
+    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
+    We detect the smallest size sz such that:
+      - g[sz-1, 0:sz] are all x
+      - g[0:sz, sz-1] are all x
+    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
+    excluding bg and excluding the border color x.
+    """
+    h, w = g.shape
+    for sz in range(2, min(h, w) + 1):
+        x = int(g[sz - 1, sz - 1])
+        if x == bg:
+            continue
+        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
+            inside = g[0 : sz - 1, 0 : sz - 1]
+            colors = set(map(int, np.unique(inside)))
+            colors.discard(bg)
+            colors.discard(x)
+            return int(sz), int(x), colors
+    assert False, "no legend border found in grid"
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Delete connected components whose colors match a legend swatch.
+
+    Input structure:
+    - Background (bg) fills most of the grid.
+    - Top-left corner: a small square legend region bordered on its bottom and right edges by a single color; the interior holds a set of "target" colors.
+    - Elsewhere: multicolored objects (4-connected components) on the bg.
+
+    Rule:
+    - Read the target color set from inside the legend border.
+    - For each connected component, check whether it contains **all** target colors.
+    - Erase (fill with bg) every component that does; leave all others unchanged.
+    - Output grid is the same size.
+
+    Key insight: The legend acts as a filter specification — only components carrying the full color palette shown in the legend are removed.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = _bg_boundary(g)
+
+    legend = _find_legend(g, bg)
+    _sz, _x, legend_colors = legend
+    assert legend_colors, "legend interior contains no target colors"
+
+    out = g.copy()
+    comps = components_mask(g != bg, connectivity=4)
+    for pts in comps:
+        cols = {int(g[r, c]) for r, c in pts}
+        if legend_colors.issubset(cols):
+            for r, c in pts:
+                out[r, c] = bg
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# -- Grid & legend constants --
+GRID_H, GRID_W = 16, 16
+BG = 7
+BORDER = 3
+LEGEND_SIZE = 4                       # 4x4 legend at top-left
+PALETTE = [1, 2, 4, 5, 6, 8, 9]
+NUM_TARGETS = 3                       # target colors sampled from PALETTE
+
+# -- Component shape weights: (mode, weight) --
+SHAPE_WEIGHTS = [5, 3, 2]            # medium, tall, wide
+TALL_H = (8, 16);  TALL_W = (2, 4)
+WIDE_H = (3, 5);   WIDE_W = (5, 9)
+MED_H  = (3, 7);   MED_W  = (2, 9)
+
+# -- Component fill density (fraction of non-zero pixels) --
+DENSITY_LO = 0.10
+DENSITY_HI = 0.55
+
+# -- Component count & kept/deleted split --
+COMP_COUNTS = [4, 5, 6]
+COMP_WEIGHTS = [1, 4, 25]
+NUM_KEPT = 3                          # always keep exactly 3
+
+# -- Generation retry budget --
+MAX_RETRIES = 300
+
+
+def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
+    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
+    s = LEGEND_SIZE
+    for g in (inp, out):
+        g[:s, :s] = BG
+        g[s - 1, :s] = BORDER
+        g[:s, s - 1] = BORDER
+
+    # Pick 3 positions in the 3x3 interior: one isolated corner + two non-adjacent border cells
+    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
+    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
+    side_choices = [
+        p for p in border_side
+        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
+    ]
+    positions = [isolated] + random.sample(side_choices, 2)
+    random.shuffle(positions)
+    for color, (r, c) in zip(targets, positions):
+        inp[r, c] = color
+        out[r, c] = color
+
+
+def _component_dims() -> tuple[int, int]:
+    """Sample component (h, w) according to shape-mode weights."""
+    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
+    if mode == "tall":
+        return random.randint(*TALL_H), random.randint(*TALL_W)
+    if mode == "wide":
+        return random.randint(*WIDE_H), random.randint(*WIDE_W)
+    return random.randint(*MED_H), random.randint(*MED_W)
+
+
+def _component_patch(h: int, w: int, targets: list[int], deleted: bool) -> np.ndarray:
+    """Build an h x w patch filled with color-0 base and sprinkled colored pixels."""
+    area = h * w
+    lo = max(1, math.ceil(area * DENSITY_LO))
+    hi = max(lo, math.floor(area * DENSITY_HI))
+    if deleted:
+        lo = max(lo, NUM_TARGETS)
+
+    n_colored = random.randint(lo, hi)
+    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
+    non_targets = [v for v in PALETTE if v not in targets]
+
+    if deleted:
+        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
+    else:
+        used_target_count = random.randint(0, NUM_TARGETS - 1)
+        allowed = non_targets + random.sample(targets, used_target_count)
+        colors = [random.choice(allowed) for _ in range(n_colored)]
+
+    random.shuffle(colors)
+    patch = np.zeros((h, w), dtype=int)
+    rs, cs = zip(*coords)
+    patch[rs, cs] = colors
+    return patch
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Try once to build a valid (input, output) pair; return input or None on failure."""
+    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
+    out = inp.copy()
+
+    targets = random.sample(PALETTE, NUM_TARGETS)
+    _place_legend(inp, out, targets)
+
+    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
+    roles = [True] * (component_count - NUM_KEPT) + [False] * NUM_KEPT
+    random.shuffle(roles)
+
+    for deleted in roles:
+        h, w = _component_dims()
+        patch = _component_patch(h, w, targets, deleted)
+        try:
+            r, c = random_free_location(
+                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
+            )
+        except ValueError:
+            return None
+        paste(inp, patch, r, c)
+        if not deleted:
+            paste(out, patch, r, c)
+
+    if np.array_equal(main(inp), out):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate valid input")
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+    r0 = min(b[0] for b in bbs)
+    c0 = min(b[1] for b in bbs)
+    r1 = max(b[2] for b in bbs)
+    c1 = max(b[3] for b in bbs)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox_h(b: BBox) -> int:
+    r0, _c0, r1, _c1 = b
+    return int(r1 - r0 + 1)
+
+
+def bbox_w(b: BBox) -> int:
+    _r0, c0, _r1, c1 = b
+    return int(c1 - c0 + 1)
+
+
+def bbox_anchor(b: BBox, *, anchor: str = "upper left") -> Coord:
+    """
+    Return an anchor point (r,c) for a bbox.
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/d59b0160.json'
+with open(p) as f:
+    data=json.load(f)
+print('train',len(data['train']),'test',len(data['test']))
+for split in ['train','test']:
+    for i,ex in enumerate(data[split]):
+        inp=ex['input']; out=ex.get('output')
+        print(split,i,len(inp),len(inp[0]), 'out' if out else '')
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+train 3 test 1
+train 0 16 16 out
+train 1 16 16 out
+train 2 16 16 out
+test 0 16 16 out
+
+codex
+我已经确认原题核心是“图例定义颜色集合，按 4 连通分量过滤”。接下来补读 `arc_utils` 里真正参与生成的几个辅助函数，并把 D17 变体落成一套可生成、可观察、不会退化回原题的具体约束。
+exec
+/bin/bash -lc 'rg -n "def (components_mask|paste|random_free_location)" /home/lixinyu/snap/new/solvers/arc_utils.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+308:def paste(
+398:def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+854:def random_free_location(
+
+exec
+/bin/bash -lc "sed -n '520,760p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+    if old_col == new_col:
+        return
+    if int(connectivity) == 4:
+        def nbrs(rr: int, cc: int):
+            yield rr - 1, cc
+            yield rr + 1, cc
+            yield rr, cc - 1
+            yield rr, cc + 1
+    else:
+        def nbrs(rr: int, cc: int):
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    yield rr + dr, cc + dc
+    stack: list[Coord] = [(r0, c0)]
+    while stack:
+        rr, cc = stack.pop()
+        if not (0 <= rr < H and 0 <= cc < W):
+            continue
+        if int(grid[rr, cc]) != old_col:
+            continue
+        grid[rr, cc] = new_col
+        for nr, nc in nbrs(rr, cc):
+            stack.append((nr, nc))
+
+
+def draw_line(
+    grid: np.ndarray,
+    r: int,
+    c: int,
+    *,
+    end_r: int | None = None,
+    end_c: int | None = None,
+    length: int | None = None,
+    direction: tuple[int, int] | None = None,
+    color: int,
+    stop_at: set[int] | None = None,
+    clip: bool = False,
+) -> Coord:
+    """
+    Draw a line starting at (r,c) either to an endpoint or by (length,direction).
+    Modifies grid in-place. Returns (r_end,c_end) last drawn.
+
+    Compatibility note (seed helpers):
+      - If you provide `direction` and leave `length=None`, the line extends until
+        it would leave the grid (implemented by using a sufficiently large length).
+    """
+    rr = int(r)
+    cc = int(c)
+    H, W = grid.shape
+    col = int(color)
+    stop_at = set() if stop_at is None else set(map(int, stop_at))
+
+    if (end_r is None) != (end_c is None):
+        raise ValueError("draw_line: either provide both end_r and end_c, or neither")
+
+    if end_r is not None and end_c is not None:
+        er = int(end_r)
+        ec = int(end_c)
+        dr = er - rr
+        dc = ec - cc
+        length = max(abs(dr), abs(dc)) + 1
+        dr = 0 if dr == 0 else int(dr / abs(dr))
+        dc = 0 if dc == 0 else int(dc / abs(dc))
+    else:
+        if direction is None:
+            raise ValueError("draw_line: must provide endpoint or direction")
+        dr, dc = map(int, direction)
+        dr = 0 if dr == 0 else int(dr / abs(dr))
+        dc = 0 if dc == 0 else int(dc / abs(dc))
+        if length is None:
+            # Extend until the edge (seed-style behavior). This uses a bound that is
+            # certainly long enough even if the start is out-of-bounds and clip=True.
+            length = max(H, W) * 2
+        length = int(length)
+
+    last_r, last_c = rr, cc
+    for i in range(int(length)):
+        r2 = rr + i * dr
+        c2 = cc + i * dc
+        if not (0 <= r2 < H and 0 <= c2 < W):
+            if bool(clip):
+                continue
+            break
+        if int(grid[r2, c2]) in stop_at:
+            break
+        grid[r2, c2] = col
+        last_r, last_c = r2, c2
+    return int(last_r), int(last_c)
+
+
+# =============================================================================
+# Tiling
+# =============================================================================
+
+
+def tile_fill(shape: tuple[int, int], tile: np.ndarray, *, offset: Coord = (0, 0)) -> np.ndarray:
+    """Return a new grid of `shape` filled by repeating `tile` with a phase offset."""
+    H, W = map(int, shape)
+    h, w = tile.shape
+    r_off, c_off = map(int, offset)
+    out = np.empty((H, W), dtype=tile.dtype)
+    for r in range(H):
+        tr = (r - r_off) % h
+        for c in range(W):
+            tc = (c - c_off) % w
+            out[r, c] = tile[tr, tc]
+    return out
+
+
+
+
+# =============================================================================
+# Motion / interaction (translate, collision/contact)
+# =============================================================================
+
+
+def translate(obj: np.ndarray, dr: int, dc: int, *, background: int = Color.BLACK) -> np.ndarray:
+    """Translate a full-grid object by (dr,dc), filling empty with background."""
+    dr = int(dr)
+    dc = int(dc)
+    bg = int(background)
+    H, W = obj.shape
+    out = np.full_like(obj, bg)
+    rr, cc = np.nonzero(obj != bg)
+    rr2 = rr + dr
+    cc2 = cc + dc
+    inb = (0 <= rr2) & (rr2 < H) & (0 <= cc2) & (cc2 < W)
+    out[rr2[inb], cc2[inb]] = obj[rr[inb], cc[inb]]
+    return out
+
+
+def collision(
+    *,
+    object1: np.ndarray,
+    object2: np.ndarray,
+    r1: int = 0,
+    c1: int = 0,
+    r2: int = 0,
+    c2: int = 0,
+    background: int = Color.BLACK,
+) -> bool:
+    """Return True iff non-background pixels overlap with object2 placed at (r2,c2) relative to object1 at (r1,c1)."""
+    bg = int(background)
+    a = object1
+    b = object2
+    H1, W1 = a.shape
+    H2, W2 = b.shape
+
+    dr = int(r2) - int(r1)
+    dc = int(c2) - int(c1)
+
+    ra0 = max(0, dr)
+    ca0 = max(0, dc)
+    ra1 = min(H1, dr + H2)
+    ca1 = min(W1, dc + W2)
+    if ra0 >= ra1 or ca0 >= ca1:
+        return False
+
+    rb0 = ra0 - dr
+    cb0 = ca0 - dc
+    rb1 = rb0 + (ra1 - ra0)
+    cb1 = cb0 + (ca1 - ca0)
+    return bool(((a[ra0:ra1, ca0:ca1] != bg) & (b[rb0:rb1, cb0:cb1] != bg)).any())
+
+
+def contact(
+    *,
+    object1: np.ndarray,
+    object2: np.ndarray,
+    r1: int = 0,
+    c1: int = 0,
+    r2: int = 0,
+    c2: int = 0,
+    background: int = Color.BLACK,
+    connectivity: int = 4,
+) -> bool:
+    """Return True iff objects touch (share edge/diagonal) or overlap."""
+    bg = int(background)
+    struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+    m2 = (object2 != bg)
+    m2d = ndimage.binary_dilation(m2, structure=struct)
+    return collision(
+        object1=(object1 != bg).astype(int),
+        object2=m2d.astype(int),
+        r1=r1,
+        c1=c1,
+        r2=r2,
+        c2=c2,
+        background=0,
+    )
+
+
+# =============================================================================
+# Generation helpers
+# =============================================================================
+
+def first_free_location(
+    canvas: np.ndarray,
+    patch: np.ndarray,
+    *,
+    transparent: int,
+    border: int = 0,
+    padding: int = 0,
+    padding_connectivity: int = 8,
+) -> Coord | None:
+    """
+    Find the first (top-left) location where `patch` fits without overlap.
+
+    Args:
+        transparent: color treated as transparent in both `canvas` and `patch`
+        border: keep at least this many empty cells to the canvas border
+        padding: if > 0, treat `canvas` occupancy as dilated by `padding` pixels.
+                 (useful for “leave a gap” placement constraints)
+        padding_connectivity: 4 or 8 for the dilation neighborhood
+
+    Returns:
+        (r0,c0) or None if no placement exists.
+    """
+    H, W = canvas.shape
+    h, w = patch.shape
+    border = int(border)
+    padding = int(padding)
+    bg = int(transparent)
+
+    if h <= 0 or w <= 0:
+        return None
+    if H - h + 1 - border <= border or W - w + 1 - border <= border:
+        return None
+
+    # Occupancy of the canvas (optionally dilated to enforce padding).
+    occ = (canvas != bg)
+    if padding > 0:
+        if int(padding_connectivity) == 4:
+            struct = STRUCT4
+        elif int(padding_connectivity) == 8:
+            struct = STRUCT8
+        else:
+            raise ValueError("first_free_location: padding_connectivity must be 4 or 8")
+        occ = ndimage.binary_dilation(occ, iterations=padding, structure=struct)
+
+exec
+/bin/bash -lc "sed -n '854,940p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def random_free_location(
+    canvas: np.ndarray,
+    patch: np.ndarray,
+    *,
+    transparent: int,
+    border: int = 0,
+    padding: int = 0,
+    padding_connectivity: int = 8,
+) -> Coord:
+    """
+    Return a random (r,c) top-left location where `patch` fits without overlap.
+
+    This is the generator-friendly counterpart of `first_free_location` and mirrors the
+    legacy seeds' `random_free_location_for_sprite` behavior.
+
+    Raises:
+        ValueError: if no free location exists.
+    """
+    H, W = canvas.shape
+    h, w = patch.shape
+    border = int(border)
+    padding = int(padding)
+    pad_conn = int(padding_connectivity)
+    bg = int(transparent)
+
+    if h <= 0 or w <= 0:
+        raise ValueError("random_free_location: patch must be non-empty")
+    if H <= 0 or W <= 0:
+        raise ValueError("random_free_location: canvas must be non-empty")
+
+    if border < 0:
+        raise ValueError("random_free_location: border must be >= 0")
+    if padding < 0:
+        raise ValueError("random_free_location: padding must be >= 0")
+    if pad_conn not in (4, 8):
+        raise ValueError("random_free_location: padding_connectivity must be 4 or 8")
+
+    r_min = border
+    c_min = border
+    r_max = H - border - h
+    c_max = W - border - w
+    if r_max < r_min or c_max < c_min:
+        raise ValueError("random_free_location: patch cannot fit (border too large or patch too big)")
+
+    occ = (canvas != bg)
+    if padding > 0:
+        struct = STRUCT4 if pad_conn == 4 else STRUCT8
+        occ = ndimage.binary_dilation(occ, structure=struct, iterations=padding)
+
+    m = (patch != bg)
+
+    candidates: list[Coord] = []
+    for r0 in range(r_min, r_max + 1):
+        for c0 in range(c_min, c_max + 1):
+            if not bool((occ[r0 : r0 + h, c0 : c0 + w] & m).any()):
+                candidates.append((int(r0), int(c0)))
+
+    if not candidates:
+        raise ValueError("random_free_location: no free location")
+    return random.choice(candidates)
+
+
+def randomly_scatter_points(
+    grid: np.ndarray,
+    color: int,
+    *,
+    density: float = 0.5,
+    background: int = Color.BLACK,
+) -> np.ndarray:
+    """Randomly scatter points of `color` into `background` cells until reaching density."""
+    bg = int(background)
+    col = int(color)
+    colored = 0
+    H, W = grid.shape
+    target = int(round(float(density) * H * W))
+    while colored < target:
+        r = np.random.randint(0, H)
+        c = np.random.randint(0, W)
+        if int(grid[r, c]) == bg:
+            grid[r, c] = col
+            colored += 1
+    return grid
+
+
+def randomly_spaced_indices(max_len: int, n_indices: int, border_size: int = 1, padding: int = 1) -> np.ndarray:
+    """Generate randomly-spaced indices guaranteed to not be adjacent."""
+    max_len = int(max_len)
+
+exec
+/bin/bash -lc "sed -n '398,450p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+    """List of components from a boolean mask, each as an (N,2) coords array."""
+    lab, n = label_mask(mask, connectivity=connectivity)
+    return [np.argwhere(lab == k) for k in range(1, n + 1)]
+
+
+def find_components(
+    grid: np.ndarray,
+    *,
+    bg: int | None = None,
+    connectivity: int = 4,
+    monochromatic: bool = True,
+    colors: Sequence[int] | None = None,
+    min_area: int = 1,
+    return_format: str = "dict",
+) -> list[dict] | list[np.ndarray]:
+    """
+    Find connected components in a grid (unified API for ARC-2 + migrated seeds).
+
+    return_format:
+      - \"dict\": list of dicts {color, coords, bbox, area}
+      - \"objects\": list of full-grid arrays containing exactly one component
+    """
+    if bg is None:
+        bg = get_bg(grid)
+    bg = int(bg)
+
+    return_format = str(return_format).lower().strip()
+    if return_format not in {"dict", "objects"}:
+        raise ValueError("find_components: return_format must be 'dict' or 'objects'")
+
+    if colors is None:
+        colors_set = None
+        colors_iter = sorted(set(map(int, grid.flatten())) - {bg})
+    else:
+        colors_set = {int(c) for c in colors}
+        colors_iter = [int(c) for c in colors_set if int(c) != bg]
+
+    # Monochromatic = label per-color
+    if monochromatic:
+        if return_format == "dict":
+            out: list[dict] = []
+            for col in colors_iter:
+                mask = (grid == col)
+                if not mask.any():
+                    continue
+                comps = components_mask(mask, connectivity=connectivity)
+                for coords in comps:
+                    if int(coords.shape[0]) < int(min_area):
+                        continue
+                    out.append(
+                        {
+                            "color": int(col),
+
+exec
+/bin/bash -lc "sed -n '308,345p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def paste(
+    dst: np.ndarray,
+    patch: np.ndarray,
+    r0: int,
+    c0: int,
+    *,
+    transparent: int | None = None,
+    mask: np.ndarray | None = None,
+    overwrite: bool = True,
+    clip: bool = False,
+) -> np.ndarray:
+    """
+    Paste `patch` into `dst` at top-left (r0,c0).
+
+    This is the ONE placement primitive solver examples should use.
+
+    - Opaque paste: `paste(dst, patch, r0, c0)`
+    - Transparent overlay: `paste(dst, patch, r0, c0, transparent=bg)`
+    - Masked paste: `paste(dst, patch, r0, c0, mask=m)`
+    - Non-overwriting overlay: `paste(dst, patch, r0, c0, transparent=bg, overwrite=False)`
+    - Strict vs clip: default `clip=False` (fail fast); set `clip=True` to clip out-of-bounds.
+    """
+    H, W = dst.shape
+    r0 = int(r0)
+    c0 = int(c0)
+    h, w = map(int, patch.shape)
+
+    if not clip:
+        if r0 < 0 or c0 < 0 or r0 + h > H or c0 + w > W:
+            raise ValueError("paste: patch out of bounds (set clip=True to allow clipping)")
+        rr0, cc0 = r0, c0
+        rr1, cc1 = r0 + h, c0 + w
+        pr0, pc0 = 0, 0
+    else:
+        rr0 = max(0, r0)
+        cc0 = max(0, c0)
+        rr1 = min(H, r0 + h)
+        cc1 = min(W, c0 + w)
+
+codex
+设计已经明确：保留原题的“图例筛选匹配分量”机制，只把匹配分量的处理改成“删大留小”，并把唯一最小匹配分量重涂成固定种子色。下面我会先把设计分析写进代码注释，再实现 solver、generator，并用批量采样验证它没有退化回原题。
+Implement D17 by changing only the fate of matching components: smallest-area match becomes a visible seed, larger matches are erased. Generator will guarantee multiple matches and a unique smallest match so the new behavior is observable.
+  → Write detailed design analysis for the D17 variant and translate it into solver/generator constraints
+  • Implement updated code.py with revised main() and generation logic
+  • Run required reliability test, measure variant-specific behavior, and iterate until stable
+codex
+我准备开始落代码，先确认目标目录状态；随后会一次性写入完整变体文件，避免在旧文件上做不必要的来回改动。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+exec
+/bin/bash -lc 'ls -la /home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+total 8
+drwxrwxr-x+ 2 lixinyu lixinyu 4096 May 14 04:44 .
+drwxrwxr-x+ 4 lixinyu lixinyu 4096 May 14 04:44 ..
+
+codex
+我现在写入完整实现。solver 会显式跳过图例方块内的连通分量，只在外部匹配分量里找“唯一最小面积”的种子；generator 会强制生成至少两个匹配分量，并让最小匹配分量唯一且在输出中被绿色重标。
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2/code.py
+diff --git a/ceshi/code/d59b0160/D17/2/code.py b/ceshi/code/d59b0160/D17/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5fb744e31014cb8fc5e67fb9a9fe9f4eb6e777c
+--- /dev/null
++++ b/ceshi/code/d59b0160/D17/2/code.py
+@@ -0,0 +1,322 @@
++# Variant of d59b0160
++# Dimension: D17 — 分量面积对匹配的影响 (meta)
++# Change: 不考虑分量面积，任何大小的匹配分量都被删除... → 面积最小的匹配分量被保留为'种子'
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++# Design analysis for the D17 variant
++# -----------------------------------
++# spec:
++#   preserved_core:
++#     - 左上角 4x4 图例仍然给出 3 个目标颜色。
++#     - 网格其余对象仍然是放在背景上的 4 连通多色矩形分量。
++#     - "匹配分量" 仍然定义为: 颜色集合包含全部 3 个图例颜色。
++#   changed_behavior:
++#     - 原题: 所有匹配分量都删除。
++#     - 变体: 外部分量中, 面积最小的匹配分量保留, 并整体改涂为种子色 3;
++#       其他匹配分量照旧删除。
++#   concrete_pixel_effect:
++#     - 输入里会出现至少 2 个都含有全部图例颜色的矩形分量。
++#     - 输出里, 其中最小的那个不会消失, 而是变成纯绿色矩形;
++#       其余匹配矩形被擦成背景。
++#     - 不匹配分量保持原状。
++#   behavior_trace:
++#     - 例: 图例颜色为 {1,4,8}; 有三个外部分量 A/B/C.
++#     - A 面积 12, 颜色含 {0,1,4,8}; B 面积 20, 也含 {1,4,8}; C 缺少 8.
++#     - 原题输出: A 和 B 都被删除, C 保留。
++#     - 本变体输出: A 改成纯 3 色种子, B 删除, C 保留。
++#     - 差异集中在 "匹配分量命运判定" 这一步, 输入识别逻辑不变。
++#   complexity_calibration:
++#     - 只在匹配分量内部引入面积比较, 不引入额外排序维度或颜色映射。
++#     - 生成器强制至少 2 个匹配分量, 避免退化成 "只有一个匹配分量, 看不出删大留小"。
++#     - 生成器强制最小匹配面积唯一, 避免样例依赖隐藏 tie-break。
++#   implicit_assumption_review:
++#     - 原 solver 按 (g != bg) 找全部分量, 默认图例自身不会误判为待删对象。
++#     - 变体里若仍把图例碎片纳入最小面积比较, 可能把图例误当种子;
++#       因此 solver 显式跳过完全位于图例方块内的分量。
++#     - 原 solver 对每个匹配分量都直接清空; 该写法依赖 "所有匹配分量命运相同"。
++#       变体中此假设失效, 必须先收集全部匹配分量, 再决定哪个保留、哪些删除。
++#   placement_legality:
++#     - 每个对象仍作为完整矩形 patch 放置, 用 1 格 padding 保证互不接触。
++#     - seed/matched/kept 全都在图例外部随机布局, 不越界不重叠。
++#     - 匹配分量的面积由其矩形 bbox 决定, 与内部彩点数量无关, 因而 solver/generator 一致。
++#   visual_observability:
++#     - 绿色 3 本来只出现在图例边框; 输出把 seed 整体改成 3, 肉眼能马上看到"特殊保留者"。
++#     - 删除对象与绿色 seed 会在同一类 "全含图例色" 对象中同时出现, 规则可从 2-3 例中归纳。
++#   cleanliness:
++#     - 同一网格只叠加三类元素: 图例, 普通矩形对象, 输出中的纯绿色 seed。
++#     - 不再加入额外标记符号, 避免多层覆盖造成视觉混乱。
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color on the outer frame."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    Find the top-left legend square whose bottom row and right column share one border color.
++    Return (size, border_color, interior_target_colors).
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        border_color = int(g[sz - 1, sz - 1])
++        if border_color == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == border_color) and np.all(g[0:sz, sz - 1] == border_color):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(border_color)
++            return int(sz), int(border_color), colors
++    raise AssertionError("no legend border found in grid")
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Keep the smallest matching component as a seed and erase the larger matches.
++
++    Input structure:
++    - One background color occupies most of the board.
++    - The top-left corner contains a small legend square whose interior shows the target palette and whose bottom/right edges share one border color.
++    - Away from the legend are several 4-connected multicolor components built on the background.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - Among non-legend connected components, collect those whose color set contains every target color.
++    - Compare only those matching components by area: recolor the smallest one to the legend-border color as a seed, and erase every other matching component to background.
++    - Leave all non-matching components unchanged.
++
++    Key insight: The legend still defines which components qualify, but size now breaks the symmetry inside that qualifying set: the smallest full-palette component survives as a highlighted seed.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++    legend_size, border_color, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    matches: list[tuple[int, int, int, np.ndarray]] = []
++    for pts in components_mask(g != bg, connectivity=4):
++        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
++            continue
++        cols = {int(g[r, c]) for r, c in pts}
++        if legend_colors.issubset(cols):
++            area = int(len(pts))
++            top = int(pts[:, 0].min())
++            left = int(pts[:, 1].min())
++            matches.append((area, top, left, pts))
++
++    if not matches:
++        return out
++
++    seed_idx = min(range(len(matches)), key=lambda i: matches[i][:3])
++    for idx, (_area, _top, _left, pts) in enumerate(matches):
++        fill = border_color if idx == seed_idx else bg
++        for r, c in pts:
++            out[r, c] = fill
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component synthesis --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++MATCH_COUNTS = [2, 3]
++MATCH_WEIGHTS = [5, 2]
++NUM_KEPT = 3
++MAX_RETRIES = 400
++
++SMALL_MATCH_DIMS = [(3, 3), (3, 4), (4, 3), (4, 4)]
++KEEP_SHAPE_WEIGHTS = [5, 3, 2]  # medium, tall, wide
++MATCH_SHAPE_WEIGHTS = [5, 2, 3]  # medium, tall, wide
++TALL_H = (6, 9)
++TALL_W = (2, 4)
++WIDE_H = (3, 4)
++WIDE_W = (6, 8)
++MED_H = (4, 6)
++MED_W = (4, 6)
++KEEP_H = (3, 6)
++KEEP_W = (2, 6)
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the top-left legend; the output legend is unchanged."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _sample_mode_dims(weights: list[int]) -> tuple[int, int]:
++    """Sample rectangle dimensions from medium / tall / wide modes."""
++    mode = random.choices(["medium", "tall", "wide"], weights=weights)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _seed_dims() -> tuple[int, int]:
++    """Pick a small seed rectangle so the smallest match is visually obvious."""
++    return random.choice(SMALL_MATCH_DIMS)
++
++
++def _larger_match_dims(min_area: int) -> tuple[int, int]:
++    """Pick a matching component strictly larger than the seed area."""
++    for _ in range(100):
++        h, w = _sample_mode_dims(MATCH_SHAPE_WEIGHTS)
++        if h * w > min_area:
++            return h, w
++    raise RuntimeError("failed to sample larger matching component")
++
++
++def _keep_dims() -> tuple[int, int]:
++    """Pick a kept component; sizes remain moderate to keep packing feasible."""
++    if random.random() < 0.7:
++        return random.randint(*KEEP_H), random.randint(*KEEP_W)
++    return _sample_mode_dims(KEEP_SHAPE_WEIGHTS)
++
++
++def _component_patch(h: int, w: int, targets: list[int], match: bool) -> np.ndarray:
++    """Build a solid 4-connected rectangle with sparse colored pixels over color 0."""
++    area = h * w
++    lo = max(1, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    if match:
++        lo = max(lo, NUM_TARGETS)
++
++    n_colored = random.randint(lo, hi)
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    if match:
++        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
++    else:
++        used_target_count = random.randint(0, NUM_TARGETS - 1)
++        allowed = non_targets + random.sample(targets, used_target_count)
++        colors = [random.choice(allowed) for _ in range(n_colored)]
++
++    random.shuffle(colors)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_spec(role: str, targets: list[int], seed_area: int | None = None) -> dict:
++    """Describe one component before placement."""
++    if role == "seed":
++        h, w = _seed_dims()
++        patch = _component_patch(h, w, targets, match=True)
++    elif role == "delete":
++        assert seed_area is not None
++        h, w = _larger_match_dims(seed_area)
++        patch = _component_patch(h, w, targets, match=True)
++    else:
++        h, w = _keep_dims()
++        patch = _component_patch(h, w, targets, match=False)
++    return {"role": role, "patch": patch, "area": h * w}
++
++
++def _place_components(inp: np.ndarray, out: np.ndarray, specs: list[dict]) -> bool:
++    """Place all components with 1-cell separation and build the expected output."""
++    for spec in sorted(specs, key=lambda x: x["area"], reverse=True):
++        patch = spec["patch"]
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return False
++        paste(inp, patch, r, c)
++        if spec["role"] == "keep":
++            paste(out, patch, r, c)
++        elif spec["role"] == "seed":
++            paste(out, np.full_like(patch, BORDER), r, c)
++    return True
++
++
++def _count_matching_components(grid: np.ndarray) -> list[int]:
++    """Return areas of all external matching components in the input."""
++    bg = _bg_boundary(grid)
++    legend_size, _border, legend_colors = _find_legend(grid, bg)
++    areas = []
++    for pts in components_mask(grid != bg, connectivity=4):
++        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
++            continue
++        cols = {int(grid[r, c]) for r, c in pts}
++        if legend_colors.issubset(cols):
++            areas.append(int(len(pts)))
++    return sorted(areas)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Single generation attempt with a guaranteed unique smallest matching component."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    roles = ["seed"] + ["delete"] * (random.choices(MATCH_COUNTS, weights=MATCH_WEIGHTS)[0] - 1) + ["keep"] * NUM_KEPT
++    seed_h, seed_w = _seed_dims()
++    seed_area = seed_h * seed_w
++    specs = [{"role": "seed", "patch": _component_patch(seed_h, seed_w, targets, match=True), "area": seed_area}]
++    for role in roles[1:]:
++        specs.append(_component_spec(role, targets, seed_area=seed_area))
++
++    if not _place_components(inp, out, specs):
++        return None
++
++    match_areas = _count_matching_components(inp)
++    if len(match_areas) < 2 or match_areas[0] == match_areas[1]:
++        return None
++    solved = main(inp)
++    if not np.array_equal(solved, out):
++        return None
++    if np.array_equal(out, inp):
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+diff --git a/ceshi/code/d59b0160/D17/2/code.py b/ceshi/code/d59b0160/D17/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5fb744e31014cb8fc5e67fb9a9fe9f4eb6e777c
+--- /dev/null
++++ b/ceshi/code/d59b0160/D17/2/code.py
+@@ -0,0 +1,322 @@
++# Variant of d59b0160
++# Dimension: D17 — 分量面积对匹配的影响 (meta)
++# Change: 不考虑分量面积，任何大小的匹配分量都被删除... → 面积最小的匹配分量被保留为'种子'
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++# Design analysis for the D17 variant
++# -----------------------------------
++# spec:
++#   preserved_core:
++#     - 左上角 4x4 图例仍然给出 3 个目标颜色。
++#     - 网格其余对象仍然是放在背景上的 4 连通多色矩形分量。
++#     - "匹配分量" 仍然定义为: 颜色集合包含全部 3 个图例颜色。
++#   changed_behavior:
++#     - 原题: 所有匹配分量都删除。
++#     - 变体: 外部分量中, 面积最小的匹配分量保留, 并整体改涂为种子色 3;
++#       其他匹配分量照旧删除。
++#   concrete_pixel_effect:
++#     - 输入里会出现至少 2 个都含有全部图例颜色的矩形分量。
++#     - 输出里, 其中最小的那个不会消失, 而是变成纯绿色矩形;
++#       其余匹配矩形被擦成背景。
++#     - 不匹配分量保持原状。
++#   behavior_trace:
++#     - 例: 图例颜色为 {1,4,8}; 有三个外部分量 A/B/C.
++#     - A 面积 12, 颜色含 {0,1,4,8}; B 面积 20, 也含 {1,4,8}; C 缺少 8.
++#     - 原题输出: A 和 B 都被删除, C 保留。
++#     - 本变体输出: A 改成纯 3 色种子, B 删除, C 保留。
++#     - 差异集中在 "匹配分量命运判定" 这一步, 输入识别逻辑不变。
++#   complexity_calibration:
++#     - 只在匹配分量内部引入面积比较, 不引入额外排序维度或颜色映射。
++#     - 生成器强制至少 2 个匹配分量, 避免退化成 "只有一个匹配分量, 看不出删大留小"。
++#     - 生成器强制最小匹配面积唯一, 避免样例依赖隐藏 tie-break。
++#   implicit_assumption_review:
++#     - 原 solver 按 (g != bg) 找全部分量, 默认图例自身不会误判为待删对象。
++#     - 变体里若仍把图例碎片纳入最小面积比较, 可能把图例误当种子;
++#       因此 solver 显式跳过完全位于图例方块内的分量。
++#     - 原 solver 对每个匹配分量都直接清空; 该写法依赖 "所有匹配分量命运相同"。
++#       变体中此假设失效, 必须先收集全部匹配分量, 再决定哪个保留、哪些删除。
++#   placement_legality:
++#     - 每个对象仍作为完整矩形 patch 放置, 用 1 格 padding 保证互不接触。
++#     - seed/matched/kept 全都在图例外部随机布局, 不越界不重叠。
++#     - 匹配分量的面积由其矩形 bbox 决定, 与内部彩点数量无关, 因而 solver/generator 一致。
++#   visual_observability:
++#     - 绿色 3 本来只出现在图例边框; 输出把 seed 整体改成 3, 肉眼能马上看到"特殊保留者"。
++#     - 删除对象与绿色 seed 会在同一类 "全含图例色" 对象中同时出现, 规则可从 2-3 例中归纳。
++#   cleanliness:
++#     - 同一网格只叠加三类元素: 图例, 普通矩形对象, 输出中的纯绿色 seed。
++#     - 不再加入额外标记符号, 避免多层覆盖造成视觉混乱。
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color on the outer frame."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    Find the top-left legend square whose bottom row and right column share one border color.
++    Return (size, border_color, interior_target_colors).
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        border_color = int(g[sz - 1, sz - 1])
++        if border_color == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == border_color) and np.all(g[0:sz, sz - 1] == border_color):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(border_color)
++            return int(sz), int(border_color), colors
++    raise AssertionError("no legend border found in grid")
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Keep the smallest matching component as a seed and erase the larger matches.
++
++    Input structure:
++    - One background color occupies most of the board.
++    - The top-left corner contains a small legend square whose interior shows the target palette and whose bottom/right edges share one border color.
++    - Away from the legend are several 4-connected multicolor components built on the background.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - Among non-legend connected components, collect those whose color set contains every target color.
++    - Compare only those matching components by area: recolor the smallest one to the legend-border color as a seed, and erase every other matching component to background.
++    - Leave all non-matching components unchanged.
++
++    Key insight: The legend still defines which components qualify, but size now breaks the symmetry inside that qualifying set: the smallest full-palette component survives as a highlighted seed.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++    legend_size, border_color, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    matches: list[tuple[int, int, int, np.ndarray]] = []
++    for pts in components_mask(g != bg, connectivity=4):
++        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
++            continue
++        cols = {int(g[r, c]) for r, c in pts}
++        if legend_colors.issubset(cols):
++            area = int(len(pts))
++            top = int(pts[:, 0].min())
++            left = int(pts[:, 1].min())
++            matches.append((area, top, left, pts))
++
++    if not matches:
++        return out
++
++    seed_idx = min(range(len(matches)), key=lambda i: matches[i][:3])
++    for idx, (_area, _top, _left, pts) in enumerate(matches):
++        fill = border_color if idx == seed_idx else bg
++        for r, c in pts:
++            out[r, c] = fill
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component synthesis --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++MATCH_COUNTS = [2, 3]
++MATCH_WEIGHTS = [5, 2]
++NUM_KEPT = 3
++MAX_RETRIES = 400
++
++SMALL_MATCH_DIMS = [(3, 3), (3, 4), (4, 3), (4, 4)]
++KEEP_SHAPE_WEIGHTS = [5, 3, 2]  # medium, tall, wide
++MATCH_SHAPE_WEIGHTS = [5, 2, 3]  # medium, tall, wide
++TALL_H = (6, 9)
++TALL_W = (2, 4)
++WIDE_H = (3, 4)
++WIDE_W = (6, 8)
++MED_H = (4, 6)
++MED_W = (4, 6)
++KEEP_H = (3, 6)
++KEEP_W = (2, 6)
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the top-left legend; the output legend is unchanged."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _sample_mode_dims(weights: list[int]) -> tuple[int, int]:
++    """Sample rectangle dimensions from medium / tall / wide modes."""
++    mode = random.choices(["medium", "tall", "wide"], weights=weights)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _seed_dims() -> tuple[int, int]:
++    """Pick a small seed rectangle so the smallest match is visually obvious."""
++    return random.choice(SMALL_MATCH_DIMS)
++
++
++def _larger_match_dims(min_area: int) -> tuple[int, int]:
++    """Pick a matching component strictly larger than the seed area."""
++    for _ in range(100):
++        h, w = _sample_mode_dims(MATCH_SHAPE_WEIGHTS)
++        if h * w > min_area:
++            return h, w
++    raise RuntimeError("failed to sample larger matching component")
++
++
++def _keep_dims() -> tuple[int, int]:
++    """Pick a kept component; sizes remain moderate to keep packing feasible."""
++    if random.random() < 0.7:
++        return random.randint(*KEEP_H), random.randint(*KEEP_W)
++    return _sample_mode_dims(KEEP_SHAPE_WEIGHTS)
++
++
++def _component_patch(h: int, w: int, targets: list[int], match: bool) -> np.ndarray:
++    """Build a solid 4-connected rectangle with sparse colored pixels over color 0."""
++    area = h * w
++    lo = max(1, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    if match:
++        lo = max(lo, NUM_TARGETS)
++
++    n_colored = random.randint(lo, hi)
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    if match:
++        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
++    else:
++        used_target_count = random.randint(0, NUM_TARGETS - 1)
++        allowed = non_targets + random.sample(targets, used_target_count)
++        colors = [random.choice(allowed) for _ in range(n_colored)]
++
++    random.shuffle(colors)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_spec(role: str, targets: list[int], seed_area: int | None = None) -> dict:
++    """Describe one component before placement."""
++    if role == "seed":
++        h, w = _seed_dims()
++        patch = _component_patch(h, w, targets, match=True)
++    elif role == "delete":
++        assert seed_area is not None
++        h, w = _larger_match_dims(seed_area)
++        patch = _component_patch(h, w, targets, match=True)
++    else:
++        h, w = _keep_dims()
++        patch = _component_patch(h, w, targets, match=False)
++    return {"role": role, "patch": patch, "area": h * w}
++
++
++def _place_components(inp: np.ndarray, out: np.ndarray, specs: list[dict]) -> bool:
++    """Place all components with 1-cell separation and build the expected output."""
++    for spec in sorted(specs, key=lambda x: x["area"], reverse=True):
++        patch = spec["patch"]
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return False
++        paste(inp, patch, r, c)
++        if spec["role"] == "keep":
++            paste(out, patch, r, c)
++        elif spec["role"] == "seed":
++            paste(out, np.full_like(patch, BORDER), r, c)
++    return True
++
++
++def _count_matching_components(grid: np.ndarray) -> list[int]:
++    """Return areas of all external matching components in the input."""
++    bg = _bg_boundary(grid)
++    legend_size, _border, legend_colors = _find_legend(grid, bg)
++    areas = []
++    for pts in components_mask(grid != bg, connectivity=4):
++        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
++            continue
++        cols = {int(grid[r, c]) for r, c in pts}
++        if legend_colors.issubset(cols):
++            areas.append(int(len(pts)))
++    return sorted(areas)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Single generation attempt with a guaranteed unique smallest matching component."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    roles = ["seed"] + ["delete"] * (random.choices(MATCH_COUNTS, weights=MATCH_WEIGHTS)[0] - 1) + ["keep"] * NUM_KEPT
++    seed_h, seed_w = _seed_dims()
++    seed_area = seed_h * seed_w
++    specs = [{"role": "seed", "patch": _component_patch(seed_h, seed_w, targets, match=True), "area": seed_area}]
++    for role in roles[1:]:
++        specs.append(_component_spec(role, targets, seed_area=seed_area))
++
++    if not _place_components(inp, out, specs):
++        return None
++
++    match_areas = _count_matching_components(inp)
++    if len(match_areas) < 2 or match_areas[0] == match_areas[1]:
++        return None
++    solved = main(inp)
++    if not np.array_equal(solved, out):
++        return None
++    if np.array_equal(out, inp):
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+codex
+代码已写好，开始跑 50 次稳定性测试。若出现失败，我会先定位是放置约束、匹配判定，还是输出构造与 solver 不一致，再继续收敛。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code/d59b0160/D17/2/code.py b/ceshi/code/d59b0160/D17/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5fb744e31014cb8fc5e67fb9a9fe9f4eb6e777c
+--- /dev/null
++++ b/ceshi/code/d59b0160/D17/2/code.py
+@@ -0,0 +1,322 @@
++# Variant of d59b0160
++# Dimension: D17 — 分量面积对匹配的影响 (meta)
++# Change: 不考虑分量面积，任何大小的匹配分量都被删除... → 面积最小的匹配分量被保留为'种子'
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++# Design analysis for the D17 variant
++# -----------------------------------
++# spec:
++#   preserved_core:
++#     - 左上角 4x4 图例仍然给出 3 个目标颜色。
++#     - 网格其余对象仍然是放在背景上的 4 连通多色矩形分量。
++#     - "匹配分量" 仍然定义为: 颜色集合包含全部 3 个图例颜色。
++#   changed_behavior:
++#     - 原题: 所有匹配分量都删除。
++#     - 变体: 外部分量中, 面积最小的匹配分量保留, 并整体改涂为种子色 3;
++#       其他匹配分量照旧删除。
++#   concrete_pixel_effect:
++#     - 输入里会出现至少 2 个都含有全部图例颜色的矩形分量。
++#     - 输出里, 其中最小的那个不会消失, 而是变成纯绿色矩形;
++#       其余匹配矩形被擦成背景。
++#     - 不匹配分量保持原状。
++#   behavior_trace:
++#     - 例: 图例颜色为 {1,4,8}; 有三个外部分量 A/B/C.
++#     - A 面积 12, 颜色含 {0,1,4,8}; B 面积 20, 也含 {1,4,8}; C 缺少 8.
++#     - 原题输出: A 和 B 都被删除, C 保留。
++#     - 本变体输出: A 改成纯 3 色种子, B 删除, C 保留。
++#     - 差异集中在 "匹配分量命运判定" 这一步, 输入识别逻辑不变。
++#   complexity_calibration:
++#     - 只在匹配分量内部引入面积比较, 不引入额外排序维度或颜色映射。
++#     - 生成器强制至少 2 个匹配分量, 避免退化成 "只有一个匹配分量, 看不出删大留小"。
++#     - 生成器强制最小匹配面积唯一, 避免样例依赖隐藏 tie-break。
++#   implicit_assumption_review:
++#     - 原 solver 按 (g != bg) 找全部分量, 默认图例自身不会误判为待删对象。
++#     - 变体里若仍把图例碎片纳入最小面积比较, 可能把图例误当种子;
++#       因此 solver 显式跳过完全位于图例方块内的分量。
++#     - 原 solver 对每个匹配分量都直接清空; 该写法依赖 "所有匹配分量命运相同"。
++#       变体中此假设失效, 必须先收集全部匹配分量, 再决定哪个保留、哪些删除。
++#   placement_legality:
++#     - 每个对象仍作为完整矩形 patch 放置, 用 1 格 padding 保证互不接触。
++#     - seed/matched/kept 全都在图例外部随机布局, 不越界不重叠。
++#     - 匹配分量的面积由其矩形 bbox 决定, 与内部彩点数量无关, 因而 solver/generator 一致。
++#   visual_observability:
++#     - 绿色 3 本来只出现在图例边框; 输出把 seed 整体改成 3, 肉眼能马上看到"特殊保留者"。
++#     - 删除对象与绿色 seed 会在同一类 "全含图例色" 对象中同时出现, 规则可从 2-3 例中归纳。
++#   cleanliness:
++#     - 同一网格只叠加三类元素: 图例, 普通矩形对象, 输出中的纯绿色 seed。
++#     - 不再加入额外标记符号, 避免多层覆盖造成视觉混乱。
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color on the outer frame."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    Find the top-left legend square whose bottom row and right column share one border color.
++    Return (size, border_color, interior_target_colors).
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        border_color = int(g[sz - 1, sz - 1])
++        if border_color == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == border_color) and np.all(g[0:sz, sz - 1] == border_color):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(border_color)
++            return int(sz), int(border_color), colors
++    raise AssertionError("no legend border found in grid")
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Keep the smallest matching component as a seed and erase the larger matches.
++
++    Input structure:
++    - One background color occupies most of the board.
++    - The top-left corner contains a small legend square whose interior shows the target palette and whose bottom/right edges share one border color.
++    - Away from the legend are several 4-connected multicolor components built on the background.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - Among non-legend connected components, collect those whose color set contains every target color.
++    - Compare only those matching components by area: recolor the smallest one to the legend-border color as a seed, and erase every other matching component to background.
++    - Leave all non-matching components unchanged.
++
++    Key insight: The legend still defines which components qualify, but size now breaks the symmetry inside that qualifying set: the smallest full-palette component survives as a highlighted seed.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++    legend_size, border_color, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    matches: list[tuple[int, int, int, np.ndarray]] = []
++    for pts in components_mask(g != bg, connectivity=4):
++        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
++            continue
++        cols = {int(g[r, c]) for r, c in pts}
++        if legend_colors.issubset(cols):
++            area = int(len(pts))
++            top = int(pts[:, 0].min())
++            left = int(pts[:, 1].min())
++            matches.append((area, top, left, pts))
++
++    if not matches:
++        return out
++
++    seed_idx = min(range(len(matches)), key=lambda i: matches[i][:3])
++    for idx, (_area, _top, _left, pts) in enumerate(matches):
++        fill = border_color if idx == seed_idx else bg
++        for r, c in pts:
++            out[r, c] = fill
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component synthesis --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++MATCH_COUNTS = [2, 3]
++MATCH_WEIGHTS = [5, 2]
++NUM_KEPT = 3
++MAX_RETRIES = 400
++
++SMALL_MATCH_DIMS = [(3, 3), (3, 4), (4, 3), (4, 4)]
++KEEP_SHAPE_WEIGHTS = [5, 3, 2]  # medium, tall, wide
++MATCH_SHAPE_WEIGHTS = [5, 2, 3]  # medium, tall, wide
++TALL_H = (6, 9)
++TALL_W = (2, 4)
++WIDE_H = (3, 4)
++WIDE_W = (6, 8)
++MED_H = (4, 6)
++MED_W = (4, 6)
++KEEP_H = (3, 6)
++KEEP_W = (2, 6)
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the top-left legend; the output legend is unchanged."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _sample_mode_dims(weights: list[int]) -> tuple[int, int]:
++    """Sample rectangle dimensions from medium / tall / wide modes."""
++    mode = random.choices(["medium", "tall", "wide"], weights=weights)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _seed_dims() -> tuple[int, int]:
++    """Pick a small seed rectangle so the smallest match is visually obvious."""
++    return random.choice(SMALL_MATCH_DIMS)
++
++
++def _larger_match_dims(min_area: int) -> tuple[int, int]:
++    """Pick a matching component strictly larger than the seed area."""
++    for _ in range(100):
++        h, w = _sample_mode_dims(MATCH_SHAPE_WEIGHTS)
++        if h * w > min_area:
++            return h, w
++    raise RuntimeError("failed to sample larger matching component")
++
++
++def _keep_dims() -> tuple[int, int]:
++    """Pick a kept component; sizes remain moderate to keep packing feasible."""
++    if random.random() < 0.7:
++        return random.randint(*KEEP_H), random.randint(*KEEP_W)
++    return _sample_mode_dims(KEEP_SHAPE_WEIGHTS)
++
++
++def _component_patch(h: int, w: int, targets: list[int], match: bool) -> np.ndarray:
++    """Build a solid 4-connected rectangle with sparse colored pixels over color 0."""
++    area = h * w
++    lo = max(1, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    if match:
++        lo = max(lo, NUM_TARGETS)
++
++    n_colored = random.randint(lo, hi)
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    if match:
++        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
++    else:
++        used_target_count = random.randint(0, NUM_TARGETS - 1)
++        allowed = non_targets + random.sample(targets, used_target_count)
++        colors = [random.choice(allowed) for _ in range(n_colored)]
++
++    random.shuffle(colors)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_spec(role: str, targets: list[int], seed_area: int | None = None) -> dict:
++    """Describe one component before placement."""
++    if role == "seed":
++        h, w = _seed_dims()
++        patch = _component_patch(h, w, targets, match=True)
++    elif role == "delete":
++        assert seed_area is not None
++        h, w = _larger_match_dims(seed_area)
++        patch = _component_patch(h, w, targets, match=True)
++    else:
++        h, w = _keep_dims()
++        patch = _component_patch(h, w, targets, match=False)
++    return {"role": role, "patch": patch, "area": h * w}
++
++
++def _place_components(inp: np.ndarray, out: np.ndarray, specs: list[dict]) -> bool:
++    """Place all components with 1-cell separation and build the expected output."""
++    for spec in sorted(specs, key=lambda x: x["area"], reverse=True):
++        patch = spec["patch"]
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return False
++        paste(inp, patch, r, c)
++        if spec["role"] == "keep":
++            paste(out, patch, r, c)
++        elif spec["role"] == "seed":
++            paste(out, np.full_like(patch, BORDER), r, c)
++    return True
++
++
++def _count_matching_components(grid: np.ndarray) -> list[int]:
++    """Return areas of all external matching components in the input."""
++    bg = _bg_boundary(grid)
++    legend_size, _border, legend_colors = _find_legend(grid, bg)
++    areas = []
++    for pts in components_mask(grid != bg, connectivity=4):
++        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
++            continue
++        cols = {int(grid[r, c]) for r, c in pts}
++        if legend_colors.issubset(cols):
++            areas.append(int(len(pts)))
++    return sorted(areas)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Single generation attempt with a guaranteed unique smallest matching component."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    roles = ["seed"] + ["delete"] * (random.choices(MATCH_COUNTS, weights=MATCH_WEIGHTS)[0] - 1) + ["keep"] * NUM_KEPT
++    seed_h, seed_w = _seed_dims()
++    seed_area = seed_h * seed_w
++    specs = [{"role": "seed", "patch": _component_patch(seed_h, seed_w, targets, match=True), "area": seed_area}]
++    for role in roles[1:]:
++        specs.append(_component_spec(role, targets, seed_area=seed_area))
++
++    if not _place_components(inp, out, specs):
++        return None
++
++    match_areas = _count_matching_components(inp)
++    if len(match_areas) < 2 or match_areas[0] == match_areas[1]:
++        return None
++    solved = main(inp)
++    if not np.array_equal(solved, out):
++        return None
++    if np.array_equal(out, inp):
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+ succeeded in 653ms:
+Success: 50/50, Time: 0.4s (7ms/call)
+
+codex
+稳定性测试已经过了。现在做第二层验证：不是只看 `main(input)` 能跑通，而是统计样本里“有多少个匹配分量、最小匹配面积是否唯一、以及新规则输出是否真的不同于原题的全删输出”。
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util
+import numpy as np
+from collections import Counter
+
+path = '/home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2/code.py'
+spec = importlib.util.spec_from_file_location('variant', path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+
+def original_like(grid):
+    g = np.asarray(grid, dtype=int)
+    bg = mod._bg_boundary(g)
+    legend_size, _border, legend_colors = mod._find_legend(g, bg)
+    out = g.copy()
+    for pts in mod.components_mask(g "'!= bg, connectivity=4):
+        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
+            continue
+        cols = {int(g[r, c]) for r, c in pts}
+        if legend_colors.issubset(cols):
+            for r, c in pts:
+                out[r, c] = bg
+    return out
+
+match_counts = Counter()
+seed_areas = []
+area_gaps = []
+diff_vs_original = 0
+seed_color_counts = []
+smallest_unique = 0
+
+for _ in range(100):
+    inp = mod.generate_input()
+    out = mod.main(inp)
+    orig = original_like(inp)
+    areas = mod._count_matching_components(inp)
+    match_counts[len(areas)] += 1
+    seed_areas.append(areas[0])
+    seed_color_counts.append(int((out == mod.BORDER).sum() - (inp == mod.BORDER).sum()))
+    if len(areas) >= 2:
+        area_gaps.append(areas[1] - areas[0])
+        if areas[1] > areas[0]:
+            smallest_unique += 1
+    diff_vs_original += int(not np.array_equal(out, orig))
+
+print('"'match_count_distribution', dict(sorted(match_counts.items())))
+print('seed_area_range', (min(seed_areas), max(seed_areas)))
+print('avg_seed_area', round(sum(seed_areas) / len(seed_areas), 2))
+print('min_second_gap', min(area_gaps), 'avg_gap', round(sum(area_gaps) / len(area_gaps), 2))
+print('unique_smallest_rate', f'{smallest_unique}/100')
+print('diff_from_original_rate', f'{diff_vs_original}/100')
+print('seed_green_pixels_range', (min(seed_color_counts), max(seed_color_counts)))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code/d59b0160/D17/2/code.py b/ceshi/code/d59b0160/D17/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5fb744e31014cb8fc5e67fb9a9fe9f4eb6e777c
+--- /dev/null
++++ b/ceshi/code/d59b0160/D17/2/code.py
+@@ -0,0 +1,322 @@
++# Variant of d59b0160
++# Dimension: D17 — 分量面积对匹配的影响 (meta)
++# Change: 不考虑分量面积，任何大小的匹配分量都被删除... → 面积最小的匹配分量被保留为'种子'
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++# Design analysis for the D17 variant
++# -----------------------------------
++# spec:
++#   preserved_core:
++#     - 左上角 4x4 图例仍然给出 3 个目标颜色。
++#     - 网格其余对象仍然是放在背景上的 4 连通多色矩形分量。
++#     - "匹配分量" 仍然定义为: 颜色集合包含全部 3 个图例颜色。
++#   changed_behavior:
++#     - 原题: 所有匹配分量都删除。
++#     - 变体: 外部分量中, 面积最小的匹配分量保留, 并整体改涂为种子色 3;
++#       其他匹配分量照旧删除。
++#   concrete_pixel_effect:
++#     - 输入里会出现至少 2 个都含有全部图例颜色的矩形分量。
++#     - 输出里, 其中最小的那个不会消失, 而是变成纯绿色矩形;
++#       其余匹配矩形被擦成背景。
++#     - 不匹配分量保持原状。
++#   behavior_trace:
++#     - 例: 图例颜色为 {1,4,8}; 有三个外部分量 A/B/C.
++#     - A 面积 12, 颜色含 {0,1,4,8}; B 面积 20, 也含 {1,4,8}; C 缺少 8.
++#     - 原题输出: A 和 B 都被删除, C 保留。
++#     - 本变体输出: A 改成纯 3 色种子, B 删除, C 保留。
++#     - 差异集中在 "匹配分量命运判定" 这一步, 输入识别逻辑不变。
++#   complexity_calibration:
++#     - 只在匹配分量内部引入面积比较, 不引入额外排序维度或颜色映射。
++#     - 生成器强制至少 2 个匹配分量, 避免退化成 "只有一个匹配分量, 看不出删大留小"。
++#     - 生成器强制最小匹配面积唯一, 避免样例依赖隐藏 tie-break。
++#   implicit_assumption_review:
++#     - 原 solver 按 (g != bg) 找全部分量, 默认图例自身不会误判为待删对象。
++#     - 变体里若仍把图例碎片纳入最小面积比较, 可能把图例误当种子;
++#       因此 solver 显式跳过完全位于图例方块内的分量。
++#     - 原 solver 对每个匹配分量都直接清空; 该写法依赖 "所有匹配分量命运相同"。
++#       变体中此假设失效, 必须先收集全部匹配分量, 再决定哪个保留、哪些删除。
++#   placement_legality:
++#     - 每个对象仍作为完整矩形 patch 放置, 用 1 格 padding 保证互不接触。
++#     - seed/matched/kept 全都在图例外部随机布局, 不越界不重叠。
++#     - 匹配分量的面积由其矩形 bbox 决定, 与内部彩点数量无关, 因而 solver/generator 一致。
++#   visual_observability:
++#     - 绿色 3 本来只出现在图例边框; 输出把 seed 整体改成 3, 肉眼能马上看到"特殊保留者"。
++#     - 删除对象与绿色 seed 会在同一类 "全含图例色" 对象中同时出现, 规则可从 2-3 例中归纳。
++#   cleanliness:
++#     - 同一网格只叠加三类元素: 图例, 普通矩形对象, 输出中的纯绿色 seed。
++#     - 不再加入额外标记符号, 避免多层覆盖造成视觉混乱。
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color on the outer frame."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    Find the top-left legend square whose bottom row and right column share one border color.
++    Return (size, border_color, interior_target_colors).
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        border_color = int(g[sz - 1, sz - 1])
++        if border_color == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == border_color) and np.all(g[0:sz, sz - 1] == border_color):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(border_color)
++            return int(sz), int(border_color), colors
++    raise AssertionError("no legend border found in grid")
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Keep the smallest matching component as a seed and erase the larger matches.
++
++    Input structure:
++    - One background color occupies most of the board.
++    - The top-left corner contains a small legend square whose interior shows the target palette and whose bottom/right edges share one border color.
++    - Away from the legend are several 4-connected multicolor components built on the background.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - Among non-legend connected components, collect those whose color set contains every target color.
++    - Compare only those matching components by area: recolor the smallest one to the legend-border color as a seed, and erase every other matching component to background.
++    - Leave all non-matching components unchanged.
++
++    Key insight: The legend still defines which components qualify, but size now breaks the symmetry inside that qualifying set: the smallest full-palette component survives as a highlighted seed.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++    legend_size, border_color, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    matches: list[tuple[int, int, int, np.ndarray]] = []
++    for pts in components_mask(g != bg, connectivity=4):
++        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
++            continue
++        cols = {int(g[r, c]) for r, c in pts}
++        if legend_colors.issubset(cols):
++            area = int(len(pts))
++            top = int(pts[:, 0].min())
++            left = int(pts[:, 1].min())
++            matches.append((area, top, left, pts))
++
++    if not matches:
++        return out
++
++    seed_idx = min(range(len(matches)), key=lambda i: matches[i][:3])
++    for idx, (_area, _top, _left, pts) in enumerate(matches):
++        fill = border_color if idx == seed_idx else bg
++        for r, c in pts:
++            out[r, c] = fill
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component synthesis --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++MATCH_COUNTS = [2, 3]
++MATCH_WEIGHTS = [5, 2]
++NUM_KEPT = 3
++MAX_RETRIES = 400
++
++SMALL_MATCH_DIMS = [(3, 3), (3, 4), (4, 3), (4, 4)]
++KEEP_SHAPE_WEIGHTS = [5, 3, 2]  # medium, tall, wide
++MATCH_SHAPE_WEIGHTS = [5, 2, 3]  # medium, tall, wide
++TALL_H = (6, 9)
++TALL_W = (2, 4)
++WIDE_H = (3, 4)
++WIDE_W = (6, 8)
++MED_H = (4, 6)
++MED_W = (4, 6)
++KEEP_H = (3, 6)
++KEEP_W = (2, 6)
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the top-left legend; the output legend is unchanged."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _sample_mode_dims(weights: list[int]) -> tuple[int, int]:
++    """Sample rectangle dimensions from medium / tall / wide modes."""
++    mode = random.choices(["medium", "tall", "wide"], weights=weights)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _seed_dims() -> tuple[int, int]:
++    """Pick a small seed rectangle so the smallest match is visually obvious."""
++    return random.choice(SMALL_MATCH_DIMS)
++
++
++def _larger_match_dims(min_area: int) -> tuple[int, int]:
++    """Pick a matching component strictly larger than the seed area."""
++    for _ in range(100):
++        h, w = _sample_mode_dims(MATCH_SHAPE_WEIGHTS)
++        if h * w > min_area:
++            return h, w
++    raise RuntimeError("failed to sample larger matching component")
++
++
++def _keep_dims() -> tuple[int, int]:
++    """Pick a kept component; sizes remain moderate to keep packing feasible."""
++    if random.random() < 0.7:
++        return random.randint(*KEEP_H), random.randint(*KEEP_W)
++    return _sample_mode_dims(KEEP_SHAPE_WEIGHTS)
++
++
++def _component_patch(h: int, w: int, targets: list[int], match: bool) -> np.ndarray:
++    """Build a solid 4-connected rectangle with sparse colored pixels over color 0."""
++    area = h * w
++    lo = max(1, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    if match:
++        lo = max(lo, NUM_TARGETS)
++
++    n_colored = random.randint(lo, hi)
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    if match:
++        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
++    else:
++        used_target_count = random.randint(0, NUM_TARGETS - 1)
++        allowed = non_targets + random.sample(targets, used_target_count)
++        colors = [random.choice(allowed) for _ in range(n_colored)]
++
++    random.shuffle(colors)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_spec(role: str, targets: list[int], seed_area: int | None = None) -> dict:
++    """Describe one component before placement."""
++    if role == "seed":
++        h, w = _seed_dims()
++        patch = _component_patch(h, w, targets, match=True)
++    elif role == "delete":
++        assert seed_area is not None
++        h, w = _larger_match_dims(seed_area)
++        patch = _component_patch(h, w, targets, match=True)
++    else:
++        h, w = _keep_dims()
++        patch = _component_patch(h, w, targets, match=False)
++    return {"role": role, "patch": patch, "area": h * w}
++
++
++def _place_components(inp: np.ndarray, out: np.ndarray, specs: list[dict]) -> bool:
++    """Place all components with 1-cell separation and build the expected output."""
++    for spec in sorted(specs, key=lambda x: x["area"], reverse=True):
++        patch = spec["patch"]
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return False
++        paste(inp, patch, r, c)
++        if spec["role"] == "keep":
++            paste(out, patch, r, c)
++        elif spec["role"] == "seed":
++            paste(out, np.full_like(patch, BORDER), r, c)
++    return True
++
++
++def _count_matching_components(grid: np.ndarray) -> list[int]:
++    """Return areas of all external matching components in the input."""
++    bg = _bg_boundary(grid)
++    legend_size, _border, legend_colors = _find_legend(grid, bg)
++    areas = []
++    for pts in components_mask(grid != bg, connectivity=4):
++        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
++            continue
++        cols = {int(grid[r, c]) for r, c in pts}
++        if legend_colors.issubset(cols):
++            areas.append(int(len(pts)))
++    return sorted(areas)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Single generation attempt with a guaranteed unique smallest matching component."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    roles = ["seed"] + ["delete"] * (random.choices(MATCH_COUNTS, weights=MATCH_WEIGHTS)[0] - 1) + ["keep"] * NUM_KEPT
++    seed_h, seed_w = _seed_dims()
++    seed_area = seed_h * seed_w
++    specs = [{"role": "seed", "patch": _component_patch(seed_h, seed_w, targets, match=True), "area": seed_area}]
++    for role in roles[1:]:
++        specs.append(_component_spec(role, targets, seed_area=seed_area))
++
++    if not _place_components(inp, out, specs):
++        return None
++
++    match_areas = _count_matching_components(inp)
++    if len(match_areas) < 2 or match_areas[0] == match_areas[1]:
++        return None
++    solved = main(inp)
++    if not np.array_equal(solved, out):
++        return None
++    if np.array_equal(out, inp):
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+ succeeded in 1049ms:
+match_count_distribution {2: 85, 3: 15}
+seed_area_range (9, 16)
+avg_seed_area 12.48
+min_second_gap 2 avg_gap 10.93
+unique_smallest_rate 100/100
+diff_from_original_rate 100/100
+seed_green_pixels_range (9, 16)
+
+codex
+实现和验证都收敛了。我最后扫一遍文件结构和关键函数位置，确保答复里能准确指出 solver 改动点和生成器保证条件。
+exec
+/bin/bash -lc "nl -ba /home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2/code.py | sed -n '1,260p'" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+     1	# Variant of d59b0160
+     2	# Dimension: D17 — 分量面积对匹配的影响 (meta)
+     3	# Change: 不考虑分量面积，任何大小的匹配分量都被删除... → 面积最小的匹配分量被保留为'种子'
+     4	
+     5	import math
+     6	import random
+     7	
+     8	import numpy as np
+     9	
+    10	from arc_utils import components_mask, paste, random_free_location
+    11	
+    12	
+    13	# Design analysis for the D17 variant
+    14	# -----------------------------------
+    15	# spec:
+    16	#   preserved_core:
+    17	#     - 左上角 4x4 图例仍然给出 3 个目标颜色。
+    18	#     - 网格其余对象仍然是放在背景上的 4 连通多色矩形分量。
+    19	#     - "匹配分量" 仍然定义为: 颜色集合包含全部 3 个图例颜色。
+    20	#   changed_behavior:
+    21	#     - 原题: 所有匹配分量都删除。
+    22	#     - 变体: 外部分量中, 面积最小的匹配分量保留, 并整体改涂为种子色 3;
+    23	#       其他匹配分量照旧删除。
+    24	#   concrete_pixel_effect:
+    25	#     - 输入里会出现至少 2 个都含有全部图例颜色的矩形分量。
+    26	#     - 输出里, 其中最小的那个不会消失, 而是变成纯绿色矩形;
+    27	#       其余匹配矩形被擦成背景。
+    28	#     - 不匹配分量保持原状。
+    29	#   behavior_trace:
+    30	#     - 例: 图例颜色为 {1,4,8}; 有三个外部分量 A/B/C.
+    31	#     - A 面积 12, 颜色含 {0,1,4,8}; B 面积 20, 也含 {1,4,8}; C 缺少 8.
+    32	#     - 原题输出: A 和 B 都被删除, C 保留。
+    33	#     - 本变体输出: A 改成纯 3 色种子, B 删除, C 保留。
+    34	#     - 差异集中在 "匹配分量命运判定" 这一步, 输入识别逻辑不变。
+    35	#   complexity_calibration:
+    36	#     - 只在匹配分量内部引入面积比较, 不引入额外排序维度或颜色映射。
+    37	#     - 生成器强制至少 2 个匹配分量, 避免退化成 "只有一个匹配分量, 看不出删大留小"。
+    38	#     - 生成器强制最小匹配面积唯一, 避免样例依赖隐藏 tie-break。
+    39	#   implicit_assumption_review:
+    40	#     - 原 solver 按 (g != bg) 找全部分量, 默认图例自身不会误判为待删对象。
+    41	#     - 变体里若仍把图例碎片纳入最小面积比较, 可能把图例误当种子;
+    42	#       因此 solver 显式跳过完全位于图例方块内的分量。
+    43	#     - 原 solver 对每个匹配分量都直接清空; 该写法依赖 "所有匹配分量命运相同"。
+    44	#       变体中此假设失效, 必须先收集全部匹配分量, 再决定哪个保留、哪些删除。
+    45	#   placement_legality:
+    46	#     - 每个对象仍作为完整矩形 patch 放置, 用 1 格 padding 保证互不接触。
+    47	#     - seed/matched/kept 全都在图例外部随机布局, 不越界不重叠。
+    48	#     - 匹配分量的面积由其矩形 bbox 决定, 与内部彩点数量无关, 因而 solver/generator 一致。
+    49	#   visual_observability:
+    50	#     - 绿色 3 本来只出现在图例边框; 输出把 seed 整体改成 3, 肉眼能马上看到"特殊保留者"。
+    51	#     - 删除对象与绿色 seed 会在同一类 "全含图例色" 对象中同时出现, 规则可从 2-3 例中归纳。
+    52	#   cleanliness:
+    53	#     - 同一网格只叠加三类元素: 图例, 普通矩形对象, 输出中的纯绿色 seed。
+    54	#     - 不再加入额外标记符号, 避免多层覆盖造成视觉混乱。
+    55	
+    56	
+    57	def _bg_boundary(g: np.ndarray) -> int:
+    58	    """Most common color on the outer frame."""
+    59	    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
+    60	    vals, cnts = np.unique(border, return_counts=True)
+    61	    return int(vals[cnts.argmax()])
+    62	
+    63	
+    64	def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
+    65	    """
+    66	    Find the top-left legend square whose bottom row and right column share one border color.
+    67	    Return (size, border_color, interior_target_colors).
+    68	    """
+    69	    h, w = g.shape
+    70	    for sz in range(2, min(h, w) + 1):
+    71	        border_color = int(g[sz - 1, sz - 1])
+    72	        if border_color == bg:
+    73	            continue
+    74	        if np.all(g[sz - 1, 0:sz] == border_color) and np.all(g[0:sz, sz - 1] == border_color):
+    75	            inside = g[0 : sz - 1, 0 : sz - 1]
+    76	            colors = set(map(int, np.unique(inside)))
+    77	            colors.discard(bg)
+    78	            colors.discard(border_color)
+    79	            return int(sz), int(border_color), colors
+    80	    raise AssertionError("no legend border found in grid")
+    81	
+    82	
+    83	def main(grid: np.ndarray) -> np.ndarray:
+    84	    """
+    85	    Keep the smallest matching component as a seed and erase the larger matches.
+    86	
+    87	    Input structure:
+    88	    - One background color occupies most of the board.
+    89	    - The top-left corner contains a small legend square whose interior shows the target palette and whose bottom/right edges share one border color.
+    90	    - Away from the legend are several 4-connected multicolor components built on the background.
+    91	
+    92	    Rule:
+    93	    - Read the target color set from the legend interior.
+    94	    - Among non-legend connected components, collect those whose color set contains every target color.
+    95	    - Compare only those matching components by area: recolor the smallest one to the legend-border color as a seed, and erase every other matching component to background.
+    96	    - Leave all non-matching components unchanged.
+    97	
+    98	    Key insight: The legend still defines which components qualify, but size now breaks the symmetry inside that qualifying set: the smallest full-palette component survives as a highlighted seed.
+    99	    """
+   100	    g = np.asarray(grid, dtype=int)
+   101	    bg = _bg_boundary(g)
+   102	    legend_size, border_color, legend_colors = _find_legend(g, bg)
+   103	    assert legend_colors, "legend interior contains no target colors"
+   104	
+   105	    out = g.copy()
+   106	    matches: list[tuple[int, int, int, np.ndarray]] = []
+   107	    for pts in components_mask(g != bg, connectivity=4):
+   108	        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
+   109	            continue
+   110	        cols = {int(g[r, c]) for r, c in pts}
+   111	        if legend_colors.issubset(cols):
+   112	            area = int(len(pts))
+   113	            top = int(pts[:, 0].min())
+   114	            left = int(pts[:, 1].min())
+   115	            matches.append((area, top, left, pts))
+   116	
+   117	    if not matches:
+   118	        return out
+   119	
+   120	    seed_idx = min(range(len(matches)), key=lambda i: matches[i][:3])
+   121	    for idx, (_area, _top, _left, pts) in enumerate(matches):
+   122	        fill = border_color if idx == seed_idx else bg
+   123	        for r, c in pts:
+   124	            out[r, c] = fill
+   125	    return out
+   126	
+   127	
+   128	# --------------- generator (o5x) ---------------
+   129	
+   130	# -- Grid & legend constants --
+   131	GRID_H, GRID_W = 16, 16
+   132	BG = 7
+   133	BORDER = 3
+   134	LEGEND_SIZE = 4
+   135	PALETTE = [1, 2, 4, 5, 6, 8, 9]
+   136	NUM_TARGETS = 3
+   137	
+   138	# -- Component synthesis --
+   139	DENSITY_LO = 0.10
+   140	DENSITY_HI = 0.55
+   141	MATCH_COUNTS = [2, 3]
+   142	MATCH_WEIGHTS = [5, 2]
+   143	NUM_KEPT = 3
+   144	MAX_RETRIES = 400
+   145	
+   146	SMALL_MATCH_DIMS = [(3, 3), (3, 4), (4, 3), (4, 4)]
+   147	KEEP_SHAPE_WEIGHTS = [5, 3, 2]  # medium, tall, wide
+   148	MATCH_SHAPE_WEIGHTS = [5, 2, 3]  # medium, tall, wide
+   149	TALL_H = (6, 9)
+   150	TALL_W = (2, 4)
+   151	WIDE_H = (3, 4)
+   152	WIDE_W = (6, 8)
+   153	MED_H = (4, 6)
+   154	MED_W = (4, 6)
+   155	KEEP_H = (3, 6)
+   156	KEEP_W = (2, 6)
+   157	
+   158	
+   159	def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
+   160	    """Draw the top-left legend; the output legend is unchanged."""
+   161	    s = LEGEND_SIZE
+   162	    for g in (inp, out):
+   163	        g[:s, :s] = BG
+   164	        g[s - 1, :s] = BORDER
+   165	        g[:s, s - 1] = BORDER
+   166	
+   167	    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
+   168	    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
+   169	    side_choices = [
+   170	        p for p in border_side
+   171	        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
+   172	    ]
+   173	    positions = [isolated] + random.sample(side_choices, 2)
+   174	    random.shuffle(positions)
+   175	    for color, (r, c) in zip(targets, positions):
+   176	        inp[r, c] = color
+   177	        out[r, c] = color
+   178	
+   179	
+   180	def _sample_mode_dims(weights: list[int]) -> tuple[int, int]:
+   181	    """Sample rectangle dimensions from medium / tall / wide modes."""
+   182	    mode = random.choices(["medium", "tall", "wide"], weights=weights)[0]
+   183	    if mode == "tall":
+   184	        return random.randint(*TALL_H), random.randint(*TALL_W)
+   185	    if mode == "wide":
+   186	        return random.randint(*WIDE_H), random.randint(*WIDE_W)
+   187	    return random.randint(*MED_H), random.randint(*MED_W)
+   188	
+   189	
+   190	def _seed_dims() -> tuple[int, int]:
+   191	    """Pick a small seed rectangle so the smallest match is visually obvious."""
+   192	    return random.choice(SMALL_MATCH_DIMS)
+   193	
+   194	
+   195	def _larger_match_dims(min_area: int) -> tuple[int, int]:
+   196	    """Pick a matching component strictly larger than the seed area."""
+   197	    for _ in range(100):
+   198	        h, w = _sample_mode_dims(MATCH_SHAPE_WEIGHTS)
+   199	        if h * w > min_area:
+   200	            return h, w
+   201	    raise RuntimeError("failed to sample larger matching component")
+   202	
+   203	
+   204	def _keep_dims() -> tuple[int, int]:
+   205	    """Pick a kept component; sizes remain moderate to keep packing feasible."""
+   206	    if random.random() < 0.7:
+   207	        return random.randint(*KEEP_H), random.randint(*KEEP_W)
+   208	    return _sample_mode_dims(KEEP_SHAPE_WEIGHTS)
+   209	
+   210	
+   211	def _component_patch(h: int, w: int, targets: list[int], match: bool) -> np.ndarray:
+   212	    """Build a solid 4-connected rectangle with sparse colored pixels over color 0."""
+   213	    area = h * w
+   214	    lo = max(1, math.ceil(area * DENSITY_LO))
+   215	    hi = max(lo, math.floor(area * DENSITY_HI))
+   216	    if match:
+   217	        lo = max(lo, NUM_TARGETS)
+   218	
+   219	    n_colored = random.randint(lo, hi)
+   220	    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
+   221	    non_targets = [v for v in PALETTE if v not in targets]
+   222	
+   223	    if match:
+   224	        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
+   225	    else:
+   226	        used_target_count = random.randint(0, NUM_TARGETS - 1)
+   227	        allowed = non_targets + random.sample(targets, used_target_count)
+   228	        colors = [random.choice(allowed) for _ in range(n_colored)]
+   229	
+   230	    random.shuffle(colors)
+   231	    patch = np.zeros((h, w), dtype=int)
+   232	    rs, cs = zip(*coords)
+   233	    patch[rs, cs] = colors
+   234	    return patch
+   235	
+   236	
+   237	def _component_spec(role: str, targets: list[int], seed_area: int | None = None) -> dict:
+   238	    """Describe one component before placement."""
+   239	    if role == "seed":
+   240	        h, w = _seed_dims()
+   241	        patch = _component_patch(h, w, targets, match=True)
+   242	    elif role == "delete":
+   243	        assert seed_area is not None
+   244	        h, w = _larger_match_dims(seed_area)
+   245	        patch = _component_patch(h, w, targets, match=True)
+   246	    else:
+   247	        h, w = _keep_dims()
+   248	        patch = _component_patch(h, w, targets, match=False)
+   249	    return {"role": role, "patch": patch, "area": h * w}
+   250	
+   251	
+   252	def _place_components(inp: np.ndarray, out: np.ndarray, specs: list[dict]) -> bool:
+   253	    """Place all components with 1-cell separation and build the expected output."""
+   254	    for spec in sorted(specs, key=lambda x: x["area"], reverse=True):
+   255	        patch = spec["patch"]
+   256	        try:
+   257	            r, c = random_free_location(
+   258	                inp,
+   259	                np.zeros_like(patch),
+   260	                transparent=BG,
+
+Implementation, reliability testing, and variant-specific validation are complete.
+  ✓ Write detailed design analysis for the D17 variant and translate it into solver/generator constraints
+  ✓ Implement updated code.py with revised main() and generation logic
+  ✓ Run required reliability test, measure variant-specific behavior, and iterate until stable
+diff --git a/ceshi/code/d59b0160/D17/2/code.py b/ceshi/code/d59b0160/D17/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5fb744e31014cb8fc5e67fb9a9fe9f4eb6e777c
+--- /dev/null
++++ b/ceshi/code/d59b0160/D17/2/code.py
+@@ -0,0 +1,322 @@
++# Variant of d59b0160
++# Dimension: D17 — 分量面积对匹配的影响 (meta)
++# Change: 不考虑分量面积，任何大小的匹配分量都被删除... → 面积最小的匹配分量被保留为'种子'
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++# Design analysis for the D17 variant
++# -----------------------------------
++# spec:
++#   preserved_core:
++#     - 左上角 4x4 图例仍然给出 3 个目标颜色。
++#     - 网格其余对象仍然是放在背景上的 4 连通多色矩形分量。
++#     - "匹配分量" 仍然定义为: 颜色集合包含全部 3 个图例颜色。
++#   changed_behavior:
++#     - 原题: 所有匹配分量都删除。
++#     - 变体: 外部分量中, 面积最小的匹配分量保留, 并整体改涂为种子色 3;
++#       其他匹配分量照旧删除。
++#   concrete_pixel_effect:
++#     - 输入里会出现至少 2 个都含有全部图例颜色的矩形分量。
++#     - 输出里, 其中最小的那个不会消失, 而是变成纯绿色矩形;
++#       其余匹配矩形被擦成背景。
++#     - 不匹配分量保持原状。
++#   behavior_trace:
++#     - 例: 图例颜色为 {1,4,8}; 有三个外部分量 A/B/C.
++#     - A 面积 12, 颜色含 {0,1,4,8}; B 面积 20, 也含 {1,4,8}; C 缺少 8.
++#     - 原题输出: A 和 B 都被删除, C 保留。
++#     - 本变体输出: A 改成纯 3 色种子, B 删除, C 保留。
++#     - 差异集中在 "匹配分量命运判定" 这一步, 输入识别逻辑不变。
++#   complexity_calibration:
++#     - 只在匹配分量内部引入面积比较, 不引入额外排序维度或颜色映射。
++#     - 生成器强制至少 2 个匹配分量, 避免退化成 "只有一个匹配分量, 看不出删大留小"。
++#     - 生成器强制最小匹配面积唯一, 避免样例依赖隐藏 tie-break。
++#   implicit_assumption_review:
++#     - 原 solver 按 (g != bg) 找全部分量, 默认图例自身不会误判为待删对象。
++#     - 变体里若仍把图例碎片纳入最小面积比较, 可能把图例误当种子;
++#       因此 solver 显式跳过完全位于图例方块内的分量。
++#     - 原 solver 对每个匹配分量都直接清空; 该写法依赖 "所有匹配分量命运相同"。
++#       变体中此假设失效, 必须先收集全部匹配分量, 再决定哪个保留、哪些删除。
++#   placement_legality:
++#     - 每个对象仍作为完整矩形 patch 放置, 用 1 格 padding 保证互不接触。
++#     - seed/matched/kept 全都在图例外部随机布局, 不越界不重叠。
++#     - 匹配分量的面积由其矩形 bbox 决定, 与内部彩点数量无关, 因而 solver/generator 一致。
++#   visual_observability:
++#     - 绿色 3 本来只出现在图例边框; 输出把 seed 整体改成 3, 肉眼能马上看到"特殊保留者"。
++#     - 删除对象与绿色 seed 会在同一类 "全含图例色" 对象中同时出现, 规则可从 2-3 例中归纳。
++#   cleanliness:
++#     - 同一网格只叠加三类元素: 图例, 普通矩形对象, 输出中的纯绿色 seed。
++#     - 不再加入额外标记符号, 避免多层覆盖造成视觉混乱。
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color on the outer frame."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    Find the top-left legend square whose bottom row and right column share one border color.
++    Return (size, border_color, interior_target_colors).
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        border_color = int(g[sz - 1, sz - 1])
++        if border_color == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == border_color) and np.all(g[0:sz, sz - 1] == border_color):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(border_color)
++            return int(sz), int(border_color), colors
++    raise AssertionError("no legend border found in grid")
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Keep the smallest matching component as a seed and erase the larger matches.
++
++    Input structure:
++    - One background color occupies most of the board.
++    - The top-left corner contains a small legend square whose interior shows the target palette and whose bottom/right edges share one border color.
++    - Away from the legend are several 4-connected multicolor components built on the background.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - Among non-legend connected components, collect those whose color set contains every target color.
++    - Compare only those matching components by area: recolor the smallest one to the legend-border color as a seed, and erase every other matching component to background.
++    - Leave all non-matching components unchanged.
++
++    Key insight: The legend still defines which components qualify, but size now breaks the symmetry inside that qualifying set: the smallest full-palette component survives as a highlighted seed.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++    legend_size, border_color, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    matches: list[tuple[int, int, int, np.ndarray]] = []
++    for pts in components_mask(g != bg, connectivity=4):
++        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
++            continue
++        cols = {int(g[r, c]) for r, c in pts}
++        if legend_colors.issubset(cols):
++            area = int(len(pts))
++            top = int(pts[:, 0].min())
++            left = int(pts[:, 1].min())
++            matches.append((area, top, left, pts))
++
++    if not matches:
++        return out
++
++    seed_idx = min(range(len(matches)), key=lambda i: matches[i][:3])
++    for idx, (_area, _top, _left, pts) in enumerate(matches):
++        fill = border_color if idx == seed_idx else bg
++        for r, c in pts:
++            out[r, c] = fill
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component synthesis --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++MATCH_COUNTS = [2, 3]
++MATCH_WEIGHTS = [5, 2]
++NUM_KEPT = 3
++MAX_RETRIES = 400
++
++SMALL_MATCH_DIMS = [(3, 3), (3, 4), (4, 3), (4, 4)]
++KEEP_SHAPE_WEIGHTS = [5, 3, 2]  # medium, tall, wide
++MATCH_SHAPE_WEIGHTS = [5, 2, 3]  # medium, tall, wide
++TALL_H = (6, 9)
++TALL_W = (2, 4)
++WIDE_H = (3, 4)
++WIDE_W = (6, 8)
++MED_H = (4, 6)
++MED_W = (4, 6)
++KEEP_H = (3, 6)
++KEEP_W = (2, 6)
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the top-left legend; the output legend is unchanged."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _sample_mode_dims(weights: list[int]) -> tuple[int, int]:
++    """Sample rectangle dimensions from medium / tall / wide modes."""
++    mode = random.choices(["medium", "tall", "wide"], weights=weights)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _seed_dims() -> tuple[int, int]:
++    """Pick a small seed rectangle so the smallest match is visually obvious."""
++    return random.choice(SMALL_MATCH_DIMS)
++
++
++def _larger_match_dims(min_area: int) -> tuple[int, int]:
++    """Pick a matching component strictly larger than the seed area."""
++    for _ in range(100):
++        h, w = _sample_mode_dims(MATCH_SHAPE_WEIGHTS)
++        if h * w > min_area:
++            return h, w
++    raise RuntimeError("failed to sample larger matching component")
++
++
++def _keep_dims() -> tuple[int, int]:
++    """Pick a kept component; sizes remain moderate to keep packing feasible."""
++    if random.random() < 0.7:
++        return random.randint(*KEEP_H), random.randint(*KEEP_W)
++    return _sample_mode_dims(KEEP_SHAPE_WEIGHTS)
++
++
++def _component_patch(h: int, w: int, targets: list[int], match: bool) -> np.ndarray:
++    """Build a solid 4-connected rectangle with sparse colored pixels over color 0."""
++    area = h * w
++    lo = max(1, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    if match:
++        lo = max(lo, NUM_TARGETS)
++
++    n_colored = random.randint(lo, hi)
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    if match:
++        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
++    else:
++        used_target_count = random.randint(0, NUM_TARGETS - 1)
++        allowed = non_targets + random.sample(targets, used_target_count)
++        colors = [random.choice(allowed) for _ in range(n_colored)]
++
++    random.shuffle(colors)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_spec(role: str, targets: list[int], seed_area: int | None = None) -> dict:
++    """Describe one component before placement."""
++    if role == "seed":
++        h, w = _seed_dims()
++        patch = _component_patch(h, w, targets, match=True)
++    elif role == "delete":
++        assert seed_area is not None
++        h, w = _larger_match_dims(seed_area)
++        patch = _component_patch(h, w, targets, match=True)
++    else:
++        h, w = _keep_dims()
++        patch = _component_patch(h, w, targets, match=False)
++    return {"role": role, "patch": patch, "area": h * w}
++
++
++def _place_components(inp: np.ndarray, out: np.ndarray, specs: list[dict]) -> bool:
++    """Place all components with 1-cell separation and build the expected output."""
++    for spec in sorted(specs, key=lambda x: x["area"], reverse=True):
++        patch = spec["patch"]
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return False
++        paste(inp, patch, r, c)
++        if spec["role"] == "keep":
++            paste(out, patch, r, c)
++        elif spec["role"] == "seed":
++            paste(out, np.full_like(patch, BORDER), r, c)
++    return True
++
++
++def _count_matching_components(grid: np.ndarray) -> list[int]:
++    """Return areas of all external matching components in the input."""
++    bg = _bg_boundary(grid)
++    legend_size, _border, legend_colors = _find_legend(grid, bg)
++    areas = []
++    for pts in components_mask(grid != bg, connectivity=4):
++        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
++            continue
++        cols = {int(grid[r, c]) for r, c in pts}
++        if legend_colors.issubset(cols):
++            areas.append(int(len(pts)))
++    return sorted(areas)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Single generation attempt with a guaranteed unique smallest matching component."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    roles = ["seed"] + ["delete"] * (random.choices(MATCH_COUNTS, weights=MATCH_WEIGHTS)[0] - 1) + ["keep"] * NUM_KEPT
++    seed_h, seed_w = _seed_dims()
++    seed_area = seed_h * seed_w
++    specs = [{"role": "seed", "patch": _component_patch(seed_h, seed_w, targets, match=True), "area": seed_area}]
++    for role in roles[1:]:
++        specs.append(_component_spec(role, targets, seed_area=seed_area))
++
++    if not _place_components(inp, out, specs):
++        return None
++
++    match_areas = _count_matching_components(inp)
++    if len(match_areas) < 2 or match_areas[0] == match_areas[1]:
++        return None
++    solved = main(inp)
++    if not np.array_equal(solved, out):
++        return None
++    if np.array_equal(out, inp):
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+codex
+变体代码已写入 [code.py](/home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2/code.py:1)。`main()` 的核心改动在 [83 行](/home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2/code.py:83)：先收集图例外、且包含全部图例色的分量，再按 `(面积, top, left)` 选出最小匹配分量，把它整体改涂为边框色 `3` 作为 seed，其余匹配分量擦成背景。生成器从 [128 行](/home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2/code.py:128) 起同步改成强制生成至少 2 个匹配分量，并保证最小匹配面积唯一，避免退化回原题。
+
+验证结果通过。50 次要求测试为 `Success: 50/50, Time: 0.4s (7ms/call)`。额外做了 100 样本的变体行为统计：匹配分量数分布 `{2: 85, 3: 15}`，最小匹配面积唯一率 `100/100`，且新规则输出与原题“全删匹配分量”的输出差异率 `100/100`，说明 D17 的“删大留小并标种子”行为确实稳定出现。
+diff --git a/ceshi/code/d59b0160/D17/2/code.py b/ceshi/code/d59b0160/D17/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5fb744e31014cb8fc5e67fb9a9fe9f4eb6e777c
+--- /dev/null
++++ b/ceshi/code/d59b0160/D17/2/code.py
+@@ -0,0 +1,322 @@
++# Variant of d59b0160
++# Dimension: D17 — 分量面积对匹配的影响 (meta)
++# Change: 不考虑分量面积，任何大小的匹配分量都被删除... → 面积最小的匹配分量被保留为'种子'
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++
++# Design analysis for the D17 variant
++# -----------------------------------
++# spec:
++#   preserved_core:
++#     - 左上角 4x4 图例仍然给出 3 个目标颜色。
++#     - 网格其余对象仍然是放在背景上的 4 连通多色矩形分量。
++#     - "匹配分量" 仍然定义为: 颜色集合包含全部 3 个图例颜色。
++#   changed_behavior:
++#     - 原题: 所有匹配分量都删除。
++#     - 变体: 外部分量中, 面积最小的匹配分量保留, 并整体改涂为种子色 3;
++#       其他匹配分量照旧删除。
++#   concrete_pixel_effect:
++#     - 输入里会出现至少 2 个都含有全部图例颜色的矩形分量。
++#     - 输出里, 其中最小的那个不会消失, 而是变成纯绿色矩形;
++#       其余匹配矩形被擦成背景。
++#     - 不匹配分量保持原状。
++#   behavior_trace:
++#     - 例: 图例颜色为 {1,4,8}; 有三个外部分量 A/B/C.
++#     - A 面积 12, 颜色含 {0,1,4,8}; B 面积 20, 也含 {1,4,8}; C 缺少 8.
++#     - 原题输出: A 和 B 都被删除, C 保留。
++#     - 本变体输出: A 改成纯 3 色种子, B 删除, C 保留。
++#     - 差异集中在 "匹配分量命运判定" 这一步, 输入识别逻辑不变。
++#   complexity_calibration:
++#     - 只在匹配分量内部引入面积比较, 不引入额外排序维度或颜色映射。
++#     - 生成器强制至少 2 个匹配分量, 避免退化成 "只有一个匹配分量, 看不出删大留小"。
++#     - 生成器强制最小匹配面积唯一, 避免样例依赖隐藏 tie-break。
++#   implicit_assumption_review:
++#     - 原 solver 按 (g != bg) 找全部分量, 默认图例自身不会误判为待删对象。
++#     - 变体里若仍把图例碎片纳入最小面积比较, 可能把图例误当种子;
++#       因此 solver 显式跳过完全位于图例方块内的分量。
++#     - 原 solver 对每个匹配分量都直接清空; 该写法依赖 "所有匹配分量命运相同"。
++#       变体中此假设失效, 必须先收集全部匹配分量, 再决定哪个保留、哪些删除。
++#   placement_legality:
++#     - 每个对象仍作为完整矩形 patch 放置, 用 1 格 padding 保证互不接触。
++#     - seed/matched/kept 全都在图例外部随机布局, 不越界不重叠。
++#     - 匹配分量的面积由其矩形 bbox 决定, 与内部彩点数量无关, 因而 solver/generator 一致。
++#   visual_observability:
++#     - 绿色 3 本来只出现在图例边框; 输出把 seed 整体改成 3, 肉眼能马上看到"特殊保留者"。
++#     - 删除对象与绿色 seed 会在同一类 "全含图例色" 对象中同时出现, 规则可从 2-3 例中归纳。
++#   cleanliness:
++#     - 同一网格只叠加三类元素: 图例, 普通矩形对象, 输出中的纯绿色 seed。
++#     - 不再加入额外标记符号, 避免多层覆盖造成视觉混乱。
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color on the outer frame."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    Find the top-left legend square whose bottom row and right column share one border color.
++    Return (size, border_color, interior_target_colors).
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        border_color = int(g[sz - 1, sz - 1])
++        if border_color == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == border_color) and np.all(g[0:sz, sz - 1] == border_color):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(border_color)
++            return int(sz), int(border_color), colors
++    raise AssertionError("no legend border found in grid")
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Keep the smallest matching component as a seed and erase the larger matches.
++
++    Input structure:
++    - One background color occupies most of the board.
++    - The top-left corner contains a small legend square whose interior shows the target palette and whose bottom/right edges share one border color.
++    - Away from the legend are several 4-connected multicolor components built on the background.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - Among non-legend connected components, collect those whose color set contains every target color.
++    - Compare only those matching components by area: recolor the smallest one to the legend-border color as a seed, and erase every other matching component to background.
++    - Leave all non-matching components unchanged.
++
++    Key insight: The legend still defines which components qualify, but size now breaks the symmetry inside that qualifying set: the smallest full-palette component survives as a highlighted seed.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++    legend_size, border_color, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    matches: list[tuple[int, int, int, np.ndarray]] = []
++    for pts in components_mask(g != bg, connectivity=4):
++        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
++            continue
++        cols = {int(g[r, c]) for r, c in pts}
++        if legend_colors.issubset(cols):
++            area = int(len(pts))
++            top = int(pts[:, 0].min())
++            left = int(pts[:, 1].min())
++            matches.append((area, top, left, pts))
++
++    if not matches:
++        return out
++
++    seed_idx = min(range(len(matches)), key=lambda i: matches[i][:3])
++    for idx, (_area, _top, _left, pts) in enumerate(matches):
++        fill = border_color if idx == seed_idx else bg
++        for r, c in pts:
++            out[r, c] = fill
++    return out
++
++
++# --------------- generator (o5x) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component synthesis --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++MATCH_COUNTS = [2, 3]
++MATCH_WEIGHTS = [5, 2]
++NUM_KEPT = 3
++MAX_RETRIES = 400
++
++SMALL_MATCH_DIMS = [(3, 3), (3, 4), (4, 3), (4, 4)]
++KEEP_SHAPE_WEIGHTS = [5, 3, 2]  # medium, tall, wide
++MATCH_SHAPE_WEIGHTS = [5, 2, 3]  # medium, tall, wide
++TALL_H = (6, 9)
++TALL_W = (2, 4)
++WIDE_H = (3, 4)
++WIDE_W = (6, 8)
++MED_H = (4, 6)
++MED_W = (4, 6)
++KEEP_H = (3, 6)
++KEEP_W = (2, 6)
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the top-left legend; the output legend is unchanged."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _sample_mode_dims(weights: list[int]) -> tuple[int, int]:
++    """Sample rectangle dimensions from medium / tall / wide modes."""
++    mode = random.choices(["medium", "tall", "wide"], weights=weights)[0]
++    if mode == "tall":
++        return random.randint(*TALL_H), random.randint(*TALL_W)
++    if mode == "wide":
++        return random.randint(*WIDE_H), random.randint(*WIDE_W)
++    return random.randint(*MED_H), random.randint(*MED_W)
++
++
++def _seed_dims() -> tuple[int, int]:
++    """Pick a small seed rectangle so the smallest match is visually obvious."""
++    return random.choice(SMALL_MATCH_DIMS)
++
++
++def _larger_match_dims(min_area: int) -> tuple[int, int]:
++    """Pick a matching component strictly larger than the seed area."""
++    for _ in range(100):
++        h, w = _sample_mode_dims(MATCH_SHAPE_WEIGHTS)
++        if h * w > min_area:
++            return h, w
++    raise RuntimeError("failed to sample larger matching component")
++
++
++def _keep_dims() -> tuple[int, int]:
++    """Pick a kept component; sizes remain moderate to keep packing feasible."""
++    if random.random() < 0.7:
++        return random.randint(*KEEP_H), random.randint(*KEEP_W)
++    return _sample_mode_dims(KEEP_SHAPE_WEIGHTS)
++
++
++def _component_patch(h: int, w: int, targets: list[int], match: bool) -> np.ndarray:
++    """Build a solid 4-connected rectangle with sparse colored pixels over color 0."""
++    area = h * w
++    lo = max(1, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    if match:
++        lo = max(lo, NUM_TARGETS)
++
++    n_colored = random.randint(lo, hi)
++    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    if match:
++        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
++    else:
++        used_target_count = random.randint(0, NUM_TARGETS - 1)
++        allowed = non_targets + random.sample(targets, used_target_count)
++        colors = [random.choice(allowed) for _ in range(n_colored)]
++
++    random.shuffle(colors)
++    patch = np.zeros((h, w), dtype=int)
++    rs, cs = zip(*coords)
++    patch[rs, cs] = colors
++    return patch
++
++
++def _component_spec(role: str, targets: list[int], seed_area: int | None = None) -> dict:
++    """Describe one component before placement."""
++    if role == "seed":
++        h, w = _seed_dims()
++        patch = _component_patch(h, w, targets, match=True)
++    elif role == "delete":
++        assert seed_area is not None
++        h, w = _larger_match_dims(seed_area)
++        patch = _component_patch(h, w, targets, match=True)
++    else:
++        h, w = _keep_dims()
++        patch = _component_patch(h, w, targets, match=False)
++    return {"role": role, "patch": patch, "area": h * w}
++
++
++def _place_components(inp: np.ndarray, out: np.ndarray, specs: list[dict]) -> bool:
++    """Place all components with 1-cell separation and build the expected output."""
++    for spec in sorted(specs, key=lambda x: x["area"], reverse=True):
++        patch = spec["patch"]
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return False
++        paste(inp, patch, r, c)
++        if spec["role"] == "keep":
++            paste(out, patch, r, c)
++        elif spec["role"] == "seed":
++            paste(out, np.full_like(patch, BORDER), r, c)
++    return True
++
++
++def _count_matching_components(grid: np.ndarray) -> list[int]:
++    """Return areas of all external matching components in the input."""
++    bg = _bg_boundary(grid)
++    legend_size, _border, legend_colors = _find_legend(grid, bg)
++    areas = []
++    for pts in components_mask(grid != bg, connectivity=4):
++        if np.all(pts[:, 0] < legend_size) and np.all(pts[:, 1] < legend_size):
++            continue
++        cols = {int(grid[r, c]) for r, c in pts}
++        if legend_colors.issubset(cols):
++            areas.append(int(len(pts)))
++    return sorted(areas)
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Single generation attempt with a guaranteed unique smallest matching component."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    _place_legend(inp, out, targets)
++
++    roles = ["seed"] + ["delete"] * (random.choices(MATCH_COUNTS, weights=MATCH_WEIGHTS)[0] - 1) + ["keep"] * NUM_KEPT
++    seed_h, seed_w = _seed_dims()
++    seed_area = seed_h * seed_w
++    specs = [{"role": "seed", "patch": _component_patch(seed_h, seed_w, targets, match=True), "area": seed_area}]
++    for role in roles[1:]:
++        specs.append(_component_spec(role, targets, seed_area=seed_area))
++
++    if not _place_components(inp, out, specs):
++        return None
++
++    match_areas = _count_matching_components(inp)
++    if len(match_areas) < 2 or match_areas[0] == match_areas[1]:
++        return None
++    solved = main(inp)
++    if not np.array_equal(solved, out):
++        return None
++    if np.array_equal(out, inp):
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+tokens used
+52,747
+变体代码已写入 [code.py](/home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2/code.py:1)。`main()` 的核心改动在 [83 行](/home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2/code.py:83)：先收集图例外、且包含全部图例色的分量，再按 `(面积, top, left)` 选出最小匹配分量，把它整体改涂为边框色 `3` 作为 seed，其余匹配分量擦成背景。生成器从 [128 行](/home/lixinyu/snap/new/ceshi/code/d59b0160/D17/2/code.py:128) 起同步改成强制生成至少 2 个匹配分量，并保证最小匹配面积唯一，避免退化回原题。
+
+验证结果通过。50 次要求测试为 `Success: 50/50, Time: 0.4s (7ms/call)`。额外做了 100 样本的变体行为统计：匹配分量数分布 `{2: 85, 3: 15}`，最小匹配面积唯一率 `100/100`，且新规则输出与原题“全删匹配分量”的输出差异率 `100/100`，说明 D17 的“删大留小并标种子”行为确实稳定出现。

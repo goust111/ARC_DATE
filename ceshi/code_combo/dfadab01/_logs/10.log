@@ -1,0 +1,3110 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e2baf-ff30-7df0-8182-9556cccf9702
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: dfadab01
+    **摘要**: 输入中的单像素标记按固定字形字典被替换为对应的4x4图案（标记色->图案色），样本字形及其右下标签在输出中消失，超出网格边缘的部分被裁剪
+
+    ## 要实现的融合组合
+    - **组合名称**: 完整图例+全字形样本展示
+    - **combo_spec**: D4/1+D11/0
+
+    ### 融合描述（实现规格）
+
+    输入中展示所有四种字形的完整图例区域（样本+标签），每种字形都有对应的4x4样本 和标签色标记。图例区域在输出中保留（D4/0的保留规则被D4/1的完整图例覆盖—— 这里采用完整图例但图例在输出中消失的规则）。字形图案每题随机生成， 解题者必须从完整图例中学习所有映射。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D4/1** — 样本字形展示与消失 (`symbol_instructions`)
+  - 当前值: 输入中可能包含一个样本字形（完整4x4图案）及其右下角一格处的单像素标签（标签颜色=该字形对应的标记色），样本和标签在输出中消失
+  - 改为: 多个样本字形作为完整图例 — 输入中展示所有字形类型的样本（如4个样本排成一列），每个样本旁有对应标签色。形成完整的图例区域，解题者必须通读整个图例才能解码映射关系。样本不使用固定字形字典，而是每题随机生成图案。
+  - 来源: glyph_decoding（参考任务: 136b0064）
+- **D11/0** — 样本字形的数量与位置 (`symbol_instructions`)
+  - 当前值: 0或1个样本字形出现在输入中，位置不固定（可能在角落或中间区域），部分示例无样本
+  - 改为: 每种字形都有样本展示 — 输入中展示所有四种字形的样本和对应标签，形成完整的'字形字典'图例区域。解题者不需要记忆固定字形字典，完全从图例中学习映射。每道题的字形图案可以不同。
+  - 来源: glyph_decoding（参考任务: 136b0064）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/dfadab01.py`
+
+    ```python
+    from __future__ import annotations
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding fixed 4x4 glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show a sample 4x4 glyph in the output color, with a same-rule marker just below-right of the sample.
+
+    Rule:
+    - Replace each marker color by its learned 4x4 glyph: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping at the grid boundary.
+    - Remove the sample glyphs and skip their below-right label markers.
+
+    Key insight:
+    - The colored pixels are control pixels for a fixed glyph alphabet; non-control sample glyphs are only legend entries, not preserved scene objects.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            # Legend labels appear one cell below-right of the sample glyph bbox.
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 10x10 or 20x20 [observed]; must accommodate marker_grid_rows * row_spacing + glyph_size(4)
+  glyph_alphabet:
+    fixed 4x4 patterns, each 8 filled pixels out of 16:
+      marker 2 (red) -> color 4 (yellow) solid frame
+      marker 3 (green) -> color 1 (blue) open ring
+      marker 5 (gray) -> color 6 (magenta) diagonal blocks
+      marker 8 (azure) -> color 7 (orange) X-shape
+  marker_grid:
+    markers placed on a regular grid of positions (rows x cols)
+    shape: 2x2 to 5x5; rows and cols chosen independently
+    row_spacing: 4-6, uniform within example [observed]
+    col_spacing: 4-6, may be non-uniform across columns
+    fill_rate: 60-100% of grid cells contain a marker; unfilled cells are empty (black)
+    marker_types_used: 1-4 distinct types from {2,3,5,8}; each cell assigned one type
+  legend:
+    0 or 1 legend entry per input [observed]; shows one glyph type's mapping
+    structure: the 4x4 glyph drawn in output color + a label marker of matching type at (glyph_row+4, glyph_col+4)
+    legend glyph may overlap a grid cell position (the marker pixel sits where glyph mask has 0)
+    label marker is skipped in output (not expanded)
+  output:
+    black background; each real marker replaced by its 4x4 glyph in the mapped output color
+    glyph top-left at marker position; clipped at grid boundary
+    legend glyph and label removed; no glyph painted for label markers
+    glyphs never overlap (guaranteed by spacing >= 4)
+
+generation_strategy:
+  approach: direct construction (constraints are easy to satisfy constructively)
+  steps:
+    1. Pick grid dimensions ensuring rows * row_spacing and cols * col_spacing fit (with room for 4-cell glyph); e.g. for 5x5 grid with spacing 4, need >= 20.
+    2. Choose 1-4 marker types from {2,3,5,8}. Choose grid shape (R x C, each 2-5). Choose row_spacing and col_spacing (4-6 each).
+    3. Compute marker row/col positions; first row/col >= 0, last row + 3 <= H, last col + 3 <= W (or allow clipping for edge markers).
+    4. Fill grid cells: assign a random marker type to each cell; optionally leave some cells empty (fill_rate >= 60%).
+    5. Optionally add one legend entry: pick a used marker type, find a location where the 4x4 glyph + label at (+4,+4) fits without conflicting with real markers. Draw glyph in output color; place label marker pixel.
+    6. Build input grid: black background + single marker pixels at filled grid cells + legend if present.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+## 已有单变体参考代码
+
+以下组成项已有单变体实现，可作为融合时的参考：
+
+            ### 参考代码: D4/1
+
+            文件: `/home/lixinyu/snap/new/ceshi/code/dfadab01/D4/1/code.py`
+
+            ```python
+            # Variant of dfadab01
+# Dimension: D4 — 样本字形展示与消失 (symbol_instructions)
+# Change: 输入中可能包含一个样本字形（完整4x4图案）及其右下角一格处的单像素标签（标签颜色=该字形对应的标记色），样本和标签在输... → 多个样本字形作为完整图例
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+
+MARKER_TO_GLYPH_COLOR: dict[int, int] = {2: 4, 3: 1, 5: 6, 8: 7}
+MARKER_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR)
+GLYPH_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR[c] for c in MARKER_COLORS)
+GRID_SIZE = 20
+GLYPH_SIZE = 4
+LEGEND_COL = 0
+LEGEND_ROW_STARTS = (0, 5, 10, 15)
+BODY_ROW_LAYOUTS = (
+    (0, 4, 8, 12, 16),
+    (1, 5, 9, 13, 17),
+    (2, 6, 10, 14, 18),
+    (0, 5, 10, 15),
+    (2, 7, 12, 17),
+)
+BODY_COL_LAYOUTS = (
+    (8, 12, 16),
+    (9, 13, 17),
+    (10, 14, 18),
+    (8, 13, 18),
+)
+MASK_AREA = 8
+MAX_GEN_ATTEMPTS = 400
+
+# Design analysis
+# -
+# concretization_and_trace:
+#   - 输入左侧是完整图例区：4 个 4x4 样本纵向堆叠，每个样本右下角偏移 (+4,+4) 放 1 个单像素标签。
+#   - 标签仍用 marker 色 {2,3,5,8}；样本仍用对应输出色 {4,1,6,7}，这样“颜色变换”部分保持原题不变，变化只落在字形来源。
+#   - 主体区仍是单像素 marker 规则网格；输出仍把每个真实 marker 扩展成 4x4 图案，并在边界裁剪。
+#   - 具体追踪：原题里 color=2 时，solver 直接使用硬编码 frame mask，并把图例 label 当作特殊跳过点。
+#     现在 color=2 时，solver 必须先在输入里找到一个“黄色 4x4 样本 + 右下角红色标签”的 legend entry，从该 4x4 patch 学出 mask，
+#     再用这个 learned mask 去扩展所有真实的红色 marker。差异在于“mask 来源”从固定常量改成输入中的完整图例。
+# complexity_calibration:
+#   - 每题都展示全部 4 类 legend entry，且主体区强制出现全部 4 类 marker；这样解题者必须读完整图例，不能只靠一两个样本。
+#   - 每个样本 mask 随机生成，但限制为 4x4 内恰好 8 个像素、8 邻接连通、每行每列至少 1 个像素，避免退化成噪声点阵。
+#   - 4 个 mask 之间要求有足够的汉明距离，降低视觉近似和歧义。
+# implicit_assumption_review:
+#   - 原 main() 的 `for marker_color, (glyph_color, mask) in GLYPHS.items()` 假设 mask 事先固定可知；变体后这个前提失效，必须先解析 legend。
+#   - 原 `_has_source_glyph()` 用固定 mask 检测“这个 marker 是否是图例标签”；变体后不能再拿固定 mask 比对，只能从标签左上角整块 4x4 patch 读取。
+#   - 原 assert 允许出现少量输出色只是因为最多一个 legend；现在输入中一定有 4 个 legend，因此 solver 需要允许全部输出色并假设每种恰有 1 个 legend entry。
+# placement_legality:
+#   - 图例区固定在左 5 列，主体区的 marker top-left 固定在第 8 列以后；因此主体 glyph 展开后不会碰到图例。
+#   - 主体区行列间距始终 >= 4，保证输出中的 4x4 glyph 彼此不重叠；末行/末列布局有时放到 17/18，从而保留原题的裁剪现象。
+# observability_and_tidy_layout:
+#   - 图例独立成一列，主体 marker 独立成规则网格，输入视觉上分区清晰；输出时左侧图例完全消失，变化可直接观察。
+#   - legend 顺序打乱，mask 也随机，因此不能依赖“第几行对应哪种字形”或旧题固定字典。
+# color_inference:
+#   - 不新增颜色映射自由度，只保留原题固定的 marker 色 -> 输出色；真正变化的是 4x4 形状本身，线索完全来自可见 legend。
+# new_solver_assumptions:
+#   - `main()` 现在假设每个 marker 色都存在且只存在 1 个合法 legend label，其左上 4x4 patch 只含背景或对应输出色。
+#   - `generate_input()` 通过固定 legend 区、固定 label offset、唯一颜色区分和 oracle 校验来保证这些假设成立。
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(GLYPH_SIZE):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(GLYPH_SIZE):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def _read_legend_mask(g: np.ndarray, r: int, c: int, glyph_color: int) -> np.ndarray | None:
+    if r < GLYPH_SIZE or c < GLYPH_SIZE:
+        return None
+    patch = g[r - GLYPH_SIZE : r, c - GLYPH_SIZE : c]
+    nonzero = patch[patch != 0]
+    if nonzero.size == 0:
+        return None
+    if not np.all(nonzero == glyph_color):
+        return None
+    mask = patch == glyph_color
+    if not mask.any():
+        return None
+    return mask
+
+
+def _find_legend_masks(g: np.ndarray) -> tuple[dict[int, np.ndarray], set[tuple[int, int]]]:
+    learned_masks: dict[int, np.ndarray] = {}
+    legend_labels: set[tuple[int, int]] = set()
+    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
+        for r, c in np.argwhere(g == marker_color):
+            mask = _read_legend_mask(g, int(r), int(c), glyph_color)
+            if mask is None:
+                continue
+            assert marker_color not in learned_masks, f"duplicate legend for marker {marker_color}"
+            learned_masks[marker_color] = mask
+            legend_labels.add((int(r), int(c)))
+        assert marker_color in learned_masks, f"missing legend for marker {marker_color}"
+    return learned_masks, legend_labels
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Decode the per-input legend, then expand each control pixel into its learned 4x4 glyph.
+
+    Input structure:
+    - Left side: a full legend made of four complete 4x4 sample glyphs in colors 4, 1, 6, and 7.
+    - Each sample has a matching marker-color label pixel one cell below-right of its 4x4 box.
+    - Elsewhere: a regular field of single-pixel markers in colors 2, 3, 5, and 8.
+
+    Rule:
+    - For each marker color, read the 4x4 sample just above-left of its legend label to learn that marker's glyph mask.
+    - Replace every non-legend marker of that color with the learned 4x4 mask, painted in the same fixed output color as the legend sample.
+    - Keep the glyph top-left anchored at the marker pixel and clip any part that falls outside the grid.
+    - Remove the entire legend region and its label pixels from the output.
+
+    Key insight:
+    - The shape dictionary is no longer fixed across puzzles; the only way to know each marker's 4x4 pattern is to read the complete legend embedded in the input.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert g.shape == (GRID_SIZE, GRID_SIZE)
+    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
+
+    learned_masks, legend_labels = _find_legend_masks(g)
+
+    out = np.zeros_like(g)
+    seen_real_marker = False
+    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
+        mask = learned_masks[marker_color]
+        for r, c in np.argwhere(g == marker_color):
+            rc = (int(r), int(c))
+            if rc in legend_labels:
+                continue
+            seen_real_marker = True
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_real_marker
+    return out
+
+
+def _mask_connected(mask: np.ndarray) -> bool:
+    cells = [tuple(map(int, rc)) for rc in np.argwhere(mask)]
+    if not cells:
+        return False
+    stack = [cells[0]]
+    seen = {cells[0]}
+    while stack:
+        r, c = stack.pop()
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                rr = r + dr
+                cc = c + dc
+                if 0 <= rr < GLYPH_SIZE and 0 <= cc < GLYPH_SIZE and bool(mask[rr, cc]) and (rr, cc) not in seen:
+                    seen.add((rr, cc))
+                    stack.append((rr, cc))
+    return len(seen) == len(cells)
+
+
+def _random_mask() -> np.ndarray:
+    while True:
+        picks = random.sample(range(GLYPH_SIZE * GLYPH_SIZE), MASK_AREA)
+        mask = np.zeros((GLYPH_SIZE, GLYPH_SIZE), dtype=bool)
+        for idx in picks:
+            mask[idx // GLYPH_SIZE, idx % GLYPH_SIZE] = True
+        if not _mask_connected(mask):
+            continue
+        if np.any(mask.sum(axis=0) == 0) or np.any(mask.sum(axis=1) == 0):
+            continue
+        return mask
+
+
+def _sample_masks() -> dict[int, np.ndarray]:
+    chosen: list[np.ndarray] = []
+    for marker_color in MARKER_COLORS:
+        while True:
+            mask = _random_mask()
+            if any(int(np.sum(mask != other)) < 4 for other in chosen):
+                continue
+            chosen.append(mask)
+            break
+    return {marker_color: chosen[i] for i, marker_color in enumerate(MARKER_COLORS)}
+
+
+def _body_positions() -> list[tuple[int, int]]:
+    rows = list(random.choice(BODY_ROW_LAYOUTS))
+    cols = list(random.choice(BODY_COL_LAYOUTS))
+    positions = [(int(r), int(c)) for r in rows for c in cols]
+    random.shuffle(positions)
+    keep = random.randint(max(8, int(np.ceil(0.6 * len(positions)))), len(positions))
+    return positions[:keep]
+
+
+def _build_output(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
+    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
+    for r, c, marker_color in real_markers:
+        _paint_clipped(out, int(r), int(c), MARKER_TO_GLYPH_COLOR[marker_color], marker_masks[marker_color])
+    return out
+
+
+def _build_input(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
+    g = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
+
+    legend_order = list(MARKER_COLORS)
+    random.shuffle(legend_order)
+    for r0, marker_color in zip(LEGEND_ROW_STARTS, legend_order):
+        glyph_color = MARKER_TO_GLYPH_COLOR[marker_color]
+        mask = marker_masks[marker_color]
+        for dr in range(GLYPH_SIZE):
+            for dc in range(GLYPH_SIZE):
+                if bool(mask[dr, dc]):
+                    g[r0 + dr, LEGEND_COL + dc] = glyph_color
+        g[r0 + GLYPH_SIZE, LEGEND_COL + GLYPH_SIZE] = marker_color
+
+    for r, c, marker_color in real_markers:
+        g[r, c] = marker_color
+    return g
+
+
+def _sample_real_markers() -> list[tuple[int, int, int]]:
+    positions = _body_positions()
+    colors = list(MARKER_COLORS)
+    random.shuffle(colors)
+    chosen_colors = colors[:]
+    while len(chosen_colors) < len(positions):
+        chosen_colors.append(random.choice(MARKER_COLORS))
+    random.shuffle(chosen_colors)
+    return [(r, c, chosen_colors[i]) for i, (r, c) in enumerate(positions)]
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_GEN_ATTEMPTS):
+        marker_masks = _sample_masks()
+        real_markers = _sample_real_markers()
+        expected = _build_output(marker_masks, real_markers)
+        inp = _build_input(marker_masks, real_markers)
+        try:
+            actual = main(inp)
+        except Exception:
+            continue
+        if np.array_equal(actual, expected):
+            return inp
+    raise RuntimeError(f"generate_input: failed after {MAX_GEN_ATTEMPTS} attempts")
+
+            ```
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/dfadab01.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of dfadab01 (index 10)
+    # combo_spec: D4/1+D11/0
+    # Name: 完整图例+全字形样本展示
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/136b0064.py` — 参考任务 136b0064 的 solver（D4/1 的灵感来源）
+    - `/home/lixinyu/snap/new/arc2_solver_select/136b0064.py` — 参考任务 136b0064 的 solver（D11/0 的灵感来源）
+codex
+先检查原题代码、单变体参考和目标目录状态，再据此整理融合设计并落到 `solver/generator`。
+exec
+/bin/bash -lc 'ls -la /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10' in /home/lixinyu/snap/new
+ exited 2 in 0ms:
+ls: cannot access '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10': No such file or directory
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/136b0064.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+import numpy as np
+from arc_utils import bbox_h, bbox_w, find_components, get_bg
+import random
+
+
+def find_full_height_constant_col(grid: np.ndarray, *, bg: int | None = None) -> tuple[int | None, int | None]:
+    """
+    Local helper (only used by this solver): find a column where all values are identical and != bg.
+    Returns (col_idx, color) or (None, None).
+    """
+    H, W = grid.shape
+    if bg is None:
+        bg = get_bg(grid)
+    bg = int(bg)
+
+    for c in range(int(W)):
+        col = grid[:, int(c)]
+        if (col == col[0]).all() and int(col[0]) != bg:
+            return int(c), int(col[0])
+    return None, None
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Draw a polyline by decoding 3x3 glyph instructions read across a divided grid.
+
+    Input structure:
+    - Left of a full-height vertical divider: 3x3 colored glyphs on bg.
+    - Right of divider: a single gray (5) start pixel.
+
+    Rule:
+    - Remove the divider; shift the gray start into the left canvas.
+    - Read glyphs in column-major order (left→right, top→bottom).
+    - Each glyph's shape (pixel area) encodes a segment: area 4 → down 2, area 5 → right 3, area 6 → left 4, area 7 → left 2.
+    - Append segments sequentially, stepping down one cell between each.
+
+    Key insight: Glyph pixel count (area) uniquely determines both segment length and direction — the shape itself is the instruction.
+    """
+    g = np.array(grid, dtype=int)
+    H, W = g.shape
+    bg = int(get_bg(g))
+
+    # Divider is a full-height constant non-bg column.
+    div_c, div_color = find_full_height_constant_col(g, bg=bg)
+    assert div_c is not None
+
+    out = np.zeros((H, int(div_c)), dtype=int)
+
+    # Move gray start from right side into left canvas (remove divider col too).
+    gray = np.argwhere(g == 5)
+    if gray.size == 0:
+        return out
+    r_cur, c_cur = map(int, gray[0])
+    c_cur = int(c_cur - (int(div_c) + 1))
+    if not (0 <= c_cur < int(div_c)):
+        return out
+    out[int(r_cur), int(c_cur)] = 5
+
+    # Collect 3x3 glyph components on the left.
+    left = g[:, : int(div_c)]
+    ignore = {int(bg), 5}
+    if div_color is not None:
+        ignore.add(int(div_color))
+
+    glyphs: list[dict[str, int]] = []
+    for comp in find_components(left, bg=bg, connectivity=8, monochromatic=True, return_format="dict"):
+        col = int(comp["color"])
+        if col in ignore:
+            continue
+        b = comp["bbox"]
+        if bbox_h(b) == 3 and bbox_w(b) == 3:
+            r0, c0, _r1, _c1 = map(int, b)
+            glyphs.append({"color": int(col), "r0": int(r0), "c0": int(c0), "area": int(comp["area"])})
+
+    glyphs.sort(key=lambda d: (int(d["c0"]), int(d["r0"])))
+
+    area_to_len = {4: 2, 5: 3, 6: 4, 7: 2}
+    area_to_dir = {5: 1, 6: -1, 7: -1}  # diamond right; cross/U left
+
+    for glyph in glyphs:
+        color = int(glyph["color"])
+        area = int(glyph["area"])
+        seg_len = int(area_to_len.get(area, 2))
+
+        r_cur = int(r_cur + 1)
+        assert r_cur < H, f"segment exits bottom: r_cur={r_cur}, H={H}"
+        out[r_cur, int(c_cur)] = color
+
+        if area == 4:  # vertical (down)
+            end_r = r_cur + (seg_len - 1)
+            assert end_r < H, f"vertical segment exits bottom: end_r={end_r}, H={H}"
+            for _ in range(seg_len - 1):
+                r_cur = int(r_cur + 1)
+                out[r_cur, int(c_cur)] = color
+        else:  # horizontal
+            dir_h = int(area_to_dir.get(area, 1))
+            end_c = int(c_cur) + dir_h * (seg_len - 1)
+            assert 0 <= end_c < int(div_c), (
+                f"horizontal segment exits canvas: c_cur={c_cur}, dir={dir_h}, "
+                f"seg_len={seg_len}, div_c={div_c}"
+            )
+            for _ in range(seg_len - 1):
+                c_cur = int(c_cur + dir_h)
+                out[r_cur, c_cur] = color
+
+    return out
+
+# --------------- generator (attempt 1 (Claude)) ---------------
+
+# --- canvas geometry ---
+N_MIN, N_MAX = 2, 5            # number of tile rows; H = 4*N - 1, num_glyphs = 2*N
+GRID_W = 15                    # full input width
+DIVIDER_COL = 7                # divider position (col), full-height
+DIVIDER_COLOR = 4              # divider fill color
+LEFT_W = 7                     # left canvas width (cols 0..6)
+TILE_COLS = (0, 4)             # 3x3 tile c0 positions on the left
+TILE_ROW_STRIDE = 4            # row spacing between successive tile slots
+GRAY = 5                       # start-pixel color
+GRAY_START_ROW = 0             # gray start always sits at row 0 [observed]
+
+# --- shape grammar (area -> 3x3 template, color, and (dr, dc) walk delta) ---
+# Walk delta = total (row, col) displacement caused by one glyph instruction:
+#   step down 1 then segment of (len, dir). E.g. area 4 (vertical len 2) => (+2, 0).
+_TEMPLATES = {
+    4: np.array([[1, 0, 1], [0, 1, 0], [0, 1, 0]], dtype=int),  # plus    -> down 2,  color 6
+    5: np.array([[1, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=int),  # diamond -> right 3, color 1
+    6: np.array([[1, 1, 1], [0, 1, 0], [1, 0, 1]], dtype=int),  # cross   -> left 4,  color 3
+    7: np.array([[1, 0, 1], [1, 0, 1], [1, 1, 1]], dtype=int),  # U       -> left 2,  color 2
+}
+_AREA_TO_COLOR = {4: 6, 5: 1, 6: 3, 7: 2}
+_AREA_DELTA = {4: (2, 0), 5: (1, 2), 6: (1, -3), 7: (1, -1)}
+_AREAS = (4, 5, 6, 7)
+
+# --- generation constraints ---
+MIN_DIRECTION_CHANGES = 2      # min vertical<->horizontal flips across the walk
+MAX_ATTEMPTS = 300             # outer retry budget
+
+
+def _sample_path(N: int, start_col: int) -> list[int] | None:
+    """Random-walk a sequence of 2*N area instructions that stays in the left canvas.
+
+    Returns None if the walk dead-ends or fails the direction-change constraint.
+    """
+    H = 4 * N - 1
+    r, c = GRAY_START_ROW, start_col
+    areas: list[int] = []
+    for _ in range(2 * N):
+        opts = [a for a in _AREAS
+                if r + _AREA_DELTA[a][0] < H and 0 <= c + _AREA_DELTA[a][1] < LEFT_W]
+        if not opts:
+            return None
+        area = random.choice(opts)
+        areas.append(area)
+        dr, dc = _AREA_DELTA[area]
+        r += dr
+        c += dc
+
+    types = [a == 4 for a in areas]  # True = vertical, False = horizontal
+    changes = sum(1 for i in range(1, len(types)) if types[i] != types[i - 1])
+    if changes < MIN_DIRECTION_CHANGES:
+        return None
+    return areas
+
+
+def _render_grid(N: int, start_col: int, areas: list[int]) -> np.ndarray:
+    """Paint divider, gray start, and all 2*N tiled glyphs into the input grid."""
+    H = 4 * N - 1
+    grid = np.zeros((H, GRID_W), dtype=int)
+    grid[:, DIVIDER_COL] = DIVIDER_COLOR
+    grid[GRAY_START_ROW, DIVIDER_COL + 1 + start_col] = GRAY
+
+    # Column-major tiling: first N glyphs into TILE_COLS[0], next N into TILE_COLS[1].
+    for i, area in enumerate(areas):
+        tile_col = TILE_COLS[i // N]
+        r0 = TILE_ROW_STRIDE * (i % N)
+        grid[r0:r0 + 3, tile_col:tile_col + 3] = _TEMPLATES[area] * _AREA_TO_COLOR[area]
+    return grid
+
+
+def _gen_attempt() -> np.ndarray | None:
+    N = random.randint(N_MIN, N_MAX)
+    start_col = random.randint(0, LEFT_W - 1)
+    areas = _sample_path(N, start_col)
+    if areas is None:
+        return None
+    return _render_grid(N, start_col, areas)
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_ATTEMPTS):
+        try:
+            inp = _gen_attempt()
+            if inp is None:
+                continue
+            out = main(inp)  # oracle check
+            if out.shape != (inp.shape[0], LEFT_W):
+                continue
+            return inp
+        except Exception:
+            continue
+    raise RuntimeError(f"generate_input: failed after {MAX_ATTEMPTS} attempts")
+
+exec
+/bin/bash -lc "sed -n '1,360p' /home/lixinyu/snap/new/ceshi/code/dfadab01/D4/1/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Variant of dfadab01
+# Dimension: D4 — 样本字形展示与消失 (symbol_instructions)
+# Change: 输入中可能包含一个样本字形（完整4x4图案）及其右下角一格处的单像素标签（标签颜色=该字形对应的标记色），样本和标签在输... → 多个样本字形作为完整图例
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+
+MARKER_TO_GLYPH_COLOR: dict[int, int] = {2: 4, 3: 1, 5: 6, 8: 7}
+MARKER_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR)
+GLYPH_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR[c] for c in MARKER_COLORS)
+GRID_SIZE = 20
+GLYPH_SIZE = 4
+LEGEND_COL = 0
+LEGEND_ROW_STARTS = (0, 5, 10, 15)
+BODY_ROW_LAYOUTS = (
+    (0, 4, 8, 12, 16),
+    (1, 5, 9, 13, 17),
+    (2, 6, 10, 14, 18),
+    (0, 5, 10, 15),
+    (2, 7, 12, 17),
+)
+BODY_COL_LAYOUTS = (
+    (8, 12, 16),
+    (9, 13, 17),
+    (10, 14, 18),
+    (8, 13, 18),
+)
+MASK_AREA = 8
+MAX_GEN_ATTEMPTS = 400
+
+# Design analysis
+# -
+# concretization_and_trace:
+#   - 输入左侧是完整图例区：4 个 4x4 样本纵向堆叠，每个样本右下角偏移 (+4,+4) 放 1 个单像素标签。
+#   - 标签仍用 marker 色 {2,3,5,8}；样本仍用对应输出色 {4,1,6,7}，这样“颜色变换”部分保持原题不变，变化只落在字形来源。
+#   - 主体区仍是单像素 marker 规则网格；输出仍把每个真实 marker 扩展成 4x4 图案，并在边界裁剪。
+#   - 具体追踪：原题里 color=2 时，solver 直接使用硬编码 frame mask，并把图例 label 当作特殊跳过点。
+#     现在 color=2 时，solver 必须先在输入里找到一个“黄色 4x4 样本 + 右下角红色标签”的 legend entry，从该 4x4 patch 学出 mask，
+#     再用这个 learned mask 去扩展所有真实的红色 marker。差异在于“mask 来源”从固定常量改成输入中的完整图例。
+# complexity_calibration:
+#   - 每题都展示全部 4 类 legend entry，且主体区强制出现全部 4 类 marker；这样解题者必须读完整图例，不能只靠一两个样本。
+#   - 每个样本 mask 随机生成，但限制为 4x4 内恰好 8 个像素、8 邻接连通、每行每列至少 1 个像素，避免退化成噪声点阵。
+#   - 4 个 mask 之间要求有足够的汉明距离，降低视觉近似和歧义。
+# implicit_assumption_review:
+#   - 原 main() 的 `for marker_color, (glyph_color, mask) in GLYPHS.items()` 假设 mask 事先固定可知；变体后这个前提失效，必须先解析 legend。
+#   - 原 `_has_source_glyph()` 用固定 mask 检测“这个 marker 是否是图例标签”；变体后不能再拿固定 mask 比对，只能从标签左上角整块 4x4 patch 读取。
+#   - 原 assert 允许出现少量输出色只是因为最多一个 legend；现在输入中一定有 4 个 legend，因此 solver 需要允许全部输出色并假设每种恰有 1 个 legend entry。
+# placement_legality:
+#   - 图例区固定在左 5 列，主体区的 marker top-left 固定在第 8 列以后；因此主体 glyph 展开后不会碰到图例。
+#   - 主体区行列间距始终 >= 4，保证输出中的 4x4 glyph 彼此不重叠；末行/末列布局有时放到 17/18，从而保留原题的裁剪现象。
+# observability_and_tidy_layout:
+#   - 图例独立成一列，主体 marker 独立成规则网格，输入视觉上分区清晰；输出时左侧图例完全消失，变化可直接观察。
+#   - legend 顺序打乱，mask 也随机，因此不能依赖“第几行对应哪种字形”或旧题固定字典。
+# color_inference:
+#   - 不新增颜色映射自由度，只保留原题固定的 marker 色 -> 输出色；真正变化的是 4x4 形状本身，线索完全来自可见 legend。
+# new_solver_assumptions:
+#   - `main()` 现在假设每个 marker 色都存在且只存在 1 个合法 legend label，其左上 4x4 patch 只含背景或对应输出色。
+#   - `generate_input()` 通过固定 legend 区、固定 label offset、唯一颜色区分和 oracle 校验来保证这些假设成立。
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(GLYPH_SIZE):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(GLYPH_SIZE):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def _read_legend_mask(g: np.ndarray, r: int, c: int, glyph_color: int) -> np.ndarray | None:
+    if r < GLYPH_SIZE or c < GLYPH_SIZE:
+        return None
+    patch = g[r - GLYPH_SIZE : r, c - GLYPH_SIZE : c]
+    nonzero = patch[patch != 0]
+    if nonzero.size == 0:
+        return None
+    if not np.all(nonzero == glyph_color):
+        return None
+    mask = patch == glyph_color
+    if not mask.any():
+        return None
+    return mask
+
+
+def _find_legend_masks(g: np.ndarray) -> tuple[dict[int, np.ndarray], set[tuple[int, int]]]:
+    learned_masks: dict[int, np.ndarray] = {}
+    legend_labels: set[tuple[int, int]] = set()
+    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
+        for r, c in np.argwhere(g == marker_color):
+            mask = _read_legend_mask(g, int(r), int(c), glyph_color)
+            if mask is None:
+                continue
+            assert marker_color not in learned_masks, f"duplicate legend for marker {marker_color}"
+            learned_masks[marker_color] = mask
+            legend_labels.add((int(r), int(c)))
+        assert marker_color in learned_masks, f"missing legend for marker {marker_color}"
+    return learned_masks, legend_labels
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Decode the per-input legend, then expand each control pixel into its learned 4x4 glyph.
+
+    Input structure:
+    - Left side: a full legend made of four complete 4x4 sample glyphs in colors 4, 1, 6, and 7.
+    - Each sample has a matching marker-color label pixel one cell below-right of its 4x4 box.
+    - Elsewhere: a regular field of single-pixel markers in colors 2, 3, 5, and 8.
+
+    Rule:
+    - For each marker color, read the 4x4 sample just above-left of its legend label to learn that marker's glyph mask.
+    - Replace every non-legend marker of that color with the learned 4x4 mask, painted in the same fixed output color as the legend sample.
+    - Keep the glyph top-left anchored at the marker pixel and clip any part that falls outside the grid.
+    - Remove the entire legend region and its label pixels from the output.
+
+    Key insight:
+    - The shape dictionary is no longer fixed across puzzles; the only way to know each marker's 4x4 pattern is to read the complete legend embedded in the input.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert g.shape == (GRID_SIZE, GRID_SIZE)
+    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
+
+    learned_masks, legend_labels = _find_legend_masks(g)
+
+    out = np.zeros_like(g)
+    seen_real_marker = False
+    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
+        mask = learned_masks[marker_color]
+        for r, c in np.argwhere(g == marker_color):
+            rc = (int(r), int(c))
+            if rc in legend_labels:
+                continue
+            seen_real_marker = True
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_real_marker
+    return out
+
+
+def _mask_connected(mask: np.ndarray) -> bool:
+    cells = [tuple(map(int, rc)) for rc in np.argwhere(mask)]
+    if not cells:
+        return False
+    stack = [cells[0]]
+    seen = {cells[0]}
+    while stack:
+        r, c = stack.pop()
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                rr = r + dr
+                cc = c + dc
+                if 0 <= rr < GLYPH_SIZE and 0 <= cc < GLYPH_SIZE and bool(mask[rr, cc]) and (rr, cc) not in seen:
+                    seen.add((rr, cc))
+                    stack.append((rr, cc))
+    return len(seen) == len(cells)
+
+
+def _random_mask() -> np.ndarray:
+    while True:
+        picks = random.sample(range(GLYPH_SIZE * GLYPH_SIZE), MASK_AREA)
+        mask = np.zeros((GLYPH_SIZE, GLYPH_SIZE), dtype=bool)
+        for idx in picks:
+            mask[idx // GLYPH_SIZE, idx % GLYPH_SIZE] = True
+        if not _mask_connected(mask):
+            continue
+        if np.any(mask.sum(axis=0) == 0) or np.any(mask.sum(axis=1) == 0):
+            continue
+        return mask
+
+
+def _sample_masks() -> dict[int, np.ndarray]:
+    chosen: list[np.ndarray] = []
+    for marker_color in MARKER_COLORS:
+        while True:
+            mask = _random_mask()
+            if any(int(np.sum(mask != other)) < 4 for other in chosen):
+                continue
+            chosen.append(mask)
+            break
+    return {marker_color: chosen[i] for i, marker_color in enumerate(MARKER_COLORS)}
+
+
+def _body_positions() -> list[tuple[int, int]]:
+    rows = list(random.choice(BODY_ROW_LAYOUTS))
+    cols = list(random.choice(BODY_COL_LAYOUTS))
+    positions = [(int(r), int(c)) for r in rows for c in cols]
+    random.shuffle(positions)
+    keep = random.randint(max(8, int(np.ceil(0.6 * len(positions)))), len(positions))
+    return positions[:keep]
+
+
+def _build_output(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
+    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
+    for r, c, marker_color in real_markers:
+        _paint_clipped(out, int(r), int(c), MARKER_TO_GLYPH_COLOR[marker_color], marker_masks[marker_color])
+    return out
+
+
+def _build_input(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
+    g = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
+
+    legend_order = list(MARKER_COLORS)
+    random.shuffle(legend_order)
+    for r0, marker_color in zip(LEGEND_ROW_STARTS, legend_order):
+        glyph_color = MARKER_TO_GLYPH_COLOR[marker_color]
+        mask = marker_masks[marker_color]
+        for dr in range(GLYPH_SIZE):
+            for dc in range(GLYPH_SIZE):
+                if bool(mask[dr, dc]):
+                    g[r0 + dr, LEGEND_COL + dc] = glyph_color
+        g[r0 + GLYPH_SIZE, LEGEND_COL + GLYPH_SIZE] = marker_color
+
+    for r, c, marker_color in real_markers:
+        g[r, c] = marker_color
+    return g
+
+
+def _sample_real_markers() -> list[tuple[int, int, int]]:
+    positions = _body_positions()
+    colors = list(MARKER_COLORS)
+    random.shuffle(colors)
+    chosen_colors = colors[:]
+    while len(chosen_colors) < len(positions):
+        chosen_colors.append(random.choice(MARKER_COLORS))
+    random.shuffle(chosen_colors)
+    return [(r, c, chosen_colors[i]) for i, (r, c) in enumerate(positions)]
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_GEN_ATTEMPTS):
+        marker_masks = _sample_masks()
+        real_markers = _sample_real_markers()
+        expected = _build_output(marker_masks, real_markers)
+        inp = _build_input(marker_masks, real_markers)
+        try:
+            actual = main(inp)
+        except Exception:
+            continue
+        if np.array_equal(actual, expected):
+            return inp
+    raise RuntimeError(f"generate_input: failed after {MAX_GEN_ATTEMPTS} attempts")
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/dfadab01.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+
+import numpy as np
+
+
+GLYPHS: dict[int, tuple[int, np.ndarray]] = {
+    2: (
+        4,
+        np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [1, 1, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    3: (
+        1,
+        np.array(
+            [
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=bool,
+        ),
+    ),
+    5: (
+        6,
+        np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+    8: (
+        7,
+        np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+            dtype=bool,
+        ),
+    ),
+}
+
+
+def _has_source_glyph(g: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> bool:
+    h, w = g.shape
+    if r0 < 0 or c0 < 0 or r0 + 4 > h or c0 + 4 > w:
+        return False
+    patch = g[r0 : r0 + 4, c0 : c0 + 4]
+    return bool(np.all(patch[mask] == color) and np.all(patch[~mask] != color))
+
+
+def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    h, w = out.shape
+    for dr in range(4):
+        rr = r0 + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(4):
+            cc = c0 + dc
+            if 0 <= cc < w and bool(mask[dr, dc]):
+                out[rr, cc] = color
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand each colored control pixel into its corresponding fixed 4x4 glyph.
+
+    Input structure:
+    - Black background with single-pixel markers in colors 2, 3, 5, and/or 8.
+    - Some inputs also show a sample 4x4 glyph in the output color, with a same-rule marker just below-right of the sample.
+
+    Rule:
+    - Replace each marker color by its learned 4x4 glyph: 2->yellow frame, 3->blue ring, 5->pink diagonal blocks, 8->orange X.
+    - Paint each glyph with its top-left corner at the marker pixel, clipping at the grid boundary.
+    - Remove the sample glyphs and skip their below-right label markers.
+
+    Key insight:
+    - The colored pixels are control pixels for a fixed glyph alphabet; non-control sample glyphs are only legend entries, not preserved scene objects.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2
+    assert set(np.unique(g)).issubset({0, *GLYPHS.keys(), 1, 4, 6, 7})
+
+    out = np.zeros_like(g)
+    seen_marker = False
+    for marker_color, (glyph_color, mask) in GLYPHS.items():
+        coords = np.argwhere(g == marker_color)
+        if coords.size:
+            seen_marker = True
+        for r, c in coords:
+            # Legend labels appear one cell below-right of the sample glyph bbox.
+            if _has_source_glyph(g, int(r) - 4, int(c) - 4, glyph_color, mask):
+                continue
+            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+
+    assert seen_marker
+    return out
+
+codex
+原题的固定字典假设已经被这次融合彻底打掉了，主体实现会改成“先读完整图例，再扩展真实标记”。接下来我把设计分析写进代码注释，并据此生成一个稳定的 20x20 版本。
+codex
+现在创建目标目录并写入融合版本代码，生成器会保留原题的裁剪现象，同时强制出现完整四类图例和四类真实标记。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py
+diff --git a/ceshi/code_combo/dfadab01/10/code.py b/ceshi/code_combo/dfadab01/10/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4a022ee820676429d69fb9b97730c12f92ca361
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/10/code.py
+@@ -0,0 +1,256 @@
++# Combo variant of dfadab01 (index 10)
++# combo_spec: D4/1+D11/0
++# Name: 完整图例+全字形样本展示
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++MARKER_TO_GLYPH_COLOR: dict[int, int] = {2: 4, 3: 1, 5: 6, 8: 7}
++MARKER_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR)
++GLYPH_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR[c] for c in MARKER_COLORS)
++GRID_SIZE = 20
++GLYPH_SIZE = 4
++LEGEND_COL = 0
++LEGEND_LABEL_COL = LEGEND_COL + GLYPH_SIZE
++LEGEND_ROW_STARTS = (0, 5, 10, 15)
++BODY_ROW_LAYOUTS = (
++    (0, 4, 8, 12, 16),
++    (1, 5, 9, 13, 17),
++    (2, 6, 10, 14, 18),
++    (0, 5, 10, 15),
++    (2, 7, 12, 17),
++)
++BODY_COL_LAYOUTS = (
++    (8, 12, 16),
++    (9, 13, 17),
++    (10, 14, 18),
++    (8, 13, 18),
++)
++MASK_AREA = 8
++MIN_MASK_DISTANCE = 4
++MAX_GEN_ATTEMPTS = 400
++
++# Design analysis
++# -
++# concretization_and_trace:
++#   - 融合后输入被分成两个清晰区域：左侧是完整图例，右侧是主体 marker 网格。左侧固定出现 4 个 4x4 样本，每个样本右下角偏移
++#     (+4,+4) 放 1 个单像素标签，4 个标签颜色正好覆盖 {2,3,5,8}；右侧仍是若干真实单像素 marker。
++#   - 具体追踪一个 marker=2 的例子：原题 solver 看到红色像素后，直接调用硬编码的“黄色 frame” mask，并且只在像素左上角恰好存在
++#     那个固定 frame 时才把它识别成 legend label。融合后 solver 先在整张图里找到一个“黄色 4x4 样本 + 其右下角红色标签”，从该样本
++#     直接读出本题的 4x4 mask；随后所有其他红色真实 marker 都展开成这个刚读出的形状。差异在于 shape 来源从固定常量变成输入图例。
++# complexity_calibration:
++#   - D4/1 与 D11/0 叠加后的关键不是“可能出现多个样本”，而是“每题必须出现全部四种样本”。因此 generator 强制四种标签全出现，且
++#     主体区也强制四种真实 marker 至少各出现一次，避免任务退化成只需读单个样本或只用到少数字形。
++#   - 每个 4x4 样本限制为恰好 8 个着色格、8 邻接连通、每行每列至少有 1 个着色格，并要求任意两种样本之间至少有 4 格汉明距离，
++#     这样视觉上像“字形”而不是噪声，也减少不同样本过于相似导致的歧义。
++# implicit_assumption_review:
++#   - 原 `GLYPHS` 常量及 `for marker_color, (glyph_color, mask) in GLYPHS.items()` 依赖“字形字典跨题固定”；融合后这个前提失效，
++#     所以先改成从输入里学习 `learned_masks`，再进行扩展。
++#   - 原 `_has_source_glyph()` 依赖“知道样本的固定 mask 才能判定某个 marker 是 legend label”；融合后不能先验知道 mask，
++#     因而改成更弱但足够的判定：标签左上 4x4 patch 只允许出现该输出色和背景，并且非空。
++#   - 原代码默认输入中输出色只是可选的少量 legend 噪声；融合后四种输出色都会系统性出现于左侧 legend，因此输入颜色断言和解析顺序
++#     都必须兼容完整图例。
++# placement_legality:
++#   - 左侧 legend 占用列 0..4，其中样本画在列 0..3、标签落在列 4；主体 marker 的 top-left 只放在列 8 及以后，所以主体 glyph 展开
++#     到 4x4 后也不会碰到 legend。
++#   - 主体候选位置的行列间距都至少为 4，因此输出里的 4x4 glyph 彼此不会重叠；最后一行/列允许取 17 或 18，保留原题“靠边裁剪”的现象。
++# visual_observability_and_tidy_layout:
++#   - 解题者能直接看到“左边是四条样本-标签对照表，右边是待解码 marker 网格”，输入分区明确，输出中左侧整块消失，只剩右侧扩张后的图案，
++#     变化非常可见。
++#   - legend 顺序被打乱，样本形状也按题随机，因此不能凭固定行序或旧题字典作答，必须真正读取完整图例。
++# color_inference_and_rule_inferability:
++#   - 颜色映射仍沿用原题固定关系 2->4, 3->1, 5->6, 8->7；新的自由度只落在 4x4 形状。这样人类只需推断“标签色对应哪个样本形状”，
++#     而不必同时猜颜色重映射和形状重映射，保证 2-4 个样例内可归纳。
++# new_solver_assumptions_and_generator_guards:
++#   - `main()` 现在假设每种 marker 色都恰有一个合法 legend label，且它左上 4x4 区域非空、只含对应 glyph 色与背景。
++#   - `main()` 还假设真实 marker 不会落在 legend 区，输入中的 glyph 色不会出现在主体区；generator 通过固定分区、唯一标签偏移和 oracle
++#     校验来保证这些前提成立。
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(GLYPH_SIZE):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(GLYPH_SIZE):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _read_legend_mask(g: np.ndarray, r: int, c: int, glyph_color: int) -> np.ndarray | None:
++    if r < GLYPH_SIZE or c < GLYPH_SIZE:
++        return None
++    patch = g[r - GLYPH_SIZE : r, c - GLYPH_SIZE : c]
++    nonzero = patch[patch != 0]
++    if nonzero.size == 0 or not np.all(nonzero == glyph_color):
++        return None
++    return patch == glyph_color
++
++
++def _find_legend_masks(g: np.ndarray) -> tuple[dict[int, np.ndarray], set[tuple[int, int]]]:
++    learned_masks: dict[int, np.ndarray] = {}
++    legend_labels: set[tuple[int, int]] = set()
++    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
++        for r, c in np.argwhere(g == marker_color):
++            mask = _read_legend_mask(g, int(r), int(c), glyph_color)
++            if mask is None:
++                continue
++            assert marker_color not in learned_masks, f"duplicate legend for marker {marker_color}"
++            learned_masks[marker_color] = mask
++            legend_labels.add((int(r), int(c)))
++        assert marker_color in learned_masks, f"missing legend for marker {marker_color}"
++    return learned_masks, legend_labels
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Read the full per-input legend, then expand each real marker into its learned 4x4 glyph.
++
++    Input structure:
++    - The left side contains a complete legend: all four glyph types appear as 4x4 samples in colors 4, 1, 6, and 7.
++    - Each legend sample has a matching marker-color label pixel placed one cell below-right of the sample box.
++    - The rest of the grid contains the actual single-pixel markers in colors 2, 3, 5, and 8.
++
++    Rule:
++    - For each marker color, locate its legend label and read the 4x4 sample immediately above-left of that label.
++    - Use that learned 4x4 mask to replace every non-legend marker of the same color, painting with the sample's fixed glyph color.
++    - Keep each expansion anchored at the marker's top-left cell, clipping any part that would leave the grid.
++    - Remove the full legend region and all label pixels from the output.
++
++    Key insight:
++    - The 4x4 alphabet is no longer fixed across puzzles; the only reliable dictionary is the complete legend embedded in the input itself.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    learned_masks, legend_labels = _find_legend_masks(g)
++
++    out = np.zeros_like(g)
++    seen_real_marker = False
++    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
++        mask = learned_masks[marker_color]
++        for r, c in np.argwhere(g == marker_color):
++            rc = (int(r), int(c))
++            if rc in legend_labels:
++                continue
++            seen_real_marker = True
++            _paint_clipped(out, int(r), int(c), glyph_color, mask)
++
++    assert seen_real_marker
++    return out
++
++
++def _mask_connected(mask: np.ndarray) -> bool:
++    cells = [tuple(map(int, rc)) for rc in np.argwhere(mask)]
++    if not cells:
++        return False
++    stack = [cells[0]]
++    seen = {cells[0]}
++    while stack:
++        r, c = stack.pop()
++        for dr in (-1, 0, 1):
++            for dc in (-1, 0, 1):
++                if dr == 0 and dc == 0:
++                    continue
++                rr = r + dr
++                cc = c + dc
++                if 0 <= rr < GLYPH_SIZE and 0 <= cc < GLYPH_SIZE and bool(mask[rr, cc]) and (rr, cc) not in seen:
++                    seen.add((rr, cc))
++                    stack.append((rr, cc))
++    return len(seen) == len(cells)
++
++
++def _random_mask() -> np.ndarray:
++    while True:
++        picks = random.sample(range(GLYPH_SIZE * GLYPH_SIZE), MASK_AREA)
++        mask = np.zeros((GLYPH_SIZE, GLYPH_SIZE), dtype=bool)
++        for idx in picks:
++            mask[idx // GLYPH_SIZE, idx % GLYPH_SIZE] = True
++        if not _mask_connected(mask):
++            continue
++        if np.any(mask.sum(axis=0) == 0) or np.any(mask.sum(axis=1) == 0):
++            continue
++        return mask
++
++
++def _sample_masks() -> dict[int, np.ndarray]:
++    chosen: list[np.ndarray] = []
++    ordered_masks: list[np.ndarray] = []
++    for _marker_color in MARKER_COLORS:
++        while True:
++            mask = _random_mask()
++            if any(int(np.sum(mask != other)) < MIN_MASK_DISTANCE for other in chosen):
++                continue
++            chosen.append(mask)
++            ordered_masks.append(mask)
++            break
++    return {marker_color: ordered_masks[i] for i, marker_color in enumerate(MARKER_COLORS)}
++
++
++def _body_positions() -> list[tuple[int, int]]:
++    rows = list(random.choice(BODY_ROW_LAYOUTS))
++    cols = list(random.choice(BODY_COL_LAYOUTS))
++    positions = [(int(r), int(c)) for r in rows for c in cols]
++    random.shuffle(positions)
++    min_keep = max(len(MARKER_COLORS), int(np.ceil(0.6 * len(positions))))
++    keep = random.randint(min_keep, len(positions))
++    return positions[:keep]
++
++
++def _sample_real_markers() -> list[tuple[int, int, int]]:
++    positions = _body_positions()
++    forced_colors = list(MARKER_COLORS)
++    random.shuffle(forced_colors)
++    while len(forced_colors) < len(positions):
++        forced_colors.append(random.choice(MARKER_COLORS))
++    random.shuffle(forced_colors)
++    return [(r, c, forced_colors[i]) for i, (r, c) in enumerate(positions)]
++
++
++def _build_output(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker_color in real_markers:
++        _paint_clipped(out, int(r), int(c), MARKER_TO_GLYPH_COLOR[marker_color], marker_masks[marker_color])
++    return out
++
++
++def _build_input(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
++    g = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++
++    legend_order = list(MARKER_COLORS)
++    random.shuffle(legend_order)
++    for r0, marker_color in zip(LEGEND_ROW_STARTS, legend_order):
++        glyph_color = MARKER_TO_GLYPH_COLOR[marker_color]
++        mask = marker_masks[marker_color]
++        for dr in range(GLYPH_SIZE):
++            for dc in range(GLYPH_SIZE):
++                if bool(mask[dr, dc]):
++                    g[r0 + dr, LEGEND_COL + dc] = glyph_color
++        g[r0 + GLYPH_SIZE, LEGEND_LABEL_COL] = marker_color
++
++    for r, c, marker_color in real_markers:
++        g[r, c] = marker_color
++    return g
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_ATTEMPTS):
++        marker_masks = _sample_masks()
++        real_markers = _sample_real_markers()
++        expected = _build_output(marker_masks, real_markers)
++        inp = _build_input(marker_masks, real_markers)
++        try:
++            actual = main(inp)
++        except Exception:
++            continue
++        if np.array_equal(actual, expected):
++            return inp
++    raise RuntimeError(f"generate_input: failed after {MAX_GEN_ATTEMPTS} attempts")
+
+diff --git a/ceshi/code_combo/dfadab01/10/code.py b/ceshi/code_combo/dfadab01/10/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4a022ee820676429d69fb9b97730c12f92ca361
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/10/code.py
+@@ -0,0 +1,256 @@
++# Combo variant of dfadab01 (index 10)
++# combo_spec: D4/1+D11/0
++# Name: 完整图例+全字形样本展示
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++MARKER_TO_GLYPH_COLOR: dict[int, int] = {2: 4, 3: 1, 5: 6, 8: 7}
++MARKER_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR)
++GLYPH_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR[c] for c in MARKER_COLORS)
++GRID_SIZE = 20
++GLYPH_SIZE = 4
++LEGEND_COL = 0
++LEGEND_LABEL_COL = LEGEND_COL + GLYPH_SIZE
++LEGEND_ROW_STARTS = (0, 5, 10, 15)
++BODY_ROW_LAYOUTS = (
++    (0, 4, 8, 12, 16),
++    (1, 5, 9, 13, 17),
++    (2, 6, 10, 14, 18),
++    (0, 5, 10, 15),
++    (2, 7, 12, 17),
++)
++BODY_COL_LAYOUTS = (
++    (8, 12, 16),
++    (9, 13, 17),
++    (10, 14, 18),
++    (8, 13, 18),
++)
++MASK_AREA = 8
++MIN_MASK_DISTANCE = 4
++MAX_GEN_ATTEMPTS = 400
++
++# Design analysis
++# -
++# concretization_and_trace:
++#   - 融合后输入被分成两个清晰区域：左侧是完整图例，右侧是主体 marker 网格。左侧固定出现 4 个 4x4 样本，每个样本右下角偏移
++#     (+4,+4) 放 1 个单像素标签，4 个标签颜色正好覆盖 {2,3,5,8}；右侧仍是若干真实单像素 marker。
++#   - 具体追踪一个 marker=2 的例子：原题 solver 看到红色像素后，直接调用硬编码的“黄色 frame” mask，并且只在像素左上角恰好存在
++#     那个固定 frame 时才把它识别成 legend label。融合后 solver 先在整张图里找到一个“黄色 4x4 样本 + 其右下角红色标签”，从该样本
++#     直接读出本题的 4x4 mask；随后所有其他红色真实 marker 都展开成这个刚读出的形状。差异在于 shape 来源从固定常量变成输入图例。
++# complexity_calibration:
++#   - D4/1 与 D11/0 叠加后的关键不是“可能出现多个样本”，而是“每题必须出现全部四种样本”。因此 generator 强制四种标签全出现，且
++#     主体区也强制四种真实 marker 至少各出现一次，避免任务退化成只需读单个样本或只用到少数字形。
++#   - 每个 4x4 样本限制为恰好 8 个着色格、8 邻接连通、每行每列至少有 1 个着色格，并要求任意两种样本之间至少有 4 格汉明距离，
++#     这样视觉上像“字形”而不是噪声，也减少不同样本过于相似导致的歧义。
++# implicit_assumption_review:
++#   - 原 `GLYPHS` 常量及 `for marker_color, (glyph_color, mask) in GLYPHS.items()` 依赖“字形字典跨题固定”；融合后这个前提失效，
++#     所以先改成从输入里学习 `learned_masks`，再进行扩展。
++#   - 原 `_has_source_glyph()` 依赖“知道样本的固定 mask 才能判定某个 marker 是 legend label”；融合后不能先验知道 mask，
++#     因而改成更弱但足够的判定：标签左上 4x4 patch 只允许出现该输出色和背景，并且非空。
++#   - 原代码默认输入中输出色只是可选的少量 legend 噪声；融合后四种输出色都会系统性出现于左侧 legend，因此输入颜色断言和解析顺序
++#     都必须兼容完整图例。
++# placement_legality:
++#   - 左侧 legend 占用列 0..4，其中样本画在列 0..3、标签落在列 4；主体 marker 的 top-left 只放在列 8 及以后，所以主体 glyph 展开
++#     到 4x4 后也不会碰到 legend。
++#   - 主体候选位置的行列间距都至少为 4，因此输出里的 4x4 glyph 彼此不会重叠；最后一行/列允许取 17 或 18，保留原题“靠边裁剪”的现象。
++# visual_observability_and_tidy_layout:
++#   - 解题者能直接看到“左边是四条样本-标签对照表，右边是待解码 marker 网格”，输入分区明确，输出中左侧整块消失，只剩右侧扩张后的图案，
++#     变化非常可见。
++#   - legend 顺序被打乱，样本形状也按题随机，因此不能凭固定行序或旧题字典作答，必须真正读取完整图例。
++# color_inference_and_rule_inferability:
++#   - 颜色映射仍沿用原题固定关系 2->4, 3->1, 5->6, 8->7；新的自由度只落在 4x4 形状。这样人类只需推断“标签色对应哪个样本形状”，
++#     而不必同时猜颜色重映射和形状重映射，保证 2-4 个样例内可归纳。
++# new_solver_assumptions_and_generator_guards:
++#   - `main()` 现在假设每种 marker 色都恰有一个合法 legend label，且它左上 4x4 区域非空、只含对应 glyph 色与背景。
++#   - `main()` 还假设真实 marker 不会落在 legend 区，输入中的 glyph 色不会出现在主体区；generator 通过固定分区、唯一标签偏移和 oracle
++#     校验来保证这些前提成立。
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(GLYPH_SIZE):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(GLYPH_SIZE):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _read_legend_mask(g: np.ndarray, r: int, c: int, glyph_color: int) -> np.ndarray | None:
++    if r < GLYPH_SIZE or c < GLYPH_SIZE:
++        return None
++    patch = g[r - GLYPH_SIZE : r, c - GLYPH_SIZE : c]
++    nonzero = patch[patch != 0]
++    if nonzero.size == 0 or not np.all(nonzero == glyph_color):
++        return None
++    return patch == glyph_color
++
++
++def _find_legend_masks(g: np.ndarray) -> tuple[dict[int, np.ndarray], set[tuple[int, int]]]:
++    learned_masks: dict[int, np.ndarray] = {}
++    legend_labels: set[tuple[int, int]] = set()
++    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
++        for r, c in np.argwhere(g == marker_color):
++            mask = _read_legend_mask(g, int(r), int(c), glyph_color)
++            if mask is None:
++                continue
++            assert marker_color not in learned_masks, f"duplicate legend for marker {marker_color}"
++            learned_masks[marker_color] = mask
++            legend_labels.add((int(r), int(c)))
++        assert marker_color in learned_masks, f"missing legend for marker {marker_color}"
++    return learned_masks, legend_labels
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Read the full per-input legend, then expand each real marker into its learned 4x4 glyph.
++
++    Input structure:
++    - The left side contains a complete legend: all four glyph types appear as 4x4 samples in colors 4, 1, 6, and 7.
++    - Each legend sample has a matching marker-color label pixel placed one cell below-right of the sample box.
++    - The rest of the grid contains the actual single-pixel markers in colors 2, 3, 5, and 8.
++
++    Rule:
++    - For each marker color, locate its legend label and read the 4x4 sample immediately above-left of that label.
++    - Use that learned 4x4 mask to replace every non-legend marker of the same color, painting with the sample's fixed glyph color.
++    - Keep each expansion anchored at the marker's top-left cell, clipping any part that would leave the grid.
++    - Remove the full legend region and all label pixels from the output.
++
++    Key insight:
++    - The 4x4 alphabet is no longer fixed across puzzles; the only reliable dictionary is the complete legend embedded in the input itself.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    learned_masks, legend_labels = _find_legend_masks(g)
++
++    out = np.zeros_like(g)
++    seen_real_marker = False
++    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
++        mask = learned_masks[marker_color]
++        for r, c in np.argwhere(g == marker_color):
++            rc = (int(r), int(c))
++            if rc in legend_labels:
++                continue
++            seen_real_marker = True
++            _paint_clipped(out, int(r), int(c), glyph_color, mask)
++
++    assert seen_real_marker
++    return out
++
++
++def _mask_connected(mask: np.ndarray) -> bool:
++    cells = [tuple(map(int, rc)) for rc in np.argwhere(mask)]
++    if not cells:
++        return False
++    stack = [cells[0]]
++    seen = {cells[0]}
++    while stack:
++        r, c = stack.pop()
++        for dr in (-1, 0, 1):
++            for dc in (-1, 0, 1):
++                if dr == 0 and dc == 0:
++                    continue
++                rr = r + dr
++                cc = c + dc
++                if 0 <= rr < GLYPH_SIZE and 0 <= cc < GLYPH_SIZE and bool(mask[rr, cc]) and (rr, cc) not in seen:
++                    seen.add((rr, cc))
++                    stack.append((rr, cc))
++    return len(seen) == len(cells)
++
++
++def _random_mask() -> np.ndarray:
++    while True:
++        picks = random.sample(range(GLYPH_SIZE * GLYPH_SIZE), MASK_AREA)
++        mask = np.zeros((GLYPH_SIZE, GLYPH_SIZE), dtype=bool)
++        for idx in picks:
++            mask[idx // GLYPH_SIZE, idx % GLYPH_SIZE] = True
++        if not _mask_connected(mask):
++            continue
++        if np.any(mask.sum(axis=0) == 0) or np.any(mask.sum(axis=1) == 0):
++            continue
++        return mask
++
++
++def _sample_masks() -> dict[int, np.ndarray]:
++    chosen: list[np.ndarray] = []
++    ordered_masks: list[np.ndarray] = []
++    for _marker_color in MARKER_COLORS:
++        while True:
++            mask = _random_mask()
++            if any(int(np.sum(mask != other)) < MIN_MASK_DISTANCE for other in chosen):
++                continue
++            chosen.append(mask)
++            ordered_masks.append(mask)
++            break
++    return {marker_color: ordered_masks[i] for i, marker_color in enumerate(MARKER_COLORS)}
++
++
++def _body_positions() -> list[tuple[int, int]]:
++    rows = list(random.choice(BODY_ROW_LAYOUTS))
++    cols = list(random.choice(BODY_COL_LAYOUTS))
++    positions = [(int(r), int(c)) for r in rows for c in cols]
++    random.shuffle(positions)
++    min_keep = max(len(MARKER_COLORS), int(np.ceil(0.6 * len(positions))))
++    keep = random.randint(min_keep, len(positions))
++    return positions[:keep]
++
++
++def _sample_real_markers() -> list[tuple[int, int, int]]:
++    positions = _body_positions()
++    forced_colors = list(MARKER_COLORS)
++    random.shuffle(forced_colors)
++    while len(forced_colors) < len(positions):
++        forced_colors.append(random.choice(MARKER_COLORS))
++    random.shuffle(forced_colors)
++    return [(r, c, forced_colors[i]) for i, (r, c) in enumerate(positions)]
++
++
++def _build_output(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker_color in real_markers:
++        _paint_clipped(out, int(r), int(c), MARKER_TO_GLYPH_COLOR[marker_color], marker_masks[marker_color])
++    return out
++
++
++def _build_input(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
++    g = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++
++    legend_order = list(MARKER_COLORS)
++    random.shuffle(legend_order)
++    for r0, marker_color in zip(LEGEND_ROW_STARTS, legend_order):
++        glyph_color = MARKER_TO_GLYPH_COLOR[marker_color]
++        mask = marker_masks[marker_color]
++        for dr in range(GLYPH_SIZE):
++            for dc in range(GLYPH_SIZE):
++                if bool(mask[dr, dc]):
++                    g[r0 + dr, LEGEND_COL + dc] = glyph_color
++        g[r0 + GLYPH_SIZE, LEGEND_LABEL_COL] = marker_color
++
++    for r, c, marker_color in real_markers:
++        g[r, c] = marker_color
++    return g
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_ATTEMPTS):
++        marker_masks = _sample_masks()
++        real_markers = _sample_real_markers()
++        expected = _build_output(marker_masks, real_markers)
++        inp = _build_input(marker_masks, real_markers)
++        try:
++            actual = main(inp)
++        except Exception:
++            continue
++        if np.array_equal(actual, expected):
++            return inp
++    raise RuntimeError(f"generate_input: failed after {MAX_GEN_ATTEMPTS} attempts")
+
+codex
+代码已落盘，先跑用户指定的 50 次稳定性测试；如果有失败，我会按失败模式回修而不是只做表面调整。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/10/code.py b/ceshi/code_combo/dfadab01/10/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4a022ee820676429d69fb9b97730c12f92ca361
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/10/code.py
+@@ -0,0 +1,256 @@
++# Combo variant of dfadab01 (index 10)
++# combo_spec: D4/1+D11/0
++# Name: 完整图例+全字形样本展示
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++MARKER_TO_GLYPH_COLOR: dict[int, int] = {2: 4, 3: 1, 5: 6, 8: 7}
++MARKER_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR)
++GLYPH_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR[c] for c in MARKER_COLORS)
++GRID_SIZE = 20
++GLYPH_SIZE = 4
++LEGEND_COL = 0
++LEGEND_LABEL_COL = LEGEND_COL + GLYPH_SIZE
++LEGEND_ROW_STARTS = (0, 5, 10, 15)
++BODY_ROW_LAYOUTS = (
++    (0, 4, 8, 12, 16),
++    (1, 5, 9, 13, 17),
++    (2, 6, 10, 14, 18),
++    (0, 5, 10, 15),
++    (2, 7, 12, 17),
++)
++BODY_COL_LAYOUTS = (
++    (8, 12, 16),
++    (9, 13, 17),
++    (10, 14, 18),
++    (8, 13, 18),
++)
++MASK_AREA = 8
++MIN_MASK_DISTANCE = 4
++MAX_GEN_ATTEMPTS = 400
++
++# Design analysis
++# -
++# concretization_and_trace:
++#   - 融合后输入被分成两个清晰区域：左侧是完整图例，右侧是主体 marker 网格。左侧固定出现 4 个 4x4 样本，每个样本右下角偏移
++#     (+4,+4) 放 1 个单像素标签，4 个标签颜色正好覆盖 {2,3,5,8}；右侧仍是若干真实单像素 marker。
++#   - 具体追踪一个 marker=2 的例子：原题 solver 看到红色像素后，直接调用硬编码的“黄色 frame” mask，并且只在像素左上角恰好存在
++#     那个固定 frame 时才把它识别成 legend label。融合后 solver 先在整张图里找到一个“黄色 4x4 样本 + 其右下角红色标签”，从该样本
++#     直接读出本题的 4x4 mask；随后所有其他红色真实 marker 都展开成这个刚读出的形状。差异在于 shape 来源从固定常量变成输入图例。
++# complexity_calibration:
++#   - D4/1 与 D11/0 叠加后的关键不是“可能出现多个样本”，而是“每题必须出现全部四种样本”。因此 generator 强制四种标签全出现，且
++#     主体区也强制四种真实 marker 至少各出现一次，避免任务退化成只需读单个样本或只用到少数字形。
++#   - 每个 4x4 样本限制为恰好 8 个着色格、8 邻接连通、每行每列至少有 1 个着色格，并要求任意两种样本之间至少有 4 格汉明距离，
++#     这样视觉上像“字形”而不是噪声，也减少不同样本过于相似导致的歧义。
++# implicit_assumption_review:
++#   - 原 `GLYPHS` 常量及 `for marker_color, (glyph_color, mask) in GLYPHS.items()` 依赖“字形字典跨题固定”；融合后这个前提失效，
++#     所以先改成从输入里学习 `learned_masks`，再进行扩展。
++#   - 原 `_has_source_glyph()` 依赖“知道样本的固定 mask 才能判定某个 marker 是 legend label”；融合后不能先验知道 mask，
++#     因而改成更弱但足够的判定：标签左上 4x4 patch 只允许出现该输出色和背景，并且非空。
++#   - 原代码默认输入中输出色只是可选的少量 legend 噪声；融合后四种输出色都会系统性出现于左侧 legend，因此输入颜色断言和解析顺序
++#     都必须兼容完整图例。
++# placement_legality:
++#   - 左侧 legend 占用列 0..4，其中样本画在列 0..3、标签落在列 4；主体 marker 的 top-left 只放在列 8 及以后，所以主体 glyph 展开
++#     到 4x4 后也不会碰到 legend。
++#   - 主体候选位置的行列间距都至少为 4，因此输出里的 4x4 glyph 彼此不会重叠；最后一行/列允许取 17 或 18，保留原题“靠边裁剪”的现象。
++# visual_observability_and_tidy_layout:
++#   - 解题者能直接看到“左边是四条样本-标签对照表，右边是待解码 marker 网格”，输入分区明确，输出中左侧整块消失，只剩右侧扩张后的图案，
++#     变化非常可见。
++#   - legend 顺序被打乱，样本形状也按题随机，因此不能凭固定行序或旧题字典作答，必须真正读取完整图例。
++# color_inference_and_rule_inferability:
++#   - 颜色映射仍沿用原题固定关系 2->4, 3->1, 5->6, 8->7；新的自由度只落在 4x4 形状。这样人类只需推断“标签色对应哪个样本形状”，
++#     而不必同时猜颜色重映射和形状重映射，保证 2-4 个样例内可归纳。
++# new_solver_assumptions_and_generator_guards:
++#   - `main()` 现在假设每种 marker 色都恰有一个合法 legend label，且它左上 4x4 区域非空、只含对应 glyph 色与背景。
++#   - `main()` 还假设真实 marker 不会落在 legend 区，输入中的 glyph 色不会出现在主体区；generator 通过固定分区、唯一标签偏移和 oracle
++#     校验来保证这些前提成立。
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(GLYPH_SIZE):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(GLYPH_SIZE):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _read_legend_mask(g: np.ndarray, r: int, c: int, glyph_color: int) -> np.ndarray | None:
++    if r < GLYPH_SIZE or c < GLYPH_SIZE:
++        return None
++    patch = g[r - GLYPH_SIZE : r, c - GLYPH_SIZE : c]
++    nonzero = patch[patch != 0]
++    if nonzero.size == 0 or not np.all(nonzero == glyph_color):
++        return None
++    return patch == glyph_color
++
++
++def _find_legend_masks(g: np.ndarray) -> tuple[dict[int, np.ndarray], set[tuple[int, int]]]:
++    learned_masks: dict[int, np.ndarray] = {}
++    legend_labels: set[tuple[int, int]] = set()
++    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
++        for r, c in np.argwhere(g == marker_color):
++            mask = _read_legend_mask(g, int(r), int(c), glyph_color)
++            if mask is None:
++                continue
++            assert marker_color not in learned_masks, f"duplicate legend for marker {marker_color}"
++            learned_masks[marker_color] = mask
++            legend_labels.add((int(r), int(c)))
++        assert marker_color in learned_masks, f"missing legend for marker {marker_color}"
++    return learned_masks, legend_labels
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Read the full per-input legend, then expand each real marker into its learned 4x4 glyph.
++
++    Input structure:
++    - The left side contains a complete legend: all four glyph types appear as 4x4 samples in colors 4, 1, 6, and 7.
++    - Each legend sample has a matching marker-color label pixel placed one cell below-right of the sample box.
++    - The rest of the grid contains the actual single-pixel markers in colors 2, 3, 5, and 8.
++
++    Rule:
++    - For each marker color, locate its legend label and read the 4x4 sample immediately above-left of that label.
++    - Use that learned 4x4 mask to replace every non-legend marker of the same color, painting with the sample's fixed glyph color.
++    - Keep each expansion anchored at the marker's top-left cell, clipping any part that would leave the grid.
++    - Remove the full legend region and all label pixels from the output.
++
++    Key insight:
++    - The 4x4 alphabet is no longer fixed across puzzles; the only reliable dictionary is the complete legend embedded in the input itself.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    learned_masks, legend_labels = _find_legend_masks(g)
++
++    out = np.zeros_like(g)
++    seen_real_marker = False
++    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
++        mask = learned_masks[marker_color]
++        for r, c in np.argwhere(g == marker_color):
++            rc = (int(r), int(c))
++            if rc in legend_labels:
++                continue
++            seen_real_marker = True
++            _paint_clipped(out, int(r), int(c), glyph_color, mask)
++
++    assert seen_real_marker
++    return out
++
++
++def _mask_connected(mask: np.ndarray) -> bool:
++    cells = [tuple(map(int, rc)) for rc in np.argwhere(mask)]
++    if not cells:
++        return False
++    stack = [cells[0]]
++    seen = {cells[0]}
++    while stack:
++        r, c = stack.pop()
++        for dr in (-1, 0, 1):
++            for dc in (-1, 0, 1):
++                if dr == 0 and dc == 0:
++                    continue
++                rr = r + dr
++                cc = c + dc
++                if 0 <= rr < GLYPH_SIZE and 0 <= cc < GLYPH_SIZE and bool(mask[rr, cc]) and (rr, cc) not in seen:
++                    seen.add((rr, cc))
++                    stack.append((rr, cc))
++    return len(seen) == len(cells)
++
++
++def _random_mask() -> np.ndarray:
++    while True:
++        picks = random.sample(range(GLYPH_SIZE * GLYPH_SIZE), MASK_AREA)
++        mask = np.zeros((GLYPH_SIZE, GLYPH_SIZE), dtype=bool)
++        for idx in picks:
++            mask[idx // GLYPH_SIZE, idx % GLYPH_SIZE] = True
++        if not _mask_connected(mask):
++            continue
++        if np.any(mask.sum(axis=0) == 0) or np.any(mask.sum(axis=1) == 0):
++            continue
++        return mask
++
++
++def _sample_masks() -> dict[int, np.ndarray]:
++    chosen: list[np.ndarray] = []
++    ordered_masks: list[np.ndarray] = []
++    for _marker_color in MARKER_COLORS:
++        while True:
++            mask = _random_mask()
++            if any(int(np.sum(mask != other)) < MIN_MASK_DISTANCE for other in chosen):
++                continue
++            chosen.append(mask)
++            ordered_masks.append(mask)
++            break
++    return {marker_color: ordered_masks[i] for i, marker_color in enumerate(MARKER_COLORS)}
++
++
++def _body_positions() -> list[tuple[int, int]]:
++    rows = list(random.choice(BODY_ROW_LAYOUTS))
++    cols = list(random.choice(BODY_COL_LAYOUTS))
++    positions = [(int(r), int(c)) for r in rows for c in cols]
++    random.shuffle(positions)
++    min_keep = max(len(MARKER_COLORS), int(np.ceil(0.6 * len(positions))))
++    keep = random.randint(min_keep, len(positions))
++    return positions[:keep]
++
++
++def _sample_real_markers() -> list[tuple[int, int, int]]:
++    positions = _body_positions()
++    forced_colors = list(MARKER_COLORS)
++    random.shuffle(forced_colors)
++    while len(forced_colors) < len(positions):
++        forced_colors.append(random.choice(MARKER_COLORS))
++    random.shuffle(forced_colors)
++    return [(r, c, forced_colors[i]) for i, (r, c) in enumerate(positions)]
++
++
++def _build_output(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker_color in real_markers:
++        _paint_clipped(out, int(r), int(c), MARKER_TO_GLYPH_COLOR[marker_color], marker_masks[marker_color])
++    return out
++
++
++def _build_input(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
++    g = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++
++    legend_order = list(MARKER_COLORS)
++    random.shuffle(legend_order)
++    for r0, marker_color in zip(LEGEND_ROW_STARTS, legend_order):
++        glyph_color = MARKER_TO_GLYPH_COLOR[marker_color]
++        mask = marker_masks[marker_color]
++        for dr in range(GLYPH_SIZE):
++            for dc in range(GLYPH_SIZE):
++                if bool(mask[dr, dc]):
++                    g[r0 + dr, LEGEND_COL + dc] = glyph_color
++        g[r0 + GLYPH_SIZE, LEGEND_LABEL_COL] = marker_color
++
++    for r, c, marker_color in real_markers:
++        g[r, c] = marker_color
++    return g
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_ATTEMPTS):
++        marker_masks = _sample_masks()
++        real_markers = _sample_real_markers()
++        expected = _build_output(marker_masks, real_markers)
++        inp = _build_input(marker_masks, real_markers)
++        try:
++            actual = main(inp)
++        except Exception:
++            continue
++        if np.array_equal(actual, expected):
++            return inp
++    raise RuntimeError(f"generate_input: failed after {MAX_GEN_ATTEMPTS} attempts")
+
+ succeeded in 268ms:
+Success: 50/50, Time: 0.1s (2ms/call)
+
+codex
+稳定性已经过线。现在补做“是否真的发生融合”的定量检查，重点看两件事：每题是否真有完整四类图例，以及这些随机图例是否让新输出显著偏离原题固定字典输出。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util
+import numpy as np
+from collections import Counter
+
+new_path = '/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py'
+old_path = '/home/lixinyu/snap/new/arc2_solver_select/dfadab01.py'
+
+spec = importlib.util.spec_from_file_location('new_mod', new_path)
+new_mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(new_mod)
+
+spec = importlib.util.spec_from_file_location('old_mod', old_path)
+old_mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(old_mod)
+
+legend_counts = []
+real_color_counts = []
+mask_diff_counts = []
+out_diff_pixels = []
+for _ in range(200):
+    inp = new_mod.generate_input()
+    new_out = new_mod.main(inp)
+    old_out = old_mod.main(inp)
+
+    legend_count = 0
+    learned_diff = 0
+    for marker_color, glyph_color in new_mod.MARKER_TO_GLYPH_COLOR.items():
+        coords = np.argwhere(inp == marker_color)
+        found = 0
+        for r, c in coords:
+            mask = new_mod._read_legend_mask(inp, int(r), int(c), glyph_color)
+            if mask is not None:
+                found += 1
+                if not np.array_equal(mask, old_mod.GLYPHS[marker_color][1]):
+                    learned_diff += 1
+        legend_count += found
+    legend_counts.append(legend_count)
+
+    real_colors = set()
+    legend_labels = new_mod._find_legend_masks(inp)[1]
+    for marker_color in new_mod.MARKER_COLORS:
+        for r, c in np.argwhere(inp == marker_color):
+            if (int(r), int(c)) not in legend_labels:
+                real_colors.add(marker_color)
+    real_color_counts.append(len(real_colors))
+    mask_diff_counts.append(learned_diff)
+    out_diff_pixels.append(int(np.sum(new_out "'!= old_out)))
+
+print('"'legend_count_distribution', dict(sorted(Counter(legend_counts).items())))
+print('real_color_count_distribution', dict(sorted(Counter(real_color_counts).items())))
+print('mask_diff_count_distribution', dict(sorted(Counter(mask_diff_counts).items())))
+print('output_diff_pixels_min_mean_max', min(out_diff_pixels), round(sum(out_diff_pixels)/len(out_diff_pixels), 2), max(out_diff_pixels))
+print('same_as_original_outputs', sum(v == 0 for v in out_diff_pixels))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/dfadab01/10/code.py b/ceshi/code_combo/dfadab01/10/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4a022ee820676429d69fb9b97730c12f92ca361
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/10/code.py
+@@ -0,0 +1,256 @@
++# Combo variant of dfadab01 (index 10)
++# combo_spec: D4/1+D11/0
++# Name: 完整图例+全字形样本展示
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++MARKER_TO_GLYPH_COLOR: dict[int, int] = {2: 4, 3: 1, 5: 6, 8: 7}
++MARKER_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR)
++GLYPH_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR[c] for c in MARKER_COLORS)
++GRID_SIZE = 20
++GLYPH_SIZE = 4
++LEGEND_COL = 0
++LEGEND_LABEL_COL = LEGEND_COL + GLYPH_SIZE
++LEGEND_ROW_STARTS = (0, 5, 10, 15)
++BODY_ROW_LAYOUTS = (
++    (0, 4, 8, 12, 16),
++    (1, 5, 9, 13, 17),
++    (2, 6, 10, 14, 18),
++    (0, 5, 10, 15),
++    (2, 7, 12, 17),
++)
++BODY_COL_LAYOUTS = (
++    (8, 12, 16),
++    (9, 13, 17),
++    (10, 14, 18),
++    (8, 13, 18),
++)
++MASK_AREA = 8
++MIN_MASK_DISTANCE = 4
++MAX_GEN_ATTEMPTS = 400
++
++# Design analysis
++# -
++# concretization_and_trace:
++#   - 融合后输入被分成两个清晰区域：左侧是完整图例，右侧是主体 marker 网格。左侧固定出现 4 个 4x4 样本，每个样本右下角偏移
++#     (+4,+4) 放 1 个单像素标签，4 个标签颜色正好覆盖 {2,3,5,8}；右侧仍是若干真实单像素 marker。
++#   - 具体追踪一个 marker=2 的例子：原题 solver 看到红色像素后，直接调用硬编码的“黄色 frame” mask，并且只在像素左上角恰好存在
++#     那个固定 frame 时才把它识别成 legend label。融合后 solver 先在整张图里找到一个“黄色 4x4 样本 + 其右下角红色标签”，从该样本
++#     直接读出本题的 4x4 mask；随后所有其他红色真实 marker 都展开成这个刚读出的形状。差异在于 shape 来源从固定常量变成输入图例。
++# complexity_calibration:
++#   - D4/1 与 D11/0 叠加后的关键不是“可能出现多个样本”，而是“每题必须出现全部四种样本”。因此 generator 强制四种标签全出现，且
++#     主体区也强制四种真实 marker 至少各出现一次，避免任务退化成只需读单个样本或只用到少数字形。
++#   - 每个 4x4 样本限制为恰好 8 个着色格、8 邻接连通、每行每列至少有 1 个着色格，并要求任意两种样本之间至少有 4 格汉明距离，
++#     这样视觉上像“字形”而不是噪声，也减少不同样本过于相似导致的歧义。
++# implicit_assumption_review:
++#   - 原 `GLYPHS` 常量及 `for marker_color, (glyph_color, mask) in GLYPHS.items()` 依赖“字形字典跨题固定”；融合后这个前提失效，
++#     所以先改成从输入里学习 `learned_masks`，再进行扩展。
++#   - 原 `_has_source_glyph()` 依赖“知道样本的固定 mask 才能判定某个 marker 是 legend label”；融合后不能先验知道 mask，
++#     因而改成更弱但足够的判定：标签左上 4x4 patch 只允许出现该输出色和背景，并且非空。
++#   - 原代码默认输入中输出色只是可选的少量 legend 噪声；融合后四种输出色都会系统性出现于左侧 legend，因此输入颜色断言和解析顺序
++#     都必须兼容完整图例。
++# placement_legality:
++#   - 左侧 legend 占用列 0..4，其中样本画在列 0..3、标签落在列 4；主体 marker 的 top-left 只放在列 8 及以后，所以主体 glyph 展开
++#     到 4x4 后也不会碰到 legend。
++#   - 主体候选位置的行列间距都至少为 4，因此输出里的 4x4 glyph 彼此不会重叠；最后一行/列允许取 17 或 18，保留原题“靠边裁剪”的现象。
++# visual_observability_and_tidy_layout:
++#   - 解题者能直接看到“左边是四条样本-标签对照表，右边是待解码 marker 网格”，输入分区明确，输出中左侧整块消失，只剩右侧扩张后的图案，
++#     变化非常可见。
++#   - legend 顺序被打乱，样本形状也按题随机，因此不能凭固定行序或旧题字典作答，必须真正读取完整图例。
++# color_inference_and_rule_inferability:
++#   - 颜色映射仍沿用原题固定关系 2->4, 3->1, 5->6, 8->7；新的自由度只落在 4x4 形状。这样人类只需推断“标签色对应哪个样本形状”，
++#     而不必同时猜颜色重映射和形状重映射，保证 2-4 个样例内可归纳。
++# new_solver_assumptions_and_generator_guards:
++#   - `main()` 现在假设每种 marker 色都恰有一个合法 legend label，且它左上 4x4 区域非空、只含对应 glyph 色与背景。
++#   - `main()` 还假设真实 marker 不会落在 legend 区，输入中的 glyph 色不会出现在主体区；generator 通过固定分区、唯一标签偏移和 oracle
++#     校验来保证这些前提成立。
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(GLYPH_SIZE):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(GLYPH_SIZE):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _read_legend_mask(g: np.ndarray, r: int, c: int, glyph_color: int) -> np.ndarray | None:
++    if r < GLYPH_SIZE or c < GLYPH_SIZE:
++        return None
++    patch = g[r - GLYPH_SIZE : r, c - GLYPH_SIZE : c]
++    nonzero = patch[patch != 0]
++    if nonzero.size == 0 or not np.all(nonzero == glyph_color):
++        return None
++    return patch == glyph_color
++
++
++def _find_legend_masks(g: np.ndarray) -> tuple[dict[int, np.ndarray], set[tuple[int, int]]]:
++    learned_masks: dict[int, np.ndarray] = {}
++    legend_labels: set[tuple[int, int]] = set()
++    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
++        for r, c in np.argwhere(g == marker_color):
++            mask = _read_legend_mask(g, int(r), int(c), glyph_color)
++            if mask is None:
++                continue
++            assert marker_color not in learned_masks, f"duplicate legend for marker {marker_color}"
++            learned_masks[marker_color] = mask
++            legend_labels.add((int(r), int(c)))
++        assert marker_color in learned_masks, f"missing legend for marker {marker_color}"
++    return learned_masks, legend_labels
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Read the full per-input legend, then expand each real marker into its learned 4x4 glyph.
++
++    Input structure:
++    - The left side contains a complete legend: all four glyph types appear as 4x4 samples in colors 4, 1, 6, and 7.
++    - Each legend sample has a matching marker-color label pixel placed one cell below-right of the sample box.
++    - The rest of the grid contains the actual single-pixel markers in colors 2, 3, 5, and 8.
++
++    Rule:
++    - For each marker color, locate its legend label and read the 4x4 sample immediately above-left of that label.
++    - Use that learned 4x4 mask to replace every non-legend marker of the same color, painting with the sample's fixed glyph color.
++    - Keep each expansion anchored at the marker's top-left cell, clipping any part that would leave the grid.
++    - Remove the full legend region and all label pixels from the output.
++
++    Key insight:
++    - The 4x4 alphabet is no longer fixed across puzzles; the only reliable dictionary is the complete legend embedded in the input itself.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    learned_masks, legend_labels = _find_legend_masks(g)
++
++    out = np.zeros_like(g)
++    seen_real_marker = False
++    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
++        mask = learned_masks[marker_color]
++        for r, c in np.argwhere(g == marker_color):
++            rc = (int(r), int(c))
++            if rc in legend_labels:
++                continue
++            seen_real_marker = True
++            _paint_clipped(out, int(r), int(c), glyph_color, mask)
++
++    assert seen_real_marker
++    return out
++
++
++def _mask_connected(mask: np.ndarray) -> bool:
++    cells = [tuple(map(int, rc)) for rc in np.argwhere(mask)]
++    if not cells:
++        return False
++    stack = [cells[0]]
++    seen = {cells[0]}
++    while stack:
++        r, c = stack.pop()
++        for dr in (-1, 0, 1):
++            for dc in (-1, 0, 1):
++                if dr == 0 and dc == 0:
++                    continue
++                rr = r + dr
++                cc = c + dc
++                if 0 <= rr < GLYPH_SIZE and 0 <= cc < GLYPH_SIZE and bool(mask[rr, cc]) and (rr, cc) not in seen:
++                    seen.add((rr, cc))
++                    stack.append((rr, cc))
++    return len(seen) == len(cells)
++
++
++def _random_mask() -> np.ndarray:
++    while True:
++        picks = random.sample(range(GLYPH_SIZE * GLYPH_SIZE), MASK_AREA)
++        mask = np.zeros((GLYPH_SIZE, GLYPH_SIZE), dtype=bool)
++        for idx in picks:
++            mask[idx // GLYPH_SIZE, idx % GLYPH_SIZE] = True
++        if not _mask_connected(mask):
++            continue
++        if np.any(mask.sum(axis=0) == 0) or np.any(mask.sum(axis=1) == 0):
++            continue
++        return mask
++
++
++def _sample_masks() -> dict[int, np.ndarray]:
++    chosen: list[np.ndarray] = []
++    ordered_masks: list[np.ndarray] = []
++    for _marker_color in MARKER_COLORS:
++        while True:
++            mask = _random_mask()
++            if any(int(np.sum(mask != other)) < MIN_MASK_DISTANCE for other in chosen):
++                continue
++            chosen.append(mask)
++            ordered_masks.append(mask)
++            break
++    return {marker_color: ordered_masks[i] for i, marker_color in enumerate(MARKER_COLORS)}
++
++
++def _body_positions() -> list[tuple[int, int]]:
++    rows = list(random.choice(BODY_ROW_LAYOUTS))
++    cols = list(random.choice(BODY_COL_LAYOUTS))
++    positions = [(int(r), int(c)) for r in rows for c in cols]
++    random.shuffle(positions)
++    min_keep = max(len(MARKER_COLORS), int(np.ceil(0.6 * len(positions))))
++    keep = random.randint(min_keep, len(positions))
++    return positions[:keep]
++
++
++def _sample_real_markers() -> list[tuple[int, int, int]]:
++    positions = _body_positions()
++    forced_colors = list(MARKER_COLORS)
++    random.shuffle(forced_colors)
++    while len(forced_colors) < len(positions):
++        forced_colors.append(random.choice(MARKER_COLORS))
++    random.shuffle(forced_colors)
++    return [(r, c, forced_colors[i]) for i, (r, c) in enumerate(positions)]
++
++
++def _build_output(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker_color in real_markers:
++        _paint_clipped(out, int(r), int(c), MARKER_TO_GLYPH_COLOR[marker_color], marker_masks[marker_color])
++    return out
++
++
++def _build_input(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
++    g = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++
++    legend_order = list(MARKER_COLORS)
++    random.shuffle(legend_order)
++    for r0, marker_color in zip(LEGEND_ROW_STARTS, legend_order):
++        glyph_color = MARKER_TO_GLYPH_COLOR[marker_color]
++        mask = marker_masks[marker_color]
++        for dr in range(GLYPH_SIZE):
++            for dc in range(GLYPH_SIZE):
++                if bool(mask[dr, dc]):
++                    g[r0 + dr, LEGEND_COL + dc] = glyph_color
++        g[r0 + GLYPH_SIZE, LEGEND_LABEL_COL] = marker_color
++
++    for r, c, marker_color in real_markers:
++        g[r, c] = marker_color
++    return g
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_ATTEMPTS):
++        marker_masks = _sample_masks()
++        real_markers = _sample_real_markers()
++        expected = _build_output(marker_masks, real_markers)
++        inp = _build_input(marker_masks, real_markers)
++        try:
++            actual = main(inp)
++        except Exception:
++            continue
++        if np.array_equal(actual, expected):
++            return inp
++    raise RuntimeError(f"generate_input: failed after {MAX_GEN_ATTEMPTS} attempts")
+
+ succeeded in 636ms:
+legend_count_distribution {4: 200}
+real_color_count_distribution {4: 200}
+mask_diff_count_distribution {3: 1, 4: 199}
+output_diff_pixels_min_mean_max 66 107.2 177
+same_as_original_outputs 0
+
+codex
+融合行为指标已经出来了：200 个样本里每题都有 4 个 legend、4 种真实 marker，而且新输出与原题固定字典输出从未相同。最后再快速复核一下落盘文件的关键位置与行号。
+exec
+/bin/bash -lc 'wc -l /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+256 /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py
+
+exec
+/bin/bash -lc "nl -ba /home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py | sed -n '1,260p'" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+     1	# Combo variant of dfadab01 (index 10)
+     2	# combo_spec: D4/1+D11/0
+     3	# Name: 完整图例+全字形样本展示
+     4	
+     5	from __future__ import annotations
+     6	
+     7	import random
+     8	
+     9	import numpy as np
+    10	
+    11	
+    12	MARKER_TO_GLYPH_COLOR: dict[int, int] = {2: 4, 3: 1, 5: 6, 8: 7}
+    13	MARKER_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR)
+    14	GLYPH_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR[c] for c in MARKER_COLORS)
+    15	GRID_SIZE = 20
+    16	GLYPH_SIZE = 4
+    17	LEGEND_COL = 0
+    18	LEGEND_LABEL_COL = LEGEND_COL + GLYPH_SIZE
+    19	LEGEND_ROW_STARTS = (0, 5, 10, 15)
+    20	BODY_ROW_LAYOUTS = (
+    21	    (0, 4, 8, 12, 16),
+    22	    (1, 5, 9, 13, 17),
+    23	    (2, 6, 10, 14, 18),
+    24	    (0, 5, 10, 15),
+    25	    (2, 7, 12, 17),
+    26	)
+    27	BODY_COL_LAYOUTS = (
+    28	    (8, 12, 16),
+    29	    (9, 13, 17),
+    30	    (10, 14, 18),
+    31	    (8, 13, 18),
+    32	)
+    33	MASK_AREA = 8
+    34	MIN_MASK_DISTANCE = 4
+    35	MAX_GEN_ATTEMPTS = 400
+    36	
+    37	# Design analysis
+    38	# -
+    39	# concretization_and_trace:
+    40	#   - 融合后输入被分成两个清晰区域：左侧是完整图例，右侧是主体 marker 网格。左侧固定出现 4 个 4x4 样本，每个样本右下角偏移
+    41	#     (+4,+4) 放 1 个单像素标签，4 个标签颜色正好覆盖 {2,3,5,8}；右侧仍是若干真实单像素 marker。
+    42	#   - 具体追踪一个 marker=2 的例子：原题 solver 看到红色像素后，直接调用硬编码的“黄色 frame” mask，并且只在像素左上角恰好存在
+    43	#     那个固定 frame 时才把它识别成 legend label。融合后 solver 先在整张图里找到一个“黄色 4x4 样本 + 其右下角红色标签”，从该样本
+    44	#     直接读出本题的 4x4 mask；随后所有其他红色真实 marker 都展开成这个刚读出的形状。差异在于 shape 来源从固定常量变成输入图例。
+    45	# complexity_calibration:
+    46	#   - D4/1 与 D11/0 叠加后的关键不是“可能出现多个样本”，而是“每题必须出现全部四种样本”。因此 generator 强制四种标签全出现，且
+    47	#     主体区也强制四种真实 marker 至少各出现一次，避免任务退化成只需读单个样本或只用到少数字形。
+    48	#   - 每个 4x4 样本限制为恰好 8 个着色格、8 邻接连通、每行每列至少有 1 个着色格，并要求任意两种样本之间至少有 4 格汉明距离，
+    49	#     这样视觉上像“字形”而不是噪声，也减少不同样本过于相似导致的歧义。
+    50	# implicit_assumption_review:
+    51	#   - 原 `GLYPHS` 常量及 `for marker_color, (glyph_color, mask) in GLYPHS.items()` 依赖“字形字典跨题固定”；融合后这个前提失效，
+    52	#     所以先改成从输入里学习 `learned_masks`，再进行扩展。
+    53	#   - 原 `_has_source_glyph()` 依赖“知道样本的固定 mask 才能判定某个 marker 是 legend label”；融合后不能先验知道 mask，
+    54	#     因而改成更弱但足够的判定：标签左上 4x4 patch 只允许出现该输出色和背景，并且非空。
+    55	#   - 原代码默认输入中输出色只是可选的少量 legend 噪声；融合后四种输出色都会系统性出现于左侧 legend，因此输入颜色断言和解析顺序
+    56	#     都必须兼容完整图例。
+    57	# placement_legality:
+    58	#   - 左侧 legend 占用列 0..4，其中样本画在列 0..3、标签落在列 4；主体 marker 的 top-left 只放在列 8 及以后，所以主体 glyph 展开
+    59	#     到 4x4 后也不会碰到 legend。
+    60	#   - 主体候选位置的行列间距都至少为 4，因此输出里的 4x4 glyph 彼此不会重叠；最后一行/列允许取 17 或 18，保留原题“靠边裁剪”的现象。
+    61	# visual_observability_and_tidy_layout:
+    62	#   - 解题者能直接看到“左边是四条样本-标签对照表，右边是待解码 marker 网格”，输入分区明确，输出中左侧整块消失，只剩右侧扩张后的图案，
+    63	#     变化非常可见。
+    64	#   - legend 顺序被打乱，样本形状也按题随机，因此不能凭固定行序或旧题字典作答，必须真正读取完整图例。
+    65	# color_inference_and_rule_inferability:
+    66	#   - 颜色映射仍沿用原题固定关系 2->4, 3->1, 5->6, 8->7；新的自由度只落在 4x4 形状。这样人类只需推断“标签色对应哪个样本形状”，
+    67	#     而不必同时猜颜色重映射和形状重映射，保证 2-4 个样例内可归纳。
+    68	# new_solver_assumptions_and_generator_guards:
+    69	#   - `main()` 现在假设每种 marker 色都恰有一个合法 legend label，且它左上 4x4 区域非空、只含对应 glyph 色与背景。
+    70	#   - `main()` 还假设真实 marker 不会落在 legend 区，输入中的 glyph 色不会出现在主体区；generator 通过固定分区、唯一标签偏移和 oracle
+    71	#     校验来保证这些前提成立。
+    72	
+    73	
+    74	def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
+    75	    h, w = out.shape
+    76	    for dr in range(GLYPH_SIZE):
+    77	        rr = r0 + dr
+    78	        if rr < 0 or rr >= h:
+    79	            continue
+    80	        for dc in range(GLYPH_SIZE):
+    81	            cc = c0 + dc
+    82	            if 0 <= cc < w and bool(mask[dr, dc]):
+    83	                out[rr, cc] = color
+    84	
+    85	
+    86	def _read_legend_mask(g: np.ndarray, r: int, c: int, glyph_color: int) -> np.ndarray | None:
+    87	    if r < GLYPH_SIZE or c < GLYPH_SIZE:
+    88	        return None
+    89	    patch = g[r - GLYPH_SIZE : r, c - GLYPH_SIZE : c]
+    90	    nonzero = patch[patch != 0]
+    91	    if nonzero.size == 0 or not np.all(nonzero == glyph_color):
+    92	        return None
+    93	    return patch == glyph_color
+    94	
+    95	
+    96	def _find_legend_masks(g: np.ndarray) -> tuple[dict[int, np.ndarray], set[tuple[int, int]]]:
+    97	    learned_masks: dict[int, np.ndarray] = {}
+    98	    legend_labels: set[tuple[int, int]] = set()
+    99	    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
+   100	        for r, c in np.argwhere(g == marker_color):
+   101	            mask = _read_legend_mask(g, int(r), int(c), glyph_color)
+   102	            if mask is None:
+   103	                continue
+   104	            assert marker_color not in learned_masks, f"duplicate legend for marker {marker_color}"
+   105	            learned_masks[marker_color] = mask
+   106	            legend_labels.add((int(r), int(c)))
+   107	        assert marker_color in learned_masks, f"missing legend for marker {marker_color}"
+   108	    return learned_masks, legend_labels
+   109	
+   110	
+   111	def main(grid: np.ndarray) -> np.ndarray:
+   112	    """
+   113	    Read the full per-input legend, then expand each real marker into its learned 4x4 glyph.
+   114	
+   115	    Input structure:
+   116	    - The left side contains a complete legend: all four glyph types appear as 4x4 samples in colors 4, 1, 6, and 7.
+   117	    - Each legend sample has a matching marker-color label pixel placed one cell below-right of the sample box.
+   118	    - The rest of the grid contains the actual single-pixel markers in colors 2, 3, 5, and 8.
+   119	
+   120	    Rule:
+   121	    - For each marker color, locate its legend label and read the 4x4 sample immediately above-left of that label.
+   122	    - Use that learned 4x4 mask to replace every non-legend marker of the same color, painting with the sample's fixed glyph color.
+   123	    - Keep each expansion anchored at the marker's top-left cell, clipping any part that would leave the grid.
+   124	    - Remove the full legend region and all label pixels from the output.
+   125	
+   126	    Key insight:
+   127	    - The 4x4 alphabet is no longer fixed across puzzles; the only reliable dictionary is the complete legend embedded in the input itself.
+   128	    """
+   129	    g = np.asarray(grid, dtype=int)
+   130	    assert g.ndim == 2
+   131	    assert g.shape == (GRID_SIZE, GRID_SIZE)
+   132	    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
+   133	
+   134	    learned_masks, legend_labels = _find_legend_masks(g)
+   135	
+   136	    out = np.zeros_like(g)
+   137	    seen_real_marker = False
+   138	    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
+   139	        mask = learned_masks[marker_color]
+   140	        for r, c in np.argwhere(g == marker_color):
+   141	            rc = (int(r), int(c))
+   142	            if rc in legend_labels:
+   143	                continue
+   144	            seen_real_marker = True
+   145	            _paint_clipped(out, int(r), int(c), glyph_color, mask)
+   146	
+   147	    assert seen_real_marker
+   148	    return out
+   149	
+   150	
+   151	def _mask_connected(mask: np.ndarray) -> bool:
+   152	    cells = [tuple(map(int, rc)) for rc in np.argwhere(mask)]
+   153	    if not cells:
+   154	        return False
+   155	    stack = [cells[0]]
+   156	    seen = {cells[0]}
+   157	    while stack:
+   158	        r, c = stack.pop()
+   159	        for dr in (-1, 0, 1):
+   160	            for dc in (-1, 0, 1):
+   161	                if dr == 0 and dc == 0:
+   162	                    continue
+   163	                rr = r + dr
+   164	                cc = c + dc
+   165	                if 0 <= rr < GLYPH_SIZE and 0 <= cc < GLYPH_SIZE and bool(mask[rr, cc]) and (rr, cc) not in seen:
+   166	                    seen.add((rr, cc))
+   167	                    stack.append((rr, cc))
+   168	    return len(seen) == len(cells)
+   169	
+   170	
+   171	def _random_mask() -> np.ndarray:
+   172	    while True:
+   173	        picks = random.sample(range(GLYPH_SIZE * GLYPH_SIZE), MASK_AREA)
+   174	        mask = np.zeros((GLYPH_SIZE, GLYPH_SIZE), dtype=bool)
+   175	        for idx in picks:
+   176	            mask[idx // GLYPH_SIZE, idx % GLYPH_SIZE] = True
+   177	        if not _mask_connected(mask):
+   178	            continue
+   179	        if np.any(mask.sum(axis=0) == 0) or np.any(mask.sum(axis=1) == 0):
+   180	            continue
+   181	        return mask
+   182	
+   183	
+   184	def _sample_masks() -> dict[int, np.ndarray]:
+   185	    chosen: list[np.ndarray] = []
+   186	    ordered_masks: list[np.ndarray] = []
+   187	    for _marker_color in MARKER_COLORS:
+   188	        while True:
+   189	            mask = _random_mask()
+   190	            if any(int(np.sum(mask != other)) < MIN_MASK_DISTANCE for other in chosen):
+   191	                continue
+   192	            chosen.append(mask)
+   193	            ordered_masks.append(mask)
+   194	            break
+   195	    return {marker_color: ordered_masks[i] for i, marker_color in enumerate(MARKER_COLORS)}
+   196	
+   197	
+   198	def _body_positions() -> list[tuple[int, int]]:
+   199	    rows = list(random.choice(BODY_ROW_LAYOUTS))
+   200	    cols = list(random.choice(BODY_COL_LAYOUTS))
+   201	    positions = [(int(r), int(c)) for r in rows for c in cols]
+   202	    random.shuffle(positions)
+   203	    min_keep = max(len(MARKER_COLORS), int(np.ceil(0.6 * len(positions))))
+   204	    keep = random.randint(min_keep, len(positions))
+   205	    return positions[:keep]
+   206	
+   207	
+   208	def _sample_real_markers() -> list[tuple[int, int, int]]:
+   209	    positions = _body_positions()
+   210	    forced_colors = list(MARKER_COLORS)
+   211	    random.shuffle(forced_colors)
+   212	    while len(forced_colors) < len(positions):
+   213	        forced_colors.append(random.choice(MARKER_COLORS))
+   214	    random.shuffle(forced_colors)
+   215	    return [(r, c, forced_colors[i]) for i, (r, c) in enumerate(positions)]
+   216	
+   217	
+   218	def _build_output(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
+   219	    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
+   220	    for r, c, marker_color in real_markers:
+   221	        _paint_clipped(out, int(r), int(c), MARKER_TO_GLYPH_COLOR[marker_color], marker_masks[marker_color])
+   222	    return out
+   223	
+   224	
+   225	def _build_input(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
+   226	    g = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
+   227	
+   228	    legend_order = list(MARKER_COLORS)
+   229	    random.shuffle(legend_order)
+   230	    for r0, marker_color in zip(LEGEND_ROW_STARTS, legend_order):
+   231	        glyph_color = MARKER_TO_GLYPH_COLOR[marker_color]
+   232	        mask = marker_masks[marker_color]
+   233	        for dr in range(GLYPH_SIZE):
+   234	            for dc in range(GLYPH_SIZE):
+   235	                if bool(mask[dr, dc]):
+   236	                    g[r0 + dr, LEGEND_COL + dc] = glyph_color
+   237	        g[r0 + GLYPH_SIZE, LEGEND_LABEL_COL] = marker_color
+   238	
+   239	    for r, c, marker_color in real_markers:
+   240	        g[r, c] = marker_color
+   241	    return g
+   242	
+   243	
+   244	def generate_input() -> np.ndarray:
+   245	    for _ in range(MAX_GEN_ATTEMPTS):
+   246	        marker_masks = _sample_masks()
+   247	        real_markers = _sample_real_markers()
+   248	        expected = _build_output(marker_masks, real_markers)
+   249	        inp = _build_input(marker_masks, real_markers)
+   250	        try:
+   251	            actual = main(inp)
+   252	        except Exception:
+   253	            continue
+   254	        if np.array_equal(actual, expected):
+   255	            return inp
+   256	    raise RuntimeError(f"generate_input: failed after {MAX_GEN_ATTEMPTS} attempts")
+
+diff --git a/ceshi/code_combo/dfadab01/10/code.py b/ceshi/code_combo/dfadab01/10/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4a022ee820676429d69fb9b97730c12f92ca361
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/10/code.py
+@@ -0,0 +1,256 @@
++# Combo variant of dfadab01 (index 10)
++# combo_spec: D4/1+D11/0
++# Name: 完整图例+全字形样本展示
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++MARKER_TO_GLYPH_COLOR: dict[int, int] = {2: 4, 3: 1, 5: 6, 8: 7}
++MARKER_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR)
++GLYPH_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR[c] for c in MARKER_COLORS)
++GRID_SIZE = 20
++GLYPH_SIZE = 4
++LEGEND_COL = 0
++LEGEND_LABEL_COL = LEGEND_COL + GLYPH_SIZE
++LEGEND_ROW_STARTS = (0, 5, 10, 15)
++BODY_ROW_LAYOUTS = (
++    (0, 4, 8, 12, 16),
++    (1, 5, 9, 13, 17),
++    (2, 6, 10, 14, 18),
++    (0, 5, 10, 15),
++    (2, 7, 12, 17),
++)
++BODY_COL_LAYOUTS = (
++    (8, 12, 16),
++    (9, 13, 17),
++    (10, 14, 18),
++    (8, 13, 18),
++)
++MASK_AREA = 8
++MIN_MASK_DISTANCE = 4
++MAX_GEN_ATTEMPTS = 400
++
++# Design analysis
++# -
++# concretization_and_trace:
++#   - 融合后输入被分成两个清晰区域：左侧是完整图例，右侧是主体 marker 网格。左侧固定出现 4 个 4x4 样本，每个样本右下角偏移
++#     (+4,+4) 放 1 个单像素标签，4 个标签颜色正好覆盖 {2,3,5,8}；右侧仍是若干真实单像素 marker。
++#   - 具体追踪一个 marker=2 的例子：原题 solver 看到红色像素后，直接调用硬编码的“黄色 frame” mask，并且只在像素左上角恰好存在
++#     那个固定 frame 时才把它识别成 legend label。融合后 solver 先在整张图里找到一个“黄色 4x4 样本 + 其右下角红色标签”，从该样本
++#     直接读出本题的 4x4 mask；随后所有其他红色真实 marker 都展开成这个刚读出的形状。差异在于 shape 来源从固定常量变成输入图例。
++# complexity_calibration:
++#   - D4/1 与 D11/0 叠加后的关键不是“可能出现多个样本”，而是“每题必须出现全部四种样本”。因此 generator 强制四种标签全出现，且
++#     主体区也强制四种真实 marker 至少各出现一次，避免任务退化成只需读单个样本或只用到少数字形。
++#   - 每个 4x4 样本限制为恰好 8 个着色格、8 邻接连通、每行每列至少有 1 个着色格，并要求任意两种样本之间至少有 4 格汉明距离，
++#     这样视觉上像“字形”而不是噪声，也减少不同样本过于相似导致的歧义。
++# implicit_assumption_review:
++#   - 原 `GLYPHS` 常量及 `for marker_color, (glyph_color, mask) in GLYPHS.items()` 依赖“字形字典跨题固定”；融合后这个前提失效，
++#     所以先改成从输入里学习 `learned_masks`，再进行扩展。
++#   - 原 `_has_source_glyph()` 依赖“知道样本的固定 mask 才能判定某个 marker 是 legend label”；融合后不能先验知道 mask，
++#     因而改成更弱但足够的判定：标签左上 4x4 patch 只允许出现该输出色和背景，并且非空。
++#   - 原代码默认输入中输出色只是可选的少量 legend 噪声；融合后四种输出色都会系统性出现于左侧 legend，因此输入颜色断言和解析顺序
++#     都必须兼容完整图例。
++# placement_legality:
++#   - 左侧 legend 占用列 0..4，其中样本画在列 0..3、标签落在列 4；主体 marker 的 top-left 只放在列 8 及以后，所以主体 glyph 展开
++#     到 4x4 后也不会碰到 legend。
++#   - 主体候选位置的行列间距都至少为 4，因此输出里的 4x4 glyph 彼此不会重叠；最后一行/列允许取 17 或 18，保留原题“靠边裁剪”的现象。
++# visual_observability_and_tidy_layout:
++#   - 解题者能直接看到“左边是四条样本-标签对照表，右边是待解码 marker 网格”，输入分区明确，输出中左侧整块消失，只剩右侧扩张后的图案，
++#     变化非常可见。
++#   - legend 顺序被打乱，样本形状也按题随机，因此不能凭固定行序或旧题字典作答，必须真正读取完整图例。
++# color_inference_and_rule_inferability:
++#   - 颜色映射仍沿用原题固定关系 2->4, 3->1, 5->6, 8->7；新的自由度只落在 4x4 形状。这样人类只需推断“标签色对应哪个样本形状”，
++#     而不必同时猜颜色重映射和形状重映射，保证 2-4 个样例内可归纳。
++# new_solver_assumptions_and_generator_guards:
++#   - `main()` 现在假设每种 marker 色都恰有一个合法 legend label，且它左上 4x4 区域非空、只含对应 glyph 色与背景。
++#   - `main()` 还假设真实 marker 不会落在 legend 区，输入中的 glyph 色不会出现在主体区；generator 通过固定分区、唯一标签偏移和 oracle
++#     校验来保证这些前提成立。
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(GLYPH_SIZE):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(GLYPH_SIZE):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _read_legend_mask(g: np.ndarray, r: int, c: int, glyph_color: int) -> np.ndarray | None:
++    if r < GLYPH_SIZE or c < GLYPH_SIZE:
++        return None
++    patch = g[r - GLYPH_SIZE : r, c - GLYPH_SIZE : c]
++    nonzero = patch[patch != 0]
++    if nonzero.size == 0 or not np.all(nonzero == glyph_color):
++        return None
++    return patch == glyph_color
++
++
++def _find_legend_masks(g: np.ndarray) -> tuple[dict[int, np.ndarray], set[tuple[int, int]]]:
++    learned_masks: dict[int, np.ndarray] = {}
++    legend_labels: set[tuple[int, int]] = set()
++    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
++        for r, c in np.argwhere(g == marker_color):
++            mask = _read_legend_mask(g, int(r), int(c), glyph_color)
++            if mask is None:
++                continue
++            assert marker_color not in learned_masks, f"duplicate legend for marker {marker_color}"
++            learned_masks[marker_color] = mask
++            legend_labels.add((int(r), int(c)))
++        assert marker_color in learned_masks, f"missing legend for marker {marker_color}"
++    return learned_masks, legend_labels
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Read the full per-input legend, then expand each real marker into its learned 4x4 glyph.
++
++    Input structure:
++    - The left side contains a complete legend: all four glyph types appear as 4x4 samples in colors 4, 1, 6, and 7.
++    - Each legend sample has a matching marker-color label pixel placed one cell below-right of the sample box.
++    - The rest of the grid contains the actual single-pixel markers in colors 2, 3, 5, and 8.
++
++    Rule:
++    - For each marker color, locate its legend label and read the 4x4 sample immediately above-left of that label.
++    - Use that learned 4x4 mask to replace every non-legend marker of the same color, painting with the sample's fixed glyph color.
++    - Keep each expansion anchored at the marker's top-left cell, clipping any part that would leave the grid.
++    - Remove the full legend region and all label pixels from the output.
++
++    Key insight:
++    - The 4x4 alphabet is no longer fixed across puzzles; the only reliable dictionary is the complete legend embedded in the input itself.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    learned_masks, legend_labels = _find_legend_masks(g)
++
++    out = np.zeros_like(g)
++    seen_real_marker = False
++    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
++        mask = learned_masks[marker_color]
++        for r, c in np.argwhere(g == marker_color):
++            rc = (int(r), int(c))
++            if rc in legend_labels:
++                continue
++            seen_real_marker = True
++            _paint_clipped(out, int(r), int(c), glyph_color, mask)
++
++    assert seen_real_marker
++    return out
++
++
++def _mask_connected(mask: np.ndarray) -> bool:
++    cells = [tuple(map(int, rc)) for rc in np.argwhere(mask)]
++    if not cells:
++        return False
++    stack = [cells[0]]
++    seen = {cells[0]}
++    while stack:
++        r, c = stack.pop()
++        for dr in (-1, 0, 1):
++            for dc in (-1, 0, 1):
++                if dr == 0 and dc == 0:
++                    continue
++                rr = r + dr
++                cc = c + dc
++                if 0 <= rr < GLYPH_SIZE and 0 <= cc < GLYPH_SIZE and bool(mask[rr, cc]) and (rr, cc) not in seen:
++                    seen.add((rr, cc))
++                    stack.append((rr, cc))
++    return len(seen) == len(cells)
++
++
++def _random_mask() -> np.ndarray:
++    while True:
++        picks = random.sample(range(GLYPH_SIZE * GLYPH_SIZE), MASK_AREA)
++        mask = np.zeros((GLYPH_SIZE, GLYPH_SIZE), dtype=bool)
++        for idx in picks:
++            mask[idx // GLYPH_SIZE, idx % GLYPH_SIZE] = True
++        if not _mask_connected(mask):
++            continue
++        if np.any(mask.sum(axis=0) == 0) or np.any(mask.sum(axis=1) == 0):
++            continue
++        return mask
++
++
++def _sample_masks() -> dict[int, np.ndarray]:
++    chosen: list[np.ndarray] = []
++    ordered_masks: list[np.ndarray] = []
++    for _marker_color in MARKER_COLORS:
++        while True:
++            mask = _random_mask()
++            if any(int(np.sum(mask != other)) < MIN_MASK_DISTANCE for other in chosen):
++                continue
++            chosen.append(mask)
++            ordered_masks.append(mask)
++            break
++    return {marker_color: ordered_masks[i] for i, marker_color in enumerate(MARKER_COLORS)}
++
++
++def _body_positions() -> list[tuple[int, int]]:
++    rows = list(random.choice(BODY_ROW_LAYOUTS))
++    cols = list(random.choice(BODY_COL_LAYOUTS))
++    positions = [(int(r), int(c)) for r in rows for c in cols]
++    random.shuffle(positions)
++    min_keep = max(len(MARKER_COLORS), int(np.ceil(0.6 * len(positions))))
++    keep = random.randint(min_keep, len(positions))
++    return positions[:keep]
++
++
++def _sample_real_markers() -> list[tuple[int, int, int]]:
++    positions = _body_positions()
++    forced_colors = list(MARKER_COLORS)
++    random.shuffle(forced_colors)
++    while len(forced_colors) < len(positions):
++        forced_colors.append(random.choice(MARKER_COLORS))
++    random.shuffle(forced_colors)
++    return [(r, c, forced_colors[i]) for i, (r, c) in enumerate(positions)]
++
++
++def _build_output(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker_color in real_markers:
++        _paint_clipped(out, int(r), int(c), MARKER_TO_GLYPH_COLOR[marker_color], marker_masks[marker_color])
++    return out
++
++
++def _build_input(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
++    g = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++
++    legend_order = list(MARKER_COLORS)
++    random.shuffle(legend_order)
++    for r0, marker_color in zip(LEGEND_ROW_STARTS, legend_order):
++        glyph_color = MARKER_TO_GLYPH_COLOR[marker_color]
++        mask = marker_masks[marker_color]
++        for dr in range(GLYPH_SIZE):
++            for dc in range(GLYPH_SIZE):
++                if bool(mask[dr, dc]):
++                    g[r0 + dr, LEGEND_COL + dc] = glyph_color
++        g[r0 + GLYPH_SIZE, LEGEND_LABEL_COL] = marker_color
++
++    for r, c, marker_color in real_markers:
++        g[r, c] = marker_color
++    return g
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_ATTEMPTS):
++        marker_masks = _sample_masks()
++        real_markers = _sample_real_markers()
++        expected = _build_output(marker_masks, real_markers)
++        inp = _build_input(marker_masks, real_markers)
++        try:
++            actual = main(inp)
++        except Exception:
++            continue
++        if np.array_equal(actual, expected):
++            return inp
++    raise RuntimeError(f"generate_input: failed after {MAX_GEN_ATTEMPTS} attempts")
+
+codex
+融合代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py)。设计分析写在文件开头的注释区 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py:37)，`main()` 改为先从完整四项图例中学习每个 marker 的 4x4 随机字形，再扩展主体 marker 并删去整块图例 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py:111)。`generate_input()` 则固定构造完整 legend、强制四种真实 marker 全出现，并用 oracle 校验输出正确 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py:244)。
+
+测试结果已通过。按你给的 50 次脚本，成功率是 `50/50`，总耗时约 `0.1s`。额外做了 200 个样本的融合行为统计，指标定义为：
+- `legend_count`: 每题被 solver 识别到的合法图例标签数
+- `real_color_count`: 主体区真实 marker 覆盖的颜色种类数
+- `output_diff_pixels`: 新 solver 输出与原始固定字典 solver 输出的像素差异数
+
+统计结果：
+- `legend_count` 分布：`{4: 200}`
+- `real_color_count` 分布：`{4: 200}`
+- `output_diff_pixels` 最小/均值/最大：`66 / 107.2 / 177`
+- 与原题输出完全相同的样本数：`0`
+
+这说明生成器没有退化回原题固定字典行为，完整图例和全字形样本展示这两个融合控制变量都在稳定生效。
+diff --git a/ceshi/code_combo/dfadab01/10/code.py b/ceshi/code_combo/dfadab01/10/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4a022ee820676429d69fb9b97730c12f92ca361
+--- /dev/null
++++ b/ceshi/code_combo/dfadab01/10/code.py
+@@ -0,0 +1,256 @@
++# Combo variant of dfadab01 (index 10)
++# combo_spec: D4/1+D11/0
++# Name: 完整图例+全字形样本展示
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++
++MARKER_TO_GLYPH_COLOR: dict[int, int] = {2: 4, 3: 1, 5: 6, 8: 7}
++MARKER_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR)
++GLYPH_COLORS: tuple[int, ...] = tuple(MARKER_TO_GLYPH_COLOR[c] for c in MARKER_COLORS)
++GRID_SIZE = 20
++GLYPH_SIZE = 4
++LEGEND_COL = 0
++LEGEND_LABEL_COL = LEGEND_COL + GLYPH_SIZE
++LEGEND_ROW_STARTS = (0, 5, 10, 15)
++BODY_ROW_LAYOUTS = (
++    (0, 4, 8, 12, 16),
++    (1, 5, 9, 13, 17),
++    (2, 6, 10, 14, 18),
++    (0, 5, 10, 15),
++    (2, 7, 12, 17),
++)
++BODY_COL_LAYOUTS = (
++    (8, 12, 16),
++    (9, 13, 17),
++    (10, 14, 18),
++    (8, 13, 18),
++)
++MASK_AREA = 8
++MIN_MASK_DISTANCE = 4
++MAX_GEN_ATTEMPTS = 400
++
++# Design analysis
++# -
++# concretization_and_trace:
++#   - 融合后输入被分成两个清晰区域：左侧是完整图例，右侧是主体 marker 网格。左侧固定出现 4 个 4x4 样本，每个样本右下角偏移
++#     (+4,+4) 放 1 个单像素标签，4 个标签颜色正好覆盖 {2,3,5,8}；右侧仍是若干真实单像素 marker。
++#   - 具体追踪一个 marker=2 的例子：原题 solver 看到红色像素后，直接调用硬编码的“黄色 frame” mask，并且只在像素左上角恰好存在
++#     那个固定 frame 时才把它识别成 legend label。融合后 solver 先在整张图里找到一个“黄色 4x4 样本 + 其右下角红色标签”，从该样本
++#     直接读出本题的 4x4 mask；随后所有其他红色真实 marker 都展开成这个刚读出的形状。差异在于 shape 来源从固定常量变成输入图例。
++# complexity_calibration:
++#   - D4/1 与 D11/0 叠加后的关键不是“可能出现多个样本”，而是“每题必须出现全部四种样本”。因此 generator 强制四种标签全出现，且
++#     主体区也强制四种真实 marker 至少各出现一次，避免任务退化成只需读单个样本或只用到少数字形。
++#   - 每个 4x4 样本限制为恰好 8 个着色格、8 邻接连通、每行每列至少有 1 个着色格，并要求任意两种样本之间至少有 4 格汉明距离，
++#     这样视觉上像“字形”而不是噪声，也减少不同样本过于相似导致的歧义。
++# implicit_assumption_review:
++#   - 原 `GLYPHS` 常量及 `for marker_color, (glyph_color, mask) in GLYPHS.items()` 依赖“字形字典跨题固定”；融合后这个前提失效，
++#     所以先改成从输入里学习 `learned_masks`，再进行扩展。
++#   - 原 `_has_source_glyph()` 依赖“知道样本的固定 mask 才能判定某个 marker 是 legend label”；融合后不能先验知道 mask，
++#     因而改成更弱但足够的判定：标签左上 4x4 patch 只允许出现该输出色和背景，并且非空。
++#   - 原代码默认输入中输出色只是可选的少量 legend 噪声；融合后四种输出色都会系统性出现于左侧 legend，因此输入颜色断言和解析顺序
++#     都必须兼容完整图例。
++# placement_legality:
++#   - 左侧 legend 占用列 0..4，其中样本画在列 0..3、标签落在列 4；主体 marker 的 top-left 只放在列 8 及以后，所以主体 glyph 展开
++#     到 4x4 后也不会碰到 legend。
++#   - 主体候选位置的行列间距都至少为 4，因此输出里的 4x4 glyph 彼此不会重叠；最后一行/列允许取 17 或 18，保留原题“靠边裁剪”的现象。
++# visual_observability_and_tidy_layout:
++#   - 解题者能直接看到“左边是四条样本-标签对照表，右边是待解码 marker 网格”，输入分区明确，输出中左侧整块消失，只剩右侧扩张后的图案，
++#     变化非常可见。
++#   - legend 顺序被打乱，样本形状也按题随机，因此不能凭固定行序或旧题字典作答，必须真正读取完整图例。
++# color_inference_and_rule_inferability:
++#   - 颜色映射仍沿用原题固定关系 2->4, 3->1, 5->6, 8->7；新的自由度只落在 4x4 形状。这样人类只需推断“标签色对应哪个样本形状”，
++#     而不必同时猜颜色重映射和形状重映射，保证 2-4 个样例内可归纳。
++# new_solver_assumptions_and_generator_guards:
++#   - `main()` 现在假设每种 marker 色都恰有一个合法 legend label，且它左上 4x4 区域非空、只含对应 glyph 色与背景。
++#   - `main()` 还假设真实 marker 不会落在 legend 区，输入中的 glyph 色不会出现在主体区；generator 通过固定分区、唯一标签偏移和 oracle
++#     校验来保证这些前提成立。
++
++
++def _paint_clipped(out: np.ndarray, r0: int, c0: int, color: int, mask: np.ndarray) -> None:
++    h, w = out.shape
++    for dr in range(GLYPH_SIZE):
++        rr = r0 + dr
++        if rr < 0 or rr >= h:
++            continue
++        for dc in range(GLYPH_SIZE):
++            cc = c0 + dc
++            if 0 <= cc < w and bool(mask[dr, dc]):
++                out[rr, cc] = color
++
++
++def _read_legend_mask(g: np.ndarray, r: int, c: int, glyph_color: int) -> np.ndarray | None:
++    if r < GLYPH_SIZE or c < GLYPH_SIZE:
++        return None
++    patch = g[r - GLYPH_SIZE : r, c - GLYPH_SIZE : c]
++    nonzero = patch[patch != 0]
++    if nonzero.size == 0 or not np.all(nonzero == glyph_color):
++        return None
++    return patch == glyph_color
++
++
++def _find_legend_masks(g: np.ndarray) -> tuple[dict[int, np.ndarray], set[tuple[int, int]]]:
++    learned_masks: dict[int, np.ndarray] = {}
++    legend_labels: set[tuple[int, int]] = set()
++    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
++        for r, c in np.argwhere(g == marker_color):
++            mask = _read_legend_mask(g, int(r), int(c), glyph_color)
++            if mask is None:
++                continue
++            assert marker_color not in learned_masks, f"duplicate legend for marker {marker_color}"
++            learned_masks[marker_color] = mask
++            legend_labels.add((int(r), int(c)))
++        assert marker_color in learned_masks, f"missing legend for marker {marker_color}"
++    return learned_masks, legend_labels
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Read the full per-input legend, then expand each real marker into its learned 4x4 glyph.
++
++    Input structure:
++    - The left side contains a complete legend: all four glyph types appear as 4x4 samples in colors 4, 1, 6, and 7.
++    - Each legend sample has a matching marker-color label pixel placed one cell below-right of the sample box.
++    - The rest of the grid contains the actual single-pixel markers in colors 2, 3, 5, and 8.
++
++    Rule:
++    - For each marker color, locate its legend label and read the 4x4 sample immediately above-left of that label.
++    - Use that learned 4x4 mask to replace every non-legend marker of the same color, painting with the sample's fixed glyph color.
++    - Keep each expansion anchored at the marker's top-left cell, clipping any part that would leave the grid.
++    - Remove the full legend region and all label pixels from the output.
++
++    Key insight:
++    - The 4x4 alphabet is no longer fixed across puzzles; the only reliable dictionary is the complete legend embedded in the input itself.
++    """
++    g = np.asarray(grid, dtype=int)
++    assert g.ndim == 2
++    assert g.shape == (GRID_SIZE, GRID_SIZE)
++    assert set(np.unique(g)).issubset({0, *MARKER_COLORS, *GLYPH_COLORS})
++
++    learned_masks, legend_labels = _find_legend_masks(g)
++
++    out = np.zeros_like(g)
++    seen_real_marker = False
++    for marker_color, glyph_color in MARKER_TO_GLYPH_COLOR.items():
++        mask = learned_masks[marker_color]
++        for r, c in np.argwhere(g == marker_color):
++            rc = (int(r), int(c))
++            if rc in legend_labels:
++                continue
++            seen_real_marker = True
++            _paint_clipped(out, int(r), int(c), glyph_color, mask)
++
++    assert seen_real_marker
++    return out
++
++
++def _mask_connected(mask: np.ndarray) -> bool:
++    cells = [tuple(map(int, rc)) for rc in np.argwhere(mask)]
++    if not cells:
++        return False
++    stack = [cells[0]]
++    seen = {cells[0]}
++    while stack:
++        r, c = stack.pop()
++        for dr in (-1, 0, 1):
++            for dc in (-1, 0, 1):
++                if dr == 0 and dc == 0:
++                    continue
++                rr = r + dr
++                cc = c + dc
++                if 0 <= rr < GLYPH_SIZE and 0 <= cc < GLYPH_SIZE and bool(mask[rr, cc]) and (rr, cc) not in seen:
++                    seen.add((rr, cc))
++                    stack.append((rr, cc))
++    return len(seen) == len(cells)
++
++
++def _random_mask() -> np.ndarray:
++    while True:
++        picks = random.sample(range(GLYPH_SIZE * GLYPH_SIZE), MASK_AREA)
++        mask = np.zeros((GLYPH_SIZE, GLYPH_SIZE), dtype=bool)
++        for idx in picks:
++            mask[idx // GLYPH_SIZE, idx % GLYPH_SIZE] = True
++        if not _mask_connected(mask):
++            continue
++        if np.any(mask.sum(axis=0) == 0) or np.any(mask.sum(axis=1) == 0):
++            continue
++        return mask
++
++
++def _sample_masks() -> dict[int, np.ndarray]:
++    chosen: list[np.ndarray] = []
++    ordered_masks: list[np.ndarray] = []
++    for _marker_color in MARKER_COLORS:
++        while True:
++            mask = _random_mask()
++            if any(int(np.sum(mask != other)) < MIN_MASK_DISTANCE for other in chosen):
++                continue
++            chosen.append(mask)
++            ordered_masks.append(mask)
++            break
++    return {marker_color: ordered_masks[i] for i, marker_color in enumerate(MARKER_COLORS)}
++
++
++def _body_positions() -> list[tuple[int, int]]:
++    rows = list(random.choice(BODY_ROW_LAYOUTS))
++    cols = list(random.choice(BODY_COL_LAYOUTS))
++    positions = [(int(r), int(c)) for r in rows for c in cols]
++    random.shuffle(positions)
++    min_keep = max(len(MARKER_COLORS), int(np.ceil(0.6 * len(positions))))
++    keep = random.randint(min_keep, len(positions))
++    return positions[:keep]
++
++
++def _sample_real_markers() -> list[tuple[int, int, int]]:
++    positions = _body_positions()
++    forced_colors = list(MARKER_COLORS)
++    random.shuffle(forced_colors)
++    while len(forced_colors) < len(positions):
++        forced_colors.append(random.choice(MARKER_COLORS))
++    random.shuffle(forced_colors)
++    return [(r, c, forced_colors[i]) for i, (r, c) in enumerate(positions)]
++
++
++def _build_output(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
++    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++    for r, c, marker_color in real_markers:
++        _paint_clipped(out, int(r), int(c), MARKER_TO_GLYPH_COLOR[marker_color], marker_masks[marker_color])
++    return out
++
++
++def _build_input(marker_masks: dict[int, np.ndarray], real_markers: list[tuple[int, int, int]]) -> np.ndarray:
++    g = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
++
++    legend_order = list(MARKER_COLORS)
++    random.shuffle(legend_order)
++    for r0, marker_color in zip(LEGEND_ROW_STARTS, legend_order):
++        glyph_color = MARKER_TO_GLYPH_COLOR[marker_color]
++        mask = marker_masks[marker_color]
++        for dr in range(GLYPH_SIZE):
++            for dc in range(GLYPH_SIZE):
++                if bool(mask[dr, dc]):
++                    g[r0 + dr, LEGEND_COL + dc] = glyph_color
++        g[r0 + GLYPH_SIZE, LEGEND_LABEL_COL] = marker_color
++
++    for r, c, marker_color in real_markers:
++        g[r, c] = marker_color
++    return g
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_GEN_ATTEMPTS):
++        marker_masks = _sample_masks()
++        real_markers = _sample_real_markers()
++        expected = _build_output(marker_masks, real_markers)
++        inp = _build_input(marker_masks, real_markers)
++        try:
++            actual = main(inp)
++        except Exception:
++            continue
++        if np.array_equal(actual, expected):
++            return inp
++    raise RuntimeError(f"generate_input: failed after {MAX_GEN_ATTEMPTS} attempts")
+
+tokens used
+60,987
+融合代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py)。设计分析写在文件开头的注释区 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py:37)，`main()` 改为先从完整四项图例中学习每个 marker 的 4x4 随机字形，再扩展主体 marker 并删去整块图例 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py:111)。`generate_input()` 则固定构造完整 legend、强制四种真实 marker 全出现，并用 oracle 校验输出正确 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/dfadab01/10/code.py:244)。
+
+测试结果已通过。按你给的 50 次脚本，成功率是 `50/50`，总耗时约 `0.1s`。额外做了 200 个样本的融合行为统计，指标定义为：
+- `legend_count`: 每题被 solver 识别到的合法图例标签数
+- `real_color_count`: 主体区真实 marker 覆盖的颜色种类数
+- `output_diff_pixels`: 新 solver 输出与原始固定字典 solver 输出的像素差异数
+
+统计结果：
+- `legend_count` 分布：`{4: 200}`
+- `real_color_count` 分布：`{4: 200}`
+- `output_diff_pixels` 最小/均值/最大：`66 / 107.2 / 177`
+- 与原题输出完全相同的样本数：`0`
+
+这说明生成器没有退化回原题固定字典行为，完整图例和全字形样本展示这两个融合控制变量都在稳定生效。

@@ -1,0 +1,4738 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e25a7-2d17-7042-abfc-b50876ca76c2
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个变体。
+
+    ## 原始任务: d59b0160
+    **摘要**: 左上角绿色边框(颜色3)围成的图例区域定义目标颜色集合，识别网格中所有非背景的4-连通分量，删除包含全部图例颜色的连通分量，保留不包含全部图例颜色的连通分量
+
+    ## 要实现的变体
+    - **维度**: D16 — 分量中颜色的空间分布约束 (`meta`)
+    - **当前值**: 仅检查分量是否包含图例颜色，不关注颜色在分量内的空间分布
+    - **改为**: 图例颜色必须出现在分量的外接矩形边缘 — 图例颜色的像素必须位于连通分量的外接矩形边缘（而非内部）才算匹配。仅在内部存在图例颜色不满足条件。增加了位置约束的推理。
+    - **来源**: boundary_detection（参考任务: 71e489b6）
+
+    ## 修改原则 
+    以 D16 为核心变更，不要随意改动与该创新无关的部分。但如果其他维度需要做适配性调整才能让 D16 的变化在视觉上可观察、在逻辑上可行（例如：变换规则改为旋转/翻转，但原始对象是纯色对称的导致变换不可见，则应让对象带不对称内部结构），这种配合修改是允许且必要的。
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/d59b0160.py`
+
+    ```python
+    import numpy as np
+
+from arc_utils import components_mask, paste, random_free_location
+import math
+import random
+
+
+def _bg_boundary(g: np.ndarray) -> int:
+    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
+    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
+    vals, cnts = np.unique(border, return_counts=True)
+    return int(vals[cnts.argmax()])
+
+
+def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
+    """
+    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
+    We detect the smallest size sz such that:
+      - g[sz-1, 0:sz] are all x
+      - g[0:sz, sz-1] are all x
+    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
+    excluding bg and excluding the border color x.
+    """
+    h, w = g.shape
+    for sz in range(2, min(h, w) + 1):
+        x = int(g[sz - 1, sz - 1])
+        if x == bg:
+            continue
+        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
+            inside = g[0 : sz - 1, 0 : sz - 1]
+            colors = set(map(int, np.unique(inside)))
+            colors.discard(bg)
+            colors.discard(x)
+            return int(sz), int(x), colors
+    assert False, "no legend border found in grid"
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Delete connected components whose colors match a legend swatch.
+
+    Input structure:
+    - Background (bg) fills most of the grid.
+    - Top-left corner: a small square legend region bordered on its bottom and right edges by a single color; the interior holds a set of "target" colors.
+    - Elsewhere: multicolored objects (4-connected components) on the bg.
+
+    Rule:
+    - Read the target color set from inside the legend border.
+    - For each connected component, check whether it contains **all** target colors.
+    - Erase (fill with bg) every component that does; leave all others unchanged.
+    - Output grid is the same size.
+
+    Key insight: The legend acts as a filter specification — only components carrying the full color palette shown in the legend are removed.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = _bg_boundary(g)
+
+    legend = _find_legend(g, bg)
+    _sz, _x, legend_colors = legend
+    assert legend_colors, "legend interior contains no target colors"
+
+    out = g.copy()
+    comps = components_mask(g != bg, connectivity=4)
+    for pts in comps:
+        cols = {int(g[r, c]) for r, c in pts}
+        if legend_colors.issubset(cols):
+            for r, c in pts:
+                out[r, c] = bg
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# -- Grid & legend constants --
+GRID_H, GRID_W = 16, 16
+BG = 7
+BORDER = 3
+LEGEND_SIZE = 4                       # 4x4 legend at top-left
+PALETTE = [1, 2, 4, 5, 6, 8, 9]
+NUM_TARGETS = 3                       # target colors sampled from PALETTE
+
+# -- Component shape weights: (mode, weight) --
+SHAPE_WEIGHTS = [5, 3, 2]            # medium, tall, wide
+TALL_H = (8, 16);  TALL_W = (2, 4)
+WIDE_H = (3, 5);   WIDE_W = (5, 9)
+MED_H  = (3, 7);   MED_W  = (2, 9)
+
+# -- Component fill density (fraction of non-zero pixels) --
+DENSITY_LO = 0.10
+DENSITY_HI = 0.55
+
+# -- Component count & kept/deleted split --
+COMP_COUNTS = [4, 5, 6]
+COMP_WEIGHTS = [1, 4, 25]
+NUM_KEPT = 3                          # always keep exactly 3
+
+# -- Generation retry budget --
+MAX_RETRIES = 300
+
+
+def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
+    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
+    s = LEGEND_SIZE
+    for g in (inp, out):
+        g[:s, :s] = BG
+        g[s - 1, :s] = BORDER
+        g[:s, s - 1] = BORDER
+
+    # Pick 3 positions in the 3x3 interior: one isolated corner + two non-adjacent border cells
+    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
+    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
+    side_choices = [
+        p for p in border_side
+        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
+    ]
+    positions = [isolated] + random.sample(side_choices, 2)
+    random.shuffle(positions)
+    for color, (r, c) in zip(targets, positions):
+        inp[r, c] = color
+        out[r, c] = color
+
+
+def _component_dims() -> tuple[int, int]:
+    """Sample component (h, w) according to shape-mode weights."""
+    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
+    if mode == "tall":
+        return random.randint(*TALL_H), random.randint(*TALL_W)
+    if mode == "wide":
+        return random.randint(*WIDE_H), random.randint(*WIDE_W)
+    return random.randint(*MED_H), random.randint(*MED_W)
+
+
+def _component_patch(h: int, w: int, targets: list[int], deleted: bool) -> np.ndarray:
+    """Build an h x w patch filled with color-0 base and sprinkled colored pixels."""
+    area = h * w
+    lo = max(1, math.ceil(area * DENSITY_LO))
+    hi = max(lo, math.floor(area * DENSITY_HI))
+    if deleted:
+        lo = max(lo, NUM_TARGETS)
+
+    n_colored = random.randint(lo, hi)
+    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
+    non_targets = [v for v in PALETTE if v not in targets]
+
+    if deleted:
+        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
+    else:
+        used_target_count = random.randint(0, NUM_TARGETS - 1)
+        allowed = non_targets + random.sample(targets, used_target_count)
+        colors = [random.choice(allowed) for _ in range(n_colored)]
+
+    random.shuffle(colors)
+    patch = np.zeros((h, w), dtype=int)
+    rs, cs = zip(*coords)
+    patch[rs, cs] = colors
+    return patch
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Try once to build a valid (input, output) pair; return input or None on failure."""
+    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
+    out = inp.copy()
+
+    targets = random.sample(PALETTE, NUM_TARGETS)
+    _place_legend(inp, out, targets)
+
+    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
+    roles = [True] * (component_count - NUM_KEPT) + [False] * NUM_KEPT
+    random.shuffle(roles)
+
+    for deleted in roles:
+        h, w = _component_dims()
+        patch = _component_patch(h, w, targets, deleted)
+        try:
+            r, c = random_free_location(
+                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
+            )
+        except ValueError:
+            return None
+        paste(inp, patch, r, c)
+        if not deleted:
+            paste(out, patch, r, c)
+
+    if np.array_equal(main(inp), out):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate valid input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 16x16 [observed], bg=7
+  legend:
+    position: top-left 4x4 square [observed]
+    border_color: 3 [observed], fills bottom row and right column of 4x4 region
+    interior: 3x3, contains exactly 3 target colors each placed once, rest bg
+    target_colors: 3 distinct colors chosen from {1,2,4,5,6,8,9}
+  components:
+    type: solid rectangles of non-bg cells (fill ratio = 1.0)
+    base_color: 0 fills most cells; colored pixels (from {1,2,4,5,6,8,9}) sprinkled in at 10-55% density
+    count: 4-6 non-legend components
+    dimensions: 2-9 wide x 3-16 tall
+    separation: components separated by >=1 bg cell (no 4-adjacent touching)
+    may touch grid edges
+  deletion_rule:
+    components containing ALL 3 legend target colors are erased (filled with bg)
+    deleted: 1-3 components; kept: 3 components [observed]
+    kept components must each be missing >=1 legend target color
+  output: same-size grid with deleted components replaced by bg; legend and kept components unchanged
+
+generation_strategy:
+  approach: direct construction
+  steps:
+    1. Pick 3 target colors from {1,2,4,5,6,8,9}; remaining 4 are non-target colors
+    2. Build 4x4 legend at (0,0) - border color 3 on bottom row and right column, place each target color once in the 3x3 interior, rest bg
+    3. Decide component count (4-6) and split into deleted (1-3) and kept (3)
+    4. For each component, pick random bbox dimensions (w in 2-9, h in 3-7); place on grid ensuring >=1 bg gap from legend and all other components
+    5. Fill each component's bbox with color 0
+    6. For deleted components - sprinkle colored pixels ensuring all 3 target colors appear (plus optionally non-targets)
+    7. For kept components - sprinkle colored pixels using a subset of colors that is missing >=1 target color
+    8. Colored pixel density 10-55% of component area
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须保留这一结构，并根据**新的变体规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映变体后的输入结构、规则和关键洞察。
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考任务**（如有 source_task）: 变体描述中的 source_task 是该变体的灵感来源。**必须先阅读其 solver 代码**，理解参考任务中相关机制的实现方式和复杂度，作为你设计变体的基线。不存在就跳过。
+
+    3. **设计分析（写代码前必须完成，可仿照spec书写，尽可能的详细以供下面代码生成使用）**:
+
+       YAML 中的变体描述给出了变更的大致方向，但细节不够具体。你需要自行思考并确定完整的实现细节。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断变体改动的影响范围和实现方式。在写代码之前，完成以下分析：
+
+       a) **具体化与行为追踪**: 变体在 ARC 的像素网格中具体长什么样？变更的核心行为如何体现在输入/输出的结构上？不要停留在抽象概念上，要想清楚具体的形状、颜色、空间关系等细节。然后，确定变体的变化会影响整个流程（输入构造、solver 处理、输出生成等）中的哪个环节，在这个环节上用一个具体的小例子追踪：原始逻辑在这里是怎么执行的 → 变体要求的逻辑应该是怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 变体改变了原任务的某个属性。原始代码中哪些写法依赖了旧属性的不变性？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在变体中是否仍然成立？特别注意那些在原任务中"恰好无害"但在变体中会出错的模式（例如：原任务中某个值始终相同，所以无条件赋值不会产生覆盖问题——但变体让该值可变后，无条件赋值就会破坏已有的正确结果）。
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意（例如对象之间的空间关系、对齐方式、间距等应与任务规则一致）。同时要考虑放置后的网格是否能被 solver 正确处理并产生预期的输出。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。**禁止使用颜色id等不可见因素参与任何排序或者颜色变换（例如使用黑色=0参与排序等，禁用）**。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出变体的规则？如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。若规则本身允许多个合法分支或子情况，不要在生成器中长期固定成其中一种，除非题意本来就要求固定。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果变体后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **颜色变化可推断性**: 如果变体涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个变体设计就不合格。
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 基于第 3 步的设计分析实现变体的新规则。只改需要改的部分，其他逻辑保持不变。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发新规则。生成的输入必须能被新 `main()` 正确求解。
+    6. **保证 generator 的正确性**: 原 generator 采用 output-first 模式（先构造预期输出 → 反推输入 → 用 `main(input)` 验证一致）。修改变体时，你可以沿用或调整这个模式，但必须保证：生成的每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/d59b0160/D16/2/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证变体行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了变体的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量变体核心行为（如交互深度、参与对象数等），统计生成样本中该指标和关键分支的分布。少量样本与原始行为相似不为退化；只有当关键控制变量不起作用，样本按照新的变体逻辑执行与原逻辑执行在相同输入网格上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/d59b0160.json` — 原任务的 I/O 样例
+
+    只参考上述文件和原始 solver 代码。不要查看其他变体的实现代码（如 variants/ 目录下的已有文件），避免引入其他维度的改动。
+    - `/home/lixinyu/snap/new/arc2_solver_select/71e489b6.py` — **必读**：参考任务 71e489b6 的 solver（变体灵感来源，用于校准实现复杂度）
+
+## 输出
+
+将完整的变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+`/home/lixinyu/snap/new/ceshi/code/d59b0160/D16/2/code.py`
+
+代码文件开头加一段注释说明这是什么变体:
+```python
+# Variant of d59b0160
+# Dimension: D16 — 分量中颜色的空间分布约束 (meta)
+# Change: 仅检查分量是否包含图例颜色，不关注颜色在分量内的空间分布... → 图例颜色必须出现在分量的外接矩形边缘
+```
+
+确保目录 `/home/lixinyu/snap/new/ceshi/code/d59b0160/D16/2` 存在（如不存在则创建）。
+codex
+我先读原始 solver、参考任务 solver 和工具函数，确认 D16 变体该落在哪个判断环节，再据此改 generator，避免只改表面条件。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/d59b0160.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+import numpy as np
+
+from arc_utils import components_mask, paste, random_free_location
+import math
+import random
+
+
+def _bg_boundary(g: np.ndarray) -> int:
+    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
+    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
+    vals, cnts = np.unique(border, return_counts=True)
+    return int(vals[cnts.argmax()])
+
+
+def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
+    """
+    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
+    We detect the smallest size sz such that:
+      - g[sz-1, 0:sz] are all x
+      - g[0:sz, sz-1] are all x
+    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
+    excluding bg and excluding the border color x.
+    """
+    h, w = g.shape
+    for sz in range(2, min(h, w) + 1):
+        x = int(g[sz - 1, sz - 1])
+        if x == bg:
+            continue
+        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
+            inside = g[0 : sz - 1, 0 : sz - 1]
+            colors = set(map(int, np.unique(inside)))
+            colors.discard(bg)
+            colors.discard(x)
+            return int(sz), int(x), colors
+    assert False, "no legend border found in grid"
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Delete connected components whose colors match a legend swatch.
+
+    Input structure:
+    - Background (bg) fills most of the grid.
+    - Top-left corner: a small square legend region bordered on its bottom and right edges by a single color; the interior holds a set of "target" colors.
+    - Elsewhere: multicolored objects (4-connected components) on the bg.
+
+    Rule:
+    - Read the target color set from inside the legend border.
+    - For each connected component, check whether it contains **all** target colors.
+    - Erase (fill with bg) every component that does; leave all others unchanged.
+    - Output grid is the same size.
+
+    Key insight: The legend acts as a filter specification — only components carrying the full color palette shown in the legend are removed.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = _bg_boundary(g)
+
+    legend = _find_legend(g, bg)
+    _sz, _x, legend_colors = legend
+    assert legend_colors, "legend interior contains no target colors"
+
+    out = g.copy()
+    comps = components_mask(g != bg, connectivity=4)
+    for pts in comps:
+        cols = {int(g[r, c]) for r, c in pts}
+        if legend_colors.issubset(cols):
+            for r, c in pts:
+                out[r, c] = bg
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# -- Grid & legend constants --
+GRID_H, GRID_W = 16, 16
+BG = 7
+BORDER = 3
+LEGEND_SIZE = 4                       # 4x4 legend at top-left
+PALETTE = [1, 2, 4, 5, 6, 8, 9]
+NUM_TARGETS = 3                       # target colors sampled from PALETTE
+
+# -- Component shape weights: (mode, weight) --
+SHAPE_WEIGHTS = [5, 3, 2]            # medium, tall, wide
+TALL_H = (8, 16);  TALL_W = (2, 4)
+WIDE_H = (3, 5);   WIDE_W = (5, 9)
+MED_H  = (3, 7);   MED_W  = (2, 9)
+
+# -- Component fill density (fraction of non-zero pixels) --
+DENSITY_LO = 0.10
+DENSITY_HI = 0.55
+
+# -- Component count & kept/deleted split --
+COMP_COUNTS = [4, 5, 6]
+COMP_WEIGHTS = [1, 4, 25]
+NUM_KEPT = 3                          # always keep exactly 3
+
+# -- Generation retry budget --
+MAX_RETRIES = 300
+
+
+def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
+    """Draw the 4x4 legend box (border color 3) at top-left and place target colors."""
+    s = LEGEND_SIZE
+    for g in (inp, out):
+        g[:s, :s] = BG
+        g[s - 1, :s] = BORDER
+        g[:s, s - 1] = BORDER
+
+    # Pick 3 positions in the 3x3 interior: one isolated corner + two non-adjacent border cells
+    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
+    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
+    side_choices = [
+        p for p in border_side
+        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
+    ]
+    positions = [isolated] + random.sample(side_choices, 2)
+    random.shuffle(positions)
+    for color, (r, c) in zip(targets, positions):
+        inp[r, c] = color
+        out[r, c] = color
+
+
+def _component_dims() -> tuple[int, int]:
+    """Sample component (h, w) according to shape-mode weights."""
+    mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
+    if mode == "tall":
+        return random.randint(*TALL_H), random.randint(*TALL_W)
+    if mode == "wide":
+        return random.randint(*WIDE_H), random.randint(*WIDE_W)
+    return random.randint(*MED_H), random.randint(*MED_W)
+
+
+def _component_patch(h: int, w: int, targets: list[int], deleted: bool) -> np.ndarray:
+    """Build an h x w patch filled with color-0 base and sprinkled colored pixels."""
+    area = h * w
+    lo = max(1, math.ceil(area * DENSITY_LO))
+    hi = max(lo, math.floor(area * DENSITY_HI))
+    if deleted:
+        lo = max(lo, NUM_TARGETS)
+
+    n_colored = random.randint(lo, hi)
+    coords = random.sample([(r, c) for r in range(h) for c in range(w)], n_colored)
+    non_targets = [v for v in PALETTE if v not in targets]
+
+    if deleted:
+        colors = list(targets) + [random.choice(PALETTE) for _ in range(n_colored - NUM_TARGETS)]
+    else:
+        used_target_count = random.randint(0, NUM_TARGETS - 1)
+        allowed = non_targets + random.sample(targets, used_target_count)
+        colors = [random.choice(allowed) for _ in range(n_colored)]
+
+    random.shuffle(colors)
+    patch = np.zeros((h, w), dtype=int)
+    rs, cs = zip(*coords)
+    patch[rs, cs] = colors
+    return patch
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Try once to build a valid (input, output) pair; return input or None on failure."""
+    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
+    out = inp.copy()
+
+    targets = random.sample(PALETTE, NUM_TARGETS)
+    _place_legend(inp, out, targets)
+
+    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
+    roles = [True] * (component_count - NUM_KEPT) + [False] * NUM_KEPT
+    random.shuffle(roles)
+
+    for deleted in roles:
+        h, w = _component_dims()
+        patch = _component_patch(h, w, targets, deleted)
+        try:
+            r, c = random_free_location(
+                inp, np.zeros_like(patch), transparent=BG, padding=1, padding_connectivity=8,
+            )
+        except ValueError:
+            return None
+        paste(inp, patch, r, c)
+        if not deleted:
+            paste(out, patch, r, c)
+
+    if np.array_equal(main(inp), out):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate valid input")
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/71e489b6.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+import numpy as np
+from arc_utils import components_mask
+import random
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Highlight black defects in blue foreground by surrounding them with orange.
+
+    Input structure:
+    - Blue (1) foreground on black (0) bg; small black holes or protrusions within blue regions; occasional thin blue spurs into black areas.
+
+    Rule:
+    - Thin blue pixels mostly surrounded by black are absorbed into the background.
+    - Small black components (≤3 cells) and leaf pixels of larger black components are "defects."
+    - Each defect gets an orange (7) 8-neighbor halo; the defect pixels themselves stay black.
+
+    Key insight: Only structural anomalies—tiny isolated patches and dangling endpoints—are marked, not bulk black regions.
+    """
+    g = np.array(grid, dtype=int)
+    H, W = g.shape
+
+    hole_col = 0
+    border_col = 7
+
+    # STEP 0) Fill blue (1) pixels to black (0) when mostly surrounded by black.
+    base = g.copy()
+    for r in range(H):
+        for c in range(W):
+            if int(base[r, c]) != 1:
+                continue
+            nb = 0
+            oob = 0
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                rr = int(r + dr)
+                cc = int(c + dc)
+                if not (0 <= rr < H and 0 <= cc < W):
+                    oob += 1
+                    continue
+                if int(base[rr, cc]) == int(hole_col):
+                    nb += 1
+            # only count outside-as-black for corners (two out-of-bounds sides)
+            if oob >= 2:
+                nb += int(oob)
+            if nb >= 3:
+                base[int(r), int(c)] = int(hole_col)
+
+    # STEP 1/2) Collect target black pixels (they must remain black).
+    preserve: set[tuple[int, int]] = set()
+    comps = components_mask(base == int(hole_col), connectivity=4)
+    for coords in comps:
+        pts_list = [(int(r), int(c)) for r, c in coords]
+        if len(pts_list) <= 3:
+            preserve.update(pts_list)
+            continue
+        for r, c in pts_list:
+            nb = 0
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                rr = int(r + dr)
+                cc = int(c + dc)
+                if 0 <= rr < H and 0 <= cc < W and int(base[rr, cc]) == int(hole_col):
+                    nb += 1
+            if nb <= 1:
+                preserve.add((int(r), int(c)))
+
+    # STEP 3) Paint orange in the Chebyshev-1 neighborhood of each target set/pixel.
+    out = base.copy()
+    for coords in comps:
+        pts_list = [(int(r), int(c)) for r, c in coords]
+        targets = pts_list if len(pts_list) <= 3 else [p for p in pts_list if p in preserve]
+        for r, c in targets:
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    rr = int(r + dr)
+                    cc = int(c + dc)
+                    if 0 <= rr < H and 0 <= cc < W and (rr, cc) not in preserve:
+                        out[rr, cc] = int(border_col)
+
+    # Ensure target black pixels remain black.
+    for r, c in preserve:
+        out[int(r), int(c)] = int(hole_col)
+
+    return out
+
+# --------------- generator (att1) ---------------
+
+# ── CFG: tunable generation parameters ──────────────────────────────
+GRID_H_RANGE = (16, 19)           # canvas height bounds
+GRID_W_RANGE = (16, 19)           # canvas width bounds
+MIN_BLUE_REGION = 30              # minimum blue region size (cells)
+MIN_BLACK_REGION = 20             # minimum black region size (cells)
+PARTITION_STYLES = ['h_stripes', 'rect_inset', 'l_shape']
+STRIPE_CUTS_RANGE = (1, 3)       # number of horizontal cuts for h_stripes
+CUT_MARGIN = 3                   # min distance from grid edge for cuts
+INSET_MARGIN = 2                 # padding from edge for rect_inset
+INNER_INSET_MIN_GAP = 6          # min dimension for nested inset
+INNER_INSET_PROB = 0.5           # probability of nested inset
+DEFECT_COUNT_RANGE = (2, 9)      # number of defect holes to place
+DEFECT_SIZE_WEIGHTS = [6, 2, 1]  # weights for defect sizes [1, 2, 3]
+DEFECT_CLEARANCE = 2             # min Chebyshev distance between defects
+DEFECT_PLACE_TRIES = 50          # retries per defect placement
+LEAF_COUNT_RANGE = (0, 4)        # number of leaf protrusions
+SPUR_COUNT_RANGE = (2, 6)        # number of blue spurs in black regions
+MIN_DEFECTS = 2                  # reject grid if fewer defects placed
+MIN_SPURS = 2                    # reject grid if fewer spurs placed
+MAX_GEN_ATTEMPTS = 300           # outer retry limit
+
+
+def _nearby(r: int, c: int, dist: int, ref: set) -> bool:
+    """Return True if any pixel in `ref` is within Chebyshev distance `dist`."""
+    for dr in range(-dist, dist + 1):
+        for dc in range(-dist, dist + 1):
+            if (r + dr, c + dc) in ref:
+                return True
+    return False
+
+
+def _exclusion_zone(pixels, dist: int) -> set:
+    """Return the set of all coords within Chebyshev `dist` of any pixel."""
+    zone = set()
+    for r, c in pixels:
+        for dr in range(-dist, dist + 1):
+            for dc in range(-dist, dist + 1):
+                zone.add((r + dr, c + dc))
+    return zone
+
+
+def _build_partition(H: int, W: int) -> np.ndarray:
+    """Create an H x W grid partitioned into blue (1) and black (0) regions."""
+    grid = np.zeros((H, W), dtype=int)
+    style = random.choice(PARTITION_STYLES)
+
+    if style == 'h_stripes':
+        n_cuts = random.randint(*STRIPE_CUTS_RANGE)
+        cuts = sorted(random.sample(
+            range(CUT_MARGIN, H - CUT_MARGIN), min(n_cuts, H - 2 * CUT_MARGIN)))
+        boundaries = [0] + cuts + [H]
+        first_color = random.randint(0, 1)
+        for i in range(len(boundaries) - 1):
+            grid[boundaries[i]:boundaries[i + 1], :] = (first_color + i) % 2
+
+    elif style == 'rect_inset':
+        bg = random.randint(0, 1)
+        grid[:, :] = bg
+        r0 = random.randint(INSET_MARGIN, H // 3)
+        r1 = random.randint(2 * H // 3, H - CUT_MARGIN)
+        c0 = random.randint(INSET_MARGIN, W // 3)
+        c1 = random.randint(2 * W // 3, W - CUT_MARGIN)
+        grid[r0:r1 + 1, c0:c1 + 1] = 1 - bg
+        if (r1 - r0 > INNER_INSET_MIN_GAP and c1 - c0 > INNER_INSET_MIN_GAP
+                and random.random() < INNER_INSET_PROB):
+            ir0 = random.randint(r0 + 2, r0 + (r1 - r0) // 3)
+            ir1 = random.randint(r0 + 2 * (r1 - r0) // 3, r1 - 2)
+            ic0 = random.randint(c0 + 2, c0 + (c1 - c0) // 3)
+            ic1 = random.randint(c0 + 2 * (c1 - c0) // 3, c1 - 2)
+            grid[ir0:ir1 + 1, ic0:ic1 + 1] = bg
+
+    elif style == 'l_shape':
+        bg = random.randint(0, 1)
+        grid[:, :] = bg
+        vc = random.randint(W // 3, 2 * W // 3)
+        if random.random() < 0.5:
+            grid[:, :vc] = 1 - bg
+            hc = random.randint(H // 3, 2 * H // 3)
+            grid[:hc, vc:] = 1 - bg
+        else:
+            grid[:, vc:] = 1 - bg
+            hc = random.randint(H // 3, 2 * H // 3)
+            grid[hc:, :vc] = 1 - bg
+
+    return grid
+
+
+def _find_interior_blue(grid: np.ndarray) -> list[tuple[int, int]]:
+    """Return blue pixels whose 4-neighbors are all blue or out-of-bounds."""
+    H, W = grid.shape
+    blue = grid == 1
+    # A blue pixel is interior if no in-bounds 4-neighbor is non-blue.
+    eroded = blue.copy()
+    eroded[:-1, :] &= blue[1:, :]   # neighbor below
+    eroded[1:, :]  &= blue[:-1, :]  # neighbor above
+    eroded[:, :-1] &= blue[:, 1:]   # neighbor right
+    eroded[:, 1:]  &= blue[:, :-1]  # neighbor left
+    rs, cs = np.where(eroded)
+    coords = list(zip(rs.tolist(), cs.tolist()))
+    random.shuffle(coords)
+    return coords
+
+
+def _place_defects(grid: np.ndarray, interior_blue: list) -> tuple[set, int]:
+    """Place 2-9 small black defects in blue-region interiors.
+
+    Returns (defect_pixels, defects_placed). Modifies `interior_blue` in place.
+    """
+    H, W = grid.shape
+    n_defects = random.randint(*DEFECT_COUNT_RANGE)
+    defect_pixels: set[tuple[int, int]] = set()
+    interior_set = set(interior_blue)
+    defects_placed = 0
+
+    for _ in range(n_defects):
+        if not interior_blue:
+            break
+        defect_size = random.choices([1, 2, 3], weights=DEFECT_SIZE_WEIGHTS)[0]
+
+        placed = False
+        for _try in range(DEFECT_PLACE_TRIES):
+            if not interior_blue:
+                break
+            seed_r, seed_c = interior_blue[random.randint(0, len(interior_blue) - 1)]
+
+            if _nearby(seed_r, seed_c, DEFECT_CLEARANCE, defect_pixels):
+                continue
+
+            # Grow defect from seed
+            defect = [(seed_r, seed_c)]
+            if defect_size > 1:
+                dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                random.shuffle(dirs)
+                for dr, dc in dirs:
+                    nr, nc = seed_r + dr, seed_c + dc
+                    if (nr, nc) not in interior_set or (nr, nc) in defect_pixels:
+                        continue
+                    # Check neighbor is surrounded by blue (except the seed)
+                    ok = True
+                    for dr2, dc2 in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        rr, cc = nr + dr2, nc + dc2
+                        if (rr, cc) == (seed_r, seed_c):
+                            continue
+                        if 0 <= rr < H and 0 <= cc < W:
+                            if grid[rr, cc] != 1 or (rr, cc) in defect_pixels:
+                                ok = False
+                                break
+                    if ok and not _nearby(nr, nc, DEFECT_CLEARANCE, defect_pixels):
+                        defect.append((nr, nc))
+                        if len(defect) >= defect_size:
+                            break
+
+            # Validate: every non-defect 4-neighbor of every defect pixel must be blue
+            defect_set = set(defect)
+            valid = True
+            for r, c in defect:
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    rr, cc = r + dr, c + dc
+                    if (rr, cc) in defect_set:
+                        continue
+                    if 0 <= rr < H and 0 <= cc < W:
+                        if grid[rr, cc] != 1 or (rr, cc) in defect_pixels:
+                            valid = False
+                            break
+                if not valid:
+                    break
+
+            if valid:
+                defect_pixels.update(defect)
+                defects_placed += 1
+                placed = True
+                remove = _exclusion_zone(defect, DEFECT_CLEARANCE)
+                interior_blue[:] = [p for p in interior_blue if p not in remove]
+                interior_set -= remove
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+    r0 = min(b[0] for b in bbs)
+    c0 = min(b[1] for b in bbs)
+    r1 = max(b[2] for b in bbs)
+    c1 = max(b[3] for b in bbs)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox_h(b: BBox) -> int:
+    r0, _c0, r1, _c1 = b
+    return int(r1 - r0 + 1)
+
+
+def bbox_w(b: BBox) -> int:
+    _r0, c0, _r1, c1 = b
+    return int(c1 - c0 + 1)
+
+
+def bbox_anchor(b: BBox, *, anchor: str = "upper left") -> Coord:
+    """
+    Return an anchor point (r,c) for a bbox.
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/d59b0160.json'
+with open(p) as f:
+    data=json.load(f)
+print('train', len(data.get('train',[])), 'test', len(data.get('test',[])))
+for split in ('train','test'):
+    for i,ex in enumerate(data.get(split,[])[:3]):
+        gi=ex['input']
+        go=ex.get('output')
+        print(split, i, len(gi), len(gi[0]), 'out?', go is not None)
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+train 3 test 1
+train 0 16 16 out? True
+train 1 16 16 out? True
+train 2 16 16 out? True
+test 0 16 16 out? True
+
+codex
+参考任务已经看过了。它没有直接给可复用函数，但它强调“先提结构性特征，再按局部位置条件筛选”的复杂度基线；这和这次 D16 只在“命中条件”上加边界约束是一致的，我会保持这一量级，不额外引入别的机制。
+exec
+/bin/bash -lc "rg -n \"def (components_mask|random_free_location|paste)\\b\" /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+308:def paste(
+398:def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+854:def random_free_location(
+
+exec
+/bin/bash -lc "sed -n '360,560p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+    if transparent is not None:
+        m &= (patch_view != int(transparent))
+        if not overwrite:
+            m &= (dst_view == int(transparent))
+    else:
+        if not overwrite:
+            raise ValueError("paste: overwrite=False requires transparent to be set")
+
+    dst_view[m] = patch_view[m]
+    return dst
+
+
+def paint_coords(out: np.ndarray, coords: Iterable[Coord], color: int) -> None:
+    """Set out[r,c]=color for each coord (in-bounds only)."""
+    H, W = out.shape
+    v = int(color)
+    for r, c in coords:
+        rr = int(r)
+        cc = int(c)
+        if 0 <= rr < H and 0 <= cc < W:
+            out[rr, cc] = v
+
+
+# =============================================================================
+# Connected components (single unified entrypoint: find_components)
+# =============================================================================
+
+STRUCT4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=int)
+STRUCT8 = np.ones((3, 3), dtype=int)
+
+
+def label_mask(mask: np.ndarray, connectivity: int = 4) -> tuple[np.ndarray, int]:
+    """Connected-components labeling for a boolean mask."""
+    struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+    lab, n = label(mask.astype(bool), structure=struct)
+    return lab, int(n)
+
+
+def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+    """List of components from a boolean mask, each as an (N,2) coords array."""
+    lab, n = label_mask(mask, connectivity=connectivity)
+    return [np.argwhere(lab == k) for k in range(1, n + 1)]
+
+
+def find_components(
+    grid: np.ndarray,
+    *,
+    bg: int | None = None,
+    connectivity: int = 4,
+    monochromatic: bool = True,
+    colors: Sequence[int] | None = None,
+    min_area: int = 1,
+    return_format: str = "dict",
+) -> list[dict] | list[np.ndarray]:
+    """
+    Find connected components in a grid (unified API for ARC-2 + migrated seeds).
+
+    return_format:
+      - \"dict\": list of dicts {color, coords, bbox, area}
+      - \"objects\": list of full-grid arrays containing exactly one component
+    """
+    if bg is None:
+        bg = get_bg(grid)
+    bg = int(bg)
+
+    return_format = str(return_format).lower().strip()
+    if return_format not in {"dict", "objects"}:
+        raise ValueError("find_components: return_format must be 'dict' or 'objects'")
+
+    if colors is None:
+        colors_set = None
+        colors_iter = sorted(set(map(int, grid.flatten())) - {bg})
+    else:
+        colors_set = {int(c) for c in colors}
+        colors_iter = [int(c) for c in colors_set if int(c) != bg]
+
+    # Monochromatic = label per-color
+    if monochromatic:
+        if return_format == "dict":
+            out: list[dict] = []
+            for col in colors_iter:
+                mask = (grid == col)
+                if not mask.any():
+                    continue
+                comps = components_mask(mask, connectivity=connectivity)
+                for coords in comps:
+                    if int(coords.shape[0]) < int(min_area):
+                        continue
+                    out.append(
+                        {
+                            "color": int(col),
+                            "coords": coords,
+                            "bbox": bbox_coords(coords),
+                            "area": int(coords.shape[0]),
+                        }
+                    )
+            return out
+
+        objs: list[np.ndarray] = []
+        struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+        for col in colors_iter:
+            lab, n = label(grid == int(col), structure=struct)
+            for k in range(1, int(n) + 1):
+                m = (lab == k)
+                if int(m.sum()) < int(min_area):
+                    continue
+                obj = np.full_like(grid, bg)
+                obj[m] = int(col)
+                objs.append(obj)
+        return objs
+
+    # Multicolor components = label foreground as a whole
+    struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+    if colors_set is None:
+        fg_mask = (grid != bg)
+    else:
+        fg_mask = (grid != bg) & np.isin(grid, list(colors_set))
+
+    lab, n = label(fg_mask, structure=struct)
+    if return_format == "dict":
+        out: list[dict] = []
+        for k in range(1, int(n) + 1):
+            coords = np.argwhere(lab == k)
+            if coords.size == 0 or int(coords.shape[0]) < int(min_area):
+                continue
+            out.append(
+                {
+                    "color": None,
+                    "coords": coords,
+                    "bbox": bbox_coords(coords),
+                    "area": int(coords.shape[0]),
+                }
+            )
+        return out
+
+    objs: list[np.ndarray] = []
+    for k in range(1, int(n) + 1):
+        m = (lab == k)
+        if int(m.sum()) < int(min_area):
+            continue
+        obj = np.full_like(grid, bg)
+        obj[m] = grid[m]
+        objs.append(obj)
+    return objs
+
+
+# =============================================================================
+# Geometry
+# =============================================================================
+
+
+def flood_fill(grid: np.ndarray, r: int, c: int, color: int, *, connectivity: int = 4) -> None:
+    """Flood fill region containing (r,c) with `color` (in-place)."""
+    H, W = grid.shape
+    r0 = int(r)
+    c0 = int(c)
+    if not (0 <= r0 < H and 0 <= c0 < W):
+        return
+    new_col = int(color)
+    old_col = int(grid[r0, c0])
+    if old_col == new_col:
+        return
+    if int(connectivity) == 4:
+        def nbrs(rr: int, cc: int):
+            yield rr - 1, cc
+            yield rr + 1, cc
+            yield rr, cc - 1
+            yield rr, cc + 1
+    else:
+        def nbrs(rr: int, cc: int):
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    yield rr + dr, cc + dc
+    stack: list[Coord] = [(r0, c0)]
+    while stack:
+        rr, cc = stack.pop()
+        if not (0 <= rr < H and 0 <= cc < W):
+            continue
+        if int(grid[rr, cc]) != old_col:
+            continue
+        grid[rr, cc] = new_col
+        for nr, nc in nbrs(rr, cc):
+            stack.append((nr, nc))
+
+
+def draw_line(
+    grid: np.ndarray,
+    r: int,
+    c: int,
+    *,
+    end_r: int | None = None,
+    end_c: int | None = None,
+    length: int | None = None,
+    direction: tuple[int, int] | None = None,
+    color: int,
+    stop_at: set[int] | None = None,
+    clip: bool = False,
+) -> Coord:
+    """
+
+exec
+/bin/bash -lc "sed -n '854,940p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def random_free_location(
+    canvas: np.ndarray,
+    patch: np.ndarray,
+    *,
+    transparent: int,
+    border: int = 0,
+    padding: int = 0,
+    padding_connectivity: int = 8,
+) -> Coord:
+    """
+    Return a random (r,c) top-left location where `patch` fits without overlap.
+
+    This is the generator-friendly counterpart of `first_free_location` and mirrors the
+    legacy seeds' `random_free_location_for_sprite` behavior.
+
+    Raises:
+        ValueError: if no free location exists.
+    """
+    H, W = canvas.shape
+    h, w = patch.shape
+    border = int(border)
+    padding = int(padding)
+    pad_conn = int(padding_connectivity)
+    bg = int(transparent)
+
+    if h <= 0 or w <= 0:
+        raise ValueError("random_free_location: patch must be non-empty")
+    if H <= 0 or W <= 0:
+        raise ValueError("random_free_location: canvas must be non-empty")
+
+    if border < 0:
+        raise ValueError("random_free_location: border must be >= 0")
+    if padding < 0:
+        raise ValueError("random_free_location: padding must be >= 0")
+    if pad_conn not in (4, 8):
+        raise ValueError("random_free_location: padding_connectivity must be 4 or 8")
+
+    r_min = border
+    c_min = border
+    r_max = H - border - h
+    c_max = W - border - w
+    if r_max < r_min or c_max < c_min:
+        raise ValueError("random_free_location: patch cannot fit (border too large or patch too big)")
+
+    occ = (canvas != bg)
+    if padding > 0:
+        struct = STRUCT4 if pad_conn == 4 else STRUCT8
+        occ = ndimage.binary_dilation(occ, structure=struct, iterations=padding)
+
+    m = (patch != bg)
+
+    candidates: list[Coord] = []
+    for r0 in range(r_min, r_max + 1):
+        for c0 in range(c_min, c_max + 1):
+            if not bool((occ[r0 : r0 + h, c0 : c0 + w] & m).any()):
+                candidates.append((int(r0), int(c0)))
+
+    if not candidates:
+        raise ValueError("random_free_location: no free location")
+    return random.choice(candidates)
+
+
+def randomly_scatter_points(
+    grid: np.ndarray,
+    color: int,
+    *,
+    density: float = 0.5,
+    background: int = Color.BLACK,
+) -> np.ndarray:
+    """Randomly scatter points of `color` into `background` cells until reaching density."""
+    bg = int(background)
+    col = int(color)
+    colored = 0
+    H, W = grid.shape
+    target = int(round(float(density) * H * W))
+    while colored < target:
+        r = np.random.randint(0, H)
+        c = np.random.randint(0, W)
+        if int(grid[r, c]) == bg:
+            grid[r, c] = col
+            colored += 1
+    return grid
+
+
+def randomly_spaced_indices(max_len: int, n_indices: int, border_size: int = 1, padding: int = 1) -> np.ndarray:
+    """Generate randomly-spaced indices guaranteed to not be adjacent."""
+    max_len = int(max_len)
+
+exec
+/bin/bash -lc "sed -n '308,360p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def paste(
+    dst: np.ndarray,
+    patch: np.ndarray,
+    r0: int,
+    c0: int,
+    *,
+    transparent: int | None = None,
+    mask: np.ndarray | None = None,
+    overwrite: bool = True,
+    clip: bool = False,
+) -> np.ndarray:
+    """
+    Paste `patch` into `dst` at top-left (r0,c0).
+
+    This is the ONE placement primitive solver examples should use.
+
+    - Opaque paste: `paste(dst, patch, r0, c0)`
+    - Transparent overlay: `paste(dst, patch, r0, c0, transparent=bg)`
+    - Masked paste: `paste(dst, patch, r0, c0, mask=m)`
+    - Non-overwriting overlay: `paste(dst, patch, r0, c0, transparent=bg, overwrite=False)`
+    - Strict vs clip: default `clip=False` (fail fast); set `clip=True` to clip out-of-bounds.
+    """
+    H, W = dst.shape
+    r0 = int(r0)
+    c0 = int(c0)
+    h, w = map(int, patch.shape)
+
+    if not clip:
+        if r0 < 0 or c0 < 0 or r0 + h > H or c0 + w > W:
+            raise ValueError("paste: patch out of bounds (set clip=True to allow clipping)")
+        rr0, cc0 = r0, c0
+        rr1, cc1 = r0 + h, c0 + w
+        pr0, pc0 = 0, 0
+    else:
+        rr0 = max(0, r0)
+        cc0 = max(0, c0)
+        rr1 = min(H, r0 + h)
+        cc1 = min(W, c0 + w)
+        if rr0 >= rr1 or cc0 >= cc1:
+            return dst
+        pr0 = rr0 - r0
+        pc0 = cc0 - c0
+
+    pr1 = pr0 + (rr1 - rr0)
+    pc1 = pc0 + (cc1 - cc0)
+
+    dst_view = dst[rr0:rr1, cc0:cc1]
+    patch_view = patch[pr0:pr1, pc0:pc1]
+
+    m = np.ones(patch_view.shape, dtype=bool)
+    if mask is not None:
+        m &= mask[pr0:pr1, pc0:pc1].astype(bool)
+    if transparent is not None:
+
+codex
+我还要看一眼原题样例的对象外观，确认原任务里“整块矩形组件 + 内部彩点”的视觉基线，这样 D16 改动只会落在边缘/内部分布，不会偏离原题太远。
+exec
+/bin/bash -lc "python - <<'PY'
+import json, numpy as np
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/d59b0160.json'
+with open(p) as f:
+    data=json.load(f)
+for split in ('train','test'):
+    for i,ex in enumerate(data[split]):
+        print('\\n', split, i, 'input')
+        print(np.array(ex['input']))
+        if 'output' in ex:
+            print(split, i, 'output')
+            print(np.array(ex['output']))
+PY" in /home/lixinyu/snap/new
+ succeeded in 185ms:
+
+ train 0 input
+[[4 7 1 3 7 7 7 9 6 4 7 7 7 7 7 7]
+ [7 7 7 3 7 7 7 4 5 9 7 7 0 0 0 7]
+ [2 7 7 3 7 7 7 0 0 0 7 7 0 4 0 7]
+ [3 3 3 3 7 7 7 0 0 0 7 7 0 0 1 7]
+ [7 7 7 7 7 7 7 6 5 0 7 7 0 2 0 7]
+ [7 7 7 7 7 7 7 7 7 7 7 7 0 0 0 7]
+ [7 7 7 0 0 0 0 9 0 0 5 7 7 7 7 7]
+ [7 7 7 0 0 9 0 2 9 0 0 7 7 7 0 0]
+ [7 7 7 2 0 0 0 0 0 0 0 7 7 7 1 4]
+ [7 7 7 0 0 1 0 4 0 0 8 7 7 7 0 0]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 1 0]
+ [0 0 0 0 0 0 0 1 7 0 0 0 0 7 0 0]
+ [9 5 0 9 0 0 8 6 7 9 0 0 8 7 6 0]
+ [0 4 2 6 0 0 0 0 7 0 6 0 5 7 0 0]
+ [2 0 0 0 6 0 0 0 7 0 0 0 0 7 0 0]
+ [7 7 7 7 7 7 7 7 7 0 2 2 0 7 0 8]]
+train 0 output
+[[4 7 1 3 7 7 7 9 6 4 7 7 7 7 7 7]
+ [7 7 7 3 7 7 7 4 5 9 7 7 7 7 7 7]
+ [2 7 7 3 7 7 7 0 0 0 7 7 7 7 7 7]
+ [3 3 3 3 7 7 7 0 0 0 7 7 7 7 7 7]
+ [7 7 7 7 7 7 7 6 5 0 7 7 7 7 7 7]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 0 0]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 1 4]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 0 0]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 1 0]
+ [7 7 7 7 7 7 7 7 7 0 0 0 0 7 0 0]
+ [7 7 7 7 7 7 7 7 7 9 0 0 8 7 6 0]
+ [7 7 7 7 7 7 7 7 7 0 6 0 5 7 0 0]
+ [7 7 7 7 7 7 7 7 7 0 0 0 0 7 0 0]
+ [7 7 7 7 7 7 7 7 7 0 2 2 0 7 0 8]]
+
+ train 1 input
+[[7 9 7 3 7 7 7 7 7 7 7 7 7 7 7 7]
+ [7 7 7 3 7 7 0 0 0 7 7 7 0 0 0 7]
+ [5 7 6 3 7 7 1 0 0 7 7 7 6 0 4 7]
+ [3 3 3 3 7 7 0 5 0 7 7 7 0 0 0 7]
+ [7 7 7 7 7 7 0 0 0 7 7 7 0 9 0 7]
+ [7 7 7 7 7 7 2 0 6 7 7 7 0 0 0 7]
+ [7 7 7 7 7 7 0 0 0 7 7 7 0 8 0 7]
+ [7 7 7 7 7 7 7 7 7 7 7 7 0 0 0 7]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [7 0 0 0 1 0 0 0 7 7 7 7 7 7 7 7]
+ [7 0 0 0 0 0 5 0 7 7 7 7 7 7 7 7]
+ [7 0 9 0 8 0 0 0 7 7 7 0 0 0 0 9]
+ [7 0 0 0 0 0 4 0 7 7 7 0 6 0 0 0]
+ [7 0 2 0 4 0 0 0 7 7 7 0 0 0 0 0]
+ [7 7 7 7 7 7 7 7 7 7 7 0 0 5 1 0]
+ [7 7 7 7 7 7 7 7 7 7 7 8 0 0 0 0]]
+train 1 output
+[[7 9 7 3 7 7 7 7 7 7 7 7 7 7 7 7]
+ [7 7 7 3 7 7 0 0 0 7 7 7 0 0 0 7]
+ [5 7 6 3 7 7 1 0 0 7 7 7 6 0 4 7]
+ [3 3 3 3 7 7 0 5 0 7 7 7 0 0 0 7]
+ [7 7 7 7 7 7 0 0 0 7 7 7 0 9 0 7]
+ [7 7 7 7 7 7 2 0 6 7 7 7 0 0 0 7]
+ [7 7 7 7 7 7 0 0 0 7 7 7 0 8 0 7]
+ [7 7 7 7 7 7 7 7 7 7 7 7 0 0 0 7]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [7 0 0 0 1 0 0 0 7 7 7 7 7 7 7 7]
+ [7 0 0 0 0 0 5 0 7 7 7 7 7 7 7 7]
+ [7 0 9 0 8 0 0 0 7 7 7 7 7 7 7 7]
+ [7 0 0 0 0 0 4 0 7 7 7 7 7 7 7 7]
+ [7 0 2 0 4 0 0 0 7 7 7 7 7 7 7 7]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7]]
+
+ train 2 input
+[[7 6 7 3 7 7 7 7 7 7 7 7 7 7 7 7]
+ [1 7 7 3 7 7 7 0 8 0 0 0 5 0 0 0]
+ [7 7 8 3 7 7 7 0 5 0 0 6 0 0 0 0]
+ [3 3 3 3 7 7 7 4 0 0 0 0 0 8 0 0]
+ [7 7 7 7 7 7 7 9 0 0 6 0 0 0 4 0]
+ [7 0 0 0 0 0 7 0 0 0 0 5 9 0 5 0]
+ [7 5 2 2 0 0 7 9 0 0 0 0 8 0 0 0]
+ [7 0 0 1 0 0 7 1 0 0 2 0 0 0 0 6]
+ [7 0 0 5 5 0 7 7 7 7 7 7 7 7 7 7]
+ [7 0 0 0 9 0 7 7 7 0 9 0 0 7 7 7]
+ [7 0 0 0 6 0 7 7 7 0 0 0 0 7 7 7]
+ [7 7 7 7 7 7 7 7 7 8 0 0 0 7 7 7]
+ [7 7 6 1 0 0 0 0 7 0 0 0 0 7 0 0]
+ [7 7 0 2 0 0 0 0 7 0 0 0 0 7 0 0]
+ [7 7 0 8 0 0 0 0 7 7 7 7 7 7 0 0]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 0 0]]
+train 2 output
+[[7 6 7 3 7 7 7 7 7 7 7 7 7 7 7 7]
+ [1 7 7 3 7 7 7 7 7 7 7 7 7 7 7 7]
+ [7 7 8 3 7 7 7 7 7 7 7 7 7 7 7 7]
+ [3 3 3 3 7 7 7 7 7 7 7 7 7 7 7 7]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [7 0 0 0 0 0 7 7 7 7 7 7 7 7 7 7]
+ [7 5 2 2 0 0 7 7 7 7 7 7 7 7 7 7]
+ [7 0 0 1 0 0 7 7 7 7 7 7 7 7 7 7]
+ [7 0 0 5 5 0 7 7 7 7 7 7 7 7 7 7]
+ [7 0 0 0 9 0 7 7 7 0 9 0 0 7 7 7]
+ [7 0 0 0 6 0 7 7 7 0 0 0 0 7 7 7]
+ [7 7 7 7 7 7 7 7 7 8 0 0 0 7 7 7]
+ [7 7 7 7 7 7 7 7 7 0 0 0 0 7 0 0]
+ [7 7 7 7 7 7 7 7 7 0 0 0 0 7 0 0]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 0 0]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 0 0]]
+
+ test 0 input
+[[7 2 7 3 7 7 0 0 0 7 7 7 7 7 7 7]
+ [7 7 5 3 7 7 0 0 6 7 0 0 0 0 0 7]
+ [7 4 7 3 7 7 0 0 1 7 4 0 5 0 0 7]
+ [3 3 3 3 7 7 0 0 0 7 4 0 8 0 0 7]
+ [7 7 7 7 7 7 0 0 0 7 7 7 7 7 7 7]
+ [9 0 7 7 7 7 0 0 0 7 9 0 0 0 0 0]
+ [0 8 7 0 0 7 0 5 0 7 0 0 0 6 5 0]
+ [0 0 7 0 0 7 2 0 4 7 0 2 0 0 0 0]
+ [0 0 7 0 0 7 0 0 0 7 0 0 4 0 8 0]
+ [0 0 7 0 5 7 0 1 0 7 0 9 4 0 5 0]
+ [6 0 7 0 5 7 0 0 9 7 7 7 7 7 7 7]
+ [0 0 7 5 0 7 0 0 1 7 7 0 0 0 0 0]
+ [5 0 7 5 0 7 0 9 0 7 7 0 0 9 0 1]
+ [0 0 7 0 5 7 0 9 8 7 7 1 0 4 0 0]
+ [5 0 7 0 4 7 0 0 0 7 7 7 7 7 7 7]
+ [0 0 7 0 2 7 0 0 5 7 7 7 7 7 7 7]]
+test 0 output
+[[7 2 7 3 7 7 7 7 7 7 7 7 7 7 7 7]
+ [7 7 5 3 7 7 7 7 7 7 0 0 0 0 0 7]
+ [7 4 7 3 7 7 7 7 7 7 4 0 5 0 0 7]
+ [3 3 3 3 7 7 7 7 7 7 4 0 8 0 0 7]
+ [7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [9 0 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [0 8 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [0 0 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [0 0 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [0 0 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [6 0 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [0 0 7 7 7 7 7 7 7 7 7 0 0 0 0 0]
+ [5 0 7 7 7 7 7 7 7 7 7 0 0 9 0 1]
+ [0 0 7 7 7 7 7 7 7 7 7 1 0 4 0 0]
+ [5 0 7 7 7 7 7 7 7 7 7 7 7 7 7 7]
+ [0 0 7 7 7 7 7 7 7 7 7 7 7 7 7 7]]
+
+codex
+D16 的关键不是“多一个 if”，而是 generator 必须稳定地产生“颜色全集齐了但位置不对，所以不能删”的反例组件；否则样本会退化回原题。我会把 kept 组件拆成普通缺色型和“内部命中但边缘不全”的 decoy 型。
+exec
+/bin/bash -lc 'ls -ld /home/lixinyu/snap/new/ceshi/code/d59b0160/D16/2 || true' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+ls: cannot access '/home/lixinyu/snap/new/ceshi/code/d59b0160/D16/2': No such file or directory
+
+exec
+/bin/bash -lc "python - <<'PY'
+from pathlib import Path
+p=Path('/home/lixinyu/snap/new/ceshi/code/d59b0160/D16/2/code.py')
+print('exists', p.exists())
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+exists False
+
+codex
+接下来我会落地代码：先创建目标目录，再一次性写入新 solver/generator，并把设计分析直接放在文件注释里，便于后续核对变体是否真的只改了 D16。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code/d59b0160/D16/2' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code/d59b0160/D16/2/code.py
+diff --git a/ceshi/code/d59b0160/D16/2/code.py b/ceshi/code/d59b0160/D16/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9b6adc6bba806b72dad2a73376b6ca0df72e38a
+--- /dev/null
++++ b/ceshi/code/d59b0160/D16/2/code.py
+@@ -0,0 +1,368 @@
++# Variant of d59b0160
++# Dimension: D16 — 分量中颜色的空间分布约束 (meta)
++# Change: 仅检查分量是否包含图例颜色，不关注颜色在分量内的空间分布... → 图例颜色必须出现在分量的外接矩形边缘
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++# Design analysis for the D16 variant
++# a) Concrete behavior:
++#    The original task deletes any non-bg 4-connected component whose color set contains all legend colors.
++#    Here the object layout stays the same: a top-left 4x4 legend and several rectangular 0-based components.
++#    The changed event is inside the component test:
++#    - Old: a target color counts if it appears anywhere in the component.
++#    - New: a target color counts only if some pixel of that color lies on the bbox perimeter
++#      (top row, bottom row, left column, or right column) of that connected component.
++#    Example trace: if targets are {1, 4, 8} and a 5x5 rectangle contains 1 on the top edge, 4 on the right edge,
++#    and 8 only at the center, the old solver erases it because all three colors are present, while the new solver
++#    keeps it because 8 never touches the bbox edge.
++# b) Complexity calibration:
++#    The mechanism is still a single legend-driven filter over connected components. The only extra reasoning is
++#    computing a component bbox and restricting the matching colors to its perimeter. This matches the requested
++#    "boundary detection" flavor without adding new object classes or transformation stages.
++# c) Hidden assumptions review:
++#    - _find_legend still works unchanged because the legend encoding itself is unchanged.
++#    - The original `cols = {g[r, c] for ...}` relied on "presence anywhere is enough"; that assumption is now false.
++#      It must be replaced by a bbox-edge color set.
++#    - The original generator split objects into "contains all targets" vs "missing some target". That is no longer
++#      sufficient, because a kept object may contain all targets yet still fail the boundary condition. The generator
++#      must explicitly construct such decoys.
++# d) Placement legality:
++#    Components remain full rectangular patches of non-bg cells pasted with one-cell padding, so bbox computation is
++#    stable and components never merge. Decoy components are generated with h,w >= 3 so they have an interior cell.
++# e) Visual observability:
++#    Each generated grid contains at least one deleted component and at least one kept decoy component that contains
++#    all legend colors but places one required target only in the interior. This guarantees that the D16 behavior
++#    changes the output relative to the original rule on the same input.
++# f) Visual cleanliness:
++#    The legend stays isolated at the top-left, and each rectangular component occupies its own padded region.
++#    The only distinction viewers need to track is whether the legend colors sit on the rim or inside the rectangle.
++# g) Color inference:
++#    No hidden color-id ordering is used. Colors keep their original role as legend swatches; only their placement
++#    relative to the rectangle boundary matters.
++# h) Generator validity:
++#    Deleted components receive all target colors on boundary cells. Decoy-kept components receive all target colors
++#    overall, but one chosen target is forbidden from all boundary cells and appears only in the interior.
++# i) New solver assumptions:
++#    The solver now assumes every foreground component has a well-defined bbox edge and that the legend colors are
++#    non-empty. The generator guarantees this by keeping rectangular foreground components and a 3-color legend.
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _bbox_edge_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """Colors from component pixels that lie on the component's axis-aligned bbox perimeter."""
++    r0 = int(pts[:, 0].min())
++    c0 = int(pts[:, 1].min())
++    r1 = int(pts[:, 0].max())
++    c1 = int(pts[:, 1].max())
++    return {
++        int(g[r, c])
++        for r, c in pts
++        if int(r) in (r0, r1) or int(c) in (c0, c1)
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Erase connected components only when the legend palette reaches their bounding-frame.
++
++    Input structure:
++    - The background color fills most cells.
++    - In the top-left corner, a small square legend uses a shared border color on its bottom edge and right edge; the interior lists the target colors.
++    - Elsewhere, rectangular 4-connected foreground components contain color-0 filler plus scattered colored pixels.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each non-background connected component, compute its axis-aligned bounding rectangle.
++    - A legend color counts as matched only if that color appears on the rectangle's perimeter, not merely somewhere inside it.
++    - Erase the component iff every legend color is represented on that perimeter; otherwise leave it unchanged.
++
++    Key insight: The legend specifies a boundary signature rather than a plain palette-membership test, so interior-only target colors are insufficient.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        edge_cols = _bbox_edge_colors(g, pts)
++        if legend_colors.issubset(edge_cols):
++            for r, c in pts:
++                out[int(r), int(c)] = bg
++    return out
++
++
++# --------------- generator (D16 variant) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of colored pixels among the 0-filled rectangle) --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++
++# -- Component count & role split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box at top-left and place target colors in its 3x3 interior."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims(*, require_interior: bool) -> tuple[int, int]:
++    """Sample component dimensions, optionally enforcing a non-empty interior."""
++    for _ in range(100):
++        mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++        if mode == "tall":
++            h, w = random.randint(*TALL_H), random.randint(*TALL_W)
++        elif mode == "wide":
++            h, w = random.randint(*WIDE_H), random.randint(*WIDE_W)
++        else:
++            h, w = random.randint(*MED_H), random.randint(*MED_W)
++        if not require_interior or (h >= 3 and w >= 3):
++            return h, w
++    raise RuntimeError("failed to sample component dimensions")
++
++
++def _boundary_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(h)
++        for c in range(w)
++        if r in (0, h - 1) or c in (0, w - 1)
++    ]
++
++
++def _interior_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(1, h - 1)
++        for c in range(1, w - 1)
++    ]
++
++
++def _random_color(choices: list[int]) -> int:
++    return int(random.choice(choices))
++
++
++def _component_patch(h: int, w: int, targets: list[int], role: str) -> np.ndarray:
++    """Build one rectangular component with a role-specific boundary/interior target layout."""
++    area = h * w
++    mandatory = NUM_TARGETS if role in {"deleted", "decoy"} else 1
++    lo = max(mandatory, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    n_colored = random.randint(lo, hi)
++
++    boundary = _boundary_coords(h, w)
++    interior = _interior_coords(h, w)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    placements: dict[tuple[int, int], int] = {}
++    used: set[tuple[int, int]] = set()
++
++    if role == "deleted":
++        for color, pos in zip(targets, random.sample(boundary, NUM_TARGETS)):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden: set[int] = set()
++        interior_only_color = None
++
++    elif role == "decoy":
++        assert interior, "decoy components require an interior"
++        interior_only_color = int(random.choice(targets))
++        other_targets = [t for t in targets if t != interior_only_color]
++        inner_pos = random.choice(interior)
++        placements[inner_pos] = interior_only_color
++        used.add(inner_pos)
++        for color, pos in zip(other_targets, random.sample(boundary, len(other_targets))):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden = {interior_only_color}
++
++    elif role == "ordinary":
++        keep_count = random.randint(0, NUM_TARGETS - 1)
++        present_targets = random.sample(targets, keep_count)
++        allowed = non_targets + present_targets
++        seed_pos = random.choice(boundary)
++        placements[seed_pos] = _random_color(allowed)
++        used.add(seed_pos)
++        extra_palette = allowed
++        edge_forbidden = set()
++        interior_only_color = None
++
++    else:
++        raise ValueError(f"unknown role: {role}")
++
++    remaining_slots = [(r, c) for r in range(h) for c in range(w) if (r, c) not in used]
++    extra_count = n_colored - len(placements)
++    if extra_count > len(remaining_slots):
++        raise ValueError("not enough free slots for colored pixels")
++
++    for pos in random.sample(remaining_slots, extra_count):
++        r, c = pos
++        allowed = list(extra_palette)
++        if interior_only_color is not None and (r in (0, h - 1) or c in (0, w - 1)):
++            allowed = [col for col in allowed if col not in edge_forbidden]
++        if interior_only_color is not None and 0 < r < h - 1 and 0 < c < w - 1:
++            allowed = list(extra_palette)
++        placements[pos] = _random_color(allowed)
++
++    patch = np.zeros((h, w), dtype=int)
++    for (r, c), color in placements.items():
++        patch[r, c] = int(color)
++
++    return patch
++
++
++def _component_target_stats(patch: np.ndarray, targets: set[int]) -> tuple[set[int], set[int]]:
++    """Return (all_target_colors_present, boundary_target_colors_present) for one patch."""
++    h, w = patch.shape
++    all_targets = {int(v) for v in np.unique(patch) if int(v) in targets}
++    boundary_targets = {
++        int(patch[r, c])
++        for r in range(h)
++        for c in range(w)
++        if (r in (0, h - 1) or c in (0, w - 1)) and int(patch[r, c]) in targets
++    }
++    return all_targets, boundary_targets
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input; return it or None on failure."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    target_set = set(targets)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    deleted_count = component_count - NUM_KEPT
++    decoy_count = random.randint(1, 2)
++    ordinary_count = NUM_KEPT - decoy_count
++    roles = (
++        ["deleted"] * deleted_count
++        + ["decoy"] * decoy_count
++        + ["ordinary"] * ordinary_count
++    )
++    random.shuffle(roles)
++
++    saw_decoy = False
++    saw_deleted = False
++
++    for role in roles:
++        h, w = _component_dims(require_interior=(role == "decoy"))
++        patch = _component_patch(h, w, targets, role)
++        all_targets, boundary_targets = _component_target_stats(patch, target_set)
++
++        if role == "deleted" and boundary_targets != target_set:
++            return None
++        if role == "decoy" and not (all_targets == target_set and boundary_targets != target_set):
++            return None
++        if role == "ordinary" and all_targets == target_set:
++            return None
++
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++
++        paste(inp, patch, r, c)
++        if role != "deleted":
++            paste(out, patch, r, c)
++        saw_decoy |= role == "decoy"
++        saw_deleted |= role == "deleted"
++
++    if not (saw_decoy and saw_deleted):
++        return None
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+diff --git a/ceshi/code/d59b0160/D16/2/code.py b/ceshi/code/d59b0160/D16/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9b6adc6bba806b72dad2a73376b6ca0df72e38a
+--- /dev/null
++++ b/ceshi/code/d59b0160/D16/2/code.py
+@@ -0,0 +1,368 @@
++# Variant of d59b0160
++# Dimension: D16 — 分量中颜色的空间分布约束 (meta)
++# Change: 仅检查分量是否包含图例颜色，不关注颜色在分量内的空间分布... → 图例颜色必须出现在分量的外接矩形边缘
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++# Design analysis for the D16 variant
++# a) Concrete behavior:
++#    The original task deletes any non-bg 4-connected component whose color set contains all legend colors.
++#    Here the object layout stays the same: a top-left 4x4 legend and several rectangular 0-based components.
++#    The changed event is inside the component test:
++#    - Old: a target color counts if it appears anywhere in the component.
++#    - New: a target color counts only if some pixel of that color lies on the bbox perimeter
++#      (top row, bottom row, left column, or right column) of that connected component.
++#    Example trace: if targets are {1, 4, 8} and a 5x5 rectangle contains 1 on the top edge, 4 on the right edge,
++#    and 8 only at the center, the old solver erases it because all three colors are present, while the new solver
++#    keeps it because 8 never touches the bbox edge.
++# b) Complexity calibration:
++#    The mechanism is still a single legend-driven filter over connected components. The only extra reasoning is
++#    computing a component bbox and restricting the matching colors to its perimeter. This matches the requested
++#    "boundary detection" flavor without adding new object classes or transformation stages.
++# c) Hidden assumptions review:
++#    - _find_legend still works unchanged because the legend encoding itself is unchanged.
++#    - The original `cols = {g[r, c] for ...}` relied on "presence anywhere is enough"; that assumption is now false.
++#      It must be replaced by a bbox-edge color set.
++#    - The original generator split objects into "contains all targets" vs "missing some target". That is no longer
++#      sufficient, because a kept object may contain all targets yet still fail the boundary condition. The generator
++#      must explicitly construct such decoys.
++# d) Placement legality:
++#    Components remain full rectangular patches of non-bg cells pasted with one-cell padding, so bbox computation is
++#    stable and components never merge. Decoy components are generated with h,w >= 3 so they have an interior cell.
++# e) Visual observability:
++#    Each generated grid contains at least one deleted component and at least one kept decoy component that contains
++#    all legend colors but places one required target only in the interior. This guarantees that the D16 behavior
++#    changes the output relative to the original rule on the same input.
++# f) Visual cleanliness:
++#    The legend stays isolated at the top-left, and each rectangular component occupies its own padded region.
++#    The only distinction viewers need to track is whether the legend colors sit on the rim or inside the rectangle.
++# g) Color inference:
++#    No hidden color-id ordering is used. Colors keep their original role as legend swatches; only their placement
++#    relative to the rectangle boundary matters.
++# h) Generator validity:
++#    Deleted components receive all target colors on boundary cells. Decoy-kept components receive all target colors
++#    overall, but one chosen target is forbidden from all boundary cells and appears only in the interior.
++# i) New solver assumptions:
++#    The solver now assumes every foreground component has a well-defined bbox edge and that the legend colors are
++#    non-empty. The generator guarantees this by keeping rectangular foreground components and a 3-color legend.
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _bbox_edge_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """Colors from component pixels that lie on the component's axis-aligned bbox perimeter."""
++    r0 = int(pts[:, 0].min())
++    c0 = int(pts[:, 1].min())
++    r1 = int(pts[:, 0].max())
++    c1 = int(pts[:, 1].max())
++    return {
++        int(g[r, c])
++        for r, c in pts
++        if int(r) in (r0, r1) or int(c) in (c0, c1)
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Erase connected components only when the legend palette reaches their bounding-frame.
++
++    Input structure:
++    - The background color fills most cells.
++    - In the top-left corner, a small square legend uses a shared border color on its bottom edge and right edge; the interior lists the target colors.
++    - Elsewhere, rectangular 4-connected foreground components contain color-0 filler plus scattered colored pixels.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each non-background connected component, compute its axis-aligned bounding rectangle.
++    - A legend color counts as matched only if that color appears on the rectangle's perimeter, not merely somewhere inside it.
++    - Erase the component iff every legend color is represented on that perimeter; otherwise leave it unchanged.
++
++    Key insight: The legend specifies a boundary signature rather than a plain palette-membership test, so interior-only target colors are insufficient.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        edge_cols = _bbox_edge_colors(g, pts)
++        if legend_colors.issubset(edge_cols):
++            for r, c in pts:
++                out[int(r), int(c)] = bg
++    return out
++
++
++# --------------- generator (D16 variant) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of colored pixels among the 0-filled rectangle) --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++
++# -- Component count & role split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box at top-left and place target colors in its 3x3 interior."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims(*, require_interior: bool) -> tuple[int, int]:
++    """Sample component dimensions, optionally enforcing a non-empty interior."""
++    for _ in range(100):
++        mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++        if mode == "tall":
++            h, w = random.randint(*TALL_H), random.randint(*TALL_W)
++        elif mode == "wide":
++            h, w = random.randint(*WIDE_H), random.randint(*WIDE_W)
++        else:
++            h, w = random.randint(*MED_H), random.randint(*MED_W)
++        if not require_interior or (h >= 3 and w >= 3):
++            return h, w
++    raise RuntimeError("failed to sample component dimensions")
++
++
++def _boundary_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(h)
++        for c in range(w)
++        if r in (0, h - 1) or c in (0, w - 1)
++    ]
++
++
++def _interior_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(1, h - 1)
++        for c in range(1, w - 1)
++    ]
++
++
++def _random_color(choices: list[int]) -> int:
++    return int(random.choice(choices))
++
++
++def _component_patch(h: int, w: int, targets: list[int], role: str) -> np.ndarray:
++    """Build one rectangular component with a role-specific boundary/interior target layout."""
++    area = h * w
++    mandatory = NUM_TARGETS if role in {"deleted", "decoy"} else 1
++    lo = max(mandatory, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    n_colored = random.randint(lo, hi)
++
++    boundary = _boundary_coords(h, w)
++    interior = _interior_coords(h, w)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    placements: dict[tuple[int, int], int] = {}
++    used: set[tuple[int, int]] = set()
++
++    if role == "deleted":
++        for color, pos in zip(targets, random.sample(boundary, NUM_TARGETS)):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden: set[int] = set()
++        interior_only_color = None
++
++    elif role == "decoy":
++        assert interior, "decoy components require an interior"
++        interior_only_color = int(random.choice(targets))
++        other_targets = [t for t in targets if t != interior_only_color]
++        inner_pos = random.choice(interior)
++        placements[inner_pos] = interior_only_color
++        used.add(inner_pos)
++        for color, pos in zip(other_targets, random.sample(boundary, len(other_targets))):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden = {interior_only_color}
++
++    elif role == "ordinary":
++        keep_count = random.randint(0, NUM_TARGETS - 1)
++        present_targets = random.sample(targets, keep_count)
++        allowed = non_targets + present_targets
++        seed_pos = random.choice(boundary)
++        placements[seed_pos] = _random_color(allowed)
++        used.add(seed_pos)
++        extra_palette = allowed
++        edge_forbidden = set()
++        interior_only_color = None
++
++    else:
++        raise ValueError(f"unknown role: {role}")
++
++    remaining_slots = [(r, c) for r in range(h) for c in range(w) if (r, c) not in used]
++    extra_count = n_colored - len(placements)
++    if extra_count > len(remaining_slots):
++        raise ValueError("not enough free slots for colored pixels")
++
++    for pos in random.sample(remaining_slots, extra_count):
++        r, c = pos
++        allowed = list(extra_palette)
++        if interior_only_color is not None and (r in (0, h - 1) or c in (0, w - 1)):
++            allowed = [col for col in allowed if col not in edge_forbidden]
++        if interior_only_color is not None and 0 < r < h - 1 and 0 < c < w - 1:
++            allowed = list(extra_palette)
++        placements[pos] = _random_color(allowed)
++
++    patch = np.zeros((h, w), dtype=int)
++    for (r, c), color in placements.items():
++        patch[r, c] = int(color)
++
++    return patch
++
++
++def _component_target_stats(patch: np.ndarray, targets: set[int]) -> tuple[set[int], set[int]]:
++    """Return (all_target_colors_present, boundary_target_colors_present) for one patch."""
++    h, w = patch.shape
++    all_targets = {int(v) for v in np.unique(patch) if int(v) in targets}
++    boundary_targets = {
++        int(patch[r, c])
++        for r in range(h)
++        for c in range(w)
++        if (r in (0, h - 1) or c in (0, w - 1)) and int(patch[r, c]) in targets
++    }
++    return all_targets, boundary_targets
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input; return it or None on failure."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    target_set = set(targets)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    deleted_count = component_count - NUM_KEPT
++    decoy_count = random.randint(1, 2)
++    ordinary_count = NUM_KEPT - decoy_count
++    roles = (
++        ["deleted"] * deleted_count
++        + ["decoy"] * decoy_count
++        + ["ordinary"] * ordinary_count
++    )
++    random.shuffle(roles)
++
++    saw_decoy = False
++    saw_deleted = False
++
++    for role in roles:
++        h, w = _component_dims(require_interior=(role == "decoy"))
++        patch = _component_patch(h, w, targets, role)
++        all_targets, boundary_targets = _component_target_stats(patch, target_set)
++
++        if role == "deleted" and boundary_targets != target_set:
++            return None
++        if role == "decoy" and not (all_targets == target_set and boundary_targets != target_set):
++            return None
++        if role == "ordinary" and all_targets == target_set:
++            return None
++
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++
++        paste(inp, patch, r, c)
++        if role != "deleted":
++            paste(out, patch, r, c)
++        saw_decoy |= role == "decoy"
++        saw_deleted |= role == "deleted"
++
++    if not (saw_decoy and saw_deleted):
++        return None
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+codex
+代码已经写入。现在先跑 50 次生成/求解测试；如果 import 或放置约束有问题，会先在这一步暴露。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys; spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/d59b0160/D16/2/code.py'); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); ok, fail = 0, 0; t0 = time.time();
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code/d59b0160/D16/2/code.py b/ceshi/code/d59b0160/D16/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9b6adc6bba806b72dad2a73376b6ca0df72e38a
+--- /dev/null
++++ b/ceshi/code/d59b0160/D16/2/code.py
+@@ -0,0 +1,368 @@
++# Variant of d59b0160
++# Dimension: D16 — 分量中颜色的空间分布约束 (meta)
++# Change: 仅检查分量是否包含图例颜色，不关注颜色在分量内的空间分布... → 图例颜色必须出现在分量的外接矩形边缘
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++# Design analysis for the D16 variant
++# a) Concrete behavior:
++#    The original task deletes any non-bg 4-connected component whose color set contains all legend colors.
++#    Here the object layout stays the same: a top-left 4x4 legend and several rectangular 0-based components.
++#    The changed event is inside the component test:
++#    - Old: a target color counts if it appears anywhere in the component.
++#    - New: a target color counts only if some pixel of that color lies on the bbox perimeter
++#      (top row, bottom row, left column, or right column) of that connected component.
++#    Example trace: if targets are {1, 4, 8} and a 5x5 rectangle contains 1 on the top edge, 4 on the right edge,
++#    and 8 only at the center, the old solver erases it because all three colors are present, while the new solver
++#    keeps it because 8 never touches the bbox edge.
++# b) Complexity calibration:
++#    The mechanism is still a single legend-driven filter over connected components. The only extra reasoning is
++#    computing a component bbox and restricting the matching colors to its perimeter. This matches the requested
++#    "boundary detection" flavor without adding new object classes or transformation stages.
++# c) Hidden assumptions review:
++#    - _find_legend still works unchanged because the legend encoding itself is unchanged.
++#    - The original `cols = {g[r, c] for ...}` relied on "presence anywhere is enough"; that assumption is now false.
++#      It must be replaced by a bbox-edge color set.
++#    - The original generator split objects into "contains all targets" vs "missing some target". That is no longer
++#      sufficient, because a kept object may contain all targets yet still fail the boundary condition. The generator
++#      must explicitly construct such decoys.
++# d) Placement legality:
++#    Components remain full rectangular patches of non-bg cells pasted with one-cell padding, so bbox computation is
++#    stable and components never merge. Decoy components are generated with h,w >= 3 so they have an interior cell.
++# e) Visual observability:
++#    Each generated grid contains at least one deleted component and at least one kept decoy component that contains
++#    all legend colors but places one required target only in the interior. This guarantees that the D16 behavior
++#    changes the output relative to the original rule on the same input.
++# f) Visual cleanliness:
++#    The legend stays isolated at the top-left, and each rectangular component occupies its own padded region.
++#    The only distinction viewers need to track is whether the legend colors sit on the rim or inside the rectangle.
++# g) Color inference:
++#    No hidden color-id ordering is used. Colors keep their original role as legend swatches; only their placement
++#    relative to the rectangle boundary matters.
++# h) Generator validity:
++#    Deleted components receive all target colors on boundary cells. Decoy-kept components receive all target colors
++#    overall, but one chosen target is forbidden from all boundary cells and appears only in the interior.
++# i) New solver assumptions:
++#    The solver now assumes every foreground component has a well-defined bbox edge and that the legend colors are
++#    non-empty. The generator guarantees this by keeping rectangular foreground components and a 3-color legend.
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _bbox_edge_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """Colors from component pixels that lie on the component's axis-aligned bbox perimeter."""
++    r0 = int(pts[:, 0].min())
++    c0 = int(pts[:, 1].min())
++    r1 = int(pts[:, 0].max())
++    c1 = int(pts[:, 1].max())
++    return {
++        int(g[r, c])
++        for r, c in pts
++        if int(r) in (r0, r1) or int(c) in (c0, c1)
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Erase connected components only when the legend palette reaches their bounding-frame.
++
++    Input structure:
++    - The background color fills most cells.
++    - In the top-left corner, a small square legend uses a shared border color on its bottom edge and right edge; the interior lists the target colors.
++    - Elsewhere, rectangular 4-connected foreground components contain color-0 filler plus scattered colored pixels.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each non-background connected component, compute its axis-aligned bounding rectangle.
++    - A legend color counts as matched only if that color appears on the rectangle's perimeter, not merely somewhere inside it.
++    - Erase the component iff every legend color is represented on that perimeter; otherwise leave it unchanged.
++
++    Key insight: The legend specifies a boundary signature rather than a plain palette-membership test, so interior-only target colors are insufficient.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        edge_cols = _bbox_edge_colors(g, pts)
++        if legend_colors.issubset(edge_cols):
++            for r, c in pts:
++                out[int(r), int(c)] = bg
++    return out
++
++
++# --------------- generator (D16 variant) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of colored pixels among the 0-filled rectangle) --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++
++# -- Component count & role split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box at top-left and place target colors in its 3x3 interior."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims(*, require_interior: bool) -> tuple[int, int]:
++    """Sample component dimensions, optionally enforcing a non-empty interior."""
++    for _ in range(100):
++        mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++        if mode == "tall":
++            h, w = random.randint(*TALL_H), random.randint(*TALL_W)
++        elif mode == "wide":
++            h, w = random.randint(*WIDE_H), random.randint(*WIDE_W)
++        else:
++            h, w = random.randint(*MED_H), random.randint(*MED_W)
++        if not require_interior or (h >= 3 and w >= 3):
++            return h, w
++    raise RuntimeError("failed to sample component dimensions")
++
++
++def _boundary_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(h)
++        for c in range(w)
++        if r in (0, h - 1) or c in (0, w - 1)
++    ]
++
++
++def _interior_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(1, h - 1)
++        for c in range(1, w - 1)
++    ]
++
++
++def _random_color(choices: list[int]) -> int:
++    return int(random.choice(choices))
++
++
++def _component_patch(h: int, w: int, targets: list[int], role: str) -> np.ndarray:
++    """Build one rectangular component with a role-specific boundary/interior target layout."""
++    area = h * w
++    mandatory = NUM_TARGETS if role in {"deleted", "decoy"} else 1
++    lo = max(mandatory, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    n_colored = random.randint(lo, hi)
++
++    boundary = _boundary_coords(h, w)
++    interior = _interior_coords(h, w)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    placements: dict[tuple[int, int], int] = {}
++    used: set[tuple[int, int]] = set()
++
++    if role == "deleted":
++        for color, pos in zip(targets, random.sample(boundary, NUM_TARGETS)):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden: set[int] = set()
++        interior_only_color = None
++
++    elif role == "decoy":
++        assert interior, "decoy components require an interior"
++        interior_only_color = int(random.choice(targets))
++        other_targets = [t for t in targets if t != interior_only_color]
++        inner_pos = random.choice(interior)
++        placements[inner_pos] = interior_only_color
++        used.add(inner_pos)
++        for color, pos in zip(other_targets, random.sample(boundary, len(other_targets))):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden = {interior_only_color}
++
++    elif role == "ordinary":
++        keep_count = random.randint(0, NUM_TARGETS - 1)
++        present_targets = random.sample(targets, keep_count)
++        allowed = non_targets + present_targets
++        seed_pos = random.choice(boundary)
++        placements[seed_pos] = _random_color(allowed)
++        used.add(seed_pos)
++        extra_palette = allowed
++        edge_forbidden = set()
++        interior_only_color = None
++
++    else:
++        raise ValueError(f"unknown role: {role}")
++
++    remaining_slots = [(r, c) for r in range(h) for c in range(w) if (r, c) not in used]
++    extra_count = n_colored - len(placements)
++    if extra_count > len(remaining_slots):
++        raise ValueError("not enough free slots for colored pixels")
++
++    for pos in random.sample(remaining_slots, extra_count):
++        r, c = pos
++        allowed = list(extra_palette)
++        if interior_only_color is not None and (r in (0, h - 1) or c in (0, w - 1)):
++            allowed = [col for col in allowed if col not in edge_forbidden]
++        if interior_only_color is not None and 0 < r < h - 1 and 0 < c < w - 1:
++            allowed = list(extra_palette)
++        placements[pos] = _random_color(allowed)
++
++    patch = np.zeros((h, w), dtype=int)
++    for (r, c), color in placements.items():
++        patch[r, c] = int(color)
++
++    return patch
++
++
++def _component_target_stats(patch: np.ndarray, targets: set[int]) -> tuple[set[int], set[int]]:
++    """Return (all_target_colors_present, boundary_target_colors_present) for one patch."""
++    h, w = patch.shape
++    all_targets = {int(v) for v in np.unique(patch) if int(v) in targets}
++    boundary_targets = {
++        int(patch[r, c])
++        for r in range(h)
++        for c in range(w)
++        if (r in (0, h - 1) or c in (0, w - 1)) and int(patch[r, c]) in targets
++    }
++    return all_targets, boundary_targets
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input; return it or None on failure."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    target_set = set(targets)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    deleted_count = component_count - NUM_KEPT
++    decoy_count = random.randint(1, 2)
++    ordinary_count = NUM_KEPT - decoy_count
++    roles = (
++        ["deleted"] * deleted_count
++        + ["decoy"] * decoy_count
++        + ["ordinary"] * ordinary_count
++    )
++    random.shuffle(roles)
++
++    saw_decoy = False
++    saw_deleted = False
++
++    for role in roles:
++        h, w = _component_dims(require_interior=(role == "decoy"))
++        patch = _component_patch(h, w, targets, role)
++        all_targets, boundary_targets = _component_target_stats(patch, target_set)
++
++        if role == "deleted" and boundary_targets != target_set:
++            return None
++        if role == "decoy" and not (all_targets == target_set and boundary_targets != target_set):
++            return None
++        if role == "ordinary" and all_targets == target_set:
++            return None
++
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++
++        paste(inp, patch, r, c)
++        if role != "deleted":
++            paste(out, patch, r, c)
++        saw_decoy |= role == "decoy"
++        saw_deleted |= role == "deleted"
++
++    if not (saw_decoy and saw_deleted):
++        return None
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+diff --git a/ceshi/code/d59b0160/D16/2/code.py b/ceshi/code/d59b0160/D16/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9b6adc6bba806b72dad2a73376b6ca0df72e38a
+--- /dev/null
++++ b/ceshi/code/d59b0160/D16/2/code.py
+@@ -0,0 +1,368 @@
++# Variant of d59b0160
++# Dimension: D16 — 分量中颜色的空间分布约束 (meta)
++# Change: 仅检查分量是否包含图例颜色，不关注颜色在分量内的空间分布... → 图例颜色必须出现在分量的外接矩形边缘
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++# Design analysis for the D16 variant
++# a) Concrete behavior:
++#    The original task deletes any non-bg 4-connected component whose color set contains all legend colors.
++#    Here the object layout stays the same: a top-left 4x4 legend and several rectangular 0-based components.
++#    The changed event is inside the component test:
++#    - Old: a target color counts if it appears anywhere in the component.
++#    - New: a target color counts only if some pixel of that color lies on the bbox perimeter
++#      (top row, bottom row, left column, or right column) of that connected component.
++#    Example trace: if targets are {1, 4, 8} and a 5x5 rectangle contains 1 on the top edge, 4 on the right edge,
++#    and 8 only at the center, the old solver erases it because all three colors are present, while the new solver
++#    keeps it because 8 never touches the bbox edge.
++# b) Complexity calibration:
++#    The mechanism is still a single legend-driven filter over connected components. The only extra reasoning is
++#    computing a component bbox and restricting the matching colors to its perimeter. This matches the requested
++#    "boundary detection" flavor without adding new object classes or transformation stages.
++# c) Hidden assumptions review:
++#    - _find_legend still works unchanged because the legend encoding itself is unchanged.
++#    - The original `cols = {g[r, c] for ...}` relied on "presence anywhere is enough"; that assumption is now false.
++#      It must be replaced by a bbox-edge color set.
++#    - The original generator split objects into "contains all targets" vs "missing some target". That is no longer
++#      sufficient, because a kept object may contain all targets yet still fail the boundary condition. The generator
++#      must explicitly construct such decoys.
++# d) Placement legality:
++#    Components remain full rectangular patches of non-bg cells pasted with one-cell padding, so bbox computation is
++#    stable and components never merge. Decoy components are generated with h,w >= 3 so they have an interior cell.
++# e) Visual observability:
++#    Each generated grid contains at least one deleted component and at least one kept decoy component that contains
++#    all legend colors but places one required target only in the interior. This guarantees that the D16 behavior
++#    changes the output relative to the original rule on the same input.
++# f) Visual cleanliness:
++#    The legend stays isolated at the top-left, and each rectangular component occupies its own padded region.
++#    The only distinction viewers need to track is whether the legend colors sit on the rim or inside the rectangle.
++# g) Color inference:
++#    No hidden color-id ordering is used. Colors keep their original role as legend swatches; only their placement
++#    relative to the rectangle boundary matters.
++# h) Generator validity:
++#    Deleted components receive all target colors on boundary cells. Decoy-kept components receive all target colors
++#    overall, but one chosen target is forbidden from all boundary cells and appears only in the interior.
++# i) New solver assumptions:
++#    The solver now assumes every foreground component has a well-defined bbox edge and that the legend colors are
++#    non-empty. The generator guarantees this by keeping rectangular foreground components and a 3-color legend.
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _bbox_edge_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """Colors from component pixels that lie on the component's axis-aligned bbox perimeter."""
++    r0 = int(pts[:, 0].min())
++    c0 = int(pts[:, 1].min())
++    r1 = int(pts[:, 0].max())
++    c1 = int(pts[:, 1].max())
++    return {
++        int(g[r, c])
++        for r, c in pts
++        if int(r) in (r0, r1) or int(c) in (c0, c1)
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Erase connected components only when the legend palette reaches their bounding-frame.
++
++    Input structure:
++    - The background color fills most cells.
++    - In the top-left corner, a small square legend uses a shared border color on its bottom edge and right edge; the interior lists the target colors.
++    - Elsewhere, rectangular 4-connected foreground components contain color-0 filler plus scattered colored pixels.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each non-background connected component, compute its axis-aligned bounding rectangle.
++    - A legend color counts as matched only if that color appears on the rectangle's perimeter, not merely somewhere inside it.
++    - Erase the component iff every legend color is represented on that perimeter; otherwise leave it unchanged.
++
++    Key insight: The legend specifies a boundary signature rather than a plain palette-membership test, so interior-only target colors are insufficient.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        edge_cols = _bbox_edge_colors(g, pts)
++        if legend_colors.issubset(edge_cols):
++            for r, c in pts:
++                out[int(r), int(c)] = bg
++    return out
++
++
++# --------------- generator (D16 variant) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of colored pixels among the 0-filled rectangle) --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++
++# -- Component count & role split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box at top-left and place target colors in its 3x3 interior."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims(*, require_interior: bool) -> tuple[int, int]:
++    """Sample component dimensions, optionally enforcing a non-empty interior."""
++    for _ in range(100):
++        mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++        if mode == "tall":
++            h, w = random.randint(*TALL_H), random.randint(*TALL_W)
++        elif mode == "wide":
++            h, w = random.randint(*WIDE_H), random.randint(*WIDE_W)
++        else:
++            h, w = random.randint(*MED_H), random.randint(*MED_W)
++        if not require_interior or (h >= 3 and w >= 3):
++            return h, w
++    raise RuntimeError("failed to sample component dimensions")
++
++
++def _boundary_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(h)
++        for c in range(w)
++        if r in (0, h - 1) or c in (0, w - 1)
++    ]
++
++
++def _interior_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(1, h - 1)
++        for c in range(1, w - 1)
++    ]
++
++
++def _random_color(choices: list[int]) -> int:
++    return int(random.choice(choices))
++
++
++def _component_patch(h: int, w: int, targets: list[int], role: str) -> np.ndarray:
++    """Build one rectangular component with a role-specific boundary/interior target layout."""
++    area = h * w
++    mandatory = NUM_TARGETS if role in {"deleted", "decoy"} else 1
++    lo = max(mandatory, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    n_colored = random.randint(lo, hi)
++
++    boundary = _boundary_coords(h, w)
++    interior = _interior_coords(h, w)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    placements: dict[tuple[int, int], int] = {}
++    used: set[tuple[int, int]] = set()
++
++    if role == "deleted":
++        for color, pos in zip(targets, random.sample(boundary, NUM_TARGETS)):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden: set[int] = set()
++        interior_only_color = None
++
++    elif role == "decoy":
++        assert interior, "decoy components require an interior"
++        interior_only_color = int(random.choice(targets))
++        other_targets = [t for t in targets if t != interior_only_color]
++        inner_pos = random.choice(interior)
++        placements[inner_pos] = interior_only_color
++        used.add(inner_pos)
++        for color, pos in zip(other_targets, random.sample(boundary, len(other_targets))):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden = {interior_only_color}
++
++    elif role == "ordinary":
++        keep_count = random.randint(0, NUM_TARGETS - 1)
++        present_targets = random.sample(targets, keep_count)
++        allowed = non_targets + present_targets
++        seed_pos = random.choice(boundary)
++        placements[seed_pos] = _random_color(allowed)
++        used.add(seed_pos)
++        extra_palette = allowed
++        edge_forbidden = set()
++        interior_only_color = None
++
++    else:
++        raise ValueError(f"unknown role: {role}")
++
++    remaining_slots = [(r, c) for r in range(h) for c in range(w) if (r, c) not in used]
++    extra_count = n_colored - len(placements)
++    if extra_count > len(remaining_slots):
++        raise ValueError("not enough free slots for colored pixels")
++
++    for pos in random.sample(remaining_slots, extra_count):
++        r, c = pos
++        allowed = list(extra_palette)
++        if interior_only_color is not None and (r in (0, h - 1) or c in (0, w - 1)):
++            allowed = [col for col in allowed if col not in edge_forbidden]
++        if interior_only_color is not None and 0 < r < h - 1 and 0 < c < w - 1:
++            allowed = list(extra_palette)
++        placements[pos] = _random_color(allowed)
++
++    patch = np.zeros((h, w), dtype=int)
++    for (r, c), color in placements.items():
++        patch[r, c] = int(color)
++
++    return patch
++
++
++def _component_target_stats(patch: np.ndarray, targets: set[int]) -> tuple[set[int], set[int]]:
++    """Return (all_target_colors_present, boundary_target_colors_present) for one patch."""
++    h, w = patch.shape
++    all_targets = {int(v) for v in np.unique(patch) if int(v) in targets}
++    boundary_targets = {
++        int(patch[r, c])
++        for r in range(h)
++        for c in range(w)
++        if (r in (0, h - 1) or c in (0, w - 1)) and int(patch[r, c]) in targets
++    }
++    return all_targets, boundary_targets
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input; return it or None on failure."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    target_set = set(targets)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    deleted_count = component_count - NUM_KEPT
++    decoy_count = random.randint(1, 2)
++    ordinary_count = NUM_KEPT - decoy_count
++    roles = (
++        ["deleted"] * deleted_count
++        + ["decoy"] * decoy_count
++        + ["ordinary"] * ordinary_count
++    )
++    random.shuffle(roles)
++
++    saw_decoy = False
++    saw_deleted = False
++
++    for role in roles:
++        h, w = _component_dims(require_interior=(role == "decoy"))
++        patch = _component_patch(h, w, targets, role)
++        all_targets, boundary_targets = _component_target_stats(patch, target_set)
++
++        if role == "deleted" and boundary_targets != target_set:
++            return None
++        if role == "decoy" and not (all_targets == target_set and boundary_targets != target_set):
++            return None
++        if role == "ordinary" and all_targets == target_set:
++            return None
++
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++
++        paste(inp, patch, r, c)
++        if role != "deleted":
++            paste(out, patch, r, c)
++        saw_decoy |= role == "decoy"
++        saw_deleted |= role == "deleted"
++
++    if not (saw_decoy and saw_deleted):
++        return None
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+ succeeded in 5726ms:
+Success: 50/50, Time: 5.4s (107ms/call)
+
+codex
+基础稳定性通过了。现在做第二层验证：量化“与原规则的分歧”以及每个样本里真正出现了多少个 decoy 组件，确认这不是形式上通过、实际上退化回原题。
+exec
+/bin/bash -lc "python - <<'PY'
+import importlib.util
+import numpy as np
+from collections import Counter
+
+# load variant
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code/d59b0160/D16/2/code.py')
+variant = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(variant)
+
+# load original
+spec2 = importlib.util.spec_from_file_location('orig', '/home/lixinyu/snap/new/arc2_solver_select/d59b0160.py')
+orig = importlib.util.module_from_spec(spec2)
+spec2.loader.exec_module(orig)
+
+counter = Counter()
+decoy_counts = []
+for i in range(100):
+    g = variant.generate_input()
+    new_out = variant.main(g)
+    old_out = orig.main(g)
+    if not np.array_equal(new_out, old_out):
+        counter['output_diff'] += 1
+    bg = variant._bg_boundary(g)
+    _, _, legend = variant._find_legend(g, bg)
+    comps = variant.components_mask(g "'!= bg, connectivity=4)
+    sample_decoys = 0
+    sample_deleted = 0
+    for pts in comps:
+        cols = {int(g[r, c]) for r, c in pts}
+        edge = variant._bbox_edge_colors(g, pts)
+        if legend.issubset(cols) and not legend.issubset(edge):
+            sample_decoys += 1
+        if legend.issubset(edge):
+            sample_deleted += 1
+    decoy_counts.append(sample_decoys)
+    counter[f'"'decoy_{sample_decoys}'] += 1
+    counter[f'deleted_{sample_deleted}'] += 1
+
+print('output_diff', counter['output_diff'], '/100')
+print('decoy_count_distribution', {k:v for k,v in sorted(counter.items()) if k.startswith('decoy_')})
+print('deleted_count_distribution', {k:v for k,v in sorted(counter.items()) if k.startswith('deleted_')})
+print('avg_decoys', sum(decoy_counts)/len(decoy_counts))
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code/d59b0160/D16/2/code.py b/ceshi/code/d59b0160/D16/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9b6adc6bba806b72dad2a73376b6ca0df72e38a
+--- /dev/null
++++ b/ceshi/code/d59b0160/D16/2/code.py
+@@ -0,0 +1,368 @@
++# Variant of d59b0160
++# Dimension: D16 — 分量中颜色的空间分布约束 (meta)
++# Change: 仅检查分量是否包含图例颜色，不关注颜色在分量内的空间分布... → 图例颜色必须出现在分量的外接矩形边缘
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++# Design analysis for the D16 variant
++# a) Concrete behavior:
++#    The original task deletes any non-bg 4-connected component whose color set contains all legend colors.
++#    Here the object layout stays the same: a top-left 4x4 legend and several rectangular 0-based components.
++#    The changed event is inside the component test:
++#    - Old: a target color counts if it appears anywhere in the component.
++#    - New: a target color counts only if some pixel of that color lies on the bbox perimeter
++#      (top row, bottom row, left column, or right column) of that connected component.
++#    Example trace: if targets are {1, 4, 8} and a 5x5 rectangle contains 1 on the top edge, 4 on the right edge,
++#    and 8 only at the center, the old solver erases it because all three colors are present, while the new solver
++#    keeps it because 8 never touches the bbox edge.
++# b) Complexity calibration:
++#    The mechanism is still a single legend-driven filter over connected components. The only extra reasoning is
++#    computing a component bbox and restricting the matching colors to its perimeter. This matches the requested
++#    "boundary detection" flavor without adding new object classes or transformation stages.
++# c) Hidden assumptions review:
++#    - _find_legend still works unchanged because the legend encoding itself is unchanged.
++#    - The original `cols = {g[r, c] for ...}` relied on "presence anywhere is enough"; that assumption is now false.
++#      It must be replaced by a bbox-edge color set.
++#    - The original generator split objects into "contains all targets" vs "missing some target". That is no longer
++#      sufficient, because a kept object may contain all targets yet still fail the boundary condition. The generator
++#      must explicitly construct such decoys.
++# d) Placement legality:
++#    Components remain full rectangular patches of non-bg cells pasted with one-cell padding, so bbox computation is
++#    stable and components never merge. Decoy components are generated with h,w >= 3 so they have an interior cell.
++# e) Visual observability:
++#    Each generated grid contains at least one deleted component and at least one kept decoy component that contains
++#    all legend colors but places one required target only in the interior. This guarantees that the D16 behavior
++#    changes the output relative to the original rule on the same input.
++# f) Visual cleanliness:
++#    The legend stays isolated at the top-left, and each rectangular component occupies its own padded region.
++#    The only distinction viewers need to track is whether the legend colors sit on the rim or inside the rectangle.
++# g) Color inference:
++#    No hidden color-id ordering is used. Colors keep their original role as legend swatches; only their placement
++#    relative to the rectangle boundary matters.
++# h) Generator validity:
++#    Deleted components receive all target colors on boundary cells. Decoy-kept components receive all target colors
++#    overall, but one chosen target is forbidden from all boundary cells and appears only in the interior.
++# i) New solver assumptions:
++#    The solver now assumes every foreground component has a well-defined bbox edge and that the legend colors are
++#    non-empty. The generator guarantees this by keeping rectangular foreground components and a 3-color legend.
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _bbox_edge_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """Colors from component pixels that lie on the component's axis-aligned bbox perimeter."""
++    r0 = int(pts[:, 0].min())
++    c0 = int(pts[:, 1].min())
++    r1 = int(pts[:, 0].max())
++    c1 = int(pts[:, 1].max())
++    return {
++        int(g[r, c])
++        for r, c in pts
++        if int(r) in (r0, r1) or int(c) in (c0, c1)
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Erase connected components only when the legend palette reaches their bounding-frame.
++
++    Input structure:
++    - The background color fills most cells.
++    - In the top-left corner, a small square legend uses a shared border color on its bottom edge and right edge; the interior lists the target colors.
++    - Elsewhere, rectangular 4-connected foreground components contain color-0 filler plus scattered colored pixels.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each non-background connected component, compute its axis-aligned bounding rectangle.
++    - A legend color counts as matched only if that color appears on the rectangle's perimeter, not merely somewhere inside it.
++    - Erase the component iff every legend color is represented on that perimeter; otherwise leave it unchanged.
++
++    Key insight: The legend specifies a boundary signature rather than a plain palette-membership test, so interior-only target colors are insufficient.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        edge_cols = _bbox_edge_colors(g, pts)
++        if legend_colors.issubset(edge_cols):
++            for r, c in pts:
++                out[int(r), int(c)] = bg
++    return out
++
++
++# --------------- generator (D16 variant) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of colored pixels among the 0-filled rectangle) --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++
++# -- Component count & role split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box at top-left and place target colors in its 3x3 interior."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims(*, require_interior: bool) -> tuple[int, int]:
++    """Sample component dimensions, optionally enforcing a non-empty interior."""
++    for _ in range(100):
++        mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++        if mode == "tall":
++            h, w = random.randint(*TALL_H), random.randint(*TALL_W)
++        elif mode == "wide":
++            h, w = random.randint(*WIDE_H), random.randint(*WIDE_W)
++        else:
++            h, w = random.randint(*MED_H), random.randint(*MED_W)
++        if not require_interior or (h >= 3 and w >= 3):
++            return h, w
++    raise RuntimeError("failed to sample component dimensions")
++
++
++def _boundary_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(h)
++        for c in range(w)
++        if r in (0, h - 1) or c in (0, w - 1)
++    ]
++
++
++def _interior_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(1, h - 1)
++        for c in range(1, w - 1)
++    ]
++
++
++def _random_color(choices: list[int]) -> int:
++    return int(random.choice(choices))
++
++
++def _component_patch(h: int, w: int, targets: list[int], role: str) -> np.ndarray:
++    """Build one rectangular component with a role-specific boundary/interior target layout."""
++    area = h * w
++    mandatory = NUM_TARGETS if role in {"deleted", "decoy"} else 1
++    lo = max(mandatory, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    n_colored = random.randint(lo, hi)
++
++    boundary = _boundary_coords(h, w)
++    interior = _interior_coords(h, w)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    placements: dict[tuple[int, int], int] = {}
++    used: set[tuple[int, int]] = set()
++
++    if role == "deleted":
++        for color, pos in zip(targets, random.sample(boundary, NUM_TARGETS)):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden: set[int] = set()
++        interior_only_color = None
++
++    elif role == "decoy":
++        assert interior, "decoy components require an interior"
++        interior_only_color = int(random.choice(targets))
++        other_targets = [t for t in targets if t != interior_only_color]
++        inner_pos = random.choice(interior)
++        placements[inner_pos] = interior_only_color
++        used.add(inner_pos)
++        for color, pos in zip(other_targets, random.sample(boundary, len(other_targets))):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden = {interior_only_color}
++
++    elif role == "ordinary":
++        keep_count = random.randint(0, NUM_TARGETS - 1)
++        present_targets = random.sample(targets, keep_count)
++        allowed = non_targets + present_targets
++        seed_pos = random.choice(boundary)
++        placements[seed_pos] = _random_color(allowed)
++        used.add(seed_pos)
++        extra_palette = allowed
++        edge_forbidden = set()
++        interior_only_color = None
++
++    else:
++        raise ValueError(f"unknown role: {role}")
++
++    remaining_slots = [(r, c) for r in range(h) for c in range(w) if (r, c) not in used]
++    extra_count = n_colored - len(placements)
++    if extra_count > len(remaining_slots):
++        raise ValueError("not enough free slots for colored pixels")
++
++    for pos in random.sample(remaining_slots, extra_count):
++        r, c = pos
++        allowed = list(extra_palette)
++        if interior_only_color is not None and (r in (0, h - 1) or c in (0, w - 1)):
++            allowed = [col for col in allowed if col not in edge_forbidden]
++        if interior_only_color is not None and 0 < r < h - 1 and 0 < c < w - 1:
++            allowed = list(extra_palette)
++        placements[pos] = _random_color(allowed)
++
++    patch = np.zeros((h, w), dtype=int)
++    for (r, c), color in placements.items():
++        patch[r, c] = int(color)
++
++    return patch
++
++
++def _component_target_stats(patch: np.ndarray, targets: set[int]) -> tuple[set[int], set[int]]:
++    """Return (all_target_colors_present, boundary_target_colors_present) for one patch."""
++    h, w = patch.shape
++    all_targets = {int(v) for v in np.unique(patch) if int(v) in targets}
++    boundary_targets = {
++        int(patch[r, c])
++        for r in range(h)
++        for c in range(w)
++        if (r in (0, h - 1) or c in (0, w - 1)) and int(patch[r, c]) in targets
++    }
++    return all_targets, boundary_targets
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input; return it or None on failure."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    target_set = set(targets)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    deleted_count = component_count - NUM_KEPT
++    decoy_count = random.randint(1, 2)
++    ordinary_count = NUM_KEPT - decoy_count
++    roles = (
++        ["deleted"] * deleted_count
++        + ["decoy"] * decoy_count
++        + ["ordinary"] * ordinary_count
++    )
++    random.shuffle(roles)
++
++    saw_decoy = False
++    saw_deleted = False
++
++    for role in roles:
++        h, w = _component_dims(require_interior=(role == "decoy"))
++        patch = _component_patch(h, w, targets, role)
++        all_targets, boundary_targets = _component_target_stats(patch, target_set)
++
++        if role == "deleted" and boundary_targets != target_set:
++            return None
++        if role == "decoy" and not (all_targets == target_set and boundary_targets != target_set):
++            return None
++        if role == "ordinary" and all_targets == target_set:
++            return None
++
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++
++        paste(inp, patch, r, c)
++        if role != "deleted":
++            paste(out, patch, r, c)
++        saw_decoy |= role == "decoy"
++        saw_deleted |= role == "deleted"
++
++    if not (saw_decoy and saw_deleted):
++        return None
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+diff --git a/ceshi/code/d59b0160/D16/2/code.py b/ceshi/code/d59b0160/D16/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9b6adc6bba806b72dad2a73376b6ca0df72e38a
+--- /dev/null
++++ b/ceshi/code/d59b0160/D16/2/code.py
+@@ -0,0 +1,368 @@
++# Variant of d59b0160
++# Dimension: D16 — 分量中颜色的空间分布约束 (meta)
++# Change: 仅检查分量是否包含图例颜色，不关注颜色在分量内的空间分布... → 图例颜色必须出现在分量的外接矩形边缘
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++# Design analysis for the D16 variant
++# a) Concrete behavior:
++#    The original task deletes any non-bg 4-connected component whose color set contains all legend colors.
++#    Here the object layout stays the same: a top-left 4x4 legend and several rectangular 0-based components.
++#    The changed event is inside the component test:
++#    - Old: a target color counts if it appears anywhere in the component.
++#    - New: a target color counts only if some pixel of that color lies on the bbox perimeter
++#      (top row, bottom row, left column, or right column) of that connected component.
++#    Example trace: if targets are {1, 4, 8} and a 5x5 rectangle contains 1 on the top edge, 4 on the right edge,
++#    and 8 only at the center, the old solver erases it because all three colors are present, while the new solver
++#    keeps it because 8 never touches the bbox edge.
++# b) Complexity calibration:
++#    The mechanism is still a single legend-driven filter over connected components. The only extra reasoning is
++#    computing a component bbox and restricting the matching colors to its perimeter. This matches the requested
++#    "boundary detection" flavor without adding new object classes or transformation stages.
++# c) Hidden assumptions review:
++#    - _find_legend still works unchanged because the legend encoding itself is unchanged.
++#    - The original `cols = {g[r, c] for ...}` relied on "presence anywhere is enough"; that assumption is now false.
++#      It must be replaced by a bbox-edge color set.
++#    - The original generator split objects into "contains all targets" vs "missing some target". That is no longer
++#      sufficient, because a kept object may contain all targets yet still fail the boundary condition. The generator
++#      must explicitly construct such decoys.
++# d) Placement legality:
++#    Components remain full rectangular patches of non-bg cells pasted with one-cell padding, so bbox computation is
++#    stable and components never merge. Decoy components are generated with h,w >= 3 so they have an interior cell.
++# e) Visual observability:
++#    Each generated grid contains at least one deleted component and at least one kept decoy component that contains
++#    all legend colors but places one required target only in the interior. This guarantees that the D16 behavior
++#    changes the output relative to the original rule on the same input.
++# f) Visual cleanliness:
++#    The legend stays isolated at the top-left, and each rectangular component occupies its own padded region.
++#    The only distinction viewers need to track is whether the legend colors sit on the rim or inside the rectangle.
++# g) Color inference:
++#    No hidden color-id ordering is used. Colors keep their original role as legend swatches; only their placement
++#    relative to the rectangle boundary matters.
++# h) Generator validity:
++#    Deleted components receive all target colors on boundary cells. Decoy-kept components receive all target colors
++#    overall, but one chosen target is forbidden from all boundary cells and appears only in the interior.
++# i) New solver assumptions:
++#    The solver now assumes every foreground component has a well-defined bbox edge and that the legend colors are
++#    non-empty. The generator guarantees this by keeping rectangular foreground components and a 3-color legend.
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _bbox_edge_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """Colors from component pixels that lie on the component's axis-aligned bbox perimeter."""
++    r0 = int(pts[:, 0].min())
++    c0 = int(pts[:, 1].min())
++    r1 = int(pts[:, 0].max())
++    c1 = int(pts[:, 1].max())
++    return {
++        int(g[r, c])
++        for r, c in pts
++        if int(r) in (r0, r1) or int(c) in (c0, c1)
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Erase connected components only when the legend palette reaches their bounding-frame.
++
++    Input structure:
++    - The background color fills most cells.
++    - In the top-left corner, a small square legend uses a shared border color on its bottom edge and right edge; the interior lists the target colors.
++    - Elsewhere, rectangular 4-connected foreground components contain color-0 filler plus scattered colored pixels.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each non-background connected component, compute its axis-aligned bounding rectangle.
++    - A legend color counts as matched only if that color appears on the rectangle's perimeter, not merely somewhere inside it.
++    - Erase the component iff every legend color is represented on that perimeter; otherwise leave it unchanged.
++
++    Key insight: The legend specifies a boundary signature rather than a plain palette-membership test, so interior-only target colors are insufficient.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        edge_cols = _bbox_edge_colors(g, pts)
++        if legend_colors.issubset(edge_cols):
++            for r, c in pts:
++                out[int(r), int(c)] = bg
++    return out
++
++
++# --------------- generator (D16 variant) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of colored pixels among the 0-filled rectangle) --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++
++# -- Component count & role split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box at top-left and place target colors in its 3x3 interior."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims(*, require_interior: bool) -> tuple[int, int]:
++    """Sample component dimensions, optionally enforcing a non-empty interior."""
++    for _ in range(100):
++        mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++        if mode == "tall":
++            h, w = random.randint(*TALL_H), random.randint(*TALL_W)
++        elif mode == "wide":
++            h, w = random.randint(*WIDE_H), random.randint(*WIDE_W)
++        else:
++            h, w = random.randint(*MED_H), random.randint(*MED_W)
++        if not require_interior or (h >= 3 and w >= 3):
++            return h, w
++    raise RuntimeError("failed to sample component dimensions")
++
++
++def _boundary_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(h)
++        for c in range(w)
++        if r in (0, h - 1) or c in (0, w - 1)
++    ]
++
++
++def _interior_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(1, h - 1)
++        for c in range(1, w - 1)
++    ]
++
++
++def _random_color(choices: list[int]) -> int:
++    return int(random.choice(choices))
++
++
++def _component_patch(h: int, w: int, targets: list[int], role: str) -> np.ndarray:
++    """Build one rectangular component with a role-specific boundary/interior target layout."""
++    area = h * w
++    mandatory = NUM_TARGETS if role in {"deleted", "decoy"} else 1
++    lo = max(mandatory, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    n_colored = random.randint(lo, hi)
++
++    boundary = _boundary_coords(h, w)
++    interior = _interior_coords(h, w)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    placements: dict[tuple[int, int], int] = {}
++    used: set[tuple[int, int]] = set()
++
++    if role == "deleted":
++        for color, pos in zip(targets, random.sample(boundary, NUM_TARGETS)):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden: set[int] = set()
++        interior_only_color = None
++
++    elif role == "decoy":
++        assert interior, "decoy components require an interior"
++        interior_only_color = int(random.choice(targets))
++        other_targets = [t for t in targets if t != interior_only_color]
++        inner_pos = random.choice(interior)
++        placements[inner_pos] = interior_only_color
++        used.add(inner_pos)
++        for color, pos in zip(other_targets, random.sample(boundary, len(other_targets))):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden = {interior_only_color}
++
++    elif role == "ordinary":
++        keep_count = random.randint(0, NUM_TARGETS - 1)
++        present_targets = random.sample(targets, keep_count)
++        allowed = non_targets + present_targets
++        seed_pos = random.choice(boundary)
++        placements[seed_pos] = _random_color(allowed)
++        used.add(seed_pos)
++        extra_palette = allowed
++        edge_forbidden = set()
++        interior_only_color = None
++
++    else:
++        raise ValueError(f"unknown role: {role}")
++
++    remaining_slots = [(r, c) for r in range(h) for c in range(w) if (r, c) not in used]
++    extra_count = n_colored - len(placements)
++    if extra_count > len(remaining_slots):
++        raise ValueError("not enough free slots for colored pixels")
++
++    for pos in random.sample(remaining_slots, extra_count):
++        r, c = pos
++        allowed = list(extra_palette)
++        if interior_only_color is not None and (r in (0, h - 1) or c in (0, w - 1)):
++            allowed = [col for col in allowed if col not in edge_forbidden]
++        if interior_only_color is not None and 0 < r < h - 1 and 0 < c < w - 1:
++            allowed = list(extra_palette)
++        placements[pos] = _random_color(allowed)
++
++    patch = np.zeros((h, w), dtype=int)
++    for (r, c), color in placements.items():
++        patch[r, c] = int(color)
++
++    return patch
++
++
++def _component_target_stats(patch: np.ndarray, targets: set[int]) -> tuple[set[int], set[int]]:
++    """Return (all_target_colors_present, boundary_target_colors_present) for one patch."""
++    h, w = patch.shape
++    all_targets = {int(v) for v in np.unique(patch) if int(v) in targets}
++    boundary_targets = {
++        int(patch[r, c])
++        for r in range(h)
++        for c in range(w)
++        if (r in (0, h - 1) or c in (0, w - 1)) and int(patch[r, c]) in targets
++    }
++    return all_targets, boundary_targets
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input; return it or None on failure."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    target_set = set(targets)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    deleted_count = component_count - NUM_KEPT
++    decoy_count = random.randint(1, 2)
++    ordinary_count = NUM_KEPT - decoy_count
++    roles = (
++        ["deleted"] * deleted_count
++        + ["decoy"] * decoy_count
++        + ["ordinary"] * ordinary_count
++    )
++    random.shuffle(roles)
++
++    saw_decoy = False
++    saw_deleted = False
++
++    for role in roles:
++        h, w = _component_dims(require_interior=(role == "decoy"))
++        patch = _component_patch(h, w, targets, role)
++        all_targets, boundary_targets = _component_target_stats(patch, target_set)
++
++        if role == "deleted" and boundary_targets != target_set:
++            return None
++        if role == "decoy" and not (all_targets == target_set and boundary_targets != target_set):
++            return None
++        if role == "ordinary" and all_targets == target_set:
++            return None
++
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++
++        paste(inp, patch, r, c)
++        if role != "deleted":
++            paste(out, patch, r, c)
++        saw_decoy |= role == "decoy"
++        saw_deleted |= role == "deleted"
++
++    if not (saw_decoy and saw_deleted):
++        return None
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+diff --git a/ceshi/code/d59b0160/D16/2/code.py b/ceshi/code/d59b0160/D16/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9b6adc6bba806b72dad2a73376b6ca0df72e38a
+--- /dev/null
++++ b/ceshi/code/d59b0160/D16/2/code.py
+@@ -0,0 +1,368 @@
++# Variant of d59b0160
++# Dimension: D16 — 分量中颜色的空间分布约束 (meta)
++# Change: 仅检查分量是否包含图例颜色，不关注颜色在分量内的空间分布... → 图例颜色必须出现在分量的外接矩形边缘
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++# Design analysis for the D16 variant
++# a) Concrete behavior:
++#    The original task deletes any non-bg 4-connected component whose color set contains all legend colors.
++#    Here the object layout stays the same: a top-left 4x4 legend and several rectangular 0-based components.
++#    The changed event is inside the component test:
++#    - Old: a target color counts if it appears anywhere in the component.
++#    - New: a target color counts only if some pixel of that color lies on the bbox perimeter
++#      (top row, bottom row, left column, or right column) of that connected component.
++#    Example trace: if targets are {1, 4, 8} and a 5x5 rectangle contains 1 on the top edge, 4 on the right edge,
++#    and 8 only at the center, the old solver erases it because all three colors are present, while the new solver
++#    keeps it because 8 never touches the bbox edge.
++# b) Complexity calibration:
++#    The mechanism is still a single legend-driven filter over connected components. The only extra reasoning is
++#    computing a component bbox and restricting the matching colors to its perimeter. This matches the requested
++#    "boundary detection" flavor without adding new object classes or transformation stages.
++# c) Hidden assumptions review:
++#    - _find_legend still works unchanged because the legend encoding itself is unchanged.
++#    - The original `cols = {g[r, c] for ...}` relied on "presence anywhere is enough"; that assumption is now false.
++#      It must be replaced by a bbox-edge color set.
++#    - The original generator split objects into "contains all targets" vs "missing some target". That is no longer
++#      sufficient, because a kept object may contain all targets yet still fail the boundary condition. The generator
++#      must explicitly construct such decoys.
++# d) Placement legality:
++#    Components remain full rectangular patches of non-bg cells pasted with one-cell padding, so bbox computation is
++#    stable and components never merge. Decoy components are generated with h,w >= 3 so they have an interior cell.
++# e) Visual observability:
++#    Each generated grid contains at least one deleted component and at least one kept decoy component that contains
++#    all legend colors but places one required target only in the interior. This guarantees that the D16 behavior
++#    changes the output relative to the original rule on the same input.
++# f) Visual cleanliness:
++#    The legend stays isolated at the top-left, and each rectangular component occupies its own padded region.
++#    The only distinction viewers need to track is whether the legend colors sit on the rim or inside the rectangle.
++# g) Color inference:
++#    No hidden color-id ordering is used. Colors keep their original role as legend swatches; only their placement
++#    relative to the rectangle boundary matters.
++# h) Generator validity:
++#    Deleted components receive all target colors on boundary cells. Decoy-kept components receive all target colors
++#    overall, but one chosen target is forbidden from all boundary cells and appears only in the interior.
++# i) New solver assumptions:
++#    The solver now assumes every foreground component has a well-defined bbox edge and that the legend colors are
++#    non-empty. The generator guarantees this by keeping rectangular foreground components and a 3-color legend.
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _bbox_edge_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """Colors from component pixels that lie on the component's axis-aligned bbox perimeter."""
++    r0 = int(pts[:, 0].min())
++    c0 = int(pts[:, 1].min())
++    r1 = int(pts[:, 0].max())
++    c1 = int(pts[:, 1].max())
++    return {
++        int(g[r, c])
++        for r, c in pts
++        if int(r) in (r0, r1) or int(c) in (c0, c1)
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Erase connected components only when the legend palette reaches their bounding-frame.
++
++    Input structure:
++    - The background color fills most cells.
++    - In the top-left corner, a small square legend uses a shared border color on its bottom edge and right edge; the interior lists the target colors.
++    - Elsewhere, rectangular 4-connected foreground components contain color-0 filler plus scattered colored pixels.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each non-background connected component, compute its axis-aligned bounding rectangle.
++    - A legend color counts as matched only if that color appears on the rectangle's perimeter, not merely somewhere inside it.
++    - Erase the component iff every legend color is represented on that perimeter; otherwise leave it unchanged.
++
++    Key insight: The legend specifies a boundary signature rather than a plain palette-membership test, so interior-only target colors are insufficient.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        edge_cols = _bbox_edge_colors(g, pts)
++        if legend_colors.issubset(edge_cols):
++            for r, c in pts:
++                out[int(r), int(c)] = bg
++    return out
++
++
++# --------------- generator (D16 variant) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of colored pixels among the 0-filled rectangle) --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++
++# -- Component count & role split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box at top-left and place target colors in its 3x3 interior."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims(*, require_interior: bool) -> tuple[int, int]:
++    """Sample component dimensions, optionally enforcing a non-empty interior."""
++    for _ in range(100):
++        mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++        if mode == "tall":
++            h, w = random.randint(*TALL_H), random.randint(*TALL_W)
++        elif mode == "wide":
++            h, w = random.randint(*WIDE_H), random.randint(*WIDE_W)
++        else:
++            h, w = random.randint(*MED_H), random.randint(*MED_W)
++        if not require_interior or (h >= 3 and w >= 3):
++            return h, w
++    raise RuntimeError("failed to sample component dimensions")
++
++
++def _boundary_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(h)
++        for c in range(w)
++        if r in (0, h - 1) or c in (0, w - 1)
++    ]
++
++
++def _interior_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(1, h - 1)
++        for c in range(1, w - 1)
++    ]
++
++
++def _random_color(choices: list[int]) -> int:
++    return int(random.choice(choices))
++
++
++def _component_patch(h: int, w: int, targets: list[int], role: str) -> np.ndarray:
++    """Build one rectangular component with a role-specific boundary/interior target layout."""
++    area = h * w
++    mandatory = NUM_TARGETS if role in {"deleted", "decoy"} else 1
++    lo = max(mandatory, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    n_colored = random.randint(lo, hi)
++
++    boundary = _boundary_coords(h, w)
++    interior = _interior_coords(h, w)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    placements: dict[tuple[int, int], int] = {}
++    used: set[tuple[int, int]] = set()
++
++    if role == "deleted":
++        for color, pos in zip(targets, random.sample(boundary, NUM_TARGETS)):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden: set[int] = set()
++        interior_only_color = None
++
++    elif role == "decoy":
++        assert interior, "decoy components require an interior"
++        interior_only_color = int(random.choice(targets))
++        other_targets = [t for t in targets if t != interior_only_color]
++        inner_pos = random.choice(interior)
++        placements[inner_pos] = interior_only_color
++        used.add(inner_pos)
++        for color, pos in zip(other_targets, random.sample(boundary, len(other_targets))):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden = {interior_only_color}
++
++    elif role == "ordinary":
++        keep_count = random.randint(0, NUM_TARGETS - 1)
++        present_targets = random.sample(targets, keep_count)
++        allowed = non_targets + present_targets
++        seed_pos = random.choice(boundary)
++        placements[seed_pos] = _random_color(allowed)
++        used.add(seed_pos)
++        extra_palette = allowed
++        edge_forbidden = set()
++        interior_only_color = None
++
++    else:
++        raise ValueError(f"unknown role: {role}")
++
++    remaining_slots = [(r, c) for r in range(h) for c in range(w) if (r, c) not in used]
++    extra_count = n_colored - len(placements)
++    if extra_count > len(remaining_slots):
++        raise ValueError("not enough free slots for colored pixels")
++
++    for pos in random.sample(remaining_slots, extra_count):
++        r, c = pos
++        allowed = list(extra_palette)
++        if interior_only_color is not None and (r in (0, h - 1) or c in (0, w - 1)):
++            allowed = [col for col in allowed if col not in edge_forbidden]
++        if interior_only_color is not None and 0 < r < h - 1 and 0 < c < w - 1:
++            allowed = list(extra_palette)
++        placements[pos] = _random_color(allowed)
++
++    patch = np.zeros((h, w), dtype=int)
++    for (r, c), color in placements.items():
++        patch[r, c] = int(color)
++
++    return patch
++
++
++def _component_target_stats(patch: np.ndarray, targets: set[int]) -> tuple[set[int], set[int]]:
++    """Return (all_target_colors_present, boundary_target_colors_present) for one patch."""
++    h, w = patch.shape
++    all_targets = {int(v) for v in np.unique(patch) if int(v) in targets}
++    boundary_targets = {
++        int(patch[r, c])
++        for r in range(h)
++        for c in range(w)
++        if (r in (0, h - 1) or c in (0, w - 1)) and int(patch[r, c]) in targets
++    }
++    return all_targets, boundary_targets
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input; return it or None on failure."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    target_set = set(targets)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    deleted_count = component_count - NUM_KEPT
++    decoy_count = random.randint(1, 2)
++    ordinary_count = NUM_KEPT - decoy_count
++    roles = (
++        ["deleted"] * deleted_count
++        + ["decoy"] * decoy_count
++        + ["ordinary"] * ordinary_count
++    )
++    random.shuffle(roles)
++
++    saw_decoy = False
++    saw_deleted = False
++
++    for role in roles:
++        h, w = _component_dims(require_interior=(role == "decoy"))
++        patch = _component_patch(h, w, targets, role)
++        all_targets, boundary_targets = _component_target_stats(patch, target_set)
++
++        if role == "deleted" and boundary_targets != target_set:
++            return None
++        if role == "decoy" and not (all_targets == target_set and boundary_targets != target_set):
++            return None
++        if role == "ordinary" and all_targets == target_set:
++            return None
++
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++
++        paste(inp, patch, r, c)
++        if role != "deleted":
++            paste(out, patch, r, c)
++        saw_decoy |= role == "decoy"
++        saw_deleted |= role == "deleted"
++
++    if not (saw_decoy and saw_deleted):
++        return None
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+ succeeded in 10064ms:
+output_diff 100 /100
+decoy_count_distribution {'decoy_1': 54, 'decoy_2': 46}
+deleted_count_distribution {'deleted_1': 43, 'deleted_2': 31, 'deleted_3': 26}
+avg_decoys 1.46
+
+codex
+变体代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code/d59b0160/D16/2/code.py)。
+
+`main()` 只改了 D16 相关判定：不再看“分量里是否包含全部图例色”，而是看“这些图例色是否都出现在该分量外接矩形的边缘上”。`generate_input()` 也对应改成三类组件：`deleted`、普通 `kept`、以及关键的 `decoy kept`。这类 decoy 会包含全部图例色，但至少有一种目标色只出现在内部，因此旧规则会误删，新规则会保留。
+
+验证结果：
+- 50 次稳定性测试：`Success: 50/50`
+- 100 个生成样本的行为检验中，新旧 solver 输出 `100/100` 不同，说明没有退化回原题
+- 每个样本都包含至少 1 个 decoy；分布为 `1` 个 decoy 的样本 `54` 个，`2` 个 decoy 的样本 `46` 个
+- 被删除组件数分布为 `1/2/3 -> 43/31/26`
+
+代码文件开头也加入了这次 D16 变体的设计分析和隐式假设审查，便于复核。
+diff --git a/ceshi/code/d59b0160/D16/2/code.py b/ceshi/code/d59b0160/D16/2/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9b6adc6bba806b72dad2a73376b6ca0df72e38a
+--- /dev/null
++++ b/ceshi/code/d59b0160/D16/2/code.py
+@@ -0,0 +1,368 @@
++# Variant of d59b0160
++# Dimension: D16 — 分量中颜色的空间分布约束 (meta)
++# Change: 仅检查分量是否包含图例颜色，不关注颜色在分量内的空间分布... → 图例颜色必须出现在分量的外接矩形边缘
++
++import math
++import random
++
++import numpy as np
++
++from arc_utils import components_mask, paste, random_free_location
++
++# Design analysis for the D16 variant
++# a) Concrete behavior:
++#    The original task deletes any non-bg 4-connected component whose color set contains all legend colors.
++#    Here the object layout stays the same: a top-left 4x4 legend and several rectangular 0-based components.
++#    The changed event is inside the component test:
++#    - Old: a target color counts if it appears anywhere in the component.
++#    - New: a target color counts only if some pixel of that color lies on the bbox perimeter
++#      (top row, bottom row, left column, or right column) of that connected component.
++#    Example trace: if targets are {1, 4, 8} and a 5x5 rectangle contains 1 on the top edge, 4 on the right edge,
++#    and 8 only at the center, the old solver erases it because all three colors are present, while the new solver
++#    keeps it because 8 never touches the bbox edge.
++# b) Complexity calibration:
++#    The mechanism is still a single legend-driven filter over connected components. The only extra reasoning is
++#    computing a component bbox and restricting the matching colors to its perimeter. This matches the requested
++#    "boundary detection" flavor without adding new object classes or transformation stages.
++# c) Hidden assumptions review:
++#    - _find_legend still works unchanged because the legend encoding itself is unchanged.
++#    - The original `cols = {g[r, c] for ...}` relied on "presence anywhere is enough"; that assumption is now false.
++#      It must be replaced by a bbox-edge color set.
++#    - The original generator split objects into "contains all targets" vs "missing some target". That is no longer
++#      sufficient, because a kept object may contain all targets yet still fail the boundary condition. The generator
++#      must explicitly construct such decoys.
++# d) Placement legality:
++#    Components remain full rectangular patches of non-bg cells pasted with one-cell padding, so bbox computation is
++#    stable and components never merge. Decoy components are generated with h,w >= 3 so they have an interior cell.
++# e) Visual observability:
++#    Each generated grid contains at least one deleted component and at least one kept decoy component that contains
++#    all legend colors but places one required target only in the interior. This guarantees that the D16 behavior
++#    changes the output relative to the original rule on the same input.
++# f) Visual cleanliness:
++#    The legend stays isolated at the top-left, and each rectangular component occupies its own padded region.
++#    The only distinction viewers need to track is whether the legend colors sit on the rim or inside the rectangle.
++# g) Color inference:
++#    No hidden color-id ordering is used. Colors keep their original role as legend swatches; only their placement
++#    relative to the rectangle boundary matters.
++# h) Generator validity:
++#    Deleted components receive all target colors on boundary cells. Decoy-kept components receive all target colors
++#    overall, but one chosen target is forbidden from all boundary cells and appears only in the interior.
++# i) New solver assumptions:
++#    The solver now assumes every foreground component has a well-defined bbox edge and that the legend colors are
++#    non-empty. The generator guarantees this by keeping rectangular foreground components and a 3-color legend.
++
++
++def _bg_boundary(g: np.ndarray) -> int:
++    """Most common color along the 1-cell outer border (bg defined by the frame, not global frequency)."""
++    border = np.concatenate([g[0, :], g[-1, :], g[1:-1, 0], g[1:-1, -1]])
++    vals, cnts = np.unique(border, return_counts=True)
++    return int(vals[cnts.argmax()])
++
++
++def _find_legend(g: np.ndarray, bg: int) -> tuple[int, int, set[int]]:
++    """
++    The legend is a top-left corner region whose bottom edge and right edge are the same color x.
++    We detect the smallest size sz such that:
++      - g[sz-1, 0:sz] are all x
++      - g[0:sz, sz-1] are all x
++    Then the legend color set is the set of colors in the interior (0:sz-1, 0:sz-1),
++    excluding bg and excluding the border color x.
++    """
++    h, w = g.shape
++    for sz in range(2, min(h, w) + 1):
++        x = int(g[sz - 1, sz - 1])
++        if x == bg:
++            continue
++        if np.all(g[sz - 1, 0:sz] == x) and np.all(g[0:sz, sz - 1] == x):
++            inside = g[0 : sz - 1, 0 : sz - 1]
++            colors = set(map(int, np.unique(inside)))
++            colors.discard(bg)
++            colors.discard(x)
++            return int(sz), int(x), colors
++    assert False, "no legend border found in grid"
++
++
++def _bbox_edge_colors(g: np.ndarray, pts: np.ndarray) -> set[int]:
++    """Colors from component pixels that lie on the component's axis-aligned bbox perimeter."""
++    r0 = int(pts[:, 0].min())
++    c0 = int(pts[:, 1].min())
++    r1 = int(pts[:, 0].max())
++    c1 = int(pts[:, 1].max())
++    return {
++        int(g[r, c])
++        for r, c in pts
++        if int(r) in (r0, r1) or int(c) in (c0, c1)
++    }
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Erase connected components only when the legend palette reaches their bounding-frame.
++
++    Input structure:
++    - The background color fills most cells.
++    - In the top-left corner, a small square legend uses a shared border color on its bottom edge and right edge; the interior lists the target colors.
++    - Elsewhere, rectangular 4-connected foreground components contain color-0 filler plus scattered colored pixels.
++
++    Rule:
++    - Read the target color set from the legend interior.
++    - For each non-background connected component, compute its axis-aligned bounding rectangle.
++    - A legend color counts as matched only if that color appears on the rectangle's perimeter, not merely somewhere inside it.
++    - Erase the component iff every legend color is represented on that perimeter; otherwise leave it unchanged.
++
++    Key insight: The legend specifies a boundary signature rather than a plain palette-membership test, so interior-only target colors are insufficient.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = _bg_boundary(g)
++
++    _sz, _x, legend_colors = _find_legend(g, bg)
++    assert legend_colors, "legend interior contains no target colors"
++
++    out = g.copy()
++    comps = components_mask(g != bg, connectivity=4)
++    for pts in comps:
++        edge_cols = _bbox_edge_colors(g, pts)
++        if legend_colors.issubset(edge_cols):
++            for r, c in pts:
++                out[int(r), int(c)] = bg
++    return out
++
++
++# --------------- generator (D16 variant) ---------------
++
++# -- Grid & legend constants --
++GRID_H, GRID_W = 16, 16
++BG = 7
++BORDER = 3
++LEGEND_SIZE = 4
++PALETTE = [1, 2, 4, 5, 6, 8, 9]
++NUM_TARGETS = 3
++
++# -- Component shape weights: (mode, weight) --
++SHAPE_WEIGHTS = [5, 3, 2]
++TALL_H = (8, 16)
++TALL_W = (2, 4)
++WIDE_H = (3, 5)
++WIDE_W = (5, 9)
++MED_H = (3, 7)
++MED_W = (2, 9)
++
++# -- Component fill density (fraction of colored pixels among the 0-filled rectangle) --
++DENSITY_LO = 0.10
++DENSITY_HI = 0.55
++
++# -- Component count & role split --
++COMP_COUNTS = [4, 5, 6]
++COMP_WEIGHTS = [1, 4, 25]
++NUM_KEPT = 3
++
++# -- Generation retry budget --
++MAX_RETRIES = 400
++
++
++def _place_legend(inp: np.ndarray, out: np.ndarray, targets: list[int]) -> None:
++    """Draw the 4x4 legend box at top-left and place target colors in its 3x3 interior."""
++    s = LEGEND_SIZE
++    for g in (inp, out):
++        g[:s, :s] = BG
++        g[s - 1, :s] = BORDER
++        g[:s, s - 1] = BORDER
++
++    isolated = random.choice([(0, 0), (0, 1), (1, 0), (1, 1)])
++    border_side = [(0, 2), (1, 2), (2, 0), (2, 1), (2, 2)]
++    side_choices = [
++        p for p in border_side
++        if abs(p[0] - isolated[0]) + abs(p[1] - isolated[1]) != 1
++    ]
++    positions = [isolated] + random.sample(side_choices, 2)
++    random.shuffle(positions)
++    for color, (r, c) in zip(targets, positions):
++        inp[r, c] = color
++        out[r, c] = color
++
++
++def _component_dims(*, require_interior: bool) -> tuple[int, int]:
++    """Sample component dimensions, optionally enforcing a non-empty interior."""
++    for _ in range(100):
++        mode = random.choices(["medium", "tall", "wide"], weights=SHAPE_WEIGHTS)[0]
++        if mode == "tall":
++            h, w = random.randint(*TALL_H), random.randint(*TALL_W)
++        elif mode == "wide":
++            h, w = random.randint(*WIDE_H), random.randint(*WIDE_W)
++        else:
++            h, w = random.randint(*MED_H), random.randint(*MED_W)
++        if not require_interior or (h >= 3 and w >= 3):
++            return h, w
++    raise RuntimeError("failed to sample component dimensions")
++
++
++def _boundary_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(h)
++        for c in range(w)
++        if r in (0, h - 1) or c in (0, w - 1)
++    ]
++
++
++def _interior_coords(h: int, w: int) -> list[tuple[int, int]]:
++    return [
++        (r, c)
++        for r in range(1, h - 1)
++        for c in range(1, w - 1)
++    ]
++
++
++def _random_color(choices: list[int]) -> int:
++    return int(random.choice(choices))
++
++
++def _component_patch(h: int, w: int, targets: list[int], role: str) -> np.ndarray:
++    """Build one rectangular component with a role-specific boundary/interior target layout."""
++    area = h * w
++    mandatory = NUM_TARGETS if role in {"deleted", "decoy"} else 1
++    lo = max(mandatory, math.ceil(area * DENSITY_LO))
++    hi = max(lo, math.floor(area * DENSITY_HI))
++    n_colored = random.randint(lo, hi)
++
++    boundary = _boundary_coords(h, w)
++    interior = _interior_coords(h, w)
++    non_targets = [v for v in PALETTE if v not in targets]
++
++    placements: dict[tuple[int, int], int] = {}
++    used: set[tuple[int, int]] = set()
++
++    if role == "deleted":
++        for color, pos in zip(targets, random.sample(boundary, NUM_TARGETS)):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden: set[int] = set()
++        interior_only_color = None
++
++    elif role == "decoy":
++        assert interior, "decoy components require an interior"
++        interior_only_color = int(random.choice(targets))
++        other_targets = [t for t in targets if t != interior_only_color]
++        inner_pos = random.choice(interior)
++        placements[inner_pos] = interior_only_color
++        used.add(inner_pos)
++        for color, pos in zip(other_targets, random.sample(boundary, len(other_targets))):
++            placements[pos] = int(color)
++            used.add(pos)
++        extra_palette = PALETTE
++        edge_forbidden = {interior_only_color}
++
++    elif role == "ordinary":
++        keep_count = random.randint(0, NUM_TARGETS - 1)
++        present_targets = random.sample(targets, keep_count)
++        allowed = non_targets + present_targets
++        seed_pos = random.choice(boundary)
++        placements[seed_pos] = _random_color(allowed)
++        used.add(seed_pos)
++        extra_palette = allowed
++        edge_forbidden = set()
++        interior_only_color = None
++
++    else:
++        raise ValueError(f"unknown role: {role}")
++
++    remaining_slots = [(r, c) for r in range(h) for c in range(w) if (r, c) not in used]
++    extra_count = n_colored - len(placements)
++    if extra_count > len(remaining_slots):
++        raise ValueError("not enough free slots for colored pixels")
++
++    for pos in random.sample(remaining_slots, extra_count):
++        r, c = pos
++        allowed = list(extra_palette)
++        if interior_only_color is not None and (r in (0, h - 1) or c in (0, w - 1)):
++            allowed = [col for col in allowed if col not in edge_forbidden]
++        if interior_only_color is not None and 0 < r < h - 1 and 0 < c < w - 1:
++            allowed = list(extra_palette)
++        placements[pos] = _random_color(allowed)
++
++    patch = np.zeros((h, w), dtype=int)
++    for (r, c), color in placements.items():
++        patch[r, c] = int(color)
++
++    return patch
++
++
++def _component_target_stats(patch: np.ndarray, targets: set[int]) -> tuple[set[int], set[int]]:
++    """Return (all_target_colors_present, boundary_target_colors_present) for one patch."""
++    h, w = patch.shape
++    all_targets = {int(v) for v in np.unique(patch) if int(v) in targets}
++    boundary_targets = {
++        int(patch[r, c])
++        for r in range(h)
++        for c in range(w)
++        if (r in (0, h - 1) or c in (0, w - 1)) and int(patch[r, c]) in targets
++    }
++    return all_targets, boundary_targets
++
++
++def _gen_attempt() -> np.ndarray | None:
++    """Try once to build a valid input; return it or None on failure."""
++    inp = np.full((GRID_H, GRID_W), BG, dtype=int)
++    out = inp.copy()
++
++    targets = random.sample(PALETTE, NUM_TARGETS)
++    target_set = set(targets)
++    _place_legend(inp, out, targets)
++
++    component_count = random.choices(COMP_COUNTS, weights=COMP_WEIGHTS)[0]
++    deleted_count = component_count - NUM_KEPT
++    decoy_count = random.randint(1, 2)
++    ordinary_count = NUM_KEPT - decoy_count
++    roles = (
++        ["deleted"] * deleted_count
++        + ["decoy"] * decoy_count
++        + ["ordinary"] * ordinary_count
++    )
++    random.shuffle(roles)
++
++    saw_decoy = False
++    saw_deleted = False
++
++    for role in roles:
++        h, w = _component_dims(require_interior=(role == "decoy"))
++        patch = _component_patch(h, w, targets, role)
++        all_targets, boundary_targets = _component_target_stats(patch, target_set)
++
++        if role == "deleted" and boundary_targets != target_set:
++            return None
++        if role == "decoy" and not (all_targets == target_set and boundary_targets != target_set):
++            return None
++        if role == "ordinary" and all_targets == target_set:
++            return None
++
++        try:
++            r, c = random_free_location(
++                inp,
++                np.zeros_like(patch),
++                transparent=BG,
++                padding=1,
++                padding_connectivity=8,
++            )
++        except ValueError:
++            return None
++
++        paste(inp, patch, r, c)
++        if role != "deleted":
++            paste(out, patch, r, c)
++        saw_decoy |= role == "decoy"
++        saw_deleted |= role == "deleted"
++
++    if not (saw_decoy and saw_deleted):
++        return None
++    if np.array_equal(main(inp), out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate valid input")
+
+tokens used
+59,282
+变体代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code/d59b0160/D16/2/code.py)。
+
+`main()` 只改了 D16 相关判定：不再看“分量里是否包含全部图例色”，而是看“这些图例色是否都出现在该分量外接矩形的边缘上”。`generate_input()` 也对应改成三类组件：`deleted`、普通 `kept`、以及关键的 `decoy kept`。这类 decoy 会包含全部图例色，但至少有一种目标色只出现在内部，因此旧规则会误删，新规则会保留。
+
+验证结果：
+- 50 次稳定性测试：`Success: 50/50`
+- 100 个生成样本的行为检验中，新旧 solver 输出 `100/100` 不同，说明没有退化回原题
+- 每个样本都包含至少 1 个 decoy；分布为 `1` 个 decoy 的样本 `54` 个，`2` 个 decoy 的样本 `46` 个
+- 被删除组件数分布为 `1/2/3 -> 43/31/26`
+
+代码文件开头也加入了这次 D16 变体的设计分析和隐式假设审查，便于复核。

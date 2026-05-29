@@ -1,0 +1,2152 @@
+Reading additional input from stdin...
+2026-05-16T07:43:04.397165Z ERROR codex_models_manager::cache: failed to load models cache: EOF while parsing a string at line 246 column 4751
+2026-05-16T07:43:09.532324Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e2fbd-34dd-7252-8af1-e780fe2ccf5c
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: b9e38dc0
+    **摘要**: 半包围区域内的像素向外洪水填充并沿开口方向辐射，孤立像素沿同方向直线移动至网格边缘并留下背景色轨迹
+
+    ## 要实现的融合组合
+    - **组合名称**: 碰撞停止+吸收变色+多孤立像素
+    - **combo_spec**: D2/1+D7/3+D16/0
+
+    ### 融合描述（实现规格）
+
+    每个精灵对应多个孤立像素，像素移动到遇到精灵时停止并被吸收，障碍精灵变为最后吸收的孤立像素颜色。多个像素可能被不同精灵吸收，创造复杂的颜色传递网络。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D2/1** — 辅助路径机制——孤立像素移动 (`path`)
+  - 当前值: straight_ray——孤立像素沿与辐射相同的方向直线移动至网格边缘
+  - 改为: 孤立像素移动到最近的精灵处停止 — 孤立像素不移动到网格边缘，而是移动到遇到的第一个非背景障碍物（即另一个半包围精灵）处停止。这引入了障碍物感知的停止条件，解题者需要判断路径上是否有阻挡。
+  - 来源: collision_stop（参考任务: 195c6913）
+- **D7/3** — 障碍物阻挡机制 (`obstacle`)
+  - 当前值: obstacle_blocking——第二步变换中，第一步的精灵（含填充后的区域）作为障碍物阻挡孤立像素的直线路径
+  - 改为: 障碍物吸收孤立像素并变色 — 孤立像素到达障碍精灵时被吸收，障碍精灵的填充区域变为孤立像素的颜色。这是一种颜色传递机制，解题者需要追踪颜色流动的方向和效果。
+  - 来源: color_transfer（参考任务: 4c416de3）
+- **D16/0** — 孤立像素数量与精灵的对应关系 (`meta`)
+  - 当前值: 每个精灵对应一个孤立像素，1:1映射关系
+  - 改为: 一个精灵对应多个孤立像素 — 每个精灵可能有多个关联的孤立像素，分布在开口方向的不同距离上。所有关联像素同时沿辐射方向移动，形成多条平行轨迹。解题者需要确定多对多的映射关系。
+  - 来源: creative（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/b9e38dc0.py`
+
+    ```python
+    import numpy as np
+
+from arc_utils import neighbors4, neighbors8, components_mask, get_bg
+import random
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Fill the region enclosed by a wall sprite and radiate color outward through its opening.
+
+    Input structure:
+    - bg = most common color. Wall = most frequent non-bg color, forming a partial enclosure (e.g. U-shape).
+    - A fill-color pixel sits inside the enclosed area. Other non-bg pixels may act as obstacles.
+    Rule:
+    - Flood-fill the enclosed area with the fill color, radiating outward through the wall's open end.
+    - Obstacles cast "shadows" along the radiate direction, blocking fill behind them.
+
+    Key insight: The wall endpoints define the opening direction; fill radiates outward through it, and obstacles block propagation along that same axis.
+    """
+    g = np.array(grid, copy=True)
+    h, w = g.shape
+
+    vals = np.unique(g)
+    bg = get_bg(g)
+
+    non_bg = [int(v) for v in vals if int(v) != bg]
+    assert non_bg, "expected at least one non-background color"
+
+    # Wall: most frequent non-background color.
+    wall = max(non_bg, key=lambda c: int((g == c).sum()))
+
+    wall_mask = g == wall
+
+    # Wall connected components (8-neigh).
+    comps = [set((int(r), int(c)) for r, c in pts) for pts in components_mask(wall_mask, connectivity=8)]
+    assert comps, "expected at least one wall connected component"
+
+    def sgn(x: int) -> int:
+        return (x > 0) - (x < 0)
+
+    other_colors = [c for c in non_bg if c != wall]
+    assert other_colors, "expected at least one non-wall color (fill color)"
+
+    # Pick fill color as the non-wall color closest (Manhattan distance) to the wall pixels.
+    wall_points = [p for comp in comps for p in comp]
+
+    def min_dist_to_wall(color: int) -> tuple[int, int]:
+        pts = list(zip(*np.where(g == color)))
+        pts = [(int(r), int(c)) for r, c in pts]
+        best_d = 10**9
+        for r, c in pts:
+            for wr, wc in wall_points:
+                d = abs(r - wr) + abs(c - wc)
+                if d < best_d:
+                    best_d = d
+                    if best_d == 0:
+                        return 0, len(pts)
+        return best_d, len(pts)
+
+    fill = min(other_colors, key=lambda c: (min_dist_to_wall(c)[0], min_dist_to_wall(c)[1]))
+
+    fill_pos = list(zip(*np.where(g == fill)))
+    fill_pos = [(int(r), int(c)) for r, c in fill_pos]
+    if not fill_pos:
+        return g
+
+    # Choose the closest wall component to the fill seed (ties: larger component).
+    def comp_min_dist(comp: set[tuple[int, int]]) -> int:
+        best_d = 10**9
+        for r, c in fill_pos:
+            for wr, wc in comp:
+                d = abs(r - wr) + abs(c - wc)
+                if d < best_d:
+                    best_d = d
+                    if best_d == 0:
+                        return 0
+        return best_d
+
+    wall_comp = min(comps, key=lambda comp: (comp_min_dist(comp), -len(comp)))
+
+    comp_mask = np.zeros_like(wall_mask, dtype=bool)
+    for r, c in wall_comp:
+        comp_mask[r, c] = True
+
+    def comp_neighbors(r: int, c: int) -> list[tuple[int, int]]:
+        out = []
+        for rr, cc in neighbors8(r, c):
+            if 0 <= rr < h and 0 <= cc < w and comp_mask[rr, cc]:
+                out.append((rr, cc))
+        return out
+
+    endpoints: list[tuple[int, int]] = []
+    for r, c in wall_comp:
+        if len(comp_neighbors(r, c)) == 1:
+            endpoints.append((r, c))
+
+    assert endpoints, "expected wall component to have endpoints (degree-1 pixels)"
+
+    def outward_dir(ep: tuple[int, int]) -> tuple[tuple[int, int], bool]:
+        n1 = comp_neighbors(*ep)[0]
+        d1 = (sgn(n1[0] - ep[0]), sgn(n1[1] - ep[1]))  # inward
+        d_use = d1
+        is_12 = False
+        n2s = [p for p in comp_neighbors(*n1) if p != ep]
+        if n2s:
+            n2 = n2s[0]
+            d2 = (sgn(n2[0] - n1[0]), sgn(n2[1] - n1[1]))
+            if (d1[0] == 0) ^ (d1[1] == 0):
+                if d2[0] != 0 and d2[1] != 0:
+                    d_use = d2
+                    is_12 = True
+        return (-d_use[0], -d_use[1]), is_12
+
+    out_info = [outward_dir(ep) for ep in endpoints]
+    out_dirs = [d for d, _ in out_info]
+    tip_12 = [f for _, f in out_info]
+
+    dr_sum = sum(d[0] for d in out_dirs)
+    dc_sum = sum(d[1] for d in out_dirs)
+    rad = (sgn(dr_sum), sgn(dc_sum))
+
+    barrier = comp_mask.copy()
+
+    def add_ray(start: tuple[int, int], d: tuple[int, int], skip: int = 0) -> None:
+        rr, cc = start
+        for _ in range(skip):
+            rr += d[0]
+            cc += d[1]
+        while True:
+            rr += d[0]
+            cc += d[1]
+            if not (0 <= rr < h and 0 <= cc < w):
+                break
+            barrier[rr, cc] = True
+
+    def add_ray_12(start: tuple[int, int], d: tuple[int, int]) -> None:
+        rr, cc = start
+        step = 0
+        while True:
+            step += 1
+            if step % 2 == 1:
+                rr += d[0]; cc += d[1]
+            else:
+                if rad[0] != 0:
+                    rr += d[0]
+                else:
+                    cc += d[1]
+            if not (0 <= rr < h and 0 <= cc < w):
+                break
+            barrier[rr, cc] = True
+
+    for ep, d, is_12 in zip(endpoints, out_dirs, tip_12):
+        if is_12:
+            add_ray_12(ep, d)
+        else:
+            add_ray(ep, d, skip=0)
+
+    passable = (~barrier) & ((g == bg) | (g == fill))
+    q = fill_pos[:]
+    seen = np.zeros_like(passable, dtype=bool)
+    for r, c in q:
+        if passable[r, c]:
+            seen[r, c] = True
+    while q:
+        r, c = q.pop()
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and passable[rr, cc] and not seen[rr, cc]:
+                seen[rr, cc] = True
+                q.append((rr, cc))
+
+    filled_mask = (seen & (g == bg))
+
+    out = g.copy()
+    out[filled_mask] = fill
+
+    # Shadow behind obstacles (non-bg, non-fill, non-wall) along radiate direction.
+    obstacles = (g != bg) & (g != fill) & (g != wall)
+
+    def shadow_process(coords: list[tuple[int, int]]) -> None:
+        started = False
+        blocked = False
+        for r, c in coords:
+            if filled_mask[r, c]:
+                started = True
+            if started and obstacles[r, c]:
+                blocked = True
+                continue
+            if blocked and filled_mask[r, c]:
+                out[r, c] = bg
+                filled_mask[r, c] = False
+
+    if rad != (0, 0):
+        dr, dc = rad
+        if dr != 0 and dc == 0:
+            for c in range(w):
+                rows = range(h) if dr > 0 else range(h - 1, -1, -1)
+                shadow_process([(r, c) for r in rows])
+        elif dc != 0 and dr == 0:
+            for r in range(h):
+                cols = range(w) if dc > 0 else range(w - 1, -1, -1)
+                shadow_process([(r, c) for c in cols])
+        else:
+            # Diagonal scanlines
+            if dr == dc:
+                # r - c = const
+                for k in range(-(w - 1), h):
+                    coords = [(r, r - k) for r in range(h) if 0 <= r - k < w]
+                    coords.sort(key=lambda rc: rc[0], reverse=(dr < 0))
+                    shadow_process(coords)
+            else:
+                # r + c = const
+                for k in range(h + w - 1):
+                    coords = [(r, k - r) for r in range(h) if 0 <= k - r < w]
+                    coords.sort(key=lambda rc: rc[0], reverse=(dr < 0))
+                    shadow_process(coords)
+
+    return out
+
+# --------------- generator (o5x) ---------------
+
+from scipy.ndimage import distance_transform_cdt
+
+# -- Configuration constants --------------------------------------------------
+# Canvas size bounds
+GRID_H_VERT = (11, 18)       # height range when radiate_dir is vertical
+GRID_H_HORIZ = (8, 18)       # height range when radiate_dir is horizontal
+GRID_W = (15, 19)             # width range (all directions)
+
+# Wall geometry
+WALL_PIXELS_MIN = 17          # minimum wall pixel count
+WALL_PIXELS_MAX = 25          # maximum wall pixel count
+DEPTH_VERT = (5, 10)          # arm depth range for vertical radiate
+DEPTH_HORIZ = (6, 8)          # arm depth range for horizontal radiate
+GAP_VERT = (6, 7)             # endpoint gap for vertical radiate
+GAP_HORIZ = (5, 7)            # endpoint gap for horizontal radiate
+TIP_12_PROB = 0.5             # probability of 1:2 arm-angle mode (when eligible)
+
+# Placement margins
+OPEN_END_MARGIN = 3           # min cells from open end to radiate grid edge
+
+# Fill seed
+SEED_SIZE_WEIGHTS = [1, 1, 1, 1, 2, 2, 3, 4, 5, 6]  # weighted choices for blob size
+SEED_DEPTH_LOOKBACK = 3       # seed must be within this many rows of closed end
+
+# Obstacles
+MAX_OBSTACLES = 5             # maximum obstacle pixel count
+OBSTACLE_IN_FILL_PROB = 0.65  # probability of forcing at least one obstacle in fill zone
+OBSTACLE_MIN_SEP = 2          # Chebyshev distance between obstacles (> this value)
+
+# Validation
+MIN_NEW_FILL = 20             # minimum newly-filled pixels for a valid output
+PALETTE_SIZE = (3, 5)         # number of distinct colors (bg + wall + fill + obstacle(s))
+GEN_RETRIES = 300             # max attempts in generate_input
+
+
+def _degree1_pixels(points):
+    """Return degree-1 pixels (exactly one 8-neighbor in the set)."""
+    pts = set(points)
+    return [(r, c) for r, c in pts
+            if sum((rr, cc) in pts for rr, cc in neighbors8(r, c)) == 1]
+
+
+def _make_arm(depth, start_v, target_v, extra_steps, tip_12=False):
+    """Build one zigzag arm from (0, start_v) toward (depth, target_v)."""
+    sign = 1 if target_v > start_v else -1
+    n_side_steps = abs(target_v - start_v)
+    chosen_rows = []
+    if n_side_steps:
+        if tip_12:
+            chosen_rows = [2 * (i + 1) for i in range(n_side_steps)]
+            extra_steps = 0
+        else:
+            chosen_rows = [1]
+            if n_side_steps > 1:
+                chosen_rows += random.sample(range(2, depth + 1), n_side_steps - 1)
+            chosen_rows.sort()
+
+    first_row = chosen_rows[0] if chosen_rows else 1
+    extra_rows = [r for r in chosen_rows if r != first_row]
+    random.shuffle(extra_rows)
+    orthogonal_rows = set(extra_rows[:extra_steps])
+
+    pts = [(0, start_v)]
+    u, v = 0, start_v
+    for row in range(1, depth + 1):
+        u += 1
+        if row in orthogonal_rows:
+            pts.append((u, v))
+            v += sign
+        elif row in chosen_rows:
+            v += sign
+        pts.append((u, v))
+    return pts
+
+
+def _build_local_wall(rad, h, w):
+    """Construct wall shape in local (u, v) coordinates. Returns (pts, depth, gap) or None."""
+    if rad[0]:
+        max_depth = min(DEPTH_VERT[1], h - 6)
+        if max_depth < DEPTH_VERT[0]:
+            return None
+        depth = random.randint(DEPTH_VERT[0], max_depth)
+        gap = random.randint(*GAP_VERT)
+    else:
+        depth = random.randint(DEPTH_HORIZ[0], min(DEPTH_HORIZ[1], w - 6))
+        gap = random.randint(GAP_HORIZ[0], min(GAP_HORIZ[1], h - 1))
+
+    if gap == 5:
+        left_bottom, right_bottom = 2, 3
+    elif gap == 6:
+        left_bottom, right_bottom = 2, 4
+    else:
+        left_bottom, right_bottom = random.choice([(2, 5), (3, 4)])
+
+    bridge_extra = max(0, right_bottom - left_bottom - 1)
+    base_count = 2 * (depth + 1) + bridge_extra
+    max_extra_l = max(0, left_bottom - 1)
+    max_extra_r = max(0, gap - right_bottom - 1)
+    min_extra = max(0, WALL_PIXELS_MIN - base_count)
+    max_extra = min(max_extra_l + max_extra_r, WALL_PIXELS_MAX - base_count)
+    if min_extra > max_extra:
+        return None
+
+    extra = random.randint(min_extra, max_extra)
+    extra_l = random.randint(max(0, extra - max_extra_r), min(max_extra_l, extra))
+    extra_r = extra - extra_l
+
+    max_n_side = max(left_bottom, gap - right_bottom)
+    tip_12 = depth >= 2 * max_n_side and random.random() < TIP_12_PROB
+    left = _make_arm(depth, 0, left_bottom, extra_l, tip_12=tip_12)
+    right = _make_arm(depth, gap, right_bottom, extra_r, tip_12=tip_12)
+    pts = set(left) | set(right)
+    for v in range(left_bottom, right_bottom + 1):
+        pts.add((depth, v))
+
+    # Pad wall to minimum size by adding 8-connected pixels that preserve 2 endpoints
+    while len(pts) < WALL_PIXELS_MIN:
+        candidates = [
+            (u, v) for u in range(max(0, depth - 3), depth + 1)
+            for v in range(gap + 1) if (u, v) not in pts
+            and sum((uu, vv) in pts
+                    for uu in range(u - 1, u + 2)
+                    for vv in range(v - 1, v + 2)
+                    if (uu, vv) != (u, v)) >= 2
+        ]
+        random.shuffle(candidates)
+        added = False
+        for p in candidates:
+            trial = pts | {p}
+            if len(trial) <= WALL_PIXELS_MAX and len(_degree1_pixels(trial)) == 2:
+                pts = trial
+                added = True
+                break
+        if not added:
+            return None
+
+    if not (WALL_PIXELS_MIN <= len(pts) <= WALL_PIXELS_MAX) or len(_degree1_pixels(pts)) != 2:
+        return None
+    return pts, depth, gap
+
+
+def _map_local(u, v, rad, anchor):
+    """Map local (u, v) to grid (r, c) given radiate direction and anchor."""
+    r0, c0 = anchor
+    if rad == (-1, 0):
+        return r0 + u, c0 + v
+    if rad == (1, 0):
+        return r0 - u, c0 + v
+    if rad == (0, -1):
+        return r0 + v, c0 + u
+    return r0 + v, c0 - u
+
+
+def _place_anchor(rad, h, w, depth, gap):
+    """Choose anchor so the wall fits within margins."""
+    if rad == (-1, 0):
+        return random.randint(OPEN_END_MARGIN, h - depth - 3), random.randint(0, w - gap - 1)
+    if rad == (1, 0):
+        return random.randint(depth + 2, h - 4), random.randint(0, w - gap - 1)
+    if rad == (0, -1):
+        return random.randint(0, h - gap - 1), random.randint(OPEN_END_MARGIN, w - depth - 3)
+    return random.randint(0, h - gap - 1), random.randint(depth + 2, w - 4)
+
+
+def _local_interior(wall, depth, gap):
+    """Return bg cells strictly between the two wall arms in local coords."""
+    by_row = {}
+    for u, v in wall:
+        by_row.setdefault(u, []).append(v)
+    interior = []
+    for u in range(1, depth):
+        if u not in by_row or len(by_row[u]) < 2:
+            continue
+        lo, hi = min(by_row[u]), max(by_row[u])
+        for v in range(lo + 1, hi):
+            if (u, v) not in wall:
+                interior.append((u, v))
+    return interior
+
+
+def _grow_seed_blob(seed, interior_set):
+    """Grow a small 4-connected blob from seed within interior cells."""
+    blob = {seed}
+    target_size = random.choice(SEED_SIZE_WEIGHTS)
+    frontier = [seed]
+    while len(blob) < target_size and frontier:
+        p = frontier.pop(random.randrange(len(frontier)))
+        u, v = p
+        for q in random.sample([(u - 1, v), (u + 1, v), (u, v - 1), (u, v + 1)], 4):
+            if q in interior_set and q not in blob:
+                blob.add(q)
+                frontier.append(q)
+                if len(blob) >= target_size:
+                    break
+    return blob
+
+
+def _obstacle_fits(pos, placed):
+    """Check that pos is at least Chebyshev OBSTACLE_MIN_SEP from all placed obstacles."""
+    r, c = pos
+    return all(max(abs(r - rr), abs(c - cc)) >= OBSTACLE_MIN_SEP for rr, cc in placed)
+
+
+def _find_obstacle_candidates(grid, bg, wall_color, nominal_fill_zone):
+    """Find bg cells far enough from wall for obstacle placement, using distance transform."""
+    wall_mask = grid == wall_color
+    # distance_transform_cdt with chessboard metric gives Chebyshev distance to wall
+    dist = distance_transform_cdt(~wall_mask, metric='taxicab')
+    far_from_wall = dist > 1
+    eligible = (grid == bg) & far_from_wall
+    all_coords = list(zip(*np.where(eligible)))
+    fill_coords = [p for p in all_coords if nominal_fill_zone[p[0], p[1]]]
+    random.shuffle(all_coords)
+    random.shuffle(fill_coords)
+    return [(int(r), int(c)) for r, c in all_coords], [(int(r), int(c)) for r, c in fill_coords]
+
+
+def _place_obstacles(n_obstacles, candidates, fill_candidates, obstacle_colors, grid):
+    """Place up to n_obstacles on the grid, preferring some in the fill zone."""
+    placed = []
+    n_fill = random.randint(0, min(n_obstacles, len(fill_candidates)))
+    if fill_candidates and random.random() < OBSTACLE_IN_FILL_PROB:
+        n_fill = max(1, n_fill)
+    for p in fill_candidates:
+        if len(placed) >= n_fill:
+            break
+        if _obstacle_fits(p, placed):
+            placed.append(p)
+    placed_set = set(placed)
+    for p in candidates:
+        if len(placed) >= n_obstacles:
+            break
+        if p not in placed_set and _obstacle_fits(p, placed):
+            placed.append(p)
+            placed_set.add(p)
+    for i, (r, c) in enumerate(placed):
+        grid[r, c] = obstacle_colors[i % len(obstacle_colors)]
+
+
+def _touches_border(mask):
+    """Check if any True cell in mask lies on the grid border."""
+    return bool(mask[0, :].any() or mask[-1, :].any() or mask[:, 0].any() or mask[:, -1].any())
+
+
+def _gen_attempt():
+    """Single attempt to generate a valid input grid."""
+    rad = random.choice([(-1, 0), (1, 0), (0, -1), (0, 1)])
+    h = random.randint(*GRID_H_VERT) if rad[0] else random.randint(*GRID_H_HORIZ)
+    w = random.randint(*GRID_W)
+
+    built = _build_local_wall(rad, h, w)
+    if built is None:
+        return None
+    local_wall, depth, gap = built
+    anchor = _place_anchor(rad, h, w, depth, gap)
+
+    # Choose palette
+    palette = random.sample(range(10), random.randint(*PALETTE_SIZE))
+    bg, wall_color, fill_color = palette[:3]
+    obstacle_colors = palette[3:]
+
+    # Render wall onto grid
+    grid = np.full((h, w), bg, dtype=int)
+    for u, v in local_wall:
+        r, c = _map_local(u, v, rad, anchor)
+        grid[r, c] = wall_color
+
+    # Place fill seed near the closed end
+    interior = _local_interior(local_wall, depth, gap)
+    wall_set = set(local_wall)
+    adjacent = [
+        p for p in interior
+        if any((p[0] + dr, p[1] + dc) in wall_set for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)])
+    ]
+    seed_pool = [p for p in adjacent if p[0] >= max(1, depth - SEED_DEPTH_LOOKBACK)]
+    if not seed_pool:
+        return None
+
+    blob = _grow_seed_blob(random.choice(seed_pool), set(interior))
+    for u, v in blob:
+        r, c = _map_local(u, v, rad, anchor)
+        if grid[r, c] != bg:
+            return None
+        grid[r, c] = fill_color
+
+    # Run solver to find nominal fill zone (used for obstacle placement)
+    try:
+        nominal_out = main(grid)
+    except Exception:
+        return None
+    nominal_fill_zone = (nominal_out == fill_color) & (grid == bg)
+
+    # Place obstacles
+    n_obstacles = random.randint(0, MAX_OBSTACLES)
+    if n_obstacles and not obstacle_colors:
+        available = [c for c in range(10) if c not in (bg, wall_color, fill_color)]
+        obstacle_colors = random.sample(available, random.randint(1, 2))
+    if n_obstacles:
+        candidates, fill_candidates = _find_obstacle_candidates(grid, bg, wall_color, nominal_fill_zone)
+        _place_obstacles(n_obstacles, candidates, fill_candidates, obstacle_colors, grid)
+
+    # Validate: solver must produce enough fill that reaches a border
+    try:
+        out = main(grid)
+    except Exception:
+        return None
+    new_fill = (out == fill_color) & (grid == bg)
+    if int(new_fill.sum()) < MIN_NEW_FILL or not _touches_border(new_fill):
+        return None
+    return grid
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(GEN_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate valid b9e38dc0 input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  grid: 8-18 rows x 15-19 cols; bg = most common color
+  wall:
+    color: most frequent non-bg color; single 8-connected component of 17-25 pixels
+    shape: |
+      V/U/funnel partial enclosure with two arms diverging from a closed end toward an open end.
+      Arms are zigzag staircases mixing diagonal and orthogonal steps; may have horizontal/vertical
+      bars at turns creating branch points (degree-3/4 nodes allowed). Exactly 2 degree-1 endpoints.
+      Two arm-angle modes (both arms always same mode within one example):
+        - 1:1 (45°): arm steps are diagonal (1 lateral per 1 depth)
+        - 1:2 (<45°): arm steps strictly alternate depth-only and diagonal (1 lateral per 2 depth)
+    bbox: spans 6-11 rows x 7-9 cols
+    endpoints: both on same row, same col, or diagonally close; Chebyshev gap 5-7
+    opening: endpoints define the open end; radiate_dir is the cardinal direction (up/down/left/right) pointing outward from the opening, derived from the vector sum of endpoint outward directions
+    placement: closed end >=2 cells from its grid edge; open end >=3 cells from the radiate-edge
+  fill_seed:
+    color: non-bg non-wall color closest (Manhattan) to the wall
+    shape: 1-6 pixels, single 4-connected component (usually 1 pixel) [observed]
+    location: inside the enclosure near the closed end; Manhattan distance 1-2 from wall; always 8-adjacent to wall
+  obstacles:
+    count: 0-2 distinct colors, 0-5 singleton pixels total (one 2-pixel pair allowed)
+    location: scattered on bg cells; some in the radiate zone (between opening and grid edge), some elsewhere
+    effect: preserved unchanged; those in the fill zone cast bg shadows behind them along radiate_dir
+  output:
+    fill_interior: flood-fill (4-conn) all bg cells reachable from seed inside enclosure with fill color
+    radiate: fill continues outward through the opening, bounded by rays from endpoints
+      until grid edge. Ray slope matches arm-angle mode: 1:1 arms → 45° diagonal rays,
+      1:2 arms → 1:2 slope rays (alternating diagonal and depth-only steps)
+    shadows: obstacles in the fill zone block fill propagation along radiate_dir behind them
+    preserved: wall, fill seed, all obstacle pixels remain unchanged
+
+generation_strategy: |
+  Output-first: build the wall + fill output, then strip the fill to get the input.
+  1. Pick grid size, 3-5 colors {bg, wall, fill, obstacle(s)}, and radiate_dir.
+  2. Build the wall: place it so the closed end has >=2 margin from its edge and the
+     opening has >=3 cells toward the radiate edge. Pick arm-angle mode (1:1 or 1:2,
+     same for both arms). Draw two arms as zigzag chains from the closed end outward:
+     1:1 mode uses diagonal steps; 1:2 mode strictly alternates depth-only and diagonal
+     steps (evenly spaced at rows 2,4,6,...). Optionally add short bars at turns. Verify single 8-connected component, exactly 2 endpoints,
+     17-25 pixels, Chebyshev endpoint gap 5-7.
+  3. Place fill seed: pick a bg cell inside the enclosure near the closed end,
+     8-adjacent to a wall pixel. Optionally grow to a small blob (size 1-6).
+  4. Place 0-5 obstacle pixels on bg cells (0-2 distinct colors, singletons).
+  5. Run the solver to produce the output; reject if <20 newly-filled cells or
+     fill does not reach at least one grid border.
+  6. The constructed grid (before running solver) is the input; solver output is the output.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/b9e38dc0/36/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/b9e38dc0.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/b9e38dc0/36/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of b9e38dc0 (index 36)
+    # combo_spec: D2/1+D7/3+D16/0
+    # Name: 碰撞停止+吸收变色+多孤立像素
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/b9e38dc0/36` 存在（如不存在则创建）。
+
+    - `/home/lixinyu/snap/new/arc2_solver_select/195c6913.py` — 参考任务 195c6913 的 solver（D2/1 的灵感来源）
+    - `/home/lixinyu/snap/new/arc2_solver_select/4c416de3.py` — 参考任务 4c416de3 的 solver（D7/3 的灵感来源）
+2026-05-16T07:43:19.490985Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+2026-05-16T07:43:24.541717Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+ERROR: Reconnecting... 2/5
+2026-05-16T07:43:41.338611Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+ERROR: Reconnecting... 3/5
+2026-05-16T07:43:44.301240Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+ERROR: Reconnecting... 4/5
+2026-05-16T07:43:47.348074Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+ERROR: Reconnecting... 5/5
+2026-05-16T07:43:51.834997Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+codex
+先检查原 solver/generator、两个参考变体和工具函数，确认哪些隐式前提会被这三个维度一起打破；然后我会把设计分析直接写进目标代码注释里，再落地实现和反复测。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/195c6913.py" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/b9e38dc0.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+import numpy as np
+
+from arc_utils import neighbors4, neighbors8, components_mask, get_bg
+import random
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Fill the region enclosed by a wall sprite and radiate color outward through its opening.
+
+    Input structure:
+    - bg = most common color. Wall = most frequent non-bg color, forming a partial enclosure (e.g. U-shape).
+    - A fill-color pixel sits inside the enclosed area. Other non-bg pixels may act as obstacles.
+    Rule:
+    - Flood-fill the enclosed area with the fill color, radiating outward through the wall's open end.
+    - Obstacles cast "shadows" along the radiate direction, blocking fill behind them.
+
+    Key insight: The wall endpoints define the opening direction; fill radiates outward through it, and obstacles block propagation along that same axis.
+    """
+    g = np.array(grid, copy=True)
+    h, w = g.shape
+
+    vals = np.unique(g)
+    bg = get_bg(g)
+
+    non_bg = [int(v) for v in vals if int(v) != bg]
+    assert non_bg, "expected at least one non-background color"
+
+    # Wall: most frequent non-background color.
+    wall = max(non_bg, key=lambda c: int((g == c).sum()))
+
+    wall_mask = g == wall
+
+    # Wall connected components (8-neigh).
+    comps = [set((int(r), int(c)) for r, c in pts) for pts in components_mask(wall_mask, connectivity=8)]
+    assert comps, "expected at least one wall connected component"
+
+    def sgn(x: int) -> int:
+        return (x > 0) - (x < 0)
+
+    other_colors = [c for c in non_bg if c != wall]
+    assert other_colors, "expected at least one non-wall color (fill color)"
+
+    # Pick fill color as the non-wall color closest (Manhattan distance) to the wall pixels.
+    wall_points = [p for comp in comps for p in comp]
+
+    def min_dist_to_wall(color: int) -> tuple[int, int]:
+        pts = list(zip(*np.where(g == color)))
+        pts = [(int(r), int(c)) for r, c in pts]
+        best_d = 10**9
+        for r, c in pts:
+            for wr, wc in wall_points:
+                d = abs(r - wr) + abs(c - wc)
+                if d < best_d:
+                    best_d = d
+                    if best_d == 0:
+                        return 0, len(pts)
+        return best_d, len(pts)
+
+    fill = min(other_colors, key=lambda c: (min_dist_to_wall(c)[0], min_dist_to_wall(c)[1]))
+
+    fill_pos = list(zip(*np.where(g == fill)))
+    fill_pos = [(int(r), int(c)) for r, c in fill_pos]
+    if not fill_pos:
+        return g
+
+    # Choose the closest wall component to the fill seed (ties: larger component).
+    def comp_min_dist(comp: set[tuple[int, int]]) -> int:
+        best_d = 10**9
+        for r, c in fill_pos:
+            for wr, wc in comp:
+                d = abs(r - wr) + abs(c - wc)
+                if d < best_d:
+                    best_d = d
+                    if best_d == 0:
+                        return 0
+        return best_d
+
+    wall_comp = min(comps, key=lambda comp: (comp_min_dist(comp), -len(comp)))
+
+    comp_mask = np.zeros_like(wall_mask, dtype=bool)
+    for r, c in wall_comp:
+        comp_mask[r, c] = True
+
+    def comp_neighbors(r: int, c: int) -> list[tuple[int, int]]:
+        out = []
+        for rr, cc in neighbors8(r, c):
+            if 0 <= rr < h and 0 <= cc < w and comp_mask[rr, cc]:
+                out.append((rr, cc))
+        return out
+
+    endpoints: list[tuple[int, int]] = []
+    for r, c in wall_comp:
+        if len(comp_neighbors(r, c)) == 1:
+            endpoints.append((r, c))
+
+    assert endpoints, "expected wall component to have endpoints (degree-1 pixels)"
+
+    def outward_dir(ep: tuple[int, int]) -> tuple[tuple[int, int], bool]:
+        n1 = comp_neighbors(*ep)[0]
+        d1 = (sgn(n1[0] - ep[0]), sgn(n1[1] - ep[1]))  # inward
+        d_use = d1
+        is_12 = False
+        n2s = [p for p in comp_neighbors(*n1) if p != ep]
+        if n2s:
+            n2 = n2s[0]
+            d2 = (sgn(n2[0] - n1[0]), sgn(n2[1] - n1[1]))
+            if (d1[0] == 0) ^ (d1[1] == 0):
+                if d2[0] != 0 and d2[1] != 0:
+                    d_use = d2
+                    is_12 = True
+        return (-d_use[0], -d_use[1]), is_12
+
+    out_info = [outward_dir(ep) for ep in endpoints]
+    out_dirs = [d for d, _ in out_info]
+    tip_12 = [f for _, f in out_info]
+
+    dr_sum = sum(d[0] for d in out_dirs)
+    dc_sum = sum(d[1] for d in out_dirs)
+    rad = (sgn(dr_sum), sgn(dc_sum))
+
+    barrier = comp_mask.copy()
+
+    def add_ray(start: tuple[int, int], d: tuple[int, int], skip: int = 0) -> None:
+        rr, cc = start
+        for _ in range(skip):
+            rr += d[0]
+            cc += d[1]
+        while True:
+            rr += d[0]
+            cc += d[1]
+            if not (0 <= rr < h and 0 <= cc < w):
+                break
+            barrier[rr, cc] = True
+
+    def add_ray_12(start: tuple[int, int], d: tuple[int, int]) -> None:
+        rr, cc = start
+        step = 0
+        while True:
+            step += 1
+            if step % 2 == 1:
+                rr += d[0]; cc += d[1]
+            else:
+                if rad[0] != 0:
+                    rr += d[0]
+                else:
+                    cc += d[1]
+            if not (0 <= rr < h and 0 <= cc < w):
+                break
+            barrier[rr, cc] = True
+
+    for ep, d, is_12 in zip(endpoints, out_dirs, tip_12):
+        if is_12:
+            add_ray_12(ep, d)
+        else:
+            add_ray(ep, d, skip=0)
+
+    passable = (~barrier) & ((g == bg) | (g == fill))
+    q = fill_pos[:]
+    seen = np.zeros_like(passable, dtype=bool)
+    for r, c in q:
+        if passable[r, c]:
+            seen[r, c] = True
+    while q:
+        r, c = q.pop()
+        for rr, cc in neighbors4(r, c):
+            if 0 <= rr < h and 0 <= cc < w and passable[rr, cc] and not seen[rr, cc]:
+                seen[rr, cc] = True
+                q.append((rr, cc))
+
+    filled_mask = (seen & (g == bg))
+
+    out = g.copy()
+    out[filled_mask] = fill
+
+    # Shadow behind obstacles (non-bg, non-fill, non-wall) along radiate direction.
+    obstacles = (g != bg) & (g != fill) & (g != wall)
+
+    def shadow_process(coords: list[tuple[int, int]]) -> None:
+        started = False
+        blocked = False
+        for r, c in coords:
+            if filled_mask[r, c]:
+                started = True
+            if started and obstacles[r, c]:
+                blocked = True
+                continue
+            if blocked and filled_mask[r, c]:
+                out[r, c] = bg
+                filled_mask[r, c] = False
+
+    if rad != (0, 0):
+        dr, dc = rad
+        if dr != 0 and dc == 0:
+            for c in range(w):
+                rows = range(h) if dr > 0 else range(h - 1, -1, -1)
+                shadow_process([(r, c) for r in rows])
+        elif dc != 0 and dr == 0:
+            for r in range(h):
+                cols = range(w) if dc > 0 else range(w - 1, -1, -1)
+                shadow_process([(r, c) for c in cols])
+        else:
+            # Diagonal scanlines
+            if dr == dc:
+                # r - c = const
+                for k in range(-(w - 1), h):
+                    coords = [(r, r - k) for r in range(h) if 0 <= r - k < w]
+                    coords.sort(key=lambda rc: rc[0], reverse=(dr < 0))
+                    shadow_process(coords)
+            else:
+                # r + c = const
+                for k in range(h + w - 1):
+                    coords = [(r, k - r) for r in range(h) if 0 <= k - r < w]
+                    coords.sort(key=lambda rc: rc[0], reverse=(dr < 0))
+                    shadow_process(coords)
+
+    return out
+
+# --------------- generator (o5x) ---------------
+
+from scipy.ndimage import distance_transform_cdt
+
+# -- Configuration constants --------------------------------------------------
+# Canvas size bounds
+GRID_H_VERT = (11, 18)       # height range when radiate_dir is vertical
+GRID_H_HORIZ = (8, 18)       # height range when radiate_dir is horizontal
+GRID_W = (15, 19)             # width range (all directions)
+
+# Wall geometry
+WALL_PIXELS_MIN = 17          # minimum wall pixel count
+WALL_PIXELS_MAX = 25          # maximum wall pixel count
+DEPTH_VERT = (5, 10)          # arm depth range for vertical radiate
+DEPTH_HORIZ = (6, 8)          # arm depth range for horizontal radiate
+GAP_VERT = (6, 7)             # endpoint gap for vertical radiate
+GAP_HORIZ = (5, 7)            # endpoint gap for horizontal radiate
+TIP_12_PROB = 0.5             # probability of 1:2 arm-angle mode (when eligible)
+
+# Placement margins
+OPEN_END_MARGIN = 3           # min cells from open end to radiate grid edge
+
+# Fill seed
+SEED_SIZE_WEIGHTS = [1, 1, 1, 1, 2, 2, 3, 4, 5, 6]  # weighted choices for blob size
+SEED_DEPTH_LOOKBACK = 3       # seed must be within this many rows of closed end
+
+# Obstacles
+MAX_OBSTACLES = 5             # maximum obstacle pixel count
+OBSTACLE_IN_FILL_PROB = 0.65  # probability of forcing at least one obstacle in fill zone
+OBSTACLE_MIN_SEP = 2          # Chebyshev distance between obstacles (> this value)
+
+# Validation
+MIN_NEW_FILL = 20             # minimum newly-filled pixels for a valid output
+PALETTE_SIZE = (3, 5)         # number of distinct colors (bg + wall + fill + obstacle(s))
+GEN_RETRIES = 300             # max attempts in generate_input
+
+
+def _degree1_pixels(points):
+    """Return degree-1 pixels (exactly one 8-neighbor in the set)."""
+    pts = set(points)
+    return [(r, c) for r, c in pts
+            if sum((rr, cc) in pts for rr, cc in neighbors8(r, c)) == 1]
+
+
+ succeeded in 0ms:
+from __future__ import annotations
+from collections import Counter
+import numpy as np
+
+def _assert_path_single_component(g: np.ndarray, path_color: int) -> None:
+    """Eval invariant: path_color forms a single 4-connected component.
+    Catches generators that build two disconnected bands as a topology shortcut."""
+    from arc_utils import label_mask
+    _, n_path = label_mask(g == path_color, connectivity=4)
+    assert n_path == 1, f"path_color must be a single 4-connected component, got {n_path}"
+
+
+def _assert_marker_embedded_in_path(
+    g: np.ndarray, markers: list[tuple[int, int, int]], path_color: int
+) -> None:
+    """Eval invariant: each marker cell's vertical neighbors at col 0 are path
+    (marker is embedded in a col-0 path segment, not floating on bg).
+    All 9 eval markers satisfy this. Catches generators that place markers on
+    bg cells with the band only touching col 1."""
+    H, _ = g.shape
+    for r, c, _ in markers:
+        if c != 0:
+            continue
+        if r > 0:
+            assert int(g[r - 1, c]) == path_color, (
+                f"marker at ({r},{c}) up-neighbor ({r-1},{c})={int(g[r-1,c])} "
+                f"must be path_color {path_color}"
+            )
+        if r < H - 1:
+            assert int(g[r + 1, c]) == path_color, (
+                f"marker at ({r},{c}) down-neighbor ({r+1},{c})={int(g[r+1,c])} "
+                f"must be path_color {path_color}"
+            )
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Simulate particles along a path with alternating turn direction at collisions.
+
+    Input structure:
+    - Top-left: 2x2 monochrome blocks define a repeating color cycle (left-to-right).
+    - Isolated single pixels of a cycle color: start markers adjacent to the path.
+    - A 2x2 monochrome block of a distinct color: end marker.
+
+    Rule:
+    - Each start marker launches a particle moving straight, painting cycle colors in order.
+    - On hitting a boundary, paint that cell with the end color and turn 90°.
+    - Turn direction alternates: odd collisions → left (CCW), even → right (CW).
+    - If the scheduled turn is blocked, the particle stops.
+
+    Key insight: The alternating left/right turn rule is the core mechanism; without it the path would be trivial.
+    """
+    g = np.array(grid, dtype=int)
+    H, W = g.shape
+
+    template_bg = int(g[0, 0])
+
+    # Path is the most frequent color != template_bg.
+    counts = Counter(map(int, g.flatten()))
+    path_color = int(max([(cnt, int(col)) for col, cnt in counts.items() if int(col) != int(template_bg)])[1])
+    _assert_path_single_component(g, path_color)
+
+    # Detect the repeating cycle from 2x2 blocks in the top-left region.
+    pattern: list[int] = []
+    pat_cells: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for r in range(min(6, H - 1)):
+        for c in range(min(25, W - 1)):
+            if (int(r), int(c)) in seen:
+                continue
+            v = int(g[int(r), int(c)])
+            if v == int(template_bg) or v == int(path_color):
+                continue
+            if int(g[int(r + 1), int(c)]) == v and int(g[int(r), int(c + 1)]) == v and int(g[int(r + 1), int(c + 1)]) == v:
+                pattern.append(int(v))
+                for rr, cc in [(r, c), (r + 1, c), (r, c + 1), (r + 1, c + 1)]:
+                    seen.add((int(rr), int(cc)))
+                    pat_cells.append((int(rr), int(cc)))
+
+    # Detect end color block (2x2).
+    end_color = None
+    end_pos = None
+    pat_set = set(map(int, pattern))
+    for r in range(H - 1):
+        for c in range(W - 1):
+            v = int(g[int(r), int(c)])
+            if v == int(template_bg) or v == int(path_color) or v in pat_set:
+                continue
+            if int(g[int(r + 1), int(c)]) == v and int(g[int(r), int(c + 1)]) == v and int(g[int(r + 1), int(c + 1)]) == v:
+                end_color = int(v)
+                end_pos = (int(r), int(c))
+                break
+        if end_pos is not None:
+            break
+
+    # Detect start markers: isolated pattern-color pixels adjacent to the path.
+    markers: list[tuple[int, int, int]] = []
+    for r in range(H):
+        for c in range(W):
+            v = int(g[int(r), int(c)])
+            if v not in pat_set:
+                continue
+            same = 0
+            has_path = False
+            for dr, dc in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                rr = int(r + dr)
+                cc = int(c + dc)
+                if 0 <= rr < H and 0 <= cc < W:
+                    if int(g[rr, cc]) == v:
+                        same += 1
+                    if int(g[rr, cc]) == int(path_color):
+                        has_path = True
+            if same == 0 and has_path:
+                markers.append((int(r), int(c), int(v)))
+
+    _assert_marker_embedded_in_path(g, markers, int(path_color))
+
+    out = g.copy()
+    # Erase template pattern blocks and the end block.
+    for r, c in pat_cells:
+        out[int(r), int(c)] = int(template_bg)
+    if end_pos is not None:
+        er, ec = end_pos
+        out[int(er) : int(er + 2), int(ec) : int(ec + 2)] = int(template_bg)
+
+    # Initial direction preference (matches examples).
+    dir_order = [(0, 1), (1, 0), (0, -1), (-1, 0)]  # R, D, L, U
+
+    per_marker_cells: list[set[tuple[int, int]]] = []
+    for sr, sc, sv in markers:
+        init = None
+        for dr, dc in dir_order:
+            rr = int(sr + dr)
+            cc = int(sc + dc)
+            if 0 <= rr < H and 0 <= cc < W and int(g[rr, cc]) == int(path_color):
+                init = (int(dr), int(dc))
+                break
+        if init is None or not pattern:
+            per_marker_cells.append(set())
+            continue
+
+        r, c = int(sr), int(sc)
+        dr, dc = init
+        idx = int(pattern.index(int(sv))) if int(sv) in pattern else 0
+        hits = 0  # collision count so far
+        visited: set[tuple[int, int, int, int, int, int]] = set()
+        my_cells: set[tuple[int, int]] = set()
+
+        for _ in range(H * W * 4):
+            state = (int(r), int(c), int(dr), int(dc), int(idx), int(hits & 1))
+            if state in visited:
+                break
+            visited.add(state)
+
+            nr = int(r + dr)
+            nc = int(c + dc)
+            if not (0 <= nr < H and 0 <= nc < W):
+                break
+
+            if int(g[nr, nc]) == int(path_color):
+                idx = int((idx + 1) % len(pattern))
+                out[nr, nc] = int(pattern[idx])
+                my_cells.add((int(nr), int(nc)))
+                r, c = nr, nc
+                continue
+
+            # Collision with non-path.
+            if int(g[nr, nc]) == int(template_bg) and end_color is not None:
+                out[nr, nc] = int(end_color)
+
+            # Strict alternating turn: no fallback if blocked.
+            left = (-int(dc), int(dr))  # CCW
+            right = (int(dc), -int(dr))  # CW
+            tdr, tdc = left if (int(hits) % 2 == 0) else right
+            rr = int(r + tdr)
+            cc = int(c + tdc)
+            if 0 <= rr < H and 0 <= cc < W and int(g[rr, cc]) == int(path_color):
+                dr, dc = int(tdr), int(tdc)
+                hits += 1
+                continue
+            break
+
+        per_marker_cells.append(my_cells)
+
+    # Trajectories must be pairwise disjoint (bg islands separate them).
+    for i in range(len(per_marker_cells)):
+        for j in range(i + 1, len(per_marker_cells)):
+            overlap = per_marker_cells[i] & per_marker_cells[j]
+            assert not overlap, (
+                f"marker trajectories {i},{j} overlap on {len(overlap)} cell(s)"
+            )
+
+    return out
+
+# --------------- generator (markers-first SAv4_mine: weighted sampling + fjord→island, 58% n=2) ---------------
+# Markers-first construction: pick markers, build band with lobe to embed them,
+# optionally carve fjord→island to create INTERIOR separator (25%), place template
+# + end_block, run solver as oracle.
+
+import random
+from arc_utils import label_mask
+
+
+def _build_band(H: int, W: int, lobe_rows: list[int] | None = None) -> np.ndarray:
+    """Return a boolean mask for a thick meandering anti-diagonal band.
+
+    Row 0's path span is in the rightmost cols (c_left[0] >= W-6, c_right[0] = W-1).
+    Row H-1's path span is in the leftmost cols (c_left[H-1] = 0, c_right[H-1] <= 5).
+    The band widens toward the middle and is 4-connected row-by-row.
+
+    If `lobe_rows` is given, the band extends to col 0 across the CONTIGUOUS
+    span [min(lobe_rows)-1, max(lobe_rows)+1] (inclusive), forming a single
+    lobe that covers each marker's col-0 neighborhood. Outside that span,
+    c_left gradients up at 2 cols/row. Baked into the parametric centerline
+    so jitter/smoothing treat the lobe as part of the band's natural shape.
+
+    Template area (rows 1-3) stays clear (c_left >= 12) so 2x2 blocks fit.
+    """
+    # Parametric centerline (anti-diagonal) and halfwidth profile.
+    # Right-edge variation: bottom endpoint of centerline can shift right from
+    # 0 up to W//4, which pushes c_right at lower rows rightward (band's right
+    # edge stays higher longer instead of always collapsing to the left corner).
+    # c_left is protected by marker-lobe + anchor, so this only expands right
+    # edge — matches user's "only shift right, not left" requirement.
+    bot_center = random.randint(0, W // 4)
+    centers = np.linspace(W - 1, bot_center, H).astype(float)
+    half_w = np.array([
+        0.5 * (3 + (1.0 - abs(2.0 * r / max(1, H - 1) - 1.0)) * (W - 6))
+        for r in range(H)
+    ])
+
+    c_left = np.zeros(H, dtype=int)
+    c_right = np.zeros(H, dtype=int)
+
+    # Smooth jitter: kernel=3 moving-average keeps adjacent-row jitter correlated
+    # (independent ±3 jitter otherwise creates 1-cell bg notches in flat regions).
+    cc_jit = np.convolve(
+        np.array([random.randint(-3, 3) for _ in range(H)], dtype=float),
+        np.ones(3) / 3, mode='same')
+    w_jit = np.convolve(
+        np.array([random.randint(-3, 3) for _ in range(H)], dtype=float),
+        np.ones(3) / 3, mode='same')
+
+    for r in range(H):
+        c_left_param = centers[r] - half_w[r]
+        if c_left_param <= 0:
+            # "Flat left edge" row: band reaches/passes col 0 (inside lobe span
+            # or natural band bottom). No left-edge jitter to avoid 1-cell notches.
+            c_left[r] = 0
+            c_right[r] = int(round(centers[r] + cc_jit[r] + half_w[r] + w_jit[r] / 2))
+        else:
+            # Slope row: legitimate c_left > 0; symmetric jitter.
+            w = max(2, min(W, int(round(2 * half_w[r] + w_jit[r]))))
+            cc = centers[r] + cc_jit[r]
+            c_left[r] = int(round(cc - w / 2))
+            c_right[r] = c_left[r] + w - 1
+
+    # Lobe constraint: c_left = 0 from above the upper marker all the way to
+    # H-1 (band reaches col 0 across the lower portion). lmax is set to H-1
+    # rather than max(lobe_rows)+1 so the gradient between max(lobe_rows)+1 and
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+    r0 = min(b[0] for b in bbs)
+    c0 = min(b[1] for b in bbs)
+    r1 = max(b[2] for b in bbs)
+    c1 = max(b[3] for b in bbs)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox_h(b: BBox) -> int:
+    r0, _c0, r1, _c1 = b
+    return int(r1 - r0 + 1)
+
+
+def bbox_w(b: BBox) -> int:
+    _r0, c0, _r1, c1 = b
+    return int(c1 - c0 + 1)
+
+
+def bbox_anchor(b: BBox, *, anchor: str = "upper left") -> Coord:
+    """
+    Return an anchor point (r,c) for a bbox.
+
+exec
+/bin/bash -lc "sed -n '1,220p' /home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/b9e38dc0.json" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/4c416de3.py" in /home/lixinyu/snap/new
+ succeeded in 149ms:
+import numpy as np
+from collections import Counter
+
+from arc_utils import get_bg
+import random
+from arc_utils import draw_line
+
+
+CORNER_KINDS = ('TL', 'TR', 'BL', 'BR')
+
+# Inward-along-frame-edge directions for each corner kind.
+EDGE_DIRS = {
+    'TL': ((+1, 0), (0, +1)),
+    'TR': ((+1, 0), (0, -1)),
+    'BL': ((-1, 0), (0, +1)),
+    'BR': ((-1, 0), (0, -1)),
+}
+# Outward-from-corner directions; cells here must not be 0 (guards mid-edge false positives).
+OUT_DIRS = {
+    'TL': ((-1, 0), (0, -1)),
+    'TR': ((-1, 0), (0, +1)),
+    'BL': ((+1, 0), (0, -1)),
+    'BR': ((+1, 0), (0, +1)),
+}
+
+# Radius for scanning a corner's neighborhood. Must exceed max canonical |dr|,|dc| a pattern can have.
+_NEIGH_R = 3
+
+
+def _rot(dr, dc, kind):
+    """Map actual offset <-> canonical (TL-orientation) offset; self-inverse."""
+    if kind == 'TL': return (dr, dc)
+    if kind == 'TR': return (dr, -dc)
+    if kind == 'BL': return (-dr, dc)
+    if kind == 'BR': return (-dr, -dc)
+
+
+def _edge_metric(g, r, c, dr, dc, bg, H, W, max_step=10):
+    """Walk from (r,c) along (dr,dc) until bg/boundary. Return (non_bg_count, saw_zero).
+    A real frame edge has both: multiple non-bg cells and at least one 0-cell (to exclude
+    pattern-interior paths composed entirely of painted cells)."""
+    cnt = 0
+    saw_zero = False
+    for k in range(1, max_step + 1):
+        rr, cc = r + k*dr, c + k*dc
+        if not (0 <= rr < H and 0 <= cc < W): break
+        v = int(g[rr, cc])
+        if v == bg: break
+        cnt += 1
+        if v == 0: saw_zero = True
+    return cnt, saw_zero
+
+
+def _find_corners(g, bg):
+    H, W = g.shape
+    corners = []
+    for r in range(H):
+        for c in range(W):
+            if int(g[r, c]) == bg:
+                continue
+            for kind in CORNER_KINDS:
+                (d1r, d1c), (d2r, d2c) = EDGE_DIRS[kind]
+                r1, c1 = r + d1r, c + d1c
+                r2, c2 = r + d2r, c + d2c
+                if not (0 <= r1 < H and 0 <= c1 < W and 0 <= r2 < H and 0 <= c2 < W):
+                    continue
+                if int(g[r1, c1]) == bg or int(g[r2, c2]) == bg:
+                    continue
+                # Each inward edge must be a real frame: >=3 non-bg cells AND >=1 actual 0.
+                cnt1, sz1 = _edge_metric(g, r, c, d1r, d1c, bg, H, W)
+                cnt2, sz2 = _edge_metric(g, r, c, d2r, d2c, bg, H, W)
+                if not (cnt1 >= 3 and sz1 and cnt2 >= 3 and sz2): continue
+                # Outward cells must not be 0 (rules out mid-edge false positives).
+                ok = True
+                for (odr, odc) in OUT_DIRS[kind]:
+                    rr, cc = r + odr, c + odc
+                    if 0 <= rr < H and 0 <= cc < W and int(g[rr, cc]) == 0:
+                        ok = False; break
+                if not ok: continue
+                corners.append((r, c, kind))
+                break  # one kind per cell
+    return corners
+
+
+def _colored_around(g, r, c, kind, bg):
+    H, W = g.shape
+    items = []
+    for dr in range(-_NEIGH_R, _NEIGH_R + 1):
+        for dc in range(-_NEIGH_R, _NEIGH_R + 1):
+            rr, cc = r + dr, c + dc
+            if not (0 <= rr < H and 0 <= cc < W): continue
+            v = int(g[rr, cc])
+            if v == bg or v == 0: continue
+            items.append((_rot(dr, dc, kind), v))
+    return items
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Replicate a pre-drawn corner pattern to every other marker-bearing corner.
+
+    Input structure:
+    - bg = most frequent color. Hollow 0-frames (possibly partial L-shapes); each
+      frame-corner cell is either 0 or a painted (non-bg, non-0) color.
+    - >= 1 'source' corner: the pattern is already drawn (one color, both outward
+      cells and an inward-diagonal trail).
+    - Other corners: a single colored pixel on the inward diagonal at the pattern's
+      deepest (k,k) offset; the pixel's color is that corner's target color.
+
+    Rule:
+    - Extract the canonical (TL-oriented) pattern from any source.
+    - For each non-source corner whose marker cell is colored, paint the same
+      pattern rotated to that corner's orientation, using the marker's color.
+
+    Key insight: the pattern is symmetric about the corner's inward-diagonal axis
+    (canonical dr == dc), so it reflects cleanly across all four corner orientations.
+    Painting uses each target's OWN marker color, not the source color.
+    """
+    g = np.asarray(grid, dtype=int)
+    H, W = g.shape
+    bg = int(get_bg(g))
+
+    corners = _find_corners(g, bg)
+    assert corners, "no frame corner detected"
+
+    per_corner = {c: _colored_around(g, *c, bg) for c in corners}
+
+    # Source = corner with >=2 strictly-outward (canonical dr<0 or dc<0) colored cells
+    # of a single color.
+    def _is_outward(off): return off[0] < 0 or off[1] < 0
+    sources = []
+    for c_key, items in per_corner.items():
+        outward = [(o, v) for (o, v) in items if _is_outward(o)]
+        if len(outward) >= 2:
+            colors = {v for (_, v) in outward}
+            assert len(colors) == 1, (
+                f"source {c_key} has mixed outward colors: {colors}"
+            )
+            sources.append(c_key)
+    assert sources, "at least one source corner (pre-drawn outward pattern) required"
+
+    def _extract(c_key):
+        items = per_corner[c_key]
+        pat_col = Counter(v for (_, v) in items).most_common(1)[0][0]
+        return frozenset(o for (o, v) in items if v == pat_col), pat_col
+
+    canon, _ = _extract(sources[0])
+    for s in sources[1:]:
+        other, _ = _extract(s)
+        assert other == canon, (
+            f"source patterns disagree: {sorted(canon)} vs {sorted(other)}"
+        )
+
+    # Pattern must be symmetric about the corner's inward-diagonal axis (dr==dc).
+    for (dr, dc) in canon:
+        assert (dc, dr) in canon, (
+            f"pattern not diagonally symmetric: ({dr},{dc}) has no mirror ({dc},{dr})"
+        )
+
+    # Pattern must anchor at least one inward-diagonal cell so targets have a marker.
+    diag_ks = [dr for (dr, dc) in canon if dr == dc and dr > 0]
+    assert diag_ks, "pattern has no inward-diagonal cell to anchor markers"
+    marker_canon = (max(diag_ks), max(diag_ks))
+
+    # Classify non-source corners as targets by reading their marker cell.
+    src_set = set(sources)
+    targets = []
+    for c_key in corners:
+        if c_key in src_set: continue
+        r, c, kind = c_key
+        mdr, mdc = _rot(*marker_canon, kind)
+        mr, mc = r + mdr, c + mdc
+        if not (0 <= mr < H and 0 <= mc < W):
+            continue
+        v = int(g[mr, mc])
+        if v == bg or v == 0:
+            continue  # no marker: this detected corner plays no role
+        tcol = v
+        # All input cells at this corner's canonical pattern offsets must agree in color.
+        for (off, color) in per_corner[c_key]:
+            if off in canon:
+                assert color == tcol, (
+                    f"target ({r},{c},{kind}) has conflicting color {color} at "
+                    f"canonical offset {off}; expected {tcol}"
+                )
+        targets.append((r, c, kind, tcol))
+
+    assert targets, "no target corners detected (every corner appears to be a source)"
+
+    out = g.copy()
+    for (r, c, kind, tcol) in targets:
+        for (cdr, cdc) in canon:
+            adr, adc = _rot(cdr, cdc, kind)
+            rr, cc = r + adr, c + adc
+            if not (0 <= rr < H and 0 <= cc < W): continue
+            v = int(out[rr, cc])
+            assert v == bg or v == 0 or v == tcol, (
+                f"paint conflict at ({rr},{cc}) for target ({r},{c},{kind}) "
+                f"color {tcol}: existing color {v}"
+            )
+            out[rr, cc] = tcol
+
+    return out
+
+# --------------- generator (output-first pattern replication (Codex)) ---------------
+
+# --- canvas & layout ---
+H_RANGE = (18, 24)            # grid height bounds (inclusive)
+W_RANGE = (18, 24)            # grid width bounds (inclusive)
+BORDER = 1                    # min bg gap between a frame and grid edge
+FRAME_GAP = 4                 # min bg gap between two frames
+FRAME_SIZE_RANGE = (5, 8)     # per-side length of a hollow 0-frame (inclusive)
+SOURCE_MIN_SIZE = 6           # only frames strictly larger than the minimum may host sources
+
+# --- structural counts ---
+N_FRAMES_2_PROB = 0.5         # probability of 2-frame layout (else 3-frame)
+TWO_FRAME_HORIZONTAL_PROB = 0.5  # probability of side-by-side vs stacked 2-frame layout
+N_SOURCES_MAX = 2             # upper bound on source corners per grid (>= 1)
+
+# --- generation retries ---
+MAX_ATTEMPTS = 300
+
+# --- canonical (TL-oriented) pattern templates ---
+# Each: list of (dr, dc) offsets from the TL corner cell; must be diagonally
+# symmetric (dr==dc axis) and contain >=1 inward-diagonal cell (k, k) with k>=1.
+PATTERN_TEMPLATES = (
+    [(-1, 0), (0, -1), (0, 0), (1, 1)],
+    [(-1, -1), (-1, 0), (0, -1), (1, 1)],
+    [(-1, 0), (0, -1), (0, 0), (1, 1), (2, 2)],
+    [(-1, -1), (-1, 0), (0, -1), (1, 1), (0, 0)],
+    [(-1, -1), (-1, 0), (0, -1), (1, 1), (2, 2)],
+    [(-1, -1), (-1, 0), (0, -1), (0, 0), (1, 1), (2, 2)],
+)
+
+# Offsets from a frame's top-left origin (r, c) to each corner cell of a size-N frame:
+# applied as (r + dr*(size-1), c + dc*(size-1)).
+_CORNER_OFFSETS = {'TL': (0, 0), 'TR': (0, 1), 'BL': (1, 0), 'BR': (1, 1)}
+
+
+def _split_total(total: int, parts: int) -> list[int]:
+    """Partition `total` non-negative units into `parts` bins uniformly at random."""
+    if parts == 1:
+        return [total]
+    cuts = sorted(random.sample(range(total + parts - 1), parts - 1))
+    out, prev = [], -1
+    for cut in cuts + [total + parts - 1]:
+        out.append(cut - prev - 1)
+        prev = cut
+    return out
+
+
+def _choose_pattern() -> tuple[list[tuple[int, int]], int]:
+    """Return (pattern cells, k_max = deepest inward-diagonal offset)."""
+    pattern = list(random.choice(PATTERN_TEMPLATES))
+    k_max = max(dr for dr, dc in pattern if dr == dc and dr > 0)
+    return pattern, k_max
+
+
+def _draw_frame(grid: np.ndarray, r: int, c: int, size: int) -> None:
+    """Draw a size x size hollow frame of 0 with TL at (r, c)."""
+
+ succeeded in 168ms:
+{"train": [{"input": [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 1, 1, 1], [1, 1, 1, 1, 1, 3, 1, 1, 9, 1, 1, 1, 3, 1, 1], [1, 1, 1, 1, 3, 1, 1, 1, 1, 3, 3, 3, 1, 1, 1], [1, 1, 1, 1, 3, 1, 1, 1, 3, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 3, 1, 1, 3, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 3, 1, 1, 3, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 3, 1, 1, 1, 1, 3, 1, 1, 1, 1], [1, 1, 1, 1, 3, 1, 1, 1, 1, 1, 1, 3, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 5, 5, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]], "output": [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 1, 1, 1], [1, 1, 1, 1, 1, 3, 9, 9, 9, 9, 9, 9, 3, 1, 1], [1, 1, 1, 1, 3, 9, 9, 9, 9, 3, 3, 3, 1, 1, 1], [1, 1, 1, 1, 3, 9, 9, 9, 3, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 3, 9, 9, 3, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 3, 9, 9, 3, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 3, 9, 9, 9, 9, 3, 1, 1, 1, 1], [1, 1, 1, 1, 3, 9, 9, 9, 9, 9, 9, 3, 1, 1, 1], [1, 1, 1, 1, 9, 9, 9, 5, 5, 9, 9, 9, 1, 1, 1], [1, 1, 1, 9, 9, 9, 9, 1, 1, 9, 9, 9, 9, 1, 1], [1, 1, 9, 9, 9, 9, 9, 1, 1, 9, 9, 9, 9, 9, 1], [1, 9, 9, 9, 9, 9, 9, 1, 1, 9, 9, 9, 9, 9, 9]]}, {"input": [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 5, 5, 5, 0], [0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 5, 0, 0, 5, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 4, 5, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 5, 0], [0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 5, 5, 5, 5, 0]], "output": [[4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0], [4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0, 5, 5, 5, 0], [4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 5, 4, 4, 5, 0], [4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 4, 4, 4, 5, 0], [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 0], [4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 4, 4, 4, 5, 0], [4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 5, 5, 5, 5, 0]]}, {"input": [[7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 9, 7, 7, 7, 7, 7, 9, 7, 7, 7, 7, 7], [7, 7, 7, 7, 9, 7, 7, 6, 7, 7, 9, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 9, 7, 7, 7, 9, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 9, 7, 7, 7, 9, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 9, 7, 9, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 9, 7, 9, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 9, 7, 7, 9, 9, 9, 7, 7, 7, 7, 7], [7, 7, 7, 7, 9, 7, 7, 7, 7, 3, 9, 7, 7, 7, 7, 7], [7, 7, 7, 7, 9, 7, 7, 3, 3, 3, 9, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 9, 7, 3, 3, 9, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 9, 9, 9, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 7, 7], [7, 7, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]], "output": [[7, 7, 7, 3, 3, 7, 3, 7, 3, 3, 3, 3, 7, 7, 7, 7], [7, 7, 7, 7, 3, 6, 3, 7, 3, 3, 3, 7, 7, 7, 7, 7], [7, 7, 7, 7, 3, 3, 3, 7, 3, 3, 3, 7, 7, 7, 7, 7], [7, 7, 7, 7, 9, 3, 3, 7, 3, 3, 9, 7, 7, 7, 7, 7], [7, 7, 7, 7, 9, 3, 3, 6, 3, 3, 9, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 9, 3, 3, 3, 9, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 9, 3, 3, 3, 9, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 9, 3, 9, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 9, 3, 9, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 9, 3, 3, 9, 9, 9, 7, 7, 7, 7, 7], [7, 7, 7, 7, 9, 3, 3, 3, 3, 3, 9, 7, 7, 7, 7, 7], [7, 7, 7, 7, 9, 3, 3, 3, 3, 3, 9, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 9, 3, 3, 3, 9, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 9, 9, 9, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 7, 7], [7, 7, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 7, 7, 7, 7, 7], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]]}], "test": [{"input": [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 4, 4, 1, 1, 1, 1, 4, 4, 4, 1, 1], [1, 1, 1, 1, 3, 1, 1, 1, 1, 1, 4, 4, 1, 4, 1, 1, 4, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 1, 1, 1, 4, 1, 1], [1, 1, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 4, 1, 1], [1, 1, 1, 1, 1, 1, 3, 1, 1, 1, 1, 1, 4, 4, 1, 1, 4, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 4, 1, 4, 4, 4, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 4, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]], "output": [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 1, 1, 1, 1, 4, 4, 4, 1, 1], [1, 1, 1, 1, 3, 2, 2, 2, 2, 2, 4, 4, 1, 4, 2, 2, 4, 1, 1], [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4, 2, 2, 2, 4, 1, 1], [1, 1, 8, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4, 1, 1], [1, 1, 1, 1, 1, 1, 3, 2, 2, 2, 2, 2, 4, 4, 2, 2, 4, 1, 1], [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 1, 4, 4, 4, 1, 1, 1], [2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]}]}
+codex
+原任务的 solver 还是单一填色+阴影阻挡模型；这次要把“孤立像素”从被动障碍改成主动粒子，并且允许一侧出现多个同向粒子，关键风险在于 `main()` 里原先“fill 色只有一种、其他颜色只是静态障碍”的假设会全部失效。
+exec
+/bin/bash -lc 'rg -n "def components_mask|def label_mask" /home/lixinyu/snap/new/solvers/arc_utils.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+391:def label_mask(mask: np.ndarray, connectivity: int = 4) -> tuple[np.ndarray, int]:
+398:def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+
+exec
+/bin/bash -lc "sed -n '260,520p' /home/lixinyu/snap/new/arc2_solver_select/b9e38dc0.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+
+
+def _make_arm(depth, start_v, target_v, extra_steps, tip_12=False):
+    """Build one zigzag arm from (0, start_v) toward (depth, target_v)."""
+    sign = 1 if target_v > start_v else -1
+    n_side_steps = abs(target_v - start_v)
+    chosen_rows = []
+    if n_side_steps:
+        if tip_12:
+            chosen_rows = [2 * (i + 1) for i in range(n_side_steps)]
+            extra_steps = 0
+        else:
+            chosen_rows = [1]
+            if n_side_steps > 1:
+                chosen_rows += random.sample(range(2, depth + 1), n_side_steps - 1)
+            chosen_rows.sort()
+
+    first_row = chosen_rows[0] if chosen_rows else 1
+    extra_rows = [r for r in chosen_rows if r != first_row]
+    random.shuffle(extra_rows)
+    orthogonal_rows = set(extra_rows[:extra_steps])
+
+    pts = [(0, start_v)]
+    u, v = 0, start_v
+    for row in range(1, depth + 1):
+        u += 1
+        if row in orthogonal_rows:
+            pts.append((u, v))
+            v += sign
+        elif row in chosen_rows:
+            v += sign
+        pts.append((u, v))
+    return pts
+
+
+def _build_local_wall(rad, h, w):
+    """Construct wall shape in local (u, v) coordinates. Returns (pts, depth, gap) or None."""
+    if rad[0]:
+        max_depth = min(DEPTH_VERT[1], h - 6)
+        if max_depth < DEPTH_VERT[0]:
+            return None
+        depth = random.randint(DEPTH_VERT[0], max_depth)
+        gap = random.randint(*GAP_VERT)
+    else:
+        depth = random.randint(DEPTH_HORIZ[0], min(DEPTH_HORIZ[1], w - 6))
+        gap = random.randint(GAP_HORIZ[0], min(GAP_HORIZ[1], h - 1))
+
+    if gap == 5:
+        left_bottom, right_bottom = 2, 3
+    elif gap == 6:
+        left_bottom, right_bottom = 2, 4
+    else:
+        left_bottom, right_bottom = random.choice([(2, 5), (3, 4)])
+
+    bridge_extra = max(0, right_bottom - left_bottom - 1)
+    base_count = 2 * (depth + 1) + bridge_extra
+    max_extra_l = max(0, left_bottom - 1)
+    max_extra_r = max(0, gap - right_bottom - 1)
+    min_extra = max(0, WALL_PIXELS_MIN - base_count)
+    max_extra = min(max_extra_l + max_extra_r, WALL_PIXELS_MAX - base_count)
+    if min_extra > max_extra:
+        return None
+
+    extra = random.randint(min_extra, max_extra)
+    extra_l = random.randint(max(0, extra - max_extra_r), min(max_extra_l, extra))
+    extra_r = extra - extra_l
+
+    max_n_side = max(left_bottom, gap - right_bottom)
+    tip_12 = depth >= 2 * max_n_side and random.random() < TIP_12_PROB
+    left = _make_arm(depth, 0, left_bottom, extra_l, tip_12=tip_12)
+    right = _make_arm(depth, gap, right_bottom, extra_r, tip_12=tip_12)
+    pts = set(left) | set(right)
+    for v in range(left_bottom, right_bottom + 1):
+        pts.add((depth, v))
+
+    # Pad wall to minimum size by adding 8-connected pixels that preserve 2 endpoints
+    while len(pts) < WALL_PIXELS_MIN:
+        candidates = [
+            (u, v) for u in range(max(0, depth - 3), depth + 1)
+            for v in range(gap + 1) if (u, v) not in pts
+            and sum((uu, vv) in pts
+                    for uu in range(u - 1, u + 2)
+                    for vv in range(v - 1, v + 2)
+                    if (uu, vv) != (u, v)) >= 2
+        ]
+        random.shuffle(candidates)
+        added = False
+        for p in candidates:
+            trial = pts | {p}
+            if len(trial) <= WALL_PIXELS_MAX and len(_degree1_pixels(trial)) == 2:
+                pts = trial
+                added = True
+                break
+        if not added:
+            return None
+
+    if not (WALL_PIXELS_MIN <= len(pts) <= WALL_PIXELS_MAX) or len(_degree1_pixels(pts)) != 2:
+        return None
+    return pts, depth, gap
+
+
+def _map_local(u, v, rad, anchor):
+    """Map local (u, v) to grid (r, c) given radiate direction and anchor."""
+    r0, c0 = anchor
+    if rad == (-1, 0):
+        return r0 + u, c0 + v
+    if rad == (1, 0):
+        return r0 - u, c0 + v
+    if rad == (0, -1):
+        return r0 + v, c0 + u
+    return r0 + v, c0 - u
+
+
+def _place_anchor(rad, h, w, depth, gap):
+    """Choose anchor so the wall fits within margins."""
+    if rad == (-1, 0):
+        return random.randint(OPEN_END_MARGIN, h - depth - 3), random.randint(0, w - gap - 1)
+    if rad == (1, 0):
+        return random.randint(depth + 2, h - 4), random.randint(0, w - gap - 1)
+    if rad == (0, -1):
+        return random.randint(0, h - gap - 1), random.randint(OPEN_END_MARGIN, w - depth - 3)
+    return random.randint(0, h - gap - 1), random.randint(depth + 2, w - 4)
+
+
+def _local_interior(wall, depth, gap):
+    """Return bg cells strictly between the two wall arms in local coords."""
+    by_row = {}
+    for u, v in wall:
+        by_row.setdefault(u, []).append(v)
+    interior = []
+    for u in range(1, depth):
+        if u not in by_row or len(by_row[u]) < 2:
+            continue
+        lo, hi = min(by_row[u]), max(by_row[u])
+        for v in range(lo + 1, hi):
+            if (u, v) not in wall:
+                interior.append((u, v))
+    return interior
+
+
+def _grow_seed_blob(seed, interior_set):
+    """Grow a small 4-connected blob from seed within interior cells."""
+    blob = {seed}
+    target_size = random.choice(SEED_SIZE_WEIGHTS)
+    frontier = [seed]
+    while len(blob) < target_size and frontier:
+        p = frontier.pop(random.randrange(len(frontier)))
+        u, v = p
+        for q in random.sample([(u - 1, v), (u + 1, v), (u, v - 1), (u, v + 1)], 4):
+            if q in interior_set and q not in blob:
+                blob.add(q)
+                frontier.append(q)
+                if len(blob) >= target_size:
+                    break
+    return blob
+
+
+def _obstacle_fits(pos, placed):
+    """Check that pos is at least Chebyshev OBSTACLE_MIN_SEP from all placed obstacles."""
+    r, c = pos
+    return all(max(abs(r - rr), abs(c - cc)) >= OBSTACLE_MIN_SEP for rr, cc in placed)
+
+
+def _find_obstacle_candidates(grid, bg, wall_color, nominal_fill_zone):
+    """Find bg cells far enough from wall for obstacle placement, using distance transform."""
+    wall_mask = grid == wall_color
+    # distance_transform_cdt with chessboard metric gives Chebyshev distance to wall
+    dist = distance_transform_cdt(~wall_mask, metric='taxicab')
+    far_from_wall = dist > 1
+    eligible = (grid == bg) & far_from_wall
+    all_coords = list(zip(*np.where(eligible)))
+    fill_coords = [p for p in all_coords if nominal_fill_zone[p[0], p[1]]]
+    random.shuffle(all_coords)
+    random.shuffle(fill_coords)
+    return [(int(r), int(c)) for r, c in all_coords], [(int(r), int(c)) for r, c in fill_coords]
+
+
+def _place_obstacles(n_obstacles, candidates, fill_candidates, obstacle_colors, grid):
+    """Place up to n_obstacles on the grid, preferring some in the fill zone."""
+    placed = []
+    n_fill = random.randint(0, min(n_obstacles, len(fill_candidates)))
+    if fill_candidates and random.random() < OBSTACLE_IN_FILL_PROB:
+        n_fill = max(1, n_fill)
+    for p in fill_candidates:
+        if len(placed) >= n_fill:
+            break
+        if _obstacle_fits(p, placed):
+            placed.append(p)
+    placed_set = set(placed)
+    for p in candidates:
+        if len(placed) >= n_obstacles:
+            break
+        if p not in placed_set and _obstacle_fits(p, placed):
+            placed.append(p)
+            placed_set.add(p)
+    for i, (r, c) in enumerate(placed):
+        grid[r, c] = obstacle_colors[i % len(obstacle_colors)]
+
+
+def _touches_border(mask):
+    """Check if any True cell in mask lies on the grid border."""
+    return bool(mask[0, :].any() or mask[-1, :].any() or mask[:, 0].any() or mask[:, -1].any())
+
+
+def _gen_attempt():
+    """Single attempt to generate a valid input grid."""
+    rad = random.choice([(-1, 0), (1, 0), (0, -1), (0, 1)])
+    h = random.randint(*GRID_H_VERT) if rad[0] else random.randint(*GRID_H_HORIZ)
+    w = random.randint(*GRID_W)
+
+    built = _build_local_wall(rad, h, w)
+    if built is None:
+        return None
+    local_wall, depth, gap = built
+    anchor = _place_anchor(rad, h, w, depth, gap)
+
+    # Choose palette
+    palette = random.sample(range(10), random.randint(*PALETTE_SIZE))
+    bg, wall_color, fill_color = palette[:3]
+    obstacle_colors = palette[3:]
+
+    # Render wall onto grid
+    grid = np.full((h, w), bg, dtype=int)
+    for u, v in local_wall:
+        r, c = _map_local(u, v, rad, anchor)
+        grid[r, c] = wall_color
+
+    # Place fill seed near the closed end
+    interior = _local_interior(local_wall, depth, gap)
+    wall_set = set(local_wall)
+    adjacent = [
+        p for p in interior
+        if any((p[0] + dr, p[1] + dc) in wall_set for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)])
+    ]
+    seed_pool = [p for p in adjacent if p[0] >= max(1, depth - SEED_DEPTH_LOOKBACK)]
+    if not seed_pool:
+        return None
+
+    blob = _grow_seed_blob(random.choice(seed_pool), set(interior))
+    for u, v in blob:
+        r, c = _map_local(u, v, rad, anchor)
+        if grid[r, c] != bg:
+            return None
+        grid[r, c] = fill_color
+
+    # Run solver to find nominal fill zone (used for obstacle placement)
+    try:
+        nominal_out = main(grid)
+    except Exception:
+        return None
+    nominal_fill_zone = (nominal_out == fill_color) & (grid == bg)
+
+    # Place obstacles
+    n_obstacles = random.randint(0, MAX_OBSTACLES)
+    if n_obstacles and not obstacle_colors:
+        available = [c for c in range(10) if c not in (bg, wall_color, fill_color)]
+        obstacle_colors = random.sample(available, random.randint(1, 2))
+    if n_obstacles:
+        candidates, fill_candidates = _find_obstacle_candidates(grid, bg, wall_color, nominal_fill_zone)
+        _place_obstacles(n_obstacles, candidates, fill_candidates, obstacle_colors, grid)
+
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json, numpy as np
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/b9e38dc0.json'
+obj=json.load(open(p))
+for split in ['train','test']:
+    for i,ex in enumerate(obj[split]):
+        arr=np.array(ex['input'])
+        vals, cnts=np.unique(arr, return_counts=True)
+        print(split, i, arr.shape, dict(zip(vals.tolist(), cnts.tolist())))
+PY" in /home/lixinyu/snap/new
+ succeeded in 200ms:
+train 0 (15, 15) {1: 200, 3: 22, 5: 2, 9: 1}
+train 1 (8, 15) {0: 102, 4: 1, 5: 17}
+train 2 (18, 16) {3: 6, 6: 4, 7: 252, 8: 1, 9: 25}
+test 0 (15, 19) {1: 259, 2: 1, 3: 2, 4: 22, 8: 1}
+
+codex
+我已经确认原生成器完全依赖“只有一个 fill 色、其他非背景色不会移动”的世界观，所以新版本不能只局部改 `shadow_process`；solver 要先识别每个半包围精灵、再为每个精灵找到一串同向孤立像素并模拟吸收顺序，generator 也要反过来按这些新前提构造。
+exec
+/bin/bash -lc "sed -n '388,430p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+STRUCT8 = np.ones((3, 3), dtype=int)
+
+
+def label_mask(mask: np.ndarray, connectivity: int = 4) -> tuple[np.ndarray, int]:
+    """Connected-components labeling for a boolean mask."""
+    struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+    lab, n = label(mask.astype(bool), structure=struct)
+    return lab, int(n)
+
+
+def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+    """List of components from a boolean mask, each as an (N,2) coords array."""
+    lab, n = label_mask(mask, connectivity=connectivity)
+    return [np.argwhere(lab == k) for k in range(1, n + 1)]
+
+
+def find_components(
+    grid: np.ndarray,
+    *,
+    bg: int | None = None,
+    connectivity: int = 4,
+    monochromatic: bool = True,
+    colors: Sequence[int] | None = None,
+    min_area: int = 1,
+    return_format: str = "dict",
+) -> list[dict] | list[np.ndarray]:
+    """
+    Find connected components in a grid (unified API for ARC-2 + migrated seeds).
+
+    return_format:
+      - \"dict\": list of dicts {color, coords, bbox, area}
+      - \"objects\": list of full-grid arrays containing exactly one component
+    """
+    if bg is None:
+        bg = get_bg(grid)
+    bg = int(bg)
+
+    return_format = str(return_format).lower().strip()
+    if return_format not in {"dict", "objects"}:
+        raise ValueError("find_components: return_format must be 'dict' or 'objects'")
+
+    if colors is None:
+        colors_set = None
+
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/b9e38dc0/36 && ls -ld /home/lixinyu/snap/new/ceshi/code_combo/b9e38dc0/36' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+drwxrwxr-x+ 2 lixinyu lixinyu 4096 May 16 03:43 /home/lixinyu/snap/new/ceshi/code_combo/b9e38dc0/36
+
+codex
+设计已经收敛了：我会把变体具体化成“同向多精灵、多 seed、多 singleton 粒子”的两层网络，粒子先视作可穿越的瞬时物体，再按共同辐射方向寻找首个墙体并把目标精灵整块填充区改成最后到达的粒子颜色；现在开始直接写目标文件。

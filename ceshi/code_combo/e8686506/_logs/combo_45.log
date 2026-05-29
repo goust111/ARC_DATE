@@ -1,0 +1,4123 @@
+Reading additional input from stdin...
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, /home/lixinyu/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019e2fc1-362f-75d1-bdf7-bb299739a800
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: e8686506
+    **摘要**: 将散落在背景上的彩色像素碎片（拼图块）通过边缘对齐拼装成一个完整的矩形复合图案，输出具有严格的左右镜像对称性，同色碎片不可4-连通相邻
+
+    ## 要实现的融合组合
+    - **组合名称**: 无颜色相邻约束+仅两个大碎片
+    - **combo_spec**: D5/2+D8/1
+
+    ### 融合描述（实现规格）
+
+    只有两个面积接近的大碎片需要拼合，且无同色相邻约束。 碎片可能在拼合后同色区域融合难以区分——因为无颜色约束且碎片大。 解题者需精确利用边缘匹配（大碎片边缘长且复杂）进行拼合， 但缺少颜色约束的辅助剪枝。
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D5/2** — 同色不相邻约束 (`meta`)
+  - 当前值: 拼合后同色碎片不可4-连通相邻（相同颜色的像素之间不能共享边）
+  - 改为: 无颜色相邻约束 — 去除同色不相邻约束，碎片拼合时不考虑颜色关系。减少一层推理但增加了视觉模糊性——同色碎片可能融合在一起难以区分
+  - 来源: inversion（参考任务: None）
+- **D8/1** — 碎片数量与复杂度 (`meta`)
+  - 当前值: 输入包含一个大框架碎片和多个小碎片（3-6个），总碎片数适中
+  - 改为: 仅两个大碎片 — 输入只有两个面积接近的大碎片需要拼合。简化了搜索但增加了边缘对齐的精确度要求，因为大碎片的边缘更长更复杂
+  - 来源: inversion（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/e8686506.py`
+
+    ```python
+    import numpy as np
+
+from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
+import random
+
+
+def _piece_sig(pts: np.ndarray) -> tuple[int, int, tuple[tuple[int, int], ...]]:
+    r0, c0, r1, c1 = bbox_coords(pts)
+    coords = tuple(sorted((int(r) - r0, int(c) - c0) for r, c in pts))
+    return (r1 - r0 + 1), (c1 - c0 + 1), coords
+
+
+def _factors(n: int) -> list[tuple[int, int]]:
+    out = []
+    for w in range(1, n + 1):
+        if n % w == 0:
+            h = n // w
+            out.append((h, w))
+    return out
+
+
+def _build_requirements(
+    H: int,
+    W: int,
+    comps_by_color: dict[int, list[list[tuple[int, int]]]],
+) -> np.ndarray:
+    """
+    Build per-cell required color constraints (req[r,c] == -1 means unconstrained).
+
+    Heuristics supported by training examples:
+      - If there is a color with exactly 4 singleton components, those are the four corners.
+      - If there are full horizontal bars of length W-2 in the input, use them as the top/bottom edges
+        between the corners (ordered by their vertical position in the input).
+      - If there is a color with exactly two full vertical line components (width=1) in the input,
+        place them on the left/right edges centered vertically.
+    """
+    req = np.full((H, W), -1, dtype=int)
+
+    # 4 singleton components -> corners
+    corner_colors = [
+        col
+        for col, comps in comps_by_color.items()
+        if len(comps) == 4 and all(len(p) == 1 for p in comps)
+    ]
+    assert len(corner_colors) <= 1, "corner singleton color must be unique when present"
+    corner_color = corner_colors[0] if corner_colors else None
+    if corner_color is not None:
+        req[0, 0] = corner_color
+        req[0, W - 1] = corner_color
+        req[H - 1, 0] = corner_color
+        req[H - 1, W - 1] = corner_color
+
+    # Horizontal bar(s) of length W-2 (filled, height 1)
+    bar_colors: list[tuple[int, int]] = []  # (min_input_row, color)
+    if W >= 3 and corner_color is not None:
+        for col, comps in comps_by_color.items():
+            for pts in comps:
+                r0, c0, r1, c1 = bbox_coords(pts)
+                hh, ww = r1 - r0 + 1, c1 - c0 + 1
+                if hh == 1 and ww == (W - 2) and len(pts) == ww:
+                    bar_colors.append((r0, col))
+                    break
+        if bar_colors:
+            assert len(bar_colors) <= 2, "horizontal edge bar colors must be top/bottom only"
+            bar_colors.sort()
+            top_col = bar_colors[0][1]
+            bot_col = bar_colors[-1][1]
+            req[0, 1 : W - 1] = top_col
+            req[H - 1, 1 : W - 1] = bot_col
+
+    # Two full vertical line components -> left/right edges, centered vertically
+    vertical_line_candidates = []
+    for col, comps in comps_by_color.items():
+        if len(comps) != 2:
+            continue
+        sigs = [_piece_sig(pts) for pts in comps]
+        (h0, w0, coords0), (h1, w1, coords1) = sigs[0], sigs[1]
+        if w0 == 1 and w1 == 1 and h0 == h1 and coords0 == coords1 and h0 > 1:
+            vertical_line_candidates.append((col, h0))
+    assert len(vertical_line_candidates) <= 1, "paired vertical edge-line color must be unique when present"
+    if vertical_line_candidates:
+        col, L = vertical_line_candidates[0]
+        top = (H - L) // 2
+        assert 0 <= top and top + L <= H, "paired vertical edge lines must fit in the output height"
+        req[top : top + L, 0] = col
+        req[top : top + L, W - 1] = col
+
+    return req
+
+
+def _assemble(
+    types: list[dict],
+    H: int,
+    W: int,
+    req: np.ndarray,
+    disallow_touch: set[int] | None = None,
+) -> np.ndarray:
+    board = np.full((H, W), -1, dtype=int)
+    counts = [int(t["cnt"]) for t in types]
+
+    def mirror_ok(r: int, c: int, col: int) -> bool:
+        mc = W - 1 - c
+        v = board[r, mc]
+        return (v == -1) or (v == col)
+
+    def can_place(ti: int, r0: int, c0: int) -> bool:
+        t = types[ti]
+        col = int(t["col"])
+        is_singleton = len(t["coords"]) == 1
+        for dr, dc in t["coords"]:
+            r, c = r0 + dr, c0 + dc
+            if board[r, c] != -1:
+                return False
+            if req[r, c] != -1 and int(req[r, c]) != col:
+                return False
+            if not mirror_ok(r, c, col):
+                return False
+            if is_singleton and not (r == 0 or r == H - 1 or c == 0 or c == W - 1):
+                return False
+            if disallow_touch and col in disallow_touch:
+                for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                    if 0 <= rr < H and 0 <= cc < W and board[rr, cc] == col:
+                        return False
+        return True
+
+    def place(ti: int, r0: int, c0: int) -> list[tuple[int, int]]:
+        t = types[ti]
+        col = int(t["col"])
+        changed = []
+        for dr, dc in t["coords"]:
+            r, c = r0 + dr, c0 + dc
+            board[r, c] = col
+            changed.append((r, c))
+        return changed
+
+    def unplace(changed: list[tuple[int, int]]) -> None:
+        for r, c in changed:
+            board[r, c] = -1
+
+    def placements_for(ti: int) -> list[tuple[int, int]]:
+        t = types[ti]
+        return [(r0, c0)
+                for r0 in range(H - int(t["h"]) + 1)
+                for c0 in range(W - int(t["w"]) + 1)
+                if can_place(ti, r0, c0)]
+
+    # Pure constraint propagation: each step, every type must be forced (1 position)
+    # or batch-forced (positions == cnt). No backtracking. Asserts if stuck.
+    changed = True
+    while changed:
+        changed = False
+        for ti in range(len(types)):
+            if counts[ti] <= 0:
+                continue
+            places = placements_for(ti)
+            assert len(places) > 0, "assembly dead end: a piece has no valid placement"
+            if len(places) == 1:
+                counts[ti] -= 1
+                place(ti, places[0][0], places[0][1])
+                changed = True
+            elif len(places) == counts[ti]:
+                for r0, c0 in places:
+                    counts[ti] -= 1
+                    place(ti, r0, c0)
+                changed = True
+    assert all(c == 0 for c in counts), "assembly not purely propagation-solvable"
+    assert np.array_equal(board, board[:, ::-1]), "assembled board must be LR-symmetric"
+    return board
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Assemble scattered colored fragments into a left-right symmetric rectangle, jigsaw-style.
+
+    Input structure:
+    - bg = most common color; remaining colors form small sprite fragments.
+    - Optional roles: 4 singleton pixels of one color mark corners; horizontal bars mark top/bottom edges; paired vertical lines mark left/right edges.
+
+    Rule:
+    - Collect all non-bg connected components as jigsaw pieces.
+    - Determine output rectangle dimensions from total piece area.
+    - Pack pieces into the rectangle so it is exactly mirror-symmetric (left-right) and same-color pieces never 4-touch.
+
+    Key insight: Left-right symmetry plus the no-same-color-touching constraint make the assembly unique; corner/edge markers anchor it when present.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+
+    # Extract pieces (connected components per color)
+    comps_by_color: dict[int, list[list[tuple[int, int]]]] = {}
+    pieces = []
+    color_piece_count: dict[int, int] = {}
+
+    for col in sorted(set(map(int, np.unique(g)))):
+        if col == bg:
+            continue
+        comps = components_mask(g == col, connectivity=4)
+        comps_by_color[col] = comps
+        color_piece_count[col] = len(comps)
+        for pts in comps:
+            _, _, coords = _piece_sig(pts)
+            pieces.append((col, coords))
+
+    # Group identical pieces into types
+    from collections import Counter
+
+    ctr = Counter(pieces)
+    types = []
+    for (col, coords), cnt in sorted(ctr.items(), key=lambda kv: (-len(kv[0][1]), kv[0][0], kv[0][1])):
+        arr = np.array(coords, dtype=int)
+        h = int(arr[:, 0].max() + 1)
+        w = int(arr[:, 1].max() + 1)
+        types.append({"col": int(col), "coords": coords, "h": h, "w": w, "cnt": int(cnt)})
+
+    total_area = sum(int(t["cnt"]) * len(t["coords"]) for t in types)
+    assert total_area > 0, "total_area must be positive: grid must contain non-background pieces"
+
+    # Disallow 4-neigh touching between different pieces of same color (preserve component counts)
+    # Eval inputs use the unique closest-to-square portrait factor pair as the output shape.
+    dims = [(h, w) for (h, w) in _factors(total_area) if h >= w]
+    assert dims, "at least one portrait factor pair must exist for the total piece area"
+    best_gap = min(abs(h - w) for h, w in dims)
+    best_dims = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+    assert len(best_dims) == 1, "closest-to-square portrait output shape must be unique"
+    H, W = best_dims[0]
+
+    # Frame constraint: under 8-connectivity, 1-2 pieces must exist whose union bbox
+    # equals the output rectangle (H x W). Their relative positions are fixed in output.
+    comps8_all = []
+    for col in sorted(set(map(int, np.unique(g))) - {bg}):
+        for pts in components_mask(g == col, connectivity=8):
+            comps8_all.append((int(col), pts))
+    def _is_lr_symmetric(parts, h, w):
+        """Check if the union of frame parts forms an LR-symmetric bitmap."""
+        all_pts = np.concatenate([p for _, p in parts])
+        r0, c0 = int(all_pts[:, 0].min()), int(all_pts[:, 1].min())
+        bmp = np.zeros((h, w), dtype=bool)
+        for _, pts in parts:
+            for r, c in pts:
+                bmp[int(r) - r0, int(c) - c0] = True
+        return np.array_equal(bmp, bmp[:, ::-1])
+
+    frame_parts: list[tuple[int, np.ndarray]] = []
+    for i, (c1, p1) in enumerate(comps8_all):
+        r0, c0, r1, c1b = bbox_coords(p1)
+        if r1 - r0 + 1 == H and c1b - c0 + 1 == W:
+            if _is_lr_symmetric([(c1, p1)], H, W):
+                frame_parts = [(c1, p1)]
+                break
+        for j in range(i + 1, len(comps8_all)):
+            c2, p2 = comps8_all[j]
+            union = np.concatenate([p1, p2])
+            ur0, uc0, ur1, uc1 = bbox_coords(union)
+            if ur1 - ur0 + 1 == H and uc1 - uc0 + 1 == W:
+                if _is_lr_symmetric([(c1, p1), (c2, p2)], H, W):
+                    frame_parts = [(c1, p1), (c2, p2)]
+                    break
+        if frame_parts:
+            break
+    assert frame_parts, "input must contain 1-2 LR-symmetric pieces (8-conn) whose union bbox equals output dims"
+
+    req = _build_requirements(H, W, comps_by_color)
+
+    # Lock frame cells into req: their output positions are determined by input-relative positions.
+    all_frame_pts = np.concatenate([p for _, p in frame_parts])
+    fr0, fc0 = int(all_frame_pts[:, 0].min()), int(all_frame_pts[:, 1].min())
+    for col, pts in frame_parts:
+        for r, c in pts:
+            or_, oc = int(r) - fr0, int(c) - fc0
+            if 0 <= or_ < H and 0 <= oc < W:
+                req[or_, oc] = col
+
+    disallow_touch = {col for col, n in color_piece_count.items() if n > 1}
+    sol = _assemble(types, H, W, req, disallow_touch)
+    return sol.astype(int)
+
+# --------------- generator (o5x) ---------------
+
+# === CFG: Output dimensions ===
+_AREA_MIN = 25               # minimum total piece area
+_AREA_MAX = 50               # maximum total piece area (exclusive upper in range)
+_WIDTH_REQUIRED = 5           # all valid outputs have width 5
+_HEIGHT_MAX = 10              # maximum output height
+
+# === CFG: Color and palette ===
+_N_COLORS_MIN = 4             # min distinct colors in abstract output
+_N_COLORS_MAX = 6             # max distinct colors in abstract output
+_TWO_FRAME_MIN_H = 6          # min height to allow 2-color frame
+_TWO_FRAME_MIN_COLORS = 5     # min palette size to allow 2-color frame
+_TWO_FRAME_PROB = 0.35         # probability of splitting frame into 2 colors
+_CENTER_CAP_PROB = 0.5         # probability of capping center col at top/bottom
+
+# === CFG: Piece constraints ===
+_MAX_PIECE_AREA = 6           # maximum area of any single 4-conn piece
+_MAX_CHUNK_SIZE = 6           # max cells per hole chunk when splitting large holes
+_PIECE_COUNT_MIN = 9          # min total 4-conn components in output
+_PIECE_COUNT_MAX = 17         # max total 4-conn components in output
+
+# === CFG: Canvas / scatter ===
+_CANVAS_MIN = 13              # min canvas dimension (rows and cols)
+_CANVAS_MAX = 15              # max canvas dimension (rows and cols)
+_SCATTER_PADDING = 1          # Chebyshev padding between scattered pieces
+
+# === CFG: Retry ===
+_GEN_MAX_RETRIES = 300        # max attempts in generate_input()
+
+
+def _valid_dims():
+    """Precompute valid (H, W) pairs: unique closest-to-square portrait factorization with W=5."""
+    results = []
+    for area in range(_AREA_MIN, _AREA_MAX + 1):
+        dims = [(area // w, w) for w in range(1, area + 1) if area % w == 0 and area // w >= w]
+        best_gap = min(abs(h - w) for h, w in dims)
+        best = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+        if len(best) == 1:
+            h, w = best[0]
+            if w == _WIDTH_REQUIRED and h <= _HEIGHT_MAX:
+                results.append((h, w))
+    return results
+
+
+_VALID_DIMS = _valid_dims()
+_DIM_WEIGHTS = [h * w for h, w in _VALID_DIMS]
+
+
+def _zigzag_frame(H):
+    """Generate frame bitmap (Hx2 left-half) via zigzag path from top to bottom.
+    Returns (cells, start_c, end_c) where start_c/end_c are the column at top/bottom."""
+    cells = set()
+    start_c = random.randint(0, 1)
+    c = start_c
+    for r in range(H):
+        cells.add((r, c))
+        if r == H - 1:
+            break
+        move = random.choice(['down', 'horiz', 'diag'])
+        if move == 'down':
+            pass
+        elif move == 'horiz':
+            cells.add((r, 1 - c))
+            c = 1 - c
+        else:
+            c = 1 - c
+    return cells, start_c, c
+
+
+def _fill_holes(grid, H, W, half, frame1, frame2, split, fill_pool):
+    """Fill non-frame cells by assigning colors to 4-conn hole regions.
+    Large holes are split into chunks of <= _MAX_CHUNK_SIZE cells."""
+    holes = components_mask(grid == -1, connectivity=4)
+    prev_col = None
+    for hole in holes:
+        cells = sorted((int(r), int(c)) for r, c in hole)
+        # Split into chunks of bounded size
+        chunks = [cells[i:i + _MAX_CHUNK_SIZE] for i in range(0, len(cells), _MAX_CHUNK_SIZE)]
+        for chunk in chunks:
+            # Determine which frame colors are adjacent to this chunk
+            fc_set = {frame1 if r < split else frame2 for r, _ in chunk}
+            # Pick a fill color avoiding frame and previous neighbor
+            avoid = fc_set | ({prev_col} if prev_col else set())
+            opts = [f for f in fill_pool if f not in avoid]
+            if not opts:
+                opts = [f for f in fill_pool if f not in fc_set] or fill_pool
+            col = random.choice(opts)
+            for r, c in chunk:
+                grid[r, c] = col
+                grid[r, W - 1 - c] = col
+            prev_col = col
+
+
+def _build_output(H, W):
+    """Build an abstract LR-symmetric output grid with zigzag frame and filled holes.
+    Returns (grid, frame_colors_set) or (None, set()) on failure."""
+    half = W // 2
+    n_colors = random.randint(_N_COLORS_MIN, _N_COLORS_MAX)
+    palette = list(range(n_colors))
+    random.shuffle(palette)
+
+    use_two_frames = (H >= _TWO_FRAME_MIN_H and n_colors >= _TWO_FRAME_MIN_COLORS
+                      and random.random() < _TWO_FRAME_PROB)
+    ci = 0
+    frame1 = palette[ci]; ci += 1
+    frame2 = frame1
+    if use_two_frames:
+        frame2 = palette[ci]; ci += 1
+    fill_pool = palette[ci:]
+    if not fill_pool:
+        return None, set()
+
+    frame_half, start_c, end_c = _zigzag_frame(H)
+    split = H // 2 if frame1 != frame2 else H
+
+    grid = np.full((H, W), -1, dtype=int)
+
+    # Paint frame cells (mirror left half to right)
+    for r, c in frame_half:
+        fc = frame1 if r < split else frame2
+        grid[r, c] = fc
+        grid[r, W - 1 - c] = fc
+
+    # Cap center column at top/bottom when zigzag endpoint is adjacent
+    if start_c == 1 and random.random() < _CENTER_CAP_PROB:
+        grid[0, half] = frame1
+    if end_c == 1 and random.random() < _CENTER_CAP_PROB:
+        grid[H - 1, half] = frame2
+
+    _fill_holes(grid, H, W, half, frame1, frame2, split, fill_pool)
+
+    if np.any(grid < 0):
+        return None, set()
+    frame_set = {frame1}
+    if frame2 != frame1:
+        frame_set.add(frame2)
+    return grid, frame_set
+
+
+def _make_output() -> tuple[np.ndarray | None, int, set[int]]:
+    """Select dims, build abstract output, then remap to real ARC colors."""
+    H, W = random.choices(_VALID_DIMS, weights=_DIM_WEIGHTS, k=1)[0]
+    out, abstract_fcs = _build_output(H, W)
+    if out is None:
+        return None, 0, set()
+    bg = random.randint(0, 9)
+    abstract = sorted(np.unique(out))
+    available = [c for c in range(10) if c != bg]
+    random.shuffle(available)
+    if len(available) < len(abstract):
+        return None, 0, set()
+    cmap = {int(a): available[i] for i, a in enumerate(abstract)}
+    real_fcs = {cmap[a] for a in abstract_fcs}
+    return np.vectorize(lambda x: cmap[int(x)])(out), bg, real_fcs
+
+
+def _extract_non_frame_patches(out, bg, fcs):
+    """Extract non-frame piece patches from the output grid, sorted largest-first."""
+    patches = []
+    for col in sorted(map(int, np.unique(out))):
+        if col in fcs:
+            continue
+        for pts in components_mask(out == col, connectivity=4):
+            r0, c0, r1, c1 = bbox_coords(pts)
+            patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
+            for r, c in pts:
+                patch[int(r) - r0, int(c) - c0] = col
+            patches.append(patch)
+    random.shuffle(patches)
+    patches.sort(key=lambda p: (-(p != bg).sum(), random.random()))
+    return patches
+
+
+def _scatter(out: np.ndarray, bg: int, fcs: set[int]) -> np.ndarray:
+    """Place pieces onto a canvas: frame as a group, non-frame scattered with padding."""
+    rows = random.randint(_CANVAS_MIN, _CANVAS_MAX)
+    cols = random.randint(_CANVAS_MIN, _CANVAS_MAX)
+    canvas = np.full((rows, cols), bg, dtype=int)
+    oh, ow = out.shape
+
+    max_r = rows - oh - 2
+    max_c = cols - ow - 2
+    if max_r < 1 or max_c < 1:
+        raise ValueError
+    off_r = random.randint(1, max_r)
+    off_c = random.randint(1, max_c)
+
+    # Block the entire frame bbox so fill pieces stay outside the outline
+    canvas[off_r:off_r + oh, off_c:off_c + ow] = -1
+
+    # Scatter non-frame pieces into the area OUTSIDE the blocked bbox
+    for patch in _extract_non_frame_patches(out, bg, fcs):
+        r, c = random_free_location(canvas, patch, transparent=bg,
+                                    padding=_SCATTER_PADDING, padding_connectivity=8)
+        paste(canvas, patch, r, c, transparent=bg)
+
+    # Replace blocked bbox with frame cells (non-frame positions revert to bg)
+    frame_mask = np.zeros((oh, ow), dtype=bool)
+    for col in fcs:
+        frame_mask |= (out == col)
+    bbox_region = canvas[off_r:off_r + oh, off_c:off_c + ow]
+    bbox_region[:] = bg
+    bbox_region[frame_mask] = out[frame_mask]
+    return canvas
+
+
+def _piece_count(out: np.ndarray) -> int:
+    return sum(len(components_mask(out == col, connectivity=4)) for col in np.unique(out))
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Single generation attempt: build output, validate constraints, scatter, oracle check."""
+    out, bg, fcs = _make_output()
+    if out is None:
+        return None
+    if not np.array_equal(out, out[:, ::-1]):
+        return None
+    if not (_N_COLORS_MIN <= len(np.unique(out)) <= _N_COLORS_MAX):
+        return None
+    pc = _piece_count(out)
+    if not (_PIECE_COUNT_MIN <= pc <= _PIECE_COUNT_MAX):
+        return None
+    if any(len(pts) > _MAX_PIECE_AREA for col in np.unique(out)
+           for pts in components_mask(out == col, connectivity=4)):
+        return None
+    try:
+        inp = _scatter(out, bg, fcs)
+        got = main(inp)
+    except Exception:
+        return None
+    if np.array_equal(got, out):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(_GEN_MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate a valid e8686506 input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    spec:
+  task: assemble scattered jigsaw pieces into a LR-symmetric dense rectangle
+  input_grid: 13-15 rows x 13-15 cols, single bg color fills most cells
+  output_grid: H x W dense rectangle, H >= W (portrait), dims = closest-to-square factor pair of total piece area
+  output_dims_observed: 5x5 (area=25) or 8x5 (area=40)
+  output_symmetry: exact left-right mirror; UD symmetry NOT required
+  pieces:
+    connectivity: each piece is a single-color 8-connected component (NOT 4-connected)
+    total_count: 9-17
+    distinct_colors: 4-6
+    area_per_piece: 1-6
+    total_area: 25-40 [observed]; must have unique closest-to-square portrait factor pair
+    shapes: rectangles, L/C/zigzag fragments; no rotation applied
+    mirror_pairing: asymmetric pieces come in LR-mirror pairs (same color); self-symmetric pieces may appear alone or in matched counts
+  frame_constraint: |
+    REQUIRED: 1-2 pieces (8-connected) whose union bounding box = output rectangle dims (H x W)
+    and whose union bitmap is LR-symmetric. These "frame" pieces outline the assembled
+    rectangle via a zigzag contour. In the input, frame pieces are placed as a group
+    preserving their relative positions from the output, so the rectangular outline is
+    visually recognizable. Non-frame pieces are scattered freely.
+  uniqueness: REQUIRED — the assembly must be solvable by pure constraint propagation
+    (each step, every remaining piece has exactly one valid placement, or a batch
+    where positions = copies). No backtracking needed. Frame locks most cells;
+    irregular hole shapes force remaining pieces into unique positions.
+  singletons_on_border: 1x1 pieces only appear on the output rectangle border [observed 100%]
+  optional_anchors:
+    corner_markers: 0-1 colors with exactly 4 singleton pixels -> placed at 4 output corners [observed in 2/3]
+    h_bar_edges: 0-2 horizontal bars of width W-2 -> top/bottom edges between corners, ordered by input row [observed in 2/3]
+    v_line_pairs: 0-1 colors with 2 identical vertical lines -> left/right edges centered vertically [observed in 2/3]
+  input_scatter: pieces placed on bg grid with min Chebyshev distance 1 between any two pieces; no overlaps
+
+generation_strategy:
+  approach: output-first
+  steps:
+    1. Choose output dims H x W (H >= W, W odd so center column exists, area has unique closest-to-square portrait factorization).
+    2. Generate frame via zigzag path on the Hx2 left-half grid (top-to-bottom,
+       3 moves: down/horiz+down/diag). Mirror to right half. Optionally cap
+       top/bottom center col if endpoint is at col 1. Optionally split frame
+       into 2 colors (top/bottom halves) for visual variety.
+    3. Frame divides the rectangle into hole regions (4-conn components of
+       non-frame cells). Fill each hole with one color (split if >6 cells).
+       This produces irregular pieces whose shapes match the hole contours.
+    4. Mirror left half to right half for LR symmetry.
+    5. Extract each 4-conn component as a piece. Validate: 9-17 pieces,
+       area 1-6 each, 4-6 distinct colors, 1x1 pieces on border only.
+    6. Scatter pieces onto 13-15 x 13-15 input grid. Frame pieces placed as
+       a group at output-relative positions (bbox blocked to keep interior clean).
+       Non-frame pieces scattered in remaining space.
+    7. Validate: solver recovers output via pure constraint propagation.
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/e8686506/45/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/e8686506.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/e8686506/45/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of e8686506 (index 45)
+    # combo_spec: D5/2+D8/1
+    # Name: 无颜色相邻约束+仅两个大碎片
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/e8686506/45` 存在（如不存在则创建）。
+codex
+先梳理原始 `solver/generator`、工具函数和评测样例，确认哪些隐式假设会被 `D5/2 + D8/1` 直接打破，然后再改成新的两大碎片拼合版本并跑 50 次稳定性测试。
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/e8686506.json'
+with open(p) as f:
+    data=json.load(f)
+print('train', len(data['train']), 'test', len(data['test']))
+for sec in ['train','test']:
+    for i,pair in enumerate(data[sec]):
+        inp=pair['input']; out=pair.get('output')
+        print(sec, i, 'in', len(inp), len(inp[0]), 'out', len(out), len(out[0]) if out else None)
+        print('input colors', sorted({v for row in inp for v in row}))
+        print('output colors', sorted({v for row in out for v in row}) if out else None)
+PY" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/e8686506.py" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 240ms:
+import numpy as np
+
+from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
+import random
+
+
+def _piece_sig(pts: np.ndarray) -> tuple[int, int, tuple[tuple[int, int], ...]]:
+    r0, c0, r1, c1 = bbox_coords(pts)
+    coords = tuple(sorted((int(r) - r0, int(c) - c0) for r, c in pts))
+    return (r1 - r0 + 1), (c1 - c0 + 1), coords
+
+
+def _factors(n: int) -> list[tuple[int, int]]:
+    out = []
+    for w in range(1, n + 1):
+        if n % w == 0:
+            h = n // w
+            out.append((h, w))
+    return out
+
+
+def _build_requirements(
+    H: int,
+    W: int,
+    comps_by_color: dict[int, list[list[tuple[int, int]]]],
+) -> np.ndarray:
+    """
+    Build per-cell required color constraints (req[r,c] == -1 means unconstrained).
+
+    Heuristics supported by training examples:
+      - If there is a color with exactly 4 singleton components, those are the four corners.
+      - If there are full horizontal bars of length W-2 in the input, use them as the top/bottom edges
+        between the corners (ordered by their vertical position in the input).
+      - If there is a color with exactly two full vertical line components (width=1) in the input,
+        place them on the left/right edges centered vertically.
+    """
+    req = np.full((H, W), -1, dtype=int)
+
+    # 4 singleton components -> corners
+    corner_colors = [
+        col
+        for col, comps in comps_by_color.items()
+        if len(comps) == 4 and all(len(p) == 1 for p in comps)
+    ]
+    assert len(corner_colors) <= 1, "corner singleton color must be unique when present"
+    corner_color = corner_colors[0] if corner_colors else None
+    if corner_color is not None:
+        req[0, 0] = corner_color
+        req[0, W - 1] = corner_color
+        req[H - 1, 0] = corner_color
+        req[H - 1, W - 1] = corner_color
+
+    # Horizontal bar(s) of length W-2 (filled, height 1)
+    bar_colors: list[tuple[int, int]] = []  # (min_input_row, color)
+    if W >= 3 and corner_color is not None:
+        for col, comps in comps_by_color.items():
+            for pts in comps:
+                r0, c0, r1, c1 = bbox_coords(pts)
+                hh, ww = r1 - r0 + 1, c1 - c0 + 1
+                if hh == 1 and ww == (W - 2) and len(pts) == ww:
+                    bar_colors.append((r0, col))
+                    break
+        if bar_colors:
+            assert len(bar_colors) <= 2, "horizontal edge bar colors must be top/bottom only"
+            bar_colors.sort()
+            top_col = bar_colors[0][1]
+            bot_col = bar_colors[-1][1]
+            req[0, 1 : W - 1] = top_col
+            req[H - 1, 1 : W - 1] = bot_col
+
+    # Two full vertical line components -> left/right edges, centered vertically
+    vertical_line_candidates = []
+    for col, comps in comps_by_color.items():
+        if len(comps) != 2:
+            continue
+        sigs = [_piece_sig(pts) for pts in comps]
+        (h0, w0, coords0), (h1, w1, coords1) = sigs[0], sigs[1]
+        if w0 == 1 and w1 == 1 and h0 == h1 and coords0 == coords1 and h0 > 1:
+            vertical_line_candidates.append((col, h0))
+    assert len(vertical_line_candidates) <= 1, "paired vertical edge-line color must be unique when present"
+    if vertical_line_candidates:
+        col, L = vertical_line_candidates[0]
+        top = (H - L) // 2
+        assert 0 <= top and top + L <= H, "paired vertical edge lines must fit in the output height"
+        req[top : top + L, 0] = col
+        req[top : top + L, W - 1] = col
+
+    return req
+
+
+def _assemble(
+    types: list[dict],
+    H: int,
+    W: int,
+    req: np.ndarray,
+    disallow_touch: set[int] | None = None,
+) -> np.ndarray:
+    board = np.full((H, W), -1, dtype=int)
+    counts = [int(t["cnt"]) for t in types]
+
+    def mirror_ok(r: int, c: int, col: int) -> bool:
+        mc = W - 1 - c
+        v = board[r, mc]
+        return (v == -1) or (v == col)
+
+    def can_place(ti: int, r0: int, c0: int) -> bool:
+        t = types[ti]
+        col = int(t["col"])
+        is_singleton = len(t["coords"]) == 1
+        for dr, dc in t["coords"]:
+            r, c = r0 + dr, c0 + dc
+            if board[r, c] != -1:
+                return False
+            if req[r, c] != -1 and int(req[r, c]) != col:
+                return False
+            if not mirror_ok(r, c, col):
+                return False
+            if is_singleton and not (r == 0 or r == H - 1 or c == 0 or c == W - 1):
+                return False
+            if disallow_touch and col in disallow_touch:
+                for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                    if 0 <= rr < H and 0 <= cc < W and board[rr, cc] == col:
+                        return False
+        return True
+
+    def place(ti: int, r0: int, c0: int) -> list[tuple[int, int]]:
+        t = types[ti]
+        col = int(t["col"])
+        changed = []
+        for dr, dc in t["coords"]:
+            r, c = r0 + dr, c0 + dc
+            board[r, c] = col
+            changed.append((r, c))
+        return changed
+
+    def unplace(changed: list[tuple[int, int]]) -> None:
+        for r, c in changed:
+            board[r, c] = -1
+
+    def placements_for(ti: int) -> list[tuple[int, int]]:
+        t = types[ti]
+        return [(r0, c0)
+                for r0 in range(H - int(t["h"]) + 1)
+                for c0 in range(W - int(t["w"]) + 1)
+                if can_place(ti, r0, c0)]
+
+    # Pure constraint propagation: each step, every type must be forced (1 position)
+    # or batch-forced (positions == cnt). No backtracking. Asserts if stuck.
+    changed = True
+    while changed:
+        changed = False
+        for ti in range(len(types)):
+            if counts[ti] <= 0:
+                continue
+            places = placements_for(ti)
+            assert len(places) > 0, "assembly dead end: a piece has no valid placement"
+            if len(places) == 1:
+                counts[ti] -= 1
+                place(ti, places[0][0], places[0][1])
+                changed = True
+            elif len(places) == counts[ti]:
+                for r0, c0 in places:
+                    counts[ti] -= 1
+                    place(ti, r0, c0)
+                changed = True
+    assert all(c == 0 for c in counts), "assembly not purely propagation-solvable"
+    assert np.array_equal(board, board[:, ::-1]), "assembled board must be LR-symmetric"
+    return board
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Assemble scattered colored fragments into a left-right symmetric rectangle, jigsaw-style.
+
+    Input structure:
+    - bg = most common color; remaining colors form small sprite fragments.
+    - Optional roles: 4 singleton pixels of one color mark corners; horizontal bars mark top/bottom edges; paired vertical lines mark left/right edges.
+
+    Rule:
+    - Collect all non-bg connected components as jigsaw pieces.
+    - Determine output rectangle dimensions from total piece area.
+    - Pack pieces into the rectangle so it is exactly mirror-symmetric (left-right) and same-color pieces never 4-touch.
+
+    Key insight: Left-right symmetry plus the no-same-color-touching constraint make the assembly unique; corner/edge markers anchor it when present.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+
+    # Extract pieces (connected components per color)
+    comps_by_color: dict[int, list[list[tuple[int, int]]]] = {}
+    pieces = []
+    color_piece_count: dict[int, int] = {}
+
+    for col in sorted(set(map(int, np.unique(g)))):
+        if col == bg:
+            continue
+        comps = components_mask(g == col, connectivity=4)
+        comps_by_color[col] = comps
+        color_piece_count[col] = len(comps)
+        for pts in comps:
+            _, _, coords = _piece_sig(pts)
+            pieces.append((col, coords))
+
+    # Group identical pieces into types
+    from collections import Counter
+
+    ctr = Counter(pieces)
+    types = []
+    for (col, coords), cnt in sorted(ctr.items(), key=lambda kv: (-len(kv[0][1]), kv[0][0], kv[0][1])):
+        arr = np.array(coords, dtype=int)
+        h = int(arr[:, 0].max() + 1)
+        w = int(arr[:, 1].max() + 1)
+        types.append({"col": int(col), "coords": coords, "h": h, "w": w, "cnt": int(cnt)})
+
+    total_area = sum(int(t["cnt"]) * len(t["coords"]) for t in types)
+    assert total_area > 0, "total_area must be positive: grid must contain non-background pieces"
+
+    # Disallow 4-neigh touching between different pieces of same color (preserve component counts)
+    # Eval inputs use the unique closest-to-square portrait factor pair as the output shape.
+    dims = [(h, w) for (h, w) in _factors(total_area) if h >= w]
+    assert dims, "at least one portrait factor pair must exist for the total piece area"
+    best_gap = min(abs(h - w) for h, w in dims)
+    best_dims = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+    assert len(best_dims) == 1, "closest-to-square portrait output shape must be unique"
+    H, W = best_dims[0]
+
+    # Frame constraint: under 8-connectivity, 1-2 pieces must exist whose union bbox
+    # equals the output rectangle (H x W). Their relative positions are fixed in output.
+    comps8_all = []
+    for col in sorted(set(map(int, np.unique(g))) - {bg}):
+        for pts in components_mask(g == col, connectivity=8):
+            comps8_all.append((int(col), pts))
+    def _is_lr_symmetric(parts, h, w):
+        """Check if the union of frame parts forms an LR-symmetric bitmap."""
+        all_pts = np.concatenate([p for _, p in parts])
+        r0, c0 = int(all_pts[:, 0].min()), int(all_pts[:, 1].min())
+        bmp = np.zeros((h, w), dtype=bool)
+        for _, pts in parts:
+            for r, c in pts:
+                bmp[int(r) - r0, int(c) - c0] = True
+        return np.array_equal(bmp, bmp[:, ::-1])
+
+    frame_parts: list[tuple[int, np.ndarray]] = []
+    for i, (c1, p1) in enumerate(comps8_all):
+        r0, c0, r1, c1b = bbox_coords(p1)
+        if r1 - r0 + 1 == H and c1b - c0 + 1 == W:
+            if _is_lr_symmetric([(c1, p1)], H, W):
+                frame_parts = [(c1, p1)]
+                break
+        for j in range(i + 1, len(comps8_all)):
+            c2, p2 = comps8_all[j]
+            union = np.concatenate([p1, p2])
+            ur0, uc0, ur1, uc1 = bbox_coords(union)
+            if ur1 - ur0 + 1 == H and uc1 - uc0 + 1 == W:
+                if _is_lr_symmetric([(c1, p1), (c2, p2)], H, W):
+                    frame_parts = [(c1, p1), (c2, p2)]
+                    break
+        if frame_parts:
+            break
+    assert frame_parts, "input must contain 1-2 LR-symmetric pieces (8-conn) whose union bbox equals output dims"
+
+ succeeded in 256ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+    r0 = min(b[0] for b in bbs)
+    c0 = min(b[1] for b in bbs)
+    r1 = max(b[2] for b in bbs)
+    c1 = max(b[3] for b in bbs)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox_h(b: BBox) -> int:
+    r0, _c0, r1, _c1 = b
+    return int(r1 - r0 + 1)
+
+
+def bbox_w(b: BBox) -> int:
+    _r0, c0, _r1, c1 = b
+    return int(c1 - c0 + 1)
+
+
+def bbox_anchor(b: BBox, *, anchor: str = "upper left") -> Coord:
+    """
+    Return an anchor point (r,c) for a bbox.
+
+ succeeded in 296ms:
+train 2 test 1
+train 0 in 13 13 out 5 5
+input colors [1, 3, 4, 6, 8]
+output colors [1, 3, 4, 6]
+train 1 in 13 13 out 8 5
+input colors [1, 2, 3, 4, 5, 6, 8]
+output colors [1, 2, 4, 5, 6, 8]
+test 0 in 15 15 out 8 5
+input colors [1, 3, 4, 6, 8, 9]
+output colors [1, 3, 6, 8, 9]
+
+codex
+我已经确认原题的核心依赖是“镜像约束 + 同色不相邻 + 轮廓框架锚定”。这次变体会直接删掉第二项，并把多碎片改成两大块，所以原先按颜色分组件、按纯传播逐块落位的假设基本都得换掉。
+exec
+/bin/bash -lc 'rg -n "def components_mask|def random_free_location|def paste" /home/lixinyu/snap/new/solvers/arc_utils.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+308:def paste(
+398:def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+854:def random_free_location(
+
+exec
+/bin/bash -lc "sed -n '260,520p' /home/lixinyu/snap/new/arc2_solver_select/e8686506.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+    assert frame_parts, "input must contain 1-2 LR-symmetric pieces (8-conn) whose union bbox equals output dims"
+
+    req = _build_requirements(H, W, comps_by_color)
+
+    # Lock frame cells into req: their output positions are determined by input-relative positions.
+    all_frame_pts = np.concatenate([p for _, p in frame_parts])
+    fr0, fc0 = int(all_frame_pts[:, 0].min()), int(all_frame_pts[:, 1].min())
+    for col, pts in frame_parts:
+        for r, c in pts:
+            or_, oc = int(r) - fr0, int(c) - fc0
+            if 0 <= or_ < H and 0 <= oc < W:
+                req[or_, oc] = col
+
+    disallow_touch = {col for col, n in color_piece_count.items() if n > 1}
+    sol = _assemble(types, H, W, req, disallow_touch)
+    return sol.astype(int)
+
+# --------------- generator (o5x) ---------------
+
+# === CFG: Output dimensions ===
+_AREA_MIN = 25               # minimum total piece area
+_AREA_MAX = 50               # maximum total piece area (exclusive upper in range)
+_WIDTH_REQUIRED = 5           # all valid outputs have width 5
+_HEIGHT_MAX = 10              # maximum output height
+
+# === CFG: Color and palette ===
+_N_COLORS_MIN = 4             # min distinct colors in abstract output
+_N_COLORS_MAX = 6             # max distinct colors in abstract output
+_TWO_FRAME_MIN_H = 6          # min height to allow 2-color frame
+_TWO_FRAME_MIN_COLORS = 5     # min palette size to allow 2-color frame
+_TWO_FRAME_PROB = 0.35         # probability of splitting frame into 2 colors
+_CENTER_CAP_PROB = 0.5         # probability of capping center col at top/bottom
+
+# === CFG: Piece constraints ===
+_MAX_PIECE_AREA = 6           # maximum area of any single 4-conn piece
+_MAX_CHUNK_SIZE = 6           # max cells per hole chunk when splitting large holes
+_PIECE_COUNT_MIN = 9          # min total 4-conn components in output
+_PIECE_COUNT_MAX = 17         # max total 4-conn components in output
+
+# === CFG: Canvas / scatter ===
+_CANVAS_MIN = 13              # min canvas dimension (rows and cols)
+_CANVAS_MAX = 15              # max canvas dimension (rows and cols)
+_SCATTER_PADDING = 1          # Chebyshev padding between scattered pieces
+
+# === CFG: Retry ===
+_GEN_MAX_RETRIES = 300        # max attempts in generate_input()
+
+
+def _valid_dims():
+    """Precompute valid (H, W) pairs: unique closest-to-square portrait factorization with W=5."""
+    results = []
+    for area in range(_AREA_MIN, _AREA_MAX + 1):
+        dims = [(area // w, w) for w in range(1, area + 1) if area % w == 0 and area // w >= w]
+        best_gap = min(abs(h - w) for h, w in dims)
+        best = [(h, w) for h, w in dims if abs(h - w) == best_gap]
+        if len(best) == 1:
+            h, w = best[0]
+            if w == _WIDTH_REQUIRED and h <= _HEIGHT_MAX:
+                results.append((h, w))
+    return results
+
+
+_VALID_DIMS = _valid_dims()
+_DIM_WEIGHTS = [h * w for h, w in _VALID_DIMS]
+
+
+def _zigzag_frame(H):
+    """Generate frame bitmap (Hx2 left-half) via zigzag path from top to bottom.
+    Returns (cells, start_c, end_c) where start_c/end_c are the column at top/bottom."""
+    cells = set()
+    start_c = random.randint(0, 1)
+    c = start_c
+    for r in range(H):
+        cells.add((r, c))
+        if r == H - 1:
+            break
+        move = random.choice(['down', 'horiz', 'diag'])
+        if move == 'down':
+            pass
+        elif move == 'horiz':
+            cells.add((r, 1 - c))
+            c = 1 - c
+        else:
+            c = 1 - c
+    return cells, start_c, c
+
+
+def _fill_holes(grid, H, W, half, frame1, frame2, split, fill_pool):
+    """Fill non-frame cells by assigning colors to 4-conn hole regions.
+    Large holes are split into chunks of <= _MAX_CHUNK_SIZE cells."""
+    holes = components_mask(grid == -1, connectivity=4)
+    prev_col = None
+    for hole in holes:
+        cells = sorted((int(r), int(c)) for r, c in hole)
+        # Split into chunks of bounded size
+        chunks = [cells[i:i + _MAX_CHUNK_SIZE] for i in range(0, len(cells), _MAX_CHUNK_SIZE)]
+        for chunk in chunks:
+            # Determine which frame colors are adjacent to this chunk
+            fc_set = {frame1 if r < split else frame2 for r, _ in chunk}
+            # Pick a fill color avoiding frame and previous neighbor
+            avoid = fc_set | ({prev_col} if prev_col else set())
+            opts = [f for f in fill_pool if f not in avoid]
+            if not opts:
+                opts = [f for f in fill_pool if f not in fc_set] or fill_pool
+            col = random.choice(opts)
+            for r, c in chunk:
+                grid[r, c] = col
+                grid[r, W - 1 - c] = col
+            prev_col = col
+
+
+def _build_output(H, W):
+    """Build an abstract LR-symmetric output grid with zigzag frame and filled holes.
+    Returns (grid, frame_colors_set) or (None, set()) on failure."""
+    half = W // 2
+    n_colors = random.randint(_N_COLORS_MIN, _N_COLORS_MAX)
+    palette = list(range(n_colors))
+    random.shuffle(palette)
+
+    use_two_frames = (H >= _TWO_FRAME_MIN_H and n_colors >= _TWO_FRAME_MIN_COLORS
+                      and random.random() < _TWO_FRAME_PROB)
+    ci = 0
+    frame1 = palette[ci]; ci += 1
+    frame2 = frame1
+    if use_two_frames:
+        frame2 = palette[ci]; ci += 1
+    fill_pool = palette[ci:]
+    if not fill_pool:
+        return None, set()
+
+    frame_half, start_c, end_c = _zigzag_frame(H)
+    split = H // 2 if frame1 != frame2 else H
+
+    grid = np.full((H, W), -1, dtype=int)
+
+    # Paint frame cells (mirror left half to right)
+    for r, c in frame_half:
+        fc = frame1 if r < split else frame2
+        grid[r, c] = fc
+        grid[r, W - 1 - c] = fc
+
+    # Cap center column at top/bottom when zigzag endpoint is adjacent
+    if start_c == 1 and random.random() < _CENTER_CAP_PROB:
+        grid[0, half] = frame1
+    if end_c == 1 and random.random() < _CENTER_CAP_PROB:
+        grid[H - 1, half] = frame2
+
+    _fill_holes(grid, H, W, half, frame1, frame2, split, fill_pool)
+
+    if np.any(grid < 0):
+        return None, set()
+    frame_set = {frame1}
+    if frame2 != frame1:
+        frame_set.add(frame2)
+    return grid, frame_set
+
+
+def _make_output() -> tuple[np.ndarray | None, int, set[int]]:
+    """Select dims, build abstract output, then remap to real ARC colors."""
+    H, W = random.choices(_VALID_DIMS, weights=_DIM_WEIGHTS, k=1)[0]
+    out, abstract_fcs = _build_output(H, W)
+    if out is None:
+        return None, 0, set()
+    bg = random.randint(0, 9)
+    abstract = sorted(np.unique(out))
+    available = [c for c in range(10) if c != bg]
+    random.shuffle(available)
+    if len(available) < len(abstract):
+        return None, 0, set()
+    cmap = {int(a): available[i] for i, a in enumerate(abstract)}
+    real_fcs = {cmap[a] for a in abstract_fcs}
+    return np.vectorize(lambda x: cmap[int(x)])(out), bg, real_fcs
+
+
+def _extract_non_frame_patches(out, bg, fcs):
+    """Extract non-frame piece patches from the output grid, sorted largest-first."""
+    patches = []
+    for col in sorted(map(int, np.unique(out))):
+        if col in fcs:
+            continue
+        for pts in components_mask(out == col, connectivity=4):
+            r0, c0, r1, c1 = bbox_coords(pts)
+            patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
+            for r, c in pts:
+                patch[int(r) - r0, int(c) - c0] = col
+            patches.append(patch)
+    random.shuffle(patches)
+    patches.sort(key=lambda p: (-(p != bg).sum(), random.random()))
+    return patches
+
+
+def _scatter(out: np.ndarray, bg: int, fcs: set[int]) -> np.ndarray:
+    """Place pieces onto a canvas: frame as a group, non-frame scattered with padding."""
+    rows = random.randint(_CANVAS_MIN, _CANVAS_MAX)
+    cols = random.randint(_CANVAS_MIN, _CANVAS_MAX)
+    canvas = np.full((rows, cols), bg, dtype=int)
+    oh, ow = out.shape
+
+    max_r = rows - oh - 2
+    max_c = cols - ow - 2
+    if max_r < 1 or max_c < 1:
+        raise ValueError
+    off_r = random.randint(1, max_r)
+    off_c = random.randint(1, max_c)
+
+    # Block the entire frame bbox so fill pieces stay outside the outline
+    canvas[off_r:off_r + oh, off_c:off_c + ow] = -1
+
+    # Scatter non-frame pieces into the area OUTSIDE the blocked bbox
+    for patch in _extract_non_frame_patches(out, bg, fcs):
+        r, c = random_free_location(canvas, patch, transparent=bg,
+                                    padding=_SCATTER_PADDING, padding_connectivity=8)
+        paste(canvas, patch, r, c, transparent=bg)
+
+    # Replace blocked bbox with frame cells (non-frame positions revert to bg)
+    frame_mask = np.zeros((oh, ow), dtype=bool)
+    for col in fcs:
+        frame_mask |= (out == col)
+    bbox_region = canvas[off_r:off_r + oh, off_c:off_c + ow]
+    bbox_region[:] = bg
+    bbox_region[frame_mask] = out[frame_mask]
+    return canvas
+
+
+def _piece_count(out: np.ndarray) -> int:
+    return sum(len(components_mask(out == col, connectivity=4)) for col in np.unique(out))
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Single generation attempt: build output, validate constraints, scatter, oracle check."""
+    out, bg, fcs = _make_output()
+    if out is None:
+        return None
+    if not np.array_equal(out, out[:, ::-1]):
+        return None
+    if not (_N_COLORS_MIN <= len(np.unique(out)) <= _N_COLORS_MAX):
+        return None
+    pc = _piece_count(out)
+    if not (_PIECE_COUNT_MIN <= pc <= _PIECE_COUNT_MAX):
+        return None
+    if any(len(pts) > _MAX_PIECE_AREA for col in np.unique(out)
+           for pts in components_mask(out == col, connectivity=4)):
+        return None
+    try:
+        inp = _scatter(out, bg, fcs)
+        got = main(inp)
+    except Exception:
+        return None
+    if np.array_equal(got, out):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(_GEN_MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise RuntimeError("failed to generate a valid e8686506 input")
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json, numpy as np
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/e8686506.json'
+with open(p) as f:
+    data=json.load(f)
+for sec in ['train','test']:
+    for i,pair in enumerate(data[sec]):
+        print('\\n',sec,i)
+        for name in ['input','output']:
+            if name not in pair: continue
+            arr=np.array(pair[name])
+            print(name, arr.shape)
+            for row in arr:
+                print(' '.join(map(str,row)))
+PY" in /home/lixinyu/snap/new
+ succeeded in 266ms:
+
+ train 0
+input (13, 13)
+8 8 8 8 8 8 8 8 8 8 8 8 8
+8 8 8 8 8 4 8 8 8 8 8 8 8
+8 8 8 8 8 8 8 8 8 8 8 8 8
+8 8 3 3 8 3 3 8 8 4 8 8 8
+8 8 3 8 8 8 3 8 8 8 8 8 8
+8 8 3 8 8 8 3 8 8 8 8 8 8
+8 8 8 3 8 3 8 8 8 8 8 4 8
+8 8 3 3 8 3 3 8 8 8 8 8 8
+8 8 8 8 8 8 8 8 8 8 8 8 8
+8 8 8 8 8 8 8 8 8 8 8 8 8
+8 8 1 1 1 8 8 8 6 8 8 8 8
+8 8 1 1 1 8 8 8 6 8 8 8 8
+8 8 8 8 8 8 8 8 8 8 8 8 8
+output (5, 5)
+3 3 4 3 3
+3 1 1 1 3
+3 1 1 1 3
+4 3 6 3 4
+3 3 6 3 3
+
+ train 1
+input (13, 13)
+3 3 3 3 3 3 3 3 3 3 3 3 3
+3 6 3 3 3 3 3 3 8 8 8 3 3
+3 6 3 3 3 3 3 3 3 8 3 3 3
+3 3 3 1 1 1 3 3 3 8 3 5 3
+3 3 1 3 3 3 1 3 3 3 3 3 3
+3 3 1 1 3 1 1 3 5 3 3 3 3
+3 3 3 1 3 1 3 3 3 3 3 3 3
+3 3 3 2 3 2 3 3 3 3 4 3 3
+3 3 2 2 3 2 2 3 3 3 4 3 3
+3 3 2 3 3 3 2 3 3 4 4 4 3
+3 3 3 2 2 2 3 3 3 3 3 3 3
+3 6 3 3 3 3 3 3 3 3 5 3 3
+3 6 3 3 3 3 3 5 3 3 3 3 3
+output (8, 5)
+5 1 1 1 5
+1 8 8 8 1
+1 1 8 1 1
+6 1 8 1 6
+6 2 4 2 6
+2 2 4 2 2
+2 4 4 4 2
+5 2 2 2 5
+
+ test 0
+input (15, 15)
+4 1 4 4 4 4 4 4 4 4 4 4 4 4 4
+4 4 4 4 4 4 4 4 4 4 4 4 4 4 4
+4 4 4 4 4 8 8 8 4 4 4 4 6 6 6
+4 4 3 4 8 4 4 4 8 4 4 4 4 6 4
+4 4 3 4 4 8 4 8 4 4 1 4 4 4 4
+4 4 3 4 4 8 4 8 4 4 4 4 4 4 4
+4 4 3 4 4 8 4 8 4 4 4 4 4 4 4
+4 4 4 4 4 8 4 8 4 4 4 4 4 4 4
+4 4 4 4 8 4 4 4 8 4 4 4 1 4 4
+4 4 4 4 4 8 8 8 4 4 4 4 4 4 4
+4 3 4 4 4 4 4 4 4 4 4 4 4 4 4
+4 3 4 4 4 4 4 9 4 4 4 4 4 4 4
+4 3 4 4 4 4 4 9 4 4 4 6 4 4 4
+4 3 4 4 1 4 4 4 4 4 6 6 6 4 4
+4 4 4 4 4 4 4 4 4 4 4 4 4 4 4
+output (8, 5)
+1 8 8 8 1
+8 6 6 6 8
+3 8 6 8 3
+3 8 9 8 3
+3 8 9 8 3
+3 8 6 8 3
+8 6 6 6 8
+1 8 8 8 1
+
+codex
+下一步我会把生成方式改成“先做镜像矩形，再用一条长锯齿分界线切成两块多色大碎片”，这样两项变体会真正耦合：碎片数确实只有 2，而且拼合后会故意出现跨分界线的同色贴边。
+exec
+/bin/bash -lc "sed -n '398,470p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def components_mask(mask: np.ndarray, connectivity: int = 4) -> list[np.ndarray]:
+    """List of components from a boolean mask, each as an (N,2) coords array."""
+    lab, n = label_mask(mask, connectivity=connectivity)
+    return [np.argwhere(lab == k) for k in range(1, n + 1)]
+
+
+def find_components(
+    grid: np.ndarray,
+    *,
+    bg: int | None = None,
+    connectivity: int = 4,
+    monochromatic: bool = True,
+    colors: Sequence[int] | None = None,
+    min_area: int = 1,
+    return_format: str = "dict",
+) -> list[dict] | list[np.ndarray]:
+    """
+    Find connected components in a grid (unified API for ARC-2 + migrated seeds).
+
+    return_format:
+      - \"dict\": list of dicts {color, coords, bbox, area}
+      - \"objects\": list of full-grid arrays containing exactly one component
+    """
+    if bg is None:
+        bg = get_bg(grid)
+    bg = int(bg)
+
+    return_format = str(return_format).lower().strip()
+    if return_format not in {"dict", "objects"}:
+        raise ValueError("find_components: return_format must be 'dict' or 'objects'")
+
+    if colors is None:
+        colors_set = None
+        colors_iter = sorted(set(map(int, grid.flatten())) - {bg})
+    else:
+        colors_set = {int(c) for c in colors}
+        colors_iter = [int(c) for c in colors_set if int(c) != bg]
+
+    # Monochromatic = label per-color
+    if monochromatic:
+        if return_format == "dict":
+            out: list[dict] = []
+            for col in colors_iter:
+                mask = (grid == col)
+                if not mask.any():
+                    continue
+                comps = components_mask(mask, connectivity=connectivity)
+                for coords in comps:
+                    if int(coords.shape[0]) < int(min_area):
+                        continue
+                    out.append(
+                        {
+                            "color": int(col),
+                            "coords": coords,
+                            "bbox": bbox_coords(coords),
+                            "area": int(coords.shape[0]),
+                        }
+                    )
+            return out
+
+        objs: list[np.ndarray] = []
+        struct = STRUCT4 if int(connectivity) == 4 else STRUCT8
+        for col in colors_iter:
+            lab, n = label(grid == int(col), structure=struct)
+            for k in range(1, int(n) + 1):
+                m = (lab == k)
+                if int(m.sum()) < int(min_area):
+                    continue
+                obj = np.full_like(grid, bg)
+                obj[m] = int(col)
+                objs.append(obj)
+        return objs
+
+
+exec
+/bin/bash -lc "sed -n '854,940p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def random_free_location(
+    canvas: np.ndarray,
+    patch: np.ndarray,
+    *,
+    transparent: int,
+    border: int = 0,
+    padding: int = 0,
+    padding_connectivity: int = 8,
+) -> Coord:
+    """
+    Return a random (r,c) top-left location where `patch` fits without overlap.
+
+    This is the generator-friendly counterpart of `first_free_location` and mirrors the
+    legacy seeds' `random_free_location_for_sprite` behavior.
+
+    Raises:
+        ValueError: if no free location exists.
+    """
+    H, W = canvas.shape
+    h, w = patch.shape
+    border = int(border)
+    padding = int(padding)
+    pad_conn = int(padding_connectivity)
+    bg = int(transparent)
+
+    if h <= 0 or w <= 0:
+        raise ValueError("random_free_location: patch must be non-empty")
+    if H <= 0 or W <= 0:
+        raise ValueError("random_free_location: canvas must be non-empty")
+
+    if border < 0:
+        raise ValueError("random_free_location: border must be >= 0")
+    if padding < 0:
+        raise ValueError("random_free_location: padding must be >= 0")
+    if pad_conn not in (4, 8):
+        raise ValueError("random_free_location: padding_connectivity must be 4 or 8")
+
+    r_min = border
+    c_min = border
+    r_max = H - border - h
+    c_max = W - border - w
+    if r_max < r_min or c_max < c_min:
+        raise ValueError("random_free_location: patch cannot fit (border too large or patch too big)")
+
+    occ = (canvas != bg)
+    if padding > 0:
+        struct = STRUCT4 if pad_conn == 4 else STRUCT8
+        occ = ndimage.binary_dilation(occ, structure=struct, iterations=padding)
+
+    m = (patch != bg)
+
+    candidates: list[Coord] = []
+    for r0 in range(r_min, r_max + 1):
+        for c0 in range(c_min, c_max + 1):
+            if not bool((occ[r0 : r0 + h, c0 : c0 + w] & m).any()):
+                candidates.append((int(r0), int(c0)))
+
+    if not candidates:
+        raise ValueError("random_free_location: no free location")
+    return random.choice(candidates)
+
+
+def randomly_scatter_points(
+    grid: np.ndarray,
+    color: int,
+    *,
+    density: float = 0.5,
+    background: int = Color.BLACK,
+) -> np.ndarray:
+    """Randomly scatter points of `color` into `background` cells until reaching density."""
+    bg = int(background)
+    col = int(color)
+    colored = 0
+    H, W = grid.shape
+    target = int(round(float(density) * H * W))
+    while colored < target:
+        r = np.random.randint(0, H)
+        c = np.random.randint(0, W)
+        if int(grid[r, c]) == bg:
+            grid[r, c] = col
+            colored += 1
+    return grid
+
+
+def randomly_spaced_indices(max_len: int, n_indices: int, border_size: int = 1, padding: int = 1) -> np.ndarray:
+    """Generate randomly-spaced indices guaranteed to not be adjacent."""
+    max_len = int(max_len)
+
+codex
+设计结论如下，先固定后再落代码。
+
+1. 原题把输出拆成很多单色小块，`main()` 依赖“按颜色分组件”“同色块不能贴边”“框架块先锁定大部分格子”三层前提。`D5/2` 去掉了第二层，`D8/1` 又把第一层直接改成“两块多色大碎片”，所以原来的 `_build_requirements / disallow_touch / 按 type 纯传播落位` 都不再成立。
+
+2. 融合后我会把输出仍做成严格左右镜像矩形，但输入只保留两个按 `grid != bg` 提取出的 4 连通大组件。它们不是单色块，而是多色拼图块；输出通过一条自上而下的锯齿分界线把整块矩形切成左右两块。这样：
+   - “只有两个大碎片”在像素层面是可见的；
+   - 两块面积接近，分界线很长，边缘匹配是主要线索；
+   - 颜色不再参与防冲突，分界线两侧会故意出现同色贴边，视觉上会融合，能真实体现 `D5/2`。
+
+3. 小例子上，原题会把一个 `5x5` 成品分成很多 1-6 格的单色组件，再靠镜像+颜色不贴边逐块填满；新题会把例如 `7x6` 的镜像矩形直接切成两块 `17/25` 或 `18/24` 格的大块。求解时不再“逐色拼”，而是“把两块整片平移回矩形内，检查是否刚好铺满且颜色左右镜像”。
+
+4. 复杂度上我不会把切分做成简单直线，否则会退化成肉眼秒拼；会限制分界线每行只小步摆动并带局部齿状突起，保证边界长但规则仍稳定。颜色数控制在 3-5 种，避免图案太乱，同时通过重复颜色制造跨缝同色接触，让“无颜色约束”在样例里可观察。
+
+5. 新 `main()` 的隐式假设会改成：
+   - 非背景像素恰好形成两个 4 连通组件；
+   - 总面积对应唯一的近方形纵向因子对；
+   - 两组件都可仅通过平移放入该矩形；
+   - 存在且仅存在一个平移组合能无重叠铺满矩形并得到左右镜像成品。
+   生成器会显式按这些条件构造并用求解器回验。
+
+6. 放置合法性上，生成器仍用 `output-first`：先造成品，再切两块，再散放到大画布；散放时每块分别做透明贴图并保留间距，确保不越界、不重叠。
+
+7. 额外的退化检查会统计“分界线两侧同色贴边数”。如果这个值经常为 0，说明样本又退回了原题那种“颜色天然分隔”的视觉效果，需要继续调生成器。
+codex
+我现在开始写新文件。求解器会改成“两块多色组件平移回唯一镜像矩形”的穷举匹配，生成器则强制输出存在跨缝同色贴边，避免退化回原题。
+exec
+/bin/bash -lc 'mkdir -p /home/lixinyu/snap/new/ceshi/code_combo/e8686506/45' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/e8686506/45/code.py
+diff --git a/ceshi/code_combo/e8686506/45/code.py b/ceshi/code_combo/e8686506/45/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..caa331c70dcef284258a49dd866a0054fe915751
+--- /dev/null
++++ b/ceshi/code_combo/e8686506/45/code.py
+@@ -0,0 +1,354 @@
++# Combo variant of e8686506 (index 45)
++# combo_spec: D5/2+D8/1
++# Name: 无颜色相邻约束+仅两个大碎片
++
++import random
++from typing import Iterable
++
++import numpy as np
++
++from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
++
++
++# Design analysis for D5/2 + D8/1
++# 1. The original task extracts many single-color fragments and leans on a no-same-color-touching
++#    rule to prune placements. This combo removes that pruning entirely and collapses the fragment
++#    set into exactly two large multicolor pieces, so grouping by color is no longer valid.
++# 2. Concrete behavior shift: instead of packing many small pieces into a mirrored rectangle, we
++#    build one LR-symmetric dense rectangle and cut it by a long jagged seam into two connected
++#    blobs. The solver therefore matches two translated multicolor patches back into the unique
++#    mirrored rectangle.
++# 3. Complexity calibration: a straight vertical cut would be too trivial, so the generator uses
++#    a row-by-row zigzag seam with multiple switches. The seam is long enough to make edge-fitting
++#    the main clue, but its step size is tightly controlled so the objects remain readable.
++# 4. Visual observability: the generator forces several same-color contacts across the seam. That
++#    makes the merged output visually blur piece boundaries, which directly exhibits the removal of
++#    the old color-adjacency restriction instead of quietly degenerating into the original task.
++# 5. New solver assumptions, all guaranteed by the generator:
++#    - non-background cells form exactly two 4-connected components;
++#    - total area has a unique closest-to-square portrait factorization;
++#    - each component is used by translation only;
++#    - exactly one translated pair tiles the rectangle and yields LR color symmetry.
++# 6. Placement legality: each generated piece is cropped from the final rectangle, then scattered
++#    onto a larger canvas with transparent background and positive spacing, so pieces never overlap
++#    or exit the input bounds.
++
++
++def _factors(n: int) -> list[tuple[int, int]]:
++    out = []
++    for w in range(1, n + 1):
++        if n % w == 0:
++            out.append((n // w, w))
++    return out
++
++
++def _closest_portrait_dims(area: int) -> tuple[int, int]:
++    dims = [(h, w) for h, w in _factors(area) if h >= w]
++    assert dims, "non-background area must admit a portrait factorization"
++    gap = min(abs(h - w) for h, w in dims)
++    best = [(h, w) for h, w in dims if abs(h - w) == gap]
++    assert len(best) == 1, "closest-to-square portrait factor pair must be unique"
++    return best[0]
++
++
++def _crop_piece(grid: np.ndarray, pts: np.ndarray, bg: int) -> np.ndarray:
++    r0, c0, r1, c1 = bbox_coords(pts)
++    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
++    for r, c in pts:
++        patch[int(r) - r0, int(c) - c0] = int(grid[int(r), int(c)])
++    return patch
++
++
++def _patch_sig(patch: np.ndarray, bg: int) -> tuple[int, int, tuple[tuple[int, int, int], ...]]:
++    cells = tuple(
++        sorted((int(r), int(c), int(patch[r, c])) for r, c in np.argwhere(patch != bg))
++    )
++    return int(patch.shape[0]), int(patch.shape[1]), cells
++
++
++def _patch_area(patch: np.ndarray, bg: int) -> int:
++    return int(np.sum(patch != bg))
++
++
++def _placements(piece: np.ndarray, H: int, W: int, bg: int) -> list[dict]:
++    h, w = piece.shape
++    assert h <= H and w <= W, "piece bbox must fit inside the reconstructed rectangle"
++    cells = [(int(r), int(c), int(piece[r, c])) for r, c in np.argwhere(piece != bg)]
++    out = []
++    for r0 in range(H - h + 1):
++        for c0 in range(W - w + 1):
++            occ = np.zeros((H, W), dtype=bool)
++            board = np.full((H, W), -1, dtype=int)
++            for dr, dc, col in cells:
++                occ[r0 + dr, c0 + dc] = True
++                board[r0 + dr, c0 + dc] = col
++            out.append({"occ": occ, "board": board})
++    return out
++
++
++def _extract_two_pieces(grid: np.ndarray, bg: int) -> list[np.ndarray]:
++    comps = components_mask(grid != bg, connectivity=4)
++    assert len(comps) == 2, "input must contain exactly two non-background pieces"
++    pieces = [_crop_piece(grid, pts, bg) for pts in comps]
++    pieces.sort(key=lambda p: (-_patch_area(p, bg), _patch_sig(p, bg)))
++    return pieces
++
++
++def _assemble_two_pieces(pieces: list[np.ndarray], H: int, W: int, bg: int) -> np.ndarray:
++    place_a = _placements(pieces[0], H, W, bg)
++    place_b = _placements(pieces[1], H, W, bg)
++    solutions: dict[bytes, np.ndarray] = {}
++
++    for pa in place_a:
++        occ_a = pa["occ"]
++        board_a = pa["board"]
++        for pb in place_b:
++            occ_b = pb["occ"]
++            if np.any(occ_a & occ_b):
++                continue
++            if int(np.sum(occ_a | occ_b)) != H * W:
++                continue
++            board = np.where(occ_a, board_a, pb["board"])
++            if not np.array_equal(board, board[:, ::-1]):
++                continue
++            solutions.setdefault(board.tobytes(), board.copy())
++
++    assert solutions, "no mirrored rectangle can be formed from the two pieces"
++    assert len(solutions) == 1, "assembly must be uniquely determined"
++    return next(iter(solutions.values()))
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Reassemble two scattered multicolor chunks into one dense rectangle with exact left-right symmetry.
++
++    Input structure:
++    - The background is the most common color.
++    - Every non-background cell belongs to one of exactly two large 4-connected pieces.
++    - Each piece is multicolor, and same-color cells from opposite pieces may legitimately touch after assembly.
++
++    Rule:
++    - Treat each non-background connected component as one rigid jigsaw piece.
++    - Infer the output rectangle from the total occupied area using the unique closest-to-square portrait factor pair.
++    - Translate the two pieces inside that rectangle so they do not overlap, cover it completely, and produce an exact LR mirror image.
++
++    Key insight:
++    - Color adjacency is no longer a safe separator. The reliable cue is the long complementary seam between the two large pieces, with symmetry used only to choose the one translation pair that closes the rectangle correctly.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    pieces = _extract_two_pieces(g, bg)
++    total_area = sum(_patch_area(piece, bg) for piece in pieces)
++    H, W = _closest_portrait_dims(total_area)
++    out = _assemble_two_pieces(pieces, H, W, bg)
++    return out.astype(int)
++
++
++# --------------- generator ---------------
++
++_OUTPUT_DIMS = [(7, 5), (8, 5), (7, 6), (8, 6), (7, 7), (8, 7)]
++_OUTPUT_WEIGHTS = [h * w for h, w in _OUTPUT_DIMS]
++
++_N_COLORS_MIN = 3
++_N_COLORS_MAX = 4
++_MIN_SEAM_CONTACTS = 2
++_MIN_SEAM_SWITCHES = 2
++
++_CANVAS_MIN = 13
++_CANVAS_MAX = 15
++_SCATTER_PADDING = 1
++
++_GEN_MAX_RETRIES = 400
++
++
++def _build_cut_path(H: int, W: int) -> list[int] | None:
++    choices = sorted({max(1, W // 2 - 1), min(W - 2, W // 2)})
++    if len(choices) < 2:
++        return None
++    path = [random.choice(choices)]
++    for _ in range(1, H):
++        cur = path[-1]
++        opts = [v for v in choices if abs(v - cur) <= 1]
++        weights = [1 if v == cur else 2 for v in opts]
++        path.append(random.choices(opts, weights=weights, k=1)[0])
++
++    switches = sum(path[i] != path[i - 1] for i in range(1, H))
++    left_area = sum(v + 1 for v in path)
++    total = H * W
++    if switches < _MIN_SEAM_SWITCHES:
++        return None
++    if len(set(path)) < 2:
++        return None
++    if abs(2 * left_area - total) > max(4, H):
++        return None
++    return path
++
++
++def _owner_from_path(path: Iterable[int], H: int, W: int) -> np.ndarray:
++    owner = np.ones((H, W), dtype=int)
++    for r, cut in enumerate(path):
++        owner[int(r), : int(cut) + 1] = 0
++    return owner
++
++
++def _owner_connected(owner: np.ndarray, label: int) -> bool:
++    return len(components_mask(owner == label, connectivity=4)) == 1
++
++
++def _boundary_edges(owner: np.ndarray) -> list[tuple[tuple[int, int], tuple[int, int]]]:
++    H, W = owner.shape
++    edges = []
++    for r in range(H):
++        for c in range(W):
++            if c + 1 < W and owner[r, c] != owner[r, c + 1]:
++                edges.append(((r, c), (r, c + 1)))
++            if r + 1 < H and owner[r, c] != owner[r + 1, c]:
++                edges.append(((r, c), (r + 1, c)))
++    return edges
++
++
++def _same_color_boundary_contacts(out: np.ndarray, owner: np.ndarray) -> int:
++    total = 0
++    for (r1, c1), (r2, c2) in _boundary_edges(owner):
++        if int(out[r1, c1]) == int(out[r2, c2]):
++            total += 1
++    return total
++
++
++def _force_same_color_contacts(out: np.ndarray, owner: np.ndarray, palette: list[int]) -> None:
++    H, W = out.shape
++    edges = _boundary_edges(owner)
++    random.shuffle(edges)
++    for (r1, c1), (r2, c2) in edges:
++        if _same_color_boundary_contacts(out, owner) >= _MIN_SEAM_CONTACTS:
++            return
++        col = random.choice(palette)
++        cells = {
++            (r1, c1),
++            (r2, c2),
++            (r1, W - 1 - c1),
++            (r2, W - 1 - c2),
++        }
++        for r, c in cells:
++            out[int(r), int(c)] = col
++
++
++def _build_symmetric_output(H: int, W: int) -> tuple[np.ndarray | None, np.ndarray | None]:
++    path = _build_cut_path(H, W)
++    if path is None:
++        return None, None
++    owner = _owner_from_path(path, H, W)
++    if not (_owner_connected(owner, 0) and _owner_connected(owner, 1)):
++        return None, None
++
++    n_colors = random.randint(_N_COLORS_MIN, _N_COLORS_MAX)
++    palette = list(range(n_colors))
++    left_w = (W + 1) // 2
++    left = np.zeros((H, left_w), dtype=int)
++    for r in range(H):
++        for c in range(left_w):
++            reuse = []
++            if r > 0:
++                reuse.extend([int(left[r - 1, c])] * 3)
++            if c > 0:
++                reuse.extend([int(left[r, c - 1])] * 2)
++            if r > 0 and c > 0:
++                reuse.append(int(left[r - 1, c - 1]))
++            if reuse and random.random() < 0.68:
++                left[r, c] = random.choice(reuse)
++            else:
++                left[r, c] = random.choice(palette)
++
++    out = np.zeros((H, W), dtype=int)
++    for r in range(H):
++        for c in range(left_w):
++            val = int(left[r, c])
++            out[r, c] = val
++            out[r, W - 1 - c] = val
++
++    _force_same_color_contacts(out, owner, palette)
++    if len(np.unique(out)) < _N_COLORS_MIN:
++        return None, None
++    if _same_color_boundary_contacts(out, owner) < _MIN_SEAM_CONTACTS:
++        return None, None
++    return out, owner
++
++
++def _remap_colors(out: np.ndarray) -> tuple[np.ndarray | None, int]:
++    bg = random.randint(0, 9)
++    abstract = sorted(map(int, np.unique(out)))
++    palette = [c for c in range(10) if c != bg]
++    random.shuffle(palette)
++    if len(palette) < len(abstract):
++        return None, 0
++    cmap = {a: palette[i] for i, a in enumerate(abstract)}
++    real = np.array([[cmap[int(v)] for v in row] for row in out], dtype=int)
++    return real, bg
++
++
++def _piece_patch_from_owner(out: np.ndarray, owner: np.ndarray, label: int, bg: int) -> np.ndarray:
++    pts = np.argwhere(owner == label)
++    r0, c0, r1, c1 = bbox_coords(pts)
++    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
++    for r, c in pts:
++        patch[int(r) - r0, int(c) - c0] = int(out[int(r), int(c)])
++    return patch
++
++
++def _scatter_pieces(patches: list[np.ndarray], bg: int) -> np.ndarray:
++    rows = random.randint(_CANVAS_MIN, _CANVAS_MAX)
++    cols = random.randint(_CANVAS_MIN, _CANVAS_MAX)
++    canvas = np.full((rows, cols), bg, dtype=int)
++    order = [0, 1]
++    random.shuffle(order)
++    for idx in order:
++        patch = patches[idx]
++        r0, c0 = random_free_location(
++            canvas,
++            patch,
++            transparent=bg,
++            border=1,
++            padding=_SCATTER_PADDING,
++            padding_connectivity=8,
++        )
++        paste(canvas, patch, r0, c0, transparent=bg)
++    return canvas
++
++
++def _piece_area_balance(owner: np.ndarray) -> tuple[int, int]:
++    a = int(np.sum(owner == 0))
++    b = int(np.sum(owner == 1))
++    return a, b
++
++
++def _gen_attempt() -> np.ndarray | None:
++    H, W = random.choices(_OUTPUT_DIMS, weights=_OUTPUT_WEIGHTS, k=1)[0]
++    out_abs, owner = _build_symmetric_output(H, W)
++    if out_abs is None or owner is None:
++        return None
++
++    a0, a1 = _piece_area_balance(owner)
++    if min(a0, a1) < (H * W) // 3:
++        return None
++
++    out, bg = _remap_colors(out_abs)
++    if out is None:
++        return None
++
++    patches = [_piece_patch_from_owner(out, owner, label, bg) for label in (0, 1)]
++    try:
++        inp = _scatter_pieces(patches, bg)
++        got = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(got, out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(_GEN_MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid e8686506 combo input")
+
+diff --git a/ceshi/code_combo/e8686506/45/code.py b/ceshi/code_combo/e8686506/45/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..caa331c70dcef284258a49dd866a0054fe915751
+--- /dev/null
++++ b/ceshi/code_combo/e8686506/45/code.py
+@@ -0,0 +1,354 @@
++# Combo variant of e8686506 (index 45)
++# combo_spec: D5/2+D8/1
++# Name: 无颜色相邻约束+仅两个大碎片
++
++import random
++from typing import Iterable
++
++import numpy as np
++
++from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
++
++
++# Design analysis for D5/2 + D8/1
++# 1. The original task extracts many single-color fragments and leans on a no-same-color-touching
++#    rule to prune placements. This combo removes that pruning entirely and collapses the fragment
++#    set into exactly two large multicolor pieces, so grouping by color is no longer valid.
++# 2. Concrete behavior shift: instead of packing many small pieces into a mirrored rectangle, we
++#    build one LR-symmetric dense rectangle and cut it by a long jagged seam into two connected
++#    blobs. The solver therefore matches two translated multicolor patches back into the unique
++#    mirrored rectangle.
++# 3. Complexity calibration: a straight vertical cut would be too trivial, so the generator uses
++#    a row-by-row zigzag seam with multiple switches. The seam is long enough to make edge-fitting
++#    the main clue, but its step size is tightly controlled so the objects remain readable.
++# 4. Visual observability: the generator forces several same-color contacts across the seam. That
++#    makes the merged output visually blur piece boundaries, which directly exhibits the removal of
++#    the old color-adjacency restriction instead of quietly degenerating into the original task.
++# 5. New solver assumptions, all guaranteed by the generator:
++#    - non-background cells form exactly two 4-connected components;
++#    - total area has a unique closest-to-square portrait factorization;
++#    - each component is used by translation only;
++#    - exactly one translated pair tiles the rectangle and yields LR color symmetry.
++# 6. Placement legality: each generated piece is cropped from the final rectangle, then scattered
++#    onto a larger canvas with transparent background and positive spacing, so pieces never overlap
++#    or exit the input bounds.
++
++
++def _factors(n: int) -> list[tuple[int, int]]:
++    out = []
++    for w in range(1, n + 1):
++        if n % w == 0:
++            out.append((n // w, w))
++    return out
++
++
++def _closest_portrait_dims(area: int) -> tuple[int, int]:
++    dims = [(h, w) for h, w in _factors(area) if h >= w]
++    assert dims, "non-background area must admit a portrait factorization"
++    gap = min(abs(h - w) for h, w in dims)
++    best = [(h, w) for h, w in dims if abs(h - w) == gap]
++    assert len(best) == 1, "closest-to-square portrait factor pair must be unique"
++    return best[0]
++
++
++def _crop_piece(grid: np.ndarray, pts: np.ndarray, bg: int) -> np.ndarray:
++    r0, c0, r1, c1 = bbox_coords(pts)
++    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
++    for r, c in pts:
++        patch[int(r) - r0, int(c) - c0] = int(grid[int(r), int(c)])
++    return patch
++
++
++def _patch_sig(patch: np.ndarray, bg: int) -> tuple[int, int, tuple[tuple[int, int, int], ...]]:
++    cells = tuple(
++        sorted((int(r), int(c), int(patch[r, c])) for r, c in np.argwhere(patch != bg))
++    )
++    return int(patch.shape[0]), int(patch.shape[1]), cells
++
++
++def _patch_area(patch: np.ndarray, bg: int) -> int:
++    return int(np.sum(patch != bg))
++
++
++def _placements(piece: np.ndarray, H: int, W: int, bg: int) -> list[dict]:
++    h, w = piece.shape
++    assert h <= H and w <= W, "piece bbox must fit inside the reconstructed rectangle"
++    cells = [(int(r), int(c), int(piece[r, c])) for r, c in np.argwhere(piece != bg)]
++    out = []
++    for r0 in range(H - h + 1):
++        for c0 in range(W - w + 1):
++            occ = np.zeros((H, W), dtype=bool)
++            board = np.full((H, W), -1, dtype=int)
++            for dr, dc, col in cells:
++                occ[r0 + dr, c0 + dc] = True
++                board[r0 + dr, c0 + dc] = col
++            out.append({"occ": occ, "board": board})
++    return out
++
++
++def _extract_two_pieces(grid: np.ndarray, bg: int) -> list[np.ndarray]:
++    comps = components_mask(grid != bg, connectivity=4)
++    assert len(comps) == 2, "input must contain exactly two non-background pieces"
++    pieces = [_crop_piece(grid, pts, bg) for pts in comps]
++    pieces.sort(key=lambda p: (-_patch_area(p, bg), _patch_sig(p, bg)))
++    return pieces
++
++
++def _assemble_two_pieces(pieces: list[np.ndarray], H: int, W: int, bg: int) -> np.ndarray:
++    place_a = _placements(pieces[0], H, W, bg)
++    place_b = _placements(pieces[1], H, W, bg)
++    solutions: dict[bytes, np.ndarray] = {}
++
++    for pa in place_a:
++        occ_a = pa["occ"]
++        board_a = pa["board"]
++        for pb in place_b:
++            occ_b = pb["occ"]
++            if np.any(occ_a & occ_b):
++                continue
++            if int(np.sum(occ_a | occ_b)) != H * W:
++                continue
++            board = np.where(occ_a, board_a, pb["board"])
++            if not np.array_equal(board, board[:, ::-1]):
++                continue
++            solutions.setdefault(board.tobytes(), board.copy())
++
++    assert solutions, "no mirrored rectangle can be formed from the two pieces"
++    assert len(solutions) == 1, "assembly must be uniquely determined"
++    return next(iter(solutions.values()))
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Reassemble two scattered multicolor chunks into one dense rectangle with exact left-right symmetry.
++
++    Input structure:
++    - The background is the most common color.
++    - Every non-background cell belongs to one of exactly two large 4-connected pieces.
++    - Each piece is multicolor, and same-color cells from opposite pieces may legitimately touch after assembly.
++
++    Rule:
++    - Treat each non-background connected component as one rigid jigsaw piece.
++    - Infer the output rectangle from the total occupied area using the unique closest-to-square portrait factor pair.
++    - Translate the two pieces inside that rectangle so they do not overlap, cover it completely, and produce an exact LR mirror image.
++
++    Key insight:
++    - Color adjacency is no longer a safe separator. The reliable cue is the long complementary seam between the two large pieces, with symmetry used only to choose the one translation pair that closes the rectangle correctly.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    pieces = _extract_two_pieces(g, bg)
++    total_area = sum(_patch_area(piece, bg) for piece in pieces)
++    H, W = _closest_portrait_dims(total_area)
++    out = _assemble_two_pieces(pieces, H, W, bg)
++    return out.astype(int)
++
++
++# --------------- generator ---------------
++
++_OUTPUT_DIMS = [(7, 5), (8, 5), (7, 6), (8, 6), (7, 7), (8, 7)]
++_OUTPUT_WEIGHTS = [h * w for h, w in _OUTPUT_DIMS]
++
++_N_COLORS_MIN = 3
++_N_COLORS_MAX = 4
++_MIN_SEAM_CONTACTS = 2
++_MIN_SEAM_SWITCHES = 2
++
++_CANVAS_MIN = 13
++_CANVAS_MAX = 15
++_SCATTER_PADDING = 1
++
++_GEN_MAX_RETRIES = 400
++
++
++def _build_cut_path(H: int, W: int) -> list[int] | None:
++    choices = sorted({max(1, W // 2 - 1), min(W - 2, W // 2)})
++    if len(choices) < 2:
++        return None
++    path = [random.choice(choices)]
++    for _ in range(1, H):
++        cur = path[-1]
++        opts = [v for v in choices if abs(v - cur) <= 1]
++        weights = [1 if v == cur else 2 for v in opts]
++        path.append(random.choices(opts, weights=weights, k=1)[0])
++
++    switches = sum(path[i] != path[i - 1] for i in range(1, H))
++    left_area = sum(v + 1 for v in path)
++    total = H * W
++    if switches < _MIN_SEAM_SWITCHES:
++        return None
++    if len(set(path)) < 2:
++        return None
++    if abs(2 * left_area - total) > max(4, H):
++        return None
++    return path
++
++
++def _owner_from_path(path: Iterable[int], H: int, W: int) -> np.ndarray:
++    owner = np.ones((H, W), dtype=int)
++    for r, cut in enumerate(path):
++        owner[int(r), : int(cut) + 1] = 0
++    return owner
++
++
++def _owner_connected(owner: np.ndarray, label: int) -> bool:
++    return len(components_mask(owner == label, connectivity=4)) == 1
++
++
++def _boundary_edges(owner: np.ndarray) -> list[tuple[tuple[int, int], tuple[int, int]]]:
++    H, W = owner.shape
++    edges = []
++    for r in range(H):
++        for c in range(W):
++            if c + 1 < W and owner[r, c] != owner[r, c + 1]:
++                edges.append(((r, c), (r, c + 1)))
++            if r + 1 < H and owner[r, c] != owner[r + 1, c]:
++                edges.append(((r, c), (r + 1, c)))
++    return edges
++
++
++def _same_color_boundary_contacts(out: np.ndarray, owner: np.ndarray) -> int:
++    total = 0
++    for (r1, c1), (r2, c2) in _boundary_edges(owner):
++        if int(out[r1, c1]) == int(out[r2, c2]):
++            total += 1
++    return total
++
++
++def _force_same_color_contacts(out: np.ndarray, owner: np.ndarray, palette: list[int]) -> None:
++    H, W = out.shape
++    edges = _boundary_edges(owner)
++    random.shuffle(edges)
++    for (r1, c1), (r2, c2) in edges:
++        if _same_color_boundary_contacts(out, owner) >= _MIN_SEAM_CONTACTS:
++            return
++        col = random.choice(palette)
++        cells = {
++            (r1, c1),
++            (r2, c2),
++            (r1, W - 1 - c1),
++            (r2, W - 1 - c2),
++        }
++        for r, c in cells:
++            out[int(r), int(c)] = col
++
++
++def _build_symmetric_output(H: int, W: int) -> tuple[np.ndarray | None, np.ndarray | None]:
++    path = _build_cut_path(H, W)
++    if path is None:
++        return None, None
++    owner = _owner_from_path(path, H, W)
++    if not (_owner_connected(owner, 0) and _owner_connected(owner, 1)):
++        return None, None
++
++    n_colors = random.randint(_N_COLORS_MIN, _N_COLORS_MAX)
++    palette = list(range(n_colors))
++    left_w = (W + 1) // 2
++    left = np.zeros((H, left_w), dtype=int)
++    for r in range(H):
++        for c in range(left_w):
++            reuse = []
++            if r > 0:
++                reuse.extend([int(left[r - 1, c])] * 3)
++            if c > 0:
++                reuse.extend([int(left[r, c - 1])] * 2)
++            if r > 0 and c > 0:
++                reuse.append(int(left[r - 1, c - 1]))
++            if reuse and random.random() < 0.68:
++                left[r, c] = random.choice(reuse)
++            else:
++                left[r, c] = random.choice(palette)
++
++    out = np.zeros((H, W), dtype=int)
++    for r in range(H):
++        for c in range(left_w):
++            val = int(left[r, c])
++            out[r, c] = val
++            out[r, W - 1 - c] = val
++
++    _force_same_color_contacts(out, owner, palette)
++    if len(np.unique(out)) < _N_COLORS_MIN:
++        return None, None
++    if _same_color_boundary_contacts(out, owner) < _MIN_SEAM_CONTACTS:
++        return None, None
++    return out, owner
++
++
++def _remap_colors(out: np.ndarray) -> tuple[np.ndarray | None, int]:
++    bg = random.randint(0, 9)
++    abstract = sorted(map(int, np.unique(out)))
++    palette = [c for c in range(10) if c != bg]
++    random.shuffle(palette)
++    if len(palette) < len(abstract):
++        return None, 0
++    cmap = {a: palette[i] for i, a in enumerate(abstract)}
++    real = np.array([[cmap[int(v)] for v in row] for row in out], dtype=int)
++    return real, bg
++
++
++def _piece_patch_from_owner(out: np.ndarray, owner: np.ndarray, label: int, bg: int) -> np.ndarray:
++    pts = np.argwhere(owner == label)
++    r0, c0, r1, c1 = bbox_coords(pts)
++    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
++    for r, c in pts:
++        patch[int(r) - r0, int(c) - c0] = int(out[int(r), int(c)])
++    return patch
++
++
++def _scatter_pieces(patches: list[np.ndarray], bg: int) -> np.ndarray:
++    rows = random.randint(_CANVAS_MIN, _CANVAS_MAX)
++    cols = random.randint(_CANVAS_MIN, _CANVAS_MAX)
++    canvas = np.full((rows, cols), bg, dtype=int)
++    order = [0, 1]
++    random.shuffle(order)
++    for idx in order:
++        patch = patches[idx]
++        r0, c0 = random_free_location(
++            canvas,
++            patch,
++            transparent=bg,
++            border=1,
++            padding=_SCATTER_PADDING,
++            padding_connectivity=8,
++        )
++        paste(canvas, patch, r0, c0, transparent=bg)
++    return canvas
++
++
++def _piece_area_balance(owner: np.ndarray) -> tuple[int, int]:
++    a = int(np.sum(owner == 0))
++    b = int(np.sum(owner == 1))
++    return a, b
++
++
++def _gen_attempt() -> np.ndarray | None:
++    H, W = random.choices(_OUTPUT_DIMS, weights=_OUTPUT_WEIGHTS, k=1)[0]
++    out_abs, owner = _build_symmetric_output(H, W)
++    if out_abs is None or owner is None:
++        return None
++
++    a0, a1 = _piece_area_balance(owner)
++    if min(a0, a1) < (H * W) // 3:
++        return None
++
++    out, bg = _remap_colors(out_abs)
++    if out is None:
++        return None
++
++    patches = [_piece_patch_from_owner(out, owner, label, bg) for label in (0, 1)]
++    try:
++        inp = _scatter_pieces(patches, bg)
++        got = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(got, out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(_GEN_MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid e8686506 combo input")
+
+codex
+文件已写好，现在先做导入和 50 次回归；如果这里不稳，我会先修求解唯一性或生成器退化问题，再重新跑。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/e8686506/45/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+print('loaded', mod.__name__)
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/e8686506/45/code.py b/ceshi/code_combo/e8686506/45/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..caa331c70dcef284258a49dd866a0054fe915751
+--- /dev/null
++++ b/ceshi/code_combo/e8686506/45/code.py
+@@ -0,0 +1,354 @@
++# Combo variant of e8686506 (index 45)
++# combo_spec: D5/2+D8/1
++# Name: 无颜色相邻约束+仅两个大碎片
++
++import random
++from typing import Iterable
++
++import numpy as np
++
++from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
++
++
++# Design analysis for D5/2 + D8/1
++# 1. The original task extracts many single-color fragments and leans on a no-same-color-touching
++#    rule to prune placements. This combo removes that pruning entirely and collapses the fragment
++#    set into exactly two large multicolor pieces, so grouping by color is no longer valid.
++# 2. Concrete behavior shift: instead of packing many small pieces into a mirrored rectangle, we
++#    build one LR-symmetric dense rectangle and cut it by a long jagged seam into two connected
++#    blobs. The solver therefore matches two translated multicolor patches back into the unique
++#    mirrored rectangle.
++# 3. Complexity calibration: a straight vertical cut would be too trivial, so the generator uses
++#    a row-by-row zigzag seam with multiple switches. The seam is long enough to make edge-fitting
++#    the main clue, but its step size is tightly controlled so the objects remain readable.
++# 4. Visual observability: the generator forces several same-color contacts across the seam. That
++#    makes the merged output visually blur piece boundaries, which directly exhibits the removal of
++#    the old color-adjacency restriction instead of quietly degenerating into the original task.
++# 5. New solver assumptions, all guaranteed by the generator:
++#    - non-background cells form exactly two 4-connected components;
++#    - total area has a unique closest-to-square portrait factorization;
++#    - each component is used by translation only;
++#    - exactly one translated pair tiles the rectangle and yields LR color symmetry.
++# 6. Placement legality: each generated piece is cropped from the final rectangle, then scattered
++#    onto a larger canvas with transparent background and positive spacing, so pieces never overlap
++#    or exit the input bounds.
++
++
++def _factors(n: int) -> list[tuple[int, int]]:
++    out = []
++    for w in range(1, n + 1):
++        if n % w == 0:
++            out.append((n // w, w))
++    return out
++
++
++def _closest_portrait_dims(area: int) -> tuple[int, int]:
++    dims = [(h, w) for h, w in _factors(area) if h >= w]
++    assert dims, "non-background area must admit a portrait factorization"
++    gap = min(abs(h - w) for h, w in dims)
++    best = [(h, w) for h, w in dims if abs(h - w) == gap]
++    assert len(best) == 1, "closest-to-square portrait factor pair must be unique"
++    return best[0]
++
++
++def _crop_piece(grid: np.ndarray, pts: np.ndarray, bg: int) -> np.ndarray:
++    r0, c0, r1, c1 = bbox_coords(pts)
++    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
++    for r, c in pts:
++        patch[int(r) - r0, int(c) - c0] = int(grid[int(r), int(c)])
++    return patch
++
++
++def _patch_sig(patch: np.ndarray, bg: int) -> tuple[int, int, tuple[tuple[int, int, int], ...]]:
++    cells = tuple(
++        sorted((int(r), int(c), int(patch[r, c])) for r, c in np.argwhere(patch != bg))
++    )
++    return int(patch.shape[0]), int(patch.shape[1]), cells
++
++
++def _patch_area(patch: np.ndarray, bg: int) -> int:
++    return int(np.sum(patch != bg))
++
++
++def _placements(piece: np.ndarray, H: int, W: int, bg: int) -> list[dict]:
++    h, w = piece.shape
++    assert h <= H and w <= W, "piece bbox must fit inside the reconstructed rectangle"
++    cells = [(int(r), int(c), int(piece[r, c])) for r, c in np.argwhere(piece != bg)]
++    out = []
++    for r0 in range(H - h + 1):
++        for c0 in range(W - w + 1):
++            occ = np.zeros((H, W), dtype=bool)
++            board = np.full((H, W), -1, dtype=int)
++            for dr, dc, col in cells:
++                occ[r0 + dr, c0 + dc] = True
++                board[r0 + dr, c0 + dc] = col
++            out.append({"occ": occ, "board": board})
++    return out
++
++
++def _extract_two_pieces(grid: np.ndarray, bg: int) -> list[np.ndarray]:
++    comps = components_mask(grid != bg, connectivity=4)
++    assert len(comps) == 2, "input must contain exactly two non-background pieces"
++    pieces = [_crop_piece(grid, pts, bg) for pts in comps]
++    pieces.sort(key=lambda p: (-_patch_area(p, bg), _patch_sig(p, bg)))
++    return pieces
++
++
++def _assemble_two_pieces(pieces: list[np.ndarray], H: int, W: int, bg: int) -> np.ndarray:
++    place_a = _placements(pieces[0], H, W, bg)
++    place_b = _placements(pieces[1], H, W, bg)
++    solutions: dict[bytes, np.ndarray] = {}
++
++    for pa in place_a:
++        occ_a = pa["occ"]
++        board_a = pa["board"]
++        for pb in place_b:
++            occ_b = pb["occ"]
++            if np.any(occ_a & occ_b):
++                continue
++            if int(np.sum(occ_a | occ_b)) != H * W:
++                continue
++            board = np.where(occ_a, board_a, pb["board"])
++            if not np.array_equal(board, board[:, ::-1]):
++                continue
++            solutions.setdefault(board.tobytes(), board.copy())
++
++    assert solutions, "no mirrored rectangle can be formed from the two pieces"
++    assert len(solutions) == 1, "assembly must be uniquely determined"
++    return next(iter(solutions.values()))
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Reassemble two scattered multicolor chunks into one dense rectangle with exact left-right symmetry.
++
++    Input structure:
++    - The background is the most common color.
++    - Every non-background cell belongs to one of exactly two large 4-connected pieces.
++    - Each piece is multicolor, and same-color cells from opposite pieces may legitimately touch after assembly.
++
++    Rule:
++    - Treat each non-background connected component as one rigid jigsaw piece.
++    - Infer the output rectangle from the total occupied area using the unique closest-to-square portrait factor pair.
++    - Translate the two pieces inside that rectangle so they do not overlap, cover it completely, and produce an exact LR mirror image.
++
++    Key insight:
++    - Color adjacency is no longer a safe separator. The reliable cue is the long complementary seam between the two large pieces, with symmetry used only to choose the one translation pair that closes the rectangle correctly.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    pieces = _extract_two_pieces(g, bg)
++    total_area = sum(_patch_area(piece, bg) for piece in pieces)
++    H, W = _closest_portrait_dims(total_area)
++    out = _assemble_two_pieces(pieces, H, W, bg)
++    return out.astype(int)
++
++
++# --------------- generator ---------------
++
++_OUTPUT_DIMS = [(7, 5), (8, 5), (7, 6), (8, 6), (7, 7), (8, 7)]
++_OUTPUT_WEIGHTS = [h * w for h, w in _OUTPUT_DIMS]
++
++_N_COLORS_MIN = 3
++_N_COLORS_MAX = 4
++_MIN_SEAM_CONTACTS = 2
++_MIN_SEAM_SWITCHES = 2
++
++_CANVAS_MIN = 13
++_CANVAS_MAX = 15
++_SCATTER_PADDING = 1
++
++_GEN_MAX_RETRIES = 400
++
++
++def _build_cut_path(H: int, W: int) -> list[int] | None:
++    choices = sorted({max(1, W // 2 - 1), min(W - 2, W // 2)})
++    if len(choices) < 2:
++        return None
++    path = [random.choice(choices)]
++    for _ in range(1, H):
++        cur = path[-1]
++        opts = [v for v in choices if abs(v - cur) <= 1]
++        weights = [1 if v == cur else 2 for v in opts]
++        path.append(random.choices(opts, weights=weights, k=1)[0])
++
++    switches = sum(path[i] != path[i - 1] for i in range(1, H))
++    left_area = sum(v + 1 for v in path)
++    total = H * W
++    if switches < _MIN_SEAM_SWITCHES:
++        return None
++    if len(set(path)) < 2:
++        return None
++    if abs(2 * left_area - total) > max(4, H):
++        return None
++    return path
++
++
++def _owner_from_path(path: Iterable[int], H: int, W: int) -> np.ndarray:
++    owner = np.ones((H, W), dtype=int)
++    for r, cut in enumerate(path):
++        owner[int(r), : int(cut) + 1] = 0
++    return owner
++
++
++def _owner_connected(owner: np.ndarray, label: int) -> bool:
++    return len(components_mask(owner == label, connectivity=4)) == 1
++
++
++def _boundary_edges(owner: np.ndarray) -> list[tuple[tuple[int, int], tuple[int, int]]]:
++    H, W = owner.shape
++    edges = []
++    for r in range(H):
++        for c in range(W):
++            if c + 1 < W and owner[r, c] != owner[r, c + 1]:
++                edges.append(((r, c), (r, c + 1)))
++            if r + 1 < H and owner[r, c] != owner[r + 1, c]:
++                edges.append(((r, c), (r + 1, c)))
++    return edges
++
++
++def _same_color_boundary_contacts(out: np.ndarray, owner: np.ndarray) -> int:
++    total = 0
++    for (r1, c1), (r2, c2) in _boundary_edges(owner):
++        if int(out[r1, c1]) == int(out[r2, c2]):
++            total += 1
++    return total
++
++
++def _force_same_color_contacts(out: np.ndarray, owner: np.ndarray, palette: list[int]) -> None:
++    H, W = out.shape
++    edges = _boundary_edges(owner)
++    random.shuffle(edges)
++    for (r1, c1), (r2, c2) in edges:
++        if _same_color_boundary_contacts(out, owner) >= _MIN_SEAM_CONTACTS:
++            return
++        col = random.choice(palette)
++        cells = {
++            (r1, c1),
++            (r2, c2),
++            (r1, W - 1 - c1),
++            (r2, W - 1 - c2),
++        }
++        for r, c in cells:
++            out[int(r), int(c)] = col
++
++
++def _build_symmetric_output(H: int, W: int) -> tuple[np.ndarray | None, np.ndarray | None]:
++    path = _build_cut_path(H, W)
++    if path is None:
++        return None, None
++    owner = _owner_from_path(path, H, W)
++    if not (_owner_connected(owner, 0) and _owner_connected(owner, 1)):
++        return None, None
++
++    n_colors = random.randint(_N_COLORS_MIN, _N_COLORS_MAX)
++    palette = list(range(n_colors))
++    left_w = (W + 1) // 2
++    left = np.zeros((H, left_w), dtype=int)
++    for r in range(H):
++        for c in range(left_w):
++            reuse = []
++            if r > 0:
++                reuse.extend([int(left[r - 1, c])] * 3)
++            if c > 0:
++                reuse.extend([int(left[r, c - 1])] * 2)
++            if r > 0 and c > 0:
++                reuse.append(int(left[r - 1, c - 1]))
++            if reuse and random.random() < 0.68:
++                left[r, c] = random.choice(reuse)
++            else:
++                left[r, c] = random.choice(palette)
++
++    out = np.zeros((H, W), dtype=int)
++    for r in range(H):
++        for c in range(left_w):
++            val = int(left[r, c])
++            out[r, c] = val
++            out[r, W - 1 - c] = val
++
++    _force_same_color_contacts(out, owner, palette)
++    if len(np.unique(out)) < _N_COLORS_MIN:
++        return None, None
++    if _same_color_boundary_contacts(out, owner) < _MIN_SEAM_CONTACTS:
++        return None, None
++    return out, owner
++
++
++def _remap_colors(out: np.ndarray) -> tuple[np.ndarray | None, int]:
++    bg = random.randint(0, 9)
++    abstract = sorted(map(int, np.unique(out)))
++    palette = [c for c in range(10) if c != bg]
++    random.shuffle(palette)
++    if len(palette) < len(abstract):
++        return None, 0
++    cmap = {a: palette[i] for i, a in enumerate(abstract)}
++    real = np.array([[cmap[int(v)] for v in row] for row in out], dtype=int)
++    return real, bg
++
++
++def _piece_patch_from_owner(out: np.ndarray, owner: np.ndarray, label: int, bg: int) -> np.ndarray:
++    pts = np.argwhere(owner == label)
++    r0, c0, r1, c1 = bbox_coords(pts)
++    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
++    for r, c in pts:
++        patch[int(r) - r0, int(c) - c0] = int(out[int(r), int(c)])
++    return patch
++
++
++def _scatter_pieces(patches: list[np.ndarray], bg: int) -> np.ndarray:
++    rows = random.randint(_CANVAS_MIN, _CANVAS_MAX)
++    cols = random.randint(_CANVAS_MIN, _CANVAS_MAX)
++    canvas = np.full((rows, cols), bg, dtype=int)
++    order = [0, 1]
++    random.shuffle(order)
++    for idx in order:
++        patch = patches[idx]
++        r0, c0 = random_free_location(
++            canvas,
++            patch,
++            transparent=bg,
++            border=1,
++            padding=_SCATTER_PADDING,
++            padding_connectivity=8,
++        )
++        paste(canvas, patch, r0, c0, transparent=bg)
++    return canvas
++
++
++def _piece_area_balance(owner: np.ndarray) -> tuple[int, int]:
++    a = int(np.sum(owner == 0))
++    b = int(np.sum(owner == 1))
++    return a, b
++
++
++def _gen_attempt() -> np.ndarray | None:
++    H, W = random.choices(_OUTPUT_DIMS, weights=_OUTPUT_WEIGHTS, k=1)[0]
++    out_abs, owner = _build_symmetric_output(H, W)
++    if out_abs is None or owner is None:
++        return None
++
++    a0, a1 = _piece_area_balance(owner)
++    if min(a0, a1) < (H * W) // 3:
++        return None
++
++    out, bg = _remap_colors(out_abs)
++    if out is None:
++        return None
++
++    patches = [_piece_patch_from_owner(out, owner, label, bg) for label in (0, 1)]
++    try:
++        inp = _scatter_pieces(patches, bg)
++        got = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(got, out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(_GEN_MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid e8686506 combo input")
+
+ succeeded in 286ms:
+loaded variant
+
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"
+import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/e8686506/45/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/e8686506/45/code.py b/ceshi/code_combo/e8686506/45/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..caa331c70dcef284258a49dd866a0054fe915751
+--- /dev/null
++++ b/ceshi/code_combo/e8686506/45/code.py
+@@ -0,0 +1,354 @@
++# Combo variant of e8686506 (index 45)
++# combo_spec: D5/2+D8/1
++# Name: 无颜色相邻约束+仅两个大碎片
++
++import random
++from typing import Iterable
++
++import numpy as np
++
++from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
++
++
++# Design analysis for D5/2 + D8/1
++# 1. The original task extracts many single-color fragments and leans on a no-same-color-touching
++#    rule to prune placements. This combo removes that pruning entirely and collapses the fragment
++#    set into exactly two large multicolor pieces, so grouping by color is no longer valid.
++# 2. Concrete behavior shift: instead of packing many small pieces into a mirrored rectangle, we
++#    build one LR-symmetric dense rectangle and cut it by a long jagged seam into two connected
++#    blobs. The solver therefore matches two translated multicolor patches back into the unique
++#    mirrored rectangle.
++# 3. Complexity calibration: a straight vertical cut would be too trivial, so the generator uses
++#    a row-by-row zigzag seam with multiple switches. The seam is long enough to make edge-fitting
++#    the main clue, but its step size is tightly controlled so the objects remain readable.
++# 4. Visual observability: the generator forces several same-color contacts across the seam. That
++#    makes the merged output visually blur piece boundaries, which directly exhibits the removal of
++#    the old color-adjacency restriction instead of quietly degenerating into the original task.
++# 5. New solver assumptions, all guaranteed by the generator:
++#    - non-background cells form exactly two 4-connected components;
++#    - total area has a unique closest-to-square portrait factorization;
++#    - each component is used by translation only;
++#    - exactly one translated pair tiles the rectangle and yields LR color symmetry.
++# 6. Placement legality: each generated piece is cropped from the final rectangle, then scattered
++#    onto a larger canvas with transparent background and positive spacing, so pieces never overlap
++#    or exit the input bounds.
++
++
++def _factors(n: int) -> list[tuple[int, int]]:
++    out = []
++    for w in range(1, n + 1):
++        if n % w == 0:
++            out.append((n // w, w))
++    return out
++
++
++def _closest_portrait_dims(area: int) -> tuple[int, int]:
++    dims = [(h, w) for h, w in _factors(area) if h >= w]
++    assert dims, "non-background area must admit a portrait factorization"
++    gap = min(abs(h - w) for h, w in dims)
++    best = [(h, w) for h, w in dims if abs(h - w) == gap]
++    assert len(best) == 1, "closest-to-square portrait factor pair must be unique"
++    return best[0]
++
++
++def _crop_piece(grid: np.ndarray, pts: np.ndarray, bg: int) -> np.ndarray:
++    r0, c0, r1, c1 = bbox_coords(pts)
++    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
++    for r, c in pts:
++        patch[int(r) - r0, int(c) - c0] = int(grid[int(r), int(c)])
++    return patch
++
++
++def _patch_sig(patch: np.ndarray, bg: int) -> tuple[int, int, tuple[tuple[int, int, int], ...]]:
++    cells = tuple(
++        sorted((int(r), int(c), int(patch[r, c])) for r, c in np.argwhere(patch != bg))
++    )
++    return int(patch.shape[0]), int(patch.shape[1]), cells
++
++
++def _patch_area(patch: np.ndarray, bg: int) -> int:
++    return int(np.sum(patch != bg))
++
++
++def _placements(piece: np.ndarray, H: int, W: int, bg: int) -> list[dict]:
++    h, w = piece.shape
++    assert h <= H and w <= W, "piece bbox must fit inside the reconstructed rectangle"
++    cells = [(int(r), int(c), int(piece[r, c])) for r, c in np.argwhere(piece != bg)]
++    out = []
++    for r0 in range(H - h + 1):
++        for c0 in range(W - w + 1):
++            occ = np.zeros((H, W), dtype=bool)
++            board = np.full((H, W), -1, dtype=int)
++            for dr, dc, col in cells:
++                occ[r0 + dr, c0 + dc] = True
++                board[r0 + dr, c0 + dc] = col
++            out.append({"occ": occ, "board": board})
++    return out
++
++
++def _extract_two_pieces(grid: np.ndarray, bg: int) -> list[np.ndarray]:
++    comps = components_mask(grid != bg, connectivity=4)
++    assert len(comps) == 2, "input must contain exactly two non-background pieces"
++    pieces = [_crop_piece(grid, pts, bg) for pts in comps]
++    pieces.sort(key=lambda p: (-_patch_area(p, bg), _patch_sig(p, bg)))
++    return pieces
++
++
++def _assemble_two_pieces(pieces: list[np.ndarray], H: int, W: int, bg: int) -> np.ndarray:
++    place_a = _placements(pieces[0], H, W, bg)
++    place_b = _placements(pieces[1], H, W, bg)
++    solutions: dict[bytes, np.ndarray] = {}
++
++    for pa in place_a:
++        occ_a = pa["occ"]
++        board_a = pa["board"]
++        for pb in place_b:
++            occ_b = pb["occ"]
++            if np.any(occ_a & occ_b):
++                continue
++            if int(np.sum(occ_a | occ_b)) != H * W:
++                continue
++            board = np.where(occ_a, board_a, pb["board"])
++            if not np.array_equal(board, board[:, ::-1]):
++                continue
++            solutions.setdefault(board.tobytes(), board.copy())
++
++    assert solutions, "no mirrored rectangle can be formed from the two pieces"
++    assert len(solutions) == 1, "assembly must be uniquely determined"
++    return next(iter(solutions.values()))
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Reassemble two scattered multicolor chunks into one dense rectangle with exact left-right symmetry.
++
++    Input structure:
++    - The background is the most common color.
++    - Every non-background cell belongs to one of exactly two large 4-connected pieces.
++    - Each piece is multicolor, and same-color cells from opposite pieces may legitimately touch after assembly.
++
++    Rule:
++    - Treat each non-background connected component as one rigid jigsaw piece.
++    - Infer the output rectangle from the total occupied area using the unique closest-to-square portrait factor pair.
++    - Translate the two pieces inside that rectangle so they do not overlap, cover it completely, and produce an exact LR mirror image.
++
++    Key insight:
++    - Color adjacency is no longer a safe separator. The reliable cue is the long complementary seam between the two large pieces, with symmetry used only to choose the one translation pair that closes the rectangle correctly.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    pieces = _extract_two_pieces(g, bg)
++    total_area = sum(_patch_area(piece, bg) for piece in pieces)
++    H, W = _closest_portrait_dims(total_area)
++    out = _assemble_two_pieces(pieces, H, W, bg)
++    return out.astype(int)
++
++
++# --------------- generator ---------------
++
++_OUTPUT_DIMS = [(7, 5), (8, 5), (7, 6), (8, 6), (7, 7), (8, 7)]
++_OUTPUT_WEIGHTS = [h * w for h, w in _OUTPUT_DIMS]
++
++_N_COLORS_MIN = 3
++_N_COLORS_MAX = 4
++_MIN_SEAM_CONTACTS = 2
++_MIN_SEAM_SWITCHES = 2
++
++_CANVAS_MIN = 13
++_CANVAS_MAX = 15
++_SCATTER_PADDING = 1
++
++_GEN_MAX_RETRIES = 400
++
++
++def _build_cut_path(H: int, W: int) -> list[int] | None:
++    choices = sorted({max(1, W // 2 - 1), min(W - 2, W // 2)})
++    if len(choices) < 2:
++        return None
++    path = [random.choice(choices)]
++    for _ in range(1, H):
++        cur = path[-1]
++        opts = [v for v in choices if abs(v - cur) <= 1]
++        weights = [1 if v == cur else 2 for v in opts]
++        path.append(random.choices(opts, weights=weights, k=1)[0])
++
++    switches = sum(path[i] != path[i - 1] for i in range(1, H))
++    left_area = sum(v + 1 for v in path)
++    total = H * W
++    if switches < _MIN_SEAM_SWITCHES:
++        return None
++    if len(set(path)) < 2:
++        return None
++    if abs(2 * left_area - total) > max(4, H):
++        return None
++    return path
++
++
++def _owner_from_path(path: Iterable[int], H: int, W: int) -> np.ndarray:
++    owner = np.ones((H, W), dtype=int)
++    for r, cut in enumerate(path):
++        owner[int(r), : int(cut) + 1] = 0
++    return owner
++
++
++def _owner_connected(owner: np.ndarray, label: int) -> bool:
++    return len(components_mask(owner == label, connectivity=4)) == 1
++
++
++def _boundary_edges(owner: np.ndarray) -> list[tuple[tuple[int, int], tuple[int, int]]]:
++    H, W = owner.shape
++    edges = []
++    for r in range(H):
++        for c in range(W):
++            if c + 1 < W and owner[r, c] != owner[r, c + 1]:
++                edges.append(((r, c), (r, c + 1)))
++            if r + 1 < H and owner[r, c] != owner[r + 1, c]:
++                edges.append(((r, c), (r + 1, c)))
++    return edges
++
++
++def _same_color_boundary_contacts(out: np.ndarray, owner: np.ndarray) -> int:
++    total = 0
++    for (r1, c1), (r2, c2) in _boundary_edges(owner):
++        if int(out[r1, c1]) == int(out[r2, c2]):
++            total += 1
++    return total
++
++
++def _force_same_color_contacts(out: np.ndarray, owner: np.ndarray, palette: list[int]) -> None:
++    H, W = out.shape
++    edges = _boundary_edges(owner)
++    random.shuffle(edges)
++    for (r1, c1), (r2, c2) in edges:
++        if _same_color_boundary_contacts(out, owner) >= _MIN_SEAM_CONTACTS:
++            return
++        col = random.choice(palette)
++        cells = {
++            (r1, c1),
++            (r2, c2),
++            (r1, W - 1 - c1),
++            (r2, W - 1 - c2),
++        }
++        for r, c in cells:
++            out[int(r), int(c)] = col
++
++
++def _build_symmetric_output(H: int, W: int) -> tuple[np.ndarray | None, np.ndarray | None]:
++    path = _build_cut_path(H, W)
++    if path is None:
++        return None, None
++    owner = _owner_from_path(path, H, W)
++    if not (_owner_connected(owner, 0) and _owner_connected(owner, 1)):
++        return None, None
++
++    n_colors = random.randint(_N_COLORS_MIN, _N_COLORS_MAX)
++    palette = list(range(n_colors))
++    left_w = (W + 1) // 2
++    left = np.zeros((H, left_w), dtype=int)
++    for r in range(H):
++        for c in range(left_w):
++            reuse = []
++            if r > 0:
++                reuse.extend([int(left[r - 1, c])] * 3)
++            if c > 0:
++                reuse.extend([int(left[r, c - 1])] * 2)
++            if r > 0 and c > 0:
++                reuse.append(int(left[r - 1, c - 1]))
++            if reuse and random.random() < 0.68:
++                left[r, c] = random.choice(reuse)
++            else:
++                left[r, c] = random.choice(palette)
++
++    out = np.zeros((H, W), dtype=int)
++    for r in range(H):
++        for c in range(left_w):
++            val = int(left[r, c])
++            out[r, c] = val
++            out[r, W - 1 - c] = val
++
++    _force_same_color_contacts(out, owner, palette)
++    if len(np.unique(out)) < _N_COLORS_MIN:
++        return None, None
++    if _same_color_boundary_contacts(out, owner) < _MIN_SEAM_CONTACTS:
++        return None, None
++    return out, owner
++
++
++def _remap_colors(out: np.ndarray) -> tuple[np.ndarray | None, int]:
++    bg = random.randint(0, 9)
++    abstract = sorted(map(int, np.unique(out)))
++    palette = [c for c in range(10) if c != bg]
++    random.shuffle(palette)
++    if len(palette) < len(abstract):
++        return None, 0
++    cmap = {a: palette[i] for i, a in enumerate(abstract)}
++    real = np.array([[cmap[int(v)] for v in row] for row in out], dtype=int)
++    return real, bg
++
++
++def _piece_patch_from_owner(out: np.ndarray, owner: np.ndarray, label: int, bg: int) -> np.ndarray:
++    pts = np.argwhere(owner == label)
++    r0, c0, r1, c1 = bbox_coords(pts)
++    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
++    for r, c in pts:
++        patch[int(r) - r0, int(c) - c0] = int(out[int(r), int(c)])
++    return patch
++
++
++def _scatter_pieces(patches: list[np.ndarray], bg: int) -> np.ndarray:
++    rows = random.randint(_CANVAS_MIN, _CANVAS_MAX)
++    cols = random.randint(_CANVAS_MIN, _CANVAS_MAX)
++    canvas = np.full((rows, cols), bg, dtype=int)
++    order = [0, 1]
++    random.shuffle(order)
++    for idx in order:
++        patch = patches[idx]
++        r0, c0 = random_free_location(
++            canvas,
++            patch,
++            transparent=bg,
++            border=1,
++            padding=_SCATTER_PADDING,
++            padding_connectivity=8,
++        )
++        paste(canvas, patch, r0, c0, transparent=bg)
++    return canvas
++
++
++def _piece_area_balance(owner: np.ndarray) -> tuple[int, int]:
++    a = int(np.sum(owner == 0))
++    b = int(np.sum(owner == 1))
++    return a, b
++
++
++def _gen_attempt() -> np.ndarray | None:
++    H, W = random.choices(_OUTPUT_DIMS, weights=_OUTPUT_WEIGHTS, k=1)[0]
++    out_abs, owner = _build_symmetric_output(H, W)
++    if out_abs is None or owner is None:
++        return None
++
++    a0, a1 = _piece_area_balance(owner)
++    if min(a0, a1) < (H * W) // 3:
++        return None
++
++    out, bg = _remap_colors(out_abs)
++    if out is None:
++        return None
++
++    patches = [_piece_patch_from_owner(out, owner, label, bg) for label in (0, 1)]
++    try:
++        inp = _scatter_pieces(patches, bg)
++        got = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(got, out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(_GEN_MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid e8686506 combo input")
+
+ succeeded in 423ms:
+Success: 50/50, Time: 0.1s (3ms/call)
+
+codex
+求解稳定性已经过了。现在做退化审查：我会统计每个样本在最终拼缝上出现的“同色 4 邻接”数量，确认生成器确实持续产出“无颜色相邻约束”的样本，而不是偶然又回到颜色天然分开的旧行为。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util, numpy as np, statistics
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/e8686506/45/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+def metric(inp):
+    bg = mod.get_bg(inp)
+    pieces = mod._extract_two_pieces(inp, bg)
+    H, W = mod._closest_portrait_dims(sum(mod._patch_area(p, bg) for p in pieces))
+    place_a = mod._placements(pieces[0], H, W, bg)
+    place_b = mod._placements(pieces[1], H, W, bg)
+    sols = []
+    for pa in place_a:
+        for pb in place_b:
+            if np.any(pa['occ'] & pb['occ']):
+                continue
+            if int(np.sum(pa['occ'] | pb['occ'])) "'!= H * W:
+                continue
+            board = np.where(pa['"'occ'], pa['board'], pb['board'])
+            if not np.array_equal(board, board[:, ::-1]):
+                continue
+            owner = np.where(pa['occ'], 0, 1)
+            sols.append((board, owner))
+    uniq = {}
+    for board, owner in sols:
+        uniq.setdefault(board.tobytes(), (board, owner))
+    board, owner = next(iter(uniq.values()))
+    seam_contacts = mod._same_color_boundary_contacts(board, owner)
+    a0 = int(np.sum(owner == 0))
+    a1 = int(np.sum(owner == 1))
+    return seam_contacts, abs(a0 - a1), board.shape
+
+contacts = []
+balances = []
+dims = {}
+for _ in range(100):
+    inp = mod.generate_input()
+    c, b, shape = metric(inp)
+    contacts.append(c)
+    balances.append(b)
+    dims[shape] = dims.get(shape, 0) + 1
+print('same_color_seam_contacts:', {
+    'min': min(contacts),
+    'median': statistics.median(contacts),
+    'mean': round(statistics.mean(contacts), 2),
+    'max': max(contacts),
+    'zero_count': sum(x == 0 for x in contacts),
+})
+print('piece_area_diff:', {
+    'min': min(balances),
+    'median': statistics.median(balances),
+    'mean': round(statistics.mean(balances), 2),
+    'max': max(balances),
+})
+print('dims:', dims)
+PY" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/e8686506/45/code.py b/ceshi/code_combo/e8686506/45/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..caa331c70dcef284258a49dd866a0054fe915751
+--- /dev/null
++++ b/ceshi/code_combo/e8686506/45/code.py
+@@ -0,0 +1,354 @@
++# Combo variant of e8686506 (index 45)
++# combo_spec: D5/2+D8/1
++# Name: 无颜色相邻约束+仅两个大碎片
++
++import random
++from typing import Iterable
++
++import numpy as np
++
++from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
++
++
++# Design analysis for D5/2 + D8/1
++# 1. The original task extracts many single-color fragments and leans on a no-same-color-touching
++#    rule to prune placements. This combo removes that pruning entirely and collapses the fragment
++#    set into exactly two large multicolor pieces, so grouping by color is no longer valid.
++# 2. Concrete behavior shift: instead of packing many small pieces into a mirrored rectangle, we
++#    build one LR-symmetric dense rectangle and cut it by a long jagged seam into two connected
++#    blobs. The solver therefore matches two translated multicolor patches back into the unique
++#    mirrored rectangle.
++# 3. Complexity calibration: a straight vertical cut would be too trivial, so the generator uses
++#    a row-by-row zigzag seam with multiple switches. The seam is long enough to make edge-fitting
++#    the main clue, but its step size is tightly controlled so the objects remain readable.
++# 4. Visual observability: the generator forces several same-color contacts across the seam. That
++#    makes the merged output visually blur piece boundaries, which directly exhibits the removal of
++#    the old color-adjacency restriction instead of quietly degenerating into the original task.
++# 5. New solver assumptions, all guaranteed by the generator:
++#    - non-background cells form exactly two 4-connected components;
++#    - total area has a unique closest-to-square portrait factorization;
++#    - each component is used by translation only;
++#    - exactly one translated pair tiles the rectangle and yields LR color symmetry.
++# 6. Placement legality: each generated piece is cropped from the final rectangle, then scattered
++#    onto a larger canvas with transparent background and positive spacing, so pieces never overlap
++#    or exit the input bounds.
++
++
++def _factors(n: int) -> list[tuple[int, int]]:
++    out = []
++    for w in range(1, n + 1):
++        if n % w == 0:
++            out.append((n // w, w))
++    return out
++
++
++def _closest_portrait_dims(area: int) -> tuple[int, int]:
++    dims = [(h, w) for h, w in _factors(area) if h >= w]
++    assert dims, "non-background area must admit a portrait factorization"
++    gap = min(abs(h - w) for h, w in dims)
++    best = [(h, w) for h, w in dims if abs(h - w) == gap]
++    assert len(best) == 1, "closest-to-square portrait factor pair must be unique"
++    return best[0]
++
++
++def _crop_piece(grid: np.ndarray, pts: np.ndarray, bg: int) -> np.ndarray:
++    r0, c0, r1, c1 = bbox_coords(pts)
++    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
++    for r, c in pts:
++        patch[int(r) - r0, int(c) - c0] = int(grid[int(r), int(c)])
++    return patch
++
++
++def _patch_sig(patch: np.ndarray, bg: int) -> tuple[int, int, tuple[tuple[int, int, int], ...]]:
++    cells = tuple(
++        sorted((int(r), int(c), int(patch[r, c])) for r, c in np.argwhere(patch != bg))
++    )
++    return int(patch.shape[0]), int(patch.shape[1]), cells
++
++
++def _patch_area(patch: np.ndarray, bg: int) -> int:
++    return int(np.sum(patch != bg))
++
++
++def _placements(piece: np.ndarray, H: int, W: int, bg: int) -> list[dict]:
++    h, w = piece.shape
++    assert h <= H and w <= W, "piece bbox must fit inside the reconstructed rectangle"
++    cells = [(int(r), int(c), int(piece[r, c])) for r, c in np.argwhere(piece != bg)]
++    out = []
++    for r0 in range(H - h + 1):
++        for c0 in range(W - w + 1):
++            occ = np.zeros((H, W), dtype=bool)
++            board = np.full((H, W), -1, dtype=int)
++            for dr, dc, col in cells:
++                occ[r0 + dr, c0 + dc] = True
++                board[r0 + dr, c0 + dc] = col
++            out.append({"occ": occ, "board": board})
++    return out
++
++
++def _extract_two_pieces(grid: np.ndarray, bg: int) -> list[np.ndarray]:
++    comps = components_mask(grid != bg, connectivity=4)
++    assert len(comps) == 2, "input must contain exactly two non-background pieces"
++    pieces = [_crop_piece(grid, pts, bg) for pts in comps]
++    pieces.sort(key=lambda p: (-_patch_area(p, bg), _patch_sig(p, bg)))
++    return pieces
++
++
++def _assemble_two_pieces(pieces: list[np.ndarray], H: int, W: int, bg: int) -> np.ndarray:
++    place_a = _placements(pieces[0], H, W, bg)
++    place_b = _placements(pieces[1], H, W, bg)
++    solutions: dict[bytes, np.ndarray] = {}
++
++    for pa in place_a:
++        occ_a = pa["occ"]
++        board_a = pa["board"]
++        for pb in place_b:
++            occ_b = pb["occ"]
++            if np.any(occ_a & occ_b):
++                continue
++            if int(np.sum(occ_a | occ_b)) != H * W:
++                continue
++            board = np.where(occ_a, board_a, pb["board"])
++            if not np.array_equal(board, board[:, ::-1]):
++                continue
++            solutions.setdefault(board.tobytes(), board.copy())
++
++    assert solutions, "no mirrored rectangle can be formed from the two pieces"
++    assert len(solutions) == 1, "assembly must be uniquely determined"
++    return next(iter(solutions.values()))
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Reassemble two scattered multicolor chunks into one dense rectangle with exact left-right symmetry.
++
++    Input structure:
++    - The background is the most common color.
++    - Every non-background cell belongs to one of exactly two large 4-connected pieces.
++    - Each piece is multicolor, and same-color cells from opposite pieces may legitimately touch after assembly.
++
++    Rule:
++    - Treat each non-background connected component as one rigid jigsaw piece.
++    - Infer the output rectangle from the total occupied area using the unique closest-to-square portrait factor pair.
++    - Translate the two pieces inside that rectangle so they do not overlap, cover it completely, and produce an exact LR mirror image.
++
++    Key insight:
++    - Color adjacency is no longer a safe separator. The reliable cue is the long complementary seam between the two large pieces, with symmetry used only to choose the one translation pair that closes the rectangle correctly.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    pieces = _extract_two_pieces(g, bg)
++    total_area = sum(_patch_area(piece, bg) for piece in pieces)
++    H, W = _closest_portrait_dims(total_area)
++    out = _assemble_two_pieces(pieces, H, W, bg)
++    return out.astype(int)
++
++
++# --------------- generator ---------------
++
++_OUTPUT_DIMS = [(7, 5), (8, 5), (7, 6), (8, 6), (7, 7), (8, 7)]
++_OUTPUT_WEIGHTS = [h * w for h, w in _OUTPUT_DIMS]
++
++_N_COLORS_MIN = 3
++_N_COLORS_MAX = 4
++_MIN_SEAM_CONTACTS = 2
++_MIN_SEAM_SWITCHES = 2
++
++_CANVAS_MIN = 13
++_CANVAS_MAX = 15
++_SCATTER_PADDING = 1
++
++_GEN_MAX_RETRIES = 400
++
++
++def _build_cut_path(H: int, W: int) -> list[int] | None:
++    choices = sorted({max(1, W // 2 - 1), min(W - 2, W // 2)})
++    if len(choices) < 2:
++        return None
++    path = [random.choice(choices)]
++    for _ in range(1, H):
++        cur = path[-1]
++        opts = [v for v in choices if abs(v - cur) <= 1]
++        weights = [1 if v == cur else 2 for v in opts]
++        path.append(random.choices(opts, weights=weights, k=1)[0])
++
++    switches = sum(path[i] != path[i - 1] for i in range(1, H))
++    left_area = sum(v + 1 for v in path)
++    total = H * W
++    if switches < _MIN_SEAM_SWITCHES:
++        return None
++    if len(set(path)) < 2:
++        return None
++    if abs(2 * left_area - total) > max(4, H):
++        return None
++    return path
++
++
++def _owner_from_path(path: Iterable[int], H: int, W: int) -> np.ndarray:
++    owner = np.ones((H, W), dtype=int)
++    for r, cut in enumerate(path):
++        owner[int(r), : int(cut) + 1] = 0
++    return owner
++
++
++def _owner_connected(owner: np.ndarray, label: int) -> bool:
++    return len(components_mask(owner == label, connectivity=4)) == 1
++
++
++def _boundary_edges(owner: np.ndarray) -> list[tuple[tuple[int, int], tuple[int, int]]]:
++    H, W = owner.shape
++    edges = []
++    for r in range(H):
++        for c in range(W):
++            if c + 1 < W and owner[r, c] != owner[r, c + 1]:
++                edges.append(((r, c), (r, c + 1)))
++            if r + 1 < H and owner[r, c] != owner[r + 1, c]:
++                edges.append(((r, c), (r + 1, c)))
++    return edges
++
++
++def _same_color_boundary_contacts(out: np.ndarray, owner: np.ndarray) -> int:
++    total = 0
++    for (r1, c1), (r2, c2) in _boundary_edges(owner):
++        if int(out[r1, c1]) == int(out[r2, c2]):
++            total += 1
++    return total
++
++
++def _force_same_color_contacts(out: np.ndarray, owner: np.ndarray, palette: list[int]) -> None:
++    H, W = out.shape
++    edges = _boundary_edges(owner)
++    random.shuffle(edges)
++    for (r1, c1), (r2, c2) in edges:
++        if _same_color_boundary_contacts(out, owner) >= _MIN_SEAM_CONTACTS:
++            return
++        col = random.choice(palette)
++        cells = {
++            (r1, c1),
++            (r2, c2),
++            (r1, W - 1 - c1),
++            (r2, W - 1 - c2),
++        }
++        for r, c in cells:
++            out[int(r), int(c)] = col
++
++
++def _build_symmetric_output(H: int, W: int) -> tuple[np.ndarray | None, np.ndarray | None]:
++    path = _build_cut_path(H, W)
++    if path is None:
++        return None, None
++    owner = _owner_from_path(path, H, W)
++    if not (_owner_connected(owner, 0) and _owner_connected(owner, 1)):
++        return None, None
++
++    n_colors = random.randint(_N_COLORS_MIN, _N_COLORS_MAX)
++    palette = list(range(n_colors))
++    left_w = (W + 1) // 2
++    left = np.zeros((H, left_w), dtype=int)
++    for r in range(H):
++        for c in range(left_w):
++            reuse = []
++            if r > 0:
++                reuse.extend([int(left[r - 1, c])] * 3)
++            if c > 0:
++                reuse.extend([int(left[r, c - 1])] * 2)
++            if r > 0 and c > 0:
++                reuse.append(int(left[r - 1, c - 1]))
++            if reuse and random.random() < 0.68:
++                left[r, c] = random.choice(reuse)
++            else:
++                left[r, c] = random.choice(palette)
++
++    out = np.zeros((H, W), dtype=int)
++    for r in range(H):
++        for c in range(left_w):
++            val = int(left[r, c])
++            out[r, c] = val
++            out[r, W - 1 - c] = val
++
++    _force_same_color_contacts(out, owner, palette)
++    if len(np.unique(out)) < _N_COLORS_MIN:
++        return None, None
++    if _same_color_boundary_contacts(out, owner) < _MIN_SEAM_CONTACTS:
++        return None, None
++    return out, owner
++
++
++def _remap_colors(out: np.ndarray) -> tuple[np.ndarray | None, int]:
++    bg = random.randint(0, 9)
++    abstract = sorted(map(int, np.unique(out)))
++    palette = [c for c in range(10) if c != bg]
++    random.shuffle(palette)
++    if len(palette) < len(abstract):
++        return None, 0
++    cmap = {a: palette[i] for i, a in enumerate(abstract)}
++    real = np.array([[cmap[int(v)] for v in row] for row in out], dtype=int)
++    return real, bg
++
++
++def _piece_patch_from_owner(out: np.ndarray, owner: np.ndarray, label: int, bg: int) -> np.ndarray:
++    pts = np.argwhere(owner == label)
++    r0, c0, r1, c1 = bbox_coords(pts)
++    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
++    for r, c in pts:
++        patch[int(r) - r0, int(c) - c0] = int(out[int(r), int(c)])
++    return patch
++
++
++def _scatter_pieces(patches: list[np.ndarray], bg: int) -> np.ndarray:
++    rows = random.randint(_CANVAS_MIN, _CANVAS_MAX)
++    cols = random.randint(_CANVAS_MIN, _CANVAS_MAX)
++    canvas = np.full((rows, cols), bg, dtype=int)
++    order = [0, 1]
++    random.shuffle(order)
++    for idx in order:
++        patch = patches[idx]
++        r0, c0 = random_free_location(
++            canvas,
++            patch,
++            transparent=bg,
++            border=1,
++            padding=_SCATTER_PADDING,
++            padding_connectivity=8,
++        )
++        paste(canvas, patch, r0, c0, transparent=bg)
++    return canvas
++
++
++def _piece_area_balance(owner: np.ndarray) -> tuple[int, int]:
++    a = int(np.sum(owner == 0))
++    b = int(np.sum(owner == 1))
++    return a, b
++
++
++def _gen_attempt() -> np.ndarray | None:
++    H, W = random.choices(_OUTPUT_DIMS, weights=_OUTPUT_WEIGHTS, k=1)[0]
++    out_abs, owner = _build_symmetric_output(H, W)
++    if out_abs is None or owner is None:
++        return None
++
++    a0, a1 = _piece_area_balance(owner)
++    if min(a0, a1) < (H * W) // 3:
++        return None
++
++    out, bg = _remap_colors(out_abs)
++    if out is None:
++        return None
++
++    patches = [_piece_patch_from_owner(out, owner, label, bg) for label in (0, 1)]
++    try:
++        inp = _scatter_pieces(patches, bg)
++        got = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(got, out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(_GEN_MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid e8686506 combo input")
+
+ succeeded in 566ms:
+same_color_seam_contacts: {'min': 2, 'median': 7.0, 'mean': 6.99, 'max': 13, 'zero_count': 0}
+piece_area_diff: {'min': 0, 'median': 2.0, 'mean': 2.44, 'max': 8}
+dims: {(7, 5): 20, (8, 7): 32, (7, 6): 6, (8, 5): 10, (7, 7): 20, (8, 6): 12}
+
+codex
+融合变体代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/e8686506/45/code.py)。`main()` 改成按 `grid != bg` 提取恰好两个多色大碎片，依据总面积推回唯一近方形纵向矩形，再穷举两块的平移组合，要求“无重叠、恰好铺满、最终左右镜像”。文件顶部和 `main()` 文档字符串里都补了这次 `D5/2 + D8/1` 的设计分析与新规则说明。
+
+测试已通过：
+- 50 次稳定性回归：`Success: 50/50`
+- 速度：约 `3ms/call`
+
+我另外做了退化审查，量化指标定义为“最终拼缝上同色 4 邻接的数量”，用来验证“无颜色相邻约束”确实发生。100 个生成样本统计结果：
+- `min=2`, `median=7`, `mean=6.99`, `max=13`
+- `zero_count=0`
+
+这说明生成器没有退回原题那种颜色天然隔开的行为；同时两块面积差统计为 `median=2`, `mean=2.44`，符合“仅两个面积接近的大碎片”。
+diff --git a/ceshi/code_combo/e8686506/45/code.py b/ceshi/code_combo/e8686506/45/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..caa331c70dcef284258a49dd866a0054fe915751
+--- /dev/null
++++ b/ceshi/code_combo/e8686506/45/code.py
+@@ -0,0 +1,354 @@
++# Combo variant of e8686506 (index 45)
++# combo_spec: D5/2+D8/1
++# Name: 无颜色相邻约束+仅两个大碎片
++
++import random
++from typing import Iterable
++
++import numpy as np
++
++from arc_utils import bbox_coords, components_mask, get_bg, paste, random_free_location
++
++
++# Design analysis for D5/2 + D8/1
++# 1. The original task extracts many single-color fragments and leans on a no-same-color-touching
++#    rule to prune placements. This combo removes that pruning entirely and collapses the fragment
++#    set into exactly two large multicolor pieces, so grouping by color is no longer valid.
++# 2. Concrete behavior shift: instead of packing many small pieces into a mirrored rectangle, we
++#    build one LR-symmetric dense rectangle and cut it by a long jagged seam into two connected
++#    blobs. The solver therefore matches two translated multicolor patches back into the unique
++#    mirrored rectangle.
++# 3. Complexity calibration: a straight vertical cut would be too trivial, so the generator uses
++#    a row-by-row zigzag seam with multiple switches. The seam is long enough to make edge-fitting
++#    the main clue, but its step size is tightly controlled so the objects remain readable.
++# 4. Visual observability: the generator forces several same-color contacts across the seam. That
++#    makes the merged output visually blur piece boundaries, which directly exhibits the removal of
++#    the old color-adjacency restriction instead of quietly degenerating into the original task.
++# 5. New solver assumptions, all guaranteed by the generator:
++#    - non-background cells form exactly two 4-connected components;
++#    - total area has a unique closest-to-square portrait factorization;
++#    - each component is used by translation only;
++#    - exactly one translated pair tiles the rectangle and yields LR color symmetry.
++# 6. Placement legality: each generated piece is cropped from the final rectangle, then scattered
++#    onto a larger canvas with transparent background and positive spacing, so pieces never overlap
++#    or exit the input bounds.
++
++
++def _factors(n: int) -> list[tuple[int, int]]:
++    out = []
++    for w in range(1, n + 1):
++        if n % w == 0:
++            out.append((n // w, w))
++    return out
++
++
++def _closest_portrait_dims(area: int) -> tuple[int, int]:
++    dims = [(h, w) for h, w in _factors(area) if h >= w]
++    assert dims, "non-background area must admit a portrait factorization"
++    gap = min(abs(h - w) for h, w in dims)
++    best = [(h, w) for h, w in dims if abs(h - w) == gap]
++    assert len(best) == 1, "closest-to-square portrait factor pair must be unique"
++    return best[0]
++
++
++def _crop_piece(grid: np.ndarray, pts: np.ndarray, bg: int) -> np.ndarray:
++    r0, c0, r1, c1 = bbox_coords(pts)
++    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
++    for r, c in pts:
++        patch[int(r) - r0, int(c) - c0] = int(grid[int(r), int(c)])
++    return patch
++
++
++def _patch_sig(patch: np.ndarray, bg: int) -> tuple[int, int, tuple[tuple[int, int, int], ...]]:
++    cells = tuple(
++        sorted((int(r), int(c), int(patch[r, c])) for r, c in np.argwhere(patch != bg))
++    )
++    return int(patch.shape[0]), int(patch.shape[1]), cells
++
++
++def _patch_area(patch: np.ndarray, bg: int) -> int:
++    return int(np.sum(patch != bg))
++
++
++def _placements(piece: np.ndarray, H: int, W: int, bg: int) -> list[dict]:
++    h, w = piece.shape
++    assert h <= H and w <= W, "piece bbox must fit inside the reconstructed rectangle"
++    cells = [(int(r), int(c), int(piece[r, c])) for r, c in np.argwhere(piece != bg)]
++    out = []
++    for r0 in range(H - h + 1):
++        for c0 in range(W - w + 1):
++            occ = np.zeros((H, W), dtype=bool)
++            board = np.full((H, W), -1, dtype=int)
++            for dr, dc, col in cells:
++                occ[r0 + dr, c0 + dc] = True
++                board[r0 + dr, c0 + dc] = col
++            out.append({"occ": occ, "board": board})
++    return out
++
++
++def _extract_two_pieces(grid: np.ndarray, bg: int) -> list[np.ndarray]:
++    comps = components_mask(grid != bg, connectivity=4)
++    assert len(comps) == 2, "input must contain exactly two non-background pieces"
++    pieces = [_crop_piece(grid, pts, bg) for pts in comps]
++    pieces.sort(key=lambda p: (-_patch_area(p, bg), _patch_sig(p, bg)))
++    return pieces
++
++
++def _assemble_two_pieces(pieces: list[np.ndarray], H: int, W: int, bg: int) -> np.ndarray:
++    place_a = _placements(pieces[0], H, W, bg)
++    place_b = _placements(pieces[1], H, W, bg)
++    solutions: dict[bytes, np.ndarray] = {}
++
++    for pa in place_a:
++        occ_a = pa["occ"]
++        board_a = pa["board"]
++        for pb in place_b:
++            occ_b = pb["occ"]
++            if np.any(occ_a & occ_b):
++                continue
++            if int(np.sum(occ_a | occ_b)) != H * W:
++                continue
++            board = np.where(occ_a, board_a, pb["board"])
++            if not np.array_equal(board, board[:, ::-1]):
++                continue
++            solutions.setdefault(board.tobytes(), board.copy())
++
++    assert solutions, "no mirrored rectangle can be formed from the two pieces"
++    assert len(solutions) == 1, "assembly must be uniquely determined"
++    return next(iter(solutions.values()))
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Reassemble two scattered multicolor chunks into one dense rectangle with exact left-right symmetry.
++
++    Input structure:
++    - The background is the most common color.
++    - Every non-background cell belongs to one of exactly two large 4-connected pieces.
++    - Each piece is multicolor, and same-color cells from opposite pieces may legitimately touch after assembly.
++
++    Rule:
++    - Treat each non-background connected component as one rigid jigsaw piece.
++    - Infer the output rectangle from the total occupied area using the unique closest-to-square portrait factor pair.
++    - Translate the two pieces inside that rectangle so they do not overlap, cover it completely, and produce an exact LR mirror image.
++
++    Key insight:
++    - Color adjacency is no longer a safe separator. The reliable cue is the long complementary seam between the two large pieces, with symmetry used only to choose the one translation pair that closes the rectangle correctly.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    pieces = _extract_two_pieces(g, bg)
++    total_area = sum(_patch_area(piece, bg) for piece in pieces)
++    H, W = _closest_portrait_dims(total_area)
++    out = _assemble_two_pieces(pieces, H, W, bg)
++    return out.astype(int)
++
++
++# --------------- generator ---------------
++
++_OUTPUT_DIMS = [(7, 5), (8, 5), (7, 6), (8, 6), (7, 7), (8, 7)]
++_OUTPUT_WEIGHTS = [h * w for h, w in _OUTPUT_DIMS]
++
++_N_COLORS_MIN = 3
++_N_COLORS_MAX = 4
++_MIN_SEAM_CONTACTS = 2
++_MIN_SEAM_SWITCHES = 2
++
++_CANVAS_MIN = 13
++_CANVAS_MAX = 15
++_SCATTER_PADDING = 1
++
++_GEN_MAX_RETRIES = 400
++
++
++def _build_cut_path(H: int, W: int) -> list[int] | None:
++    choices = sorted({max(1, W // 2 - 1), min(W - 2, W // 2)})
++    if len(choices) < 2:
++        return None
++    path = [random.choice(choices)]
++    for _ in range(1, H):
++        cur = path[-1]
++        opts = [v for v in choices if abs(v - cur) <= 1]
++        weights = [1 if v == cur else 2 for v in opts]
++        path.append(random.choices(opts, weights=weights, k=1)[0])
++
++    switches = sum(path[i] != path[i - 1] for i in range(1, H))
++    left_area = sum(v + 1 for v in path)
++    total = H * W
++    if switches < _MIN_SEAM_SWITCHES:
++        return None
++    if len(set(path)) < 2:
++        return None
++    if abs(2 * left_area - total) > max(4, H):
++        return None
++    return path
++
++
++def _owner_from_path(path: Iterable[int], H: int, W: int) -> np.ndarray:
++    owner = np.ones((H, W), dtype=int)
++    for r, cut in enumerate(path):
++        owner[int(r), : int(cut) + 1] = 0
++    return owner
++
++
++def _owner_connected(owner: np.ndarray, label: int) -> bool:
++    return len(components_mask(owner == label, connectivity=4)) == 1
++
++
++def _boundary_edges(owner: np.ndarray) -> list[tuple[tuple[int, int], tuple[int, int]]]:
++    H, W = owner.shape
++    edges = []
++    for r in range(H):
++        for c in range(W):
++            if c + 1 < W and owner[r, c] != owner[r, c + 1]:
++                edges.append(((r, c), (r, c + 1)))
++            if r + 1 < H and owner[r, c] != owner[r + 1, c]:
++                edges.append(((r, c), (r + 1, c)))
++    return edges
++
++
++def _same_color_boundary_contacts(out: np.ndarray, owner: np.ndarray) -> int:
++    total = 0
++    for (r1, c1), (r2, c2) in _boundary_edges(owner):
++        if int(out[r1, c1]) == int(out[r2, c2]):
++            total += 1
++    return total
++
++
++def _force_same_color_contacts(out: np.ndarray, owner: np.ndarray, palette: list[int]) -> None:
++    H, W = out.shape
++    edges = _boundary_edges(owner)
++    random.shuffle(edges)
++    for (r1, c1), (r2, c2) in edges:
++        if _same_color_boundary_contacts(out, owner) >= _MIN_SEAM_CONTACTS:
++            return
++        col = random.choice(palette)
++        cells = {
++            (r1, c1),
++            (r2, c2),
++            (r1, W - 1 - c1),
++            (r2, W - 1 - c2),
++        }
++        for r, c in cells:
++            out[int(r), int(c)] = col
++
++
++def _build_symmetric_output(H: int, W: int) -> tuple[np.ndarray | None, np.ndarray | None]:
++    path = _build_cut_path(H, W)
++    if path is None:
++        return None, None
++    owner = _owner_from_path(path, H, W)
++    if not (_owner_connected(owner, 0) and _owner_connected(owner, 1)):
++        return None, None
++
++    n_colors = random.randint(_N_COLORS_MIN, _N_COLORS_MAX)
++    palette = list(range(n_colors))
++    left_w = (W + 1) // 2
++    left = np.zeros((H, left_w), dtype=int)
++    for r in range(H):
++        for c in range(left_w):
++            reuse = []
++            if r > 0:
++                reuse.extend([int(left[r - 1, c])] * 3)
++            if c > 0:
++                reuse.extend([int(left[r, c - 1])] * 2)
++            if r > 0 and c > 0:
++                reuse.append(int(left[r - 1, c - 1]))
++            if reuse and random.random() < 0.68:
++                left[r, c] = random.choice(reuse)
++            else:
++                left[r, c] = random.choice(palette)
++
++    out = np.zeros((H, W), dtype=int)
++    for r in range(H):
++        for c in range(left_w):
++            val = int(left[r, c])
++            out[r, c] = val
++            out[r, W - 1 - c] = val
++
++    _force_same_color_contacts(out, owner, palette)
++    if len(np.unique(out)) < _N_COLORS_MIN:
++        return None, None
++    if _same_color_boundary_contacts(out, owner) < _MIN_SEAM_CONTACTS:
++        return None, None
++    return out, owner
++
++
++def _remap_colors(out: np.ndarray) -> tuple[np.ndarray | None, int]:
++    bg = random.randint(0, 9)
++    abstract = sorted(map(int, np.unique(out)))
++    palette = [c for c in range(10) if c != bg]
++    random.shuffle(palette)
++    if len(palette) < len(abstract):
++        return None, 0
++    cmap = {a: palette[i] for i, a in enumerate(abstract)}
++    real = np.array([[cmap[int(v)] for v in row] for row in out], dtype=int)
++    return real, bg
++
++
++def _piece_patch_from_owner(out: np.ndarray, owner: np.ndarray, label: int, bg: int) -> np.ndarray:
++    pts = np.argwhere(owner == label)
++    r0, c0, r1, c1 = bbox_coords(pts)
++    patch = np.full((r1 - r0 + 1, c1 - c0 + 1), bg, dtype=int)
++    for r, c in pts:
++        patch[int(r) - r0, int(c) - c0] = int(out[int(r), int(c)])
++    return patch
++
++
++def _scatter_pieces(patches: list[np.ndarray], bg: int) -> np.ndarray:
++    rows = random.randint(_CANVAS_MIN, _CANVAS_MAX)
++    cols = random.randint(_CANVAS_MIN, _CANVAS_MAX)
++    canvas = np.full((rows, cols), bg, dtype=int)
++    order = [0, 1]
++    random.shuffle(order)
++    for idx in order:
++        patch = patches[idx]
++        r0, c0 = random_free_location(
++            canvas,
++            patch,
++            transparent=bg,
++            border=1,
++            padding=_SCATTER_PADDING,
++            padding_connectivity=8,
++        )
++        paste(canvas, patch, r0, c0, transparent=bg)
++    return canvas
++
++
++def _piece_area_balance(owner: np.ndarray) -> tuple[int, int]:
++    a = int(np.sum(owner == 0))
++    b = int(np.sum(owner == 1))
++    return a, b
++
++
++def _gen_attempt() -> np.ndarray | None:
++    H, W = random.choices(_OUTPUT_DIMS, weights=_OUTPUT_WEIGHTS, k=1)[0]
++    out_abs, owner = _build_symmetric_output(H, W)
++    if out_abs is None or owner is None:
++        return None
++
++    a0, a1 = _piece_area_balance(owner)
++    if min(a0, a1) < (H * W) // 3:
++        return None
++
++    out, bg = _remap_colors(out_abs)
++    if out is None:
++        return None
++
++    patches = [_piece_patch_from_owner(out, owner, label, bg) for label in (0, 1)]
++    try:
++        inp = _scatter_pieces(patches, bg)
++        got = main(inp)
++    except Exception:
++        return None
++    if np.array_equal(got, out):
++        return inp
++    return None
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(_GEN_MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise RuntimeError("failed to generate a valid e8686506 combo input")
+
+tokens used
+81,421
+融合变体代码已保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/e8686506/45/code.py)。`main()` 改成按 `grid != bg` 提取恰好两个多色大碎片，依据总面积推回唯一近方形纵向矩形，再穷举两块的平移组合，要求“无重叠、恰好铺满、最终左右镜像”。文件顶部和 `main()` 文档字符串里都补了这次 `D5/2 + D8/1` 的设计分析与新规则说明。
+
+测试已通过：
+- 50 次稳定性回归：`Success: 50/50`
+- 速度：约 `3ms/call`
+
+我另外做了退化审查，量化指标定义为“最终拼缝上同色 4 邻接的数量”，用来验证“无颜色相邻约束”确实发生。100 个生成样本统计结果：
+- `min=2`, `median=7`, `mean=6.99`, `max=13`
+- `zero_count=0`
+
+这说明生成器没有退回原题那种颜色天然隔开的行为；同时两块面积差统计为 `median=2`, `mean=2.44`，符合“仅两个面积接近的大碎片”。

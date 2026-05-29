@@ -1,25 +1,19 @@
 ---
 name: gen-variant-code
-description: 为已确认的 ARC-AGI-2 创新变体生成实现代码，支持 Claude subagent (c) 和 OpenAI Codex CLI (o) 两种后端。用法：/gen-variant-code <task_id> [task_id2 ...] [--backend=c|o]，从 ceshi/des/{task_id}.txt 读取该任务的全部已确认创新题号并并行生成实现。
+description: 为已确认的 ARC-AGI-2 创新变体生成实现代码。用法：/gen-variant-code <task_id> [task_id2 ...] [--backend=c|o]，从 ceshi/des/{task_id}.txt 读取该任务的全部已确认创新题号并并行生成实现。
 ---
 
 ## 任务
-对用户确认的创新变体题目，生成变体实现代码（包含 `main()` 和 `generate_input()`），测试验证，输出汇总报告。支持 Claude subagent (c) 和 OpenAI Codex CLI (o) 两种后端。变体列表从 `/home/lixinyu/snap/new/ceshi/des/{task_id}.txt` 读取，调用方只需传入 `task_id`。
+对用户确认的创新变体题目，生成变体实现代码（包含 `main()` 和 `generate_input()`），测试验证，输出汇总报告。变体列表从 `/home/lixinyu/snap/new/ceshi/des/{task_id}.txt` 读取，调用方只需传入 `task_id`。
 
 ## 参数
 - `task_id`：任务 ID（必填，可多个任务）
 - 不接受任何形式的内联题号参数。该 skill 始终从 `/home/lixinyu/snap/new/ceshi/des/{task_id}.txt` 读取该任务的全部已确认创新题号
-- `--backend=c|o`：c=Claude subagent, o=OpenAI Codex CLI（可选，默认 c）
-- 文件每行一个题号，格式固定为 `dim_id/alt_index`，例如：
-  ```
-  D1/0
-  D5/1
-  D14/0
-  ```
+- 文件每行一个题号，格式固定为 `dim_id/alt_index`。
 
 ## 后端
 
-### OpenAI Codex CLI (o)
+### OpenAI Codex CLI 
 - 通过 Bash 调用 `codex exec`
 - 将 `variant_prompt_{task_id}_{dim_id}_alt{alt_index}.txt` 的**完整内容原样**作为 prompt 传给 Codex，不可摘要或改写
 - 调用形式：
@@ -35,7 +29,7 @@ description: 为已确认的 ARC-AGI-2 创新变体生成实现代码，支持 C
 对每个传入的 `task_id`：
 
 1. 读取 `/home/lixinyu/snap/new/ceshi/des/{task_id}.txt`
-2. 将文件中每一行解析为一个 `dim_id/alt_index`，作为该任务要实现的全部创新变体列表
+2. 将文件中每一行解析为一个 `dim_id/alt_index`，作为该任务要实现的全部创新变体列表，注意，alt_index 从 0 开始计数；dim_id 编号从 D1 开始。
 3. 若文件不存在、为空、或任一行不符合 `D<number>/<alt_index>` 形式，立即报错并停止该任务，不要猜测或补全；提示用户先运行 `/gen-dim-analysis` 生成对应文件
 
 ### 阶段一：生成提示词（parent 执行，per 变体）
@@ -66,18 +60,17 @@ description: 为已确认的 ARC-AGI-2 创新变体生成实现代码，支持 C
    - **多变体**：
      - OpenAI 后端：全部在后台并行启动 `codex exec`
 
-### 阶段三：parent 侧审查（必执行阶段；等所有后端任务完成后自动进入，严禁漏掉、跳过、弱化或用“已生成代码”代替审查；必须严格按 5、6、7 顺序执行，此过程由模型审查，不需要存储相关信息）
+### 阶段三：parent 侧审查（必执行）
 
 **强制要求：**
-- 阶段二结束后，**必须**进入阶段三，不能直接结束任务，不能直接向用户汇报“已完成/已生成/可交付”。
-- **第 5 步是阶段三的入口和硬性门禁**。对每个变体完成第 5 步审查前，不得进入第 6 步或第 7 步，不得给该变体标记完成。
-- 即使后端声称“已测试通过”或代码看起来合理，parent 也**仍然必须**亲自执行第 5 步审查；不得把后端自检结果视为对第 5 步的替代。
-- 若存在多个变体，必须**逐个变体**完成第 5 步，不能抽查，不能只审查失败样例，不能只看汇总日志。
+- 阶段二结束后必须进入阶段三，不能直接汇报"已完成"。
+- 每个变体必须由 parent 亲自完成第 5 步逐项核对，后端的自检结果不可替代。
+- 第 5 步未通过时，必须先回到第 6 步修复并重审，再进入第 7 步汇总。
 
 5. 对每个变体，读取 `code.py` 和对应的提示词，审查以下问题：
    - **此步必须逐个变体、逐项核对，不能省略任何一项；这是是否可交付的最终人工审查。**
    - **变体描述一致性**：`main()` 中的新逻辑是否真正实现了提示词中"改为"所描述的行为？有没有偷换概念或过度简化？
-   - **ARC 可解性**：变体规则必须能被人类从 2-4 组 input→output 样例中(颜色变换和逻辑变化)，基于显著且可见的结构线索稳定推断出来，**禁止颜色值参与任何颜色变换、排序**，不依赖复杂的乘除或复杂数学知识，不依赖标签值或其他不易推断的隐藏规则，不允许出现随机逻辑。
+   - **ARC 可解性**：变体规则必须能被人类从 2-4 组 input→output 样例中(颜色变换和逻辑变化)，基于显著且可见的结构线索稳定推断出来，**禁止将颜色 ID 作为数值参与排序、算术或其他对人类不可见的隐藏运算**，不依赖复杂的乘除或复杂数学知识，不依赖标签值或其他不易推断的隐藏规则，不允许出现随机逻辑。
    - **分支覆盖率**：若题目有多个分支，每个分支的覆盖率是否均衡合理，是否都有覆盖到
    - **可视化整洁度**：即使逻辑正确，如果可视化后网格看上去乱七八糟——同一网格区域多种元素覆盖叠加、不同对象或区域无法分辨——也不可接受。需确保每个网格单元的语义清晰、视觉可读。
    - **颜色变化可推断性**：如果变体涉及颜色映射或变化，颜色种类不宜过多且必须有足够的结构性线索（如位置、形状、分区等）让人类能推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况，否则人类无法从样例中归纳出规律。
@@ -95,7 +88,7 @@ description: 为已确认的 ARC-AGI-2 创新变体生成实现代码，支持 C
 - 变体代码：`ceshi/code/{task_id}/{dim_id}/{alt_index}/code.py`
 - 变体提示词（中间产物）：`ceshi/tem2/variant_prompt_{task_id}_{dim_id}_alt{alt_index}.txt`
 - 输入来源：`ceshi/des/{task_id}.txt`
-- 参考来源（由 prompt builder 自动注入）：`spce_dis/{task_id}_spec.yaml`（可选，原题代码生成时的参考文件，用于理解任务设计细节和约束验证）
+- 参考来源（由 prompt builder 自动注入）：`spce_dis/{task_id}_spec.yaml`（原题 spec，供约束校验参考）
 
 ## 模式示例
 - **单任务（Claude）**：`/gen-variant-code 2c181942` → 从 `ceshi/des/2c181942.txt` 读取全部创新题号，并用 Claude subagent 并行实现

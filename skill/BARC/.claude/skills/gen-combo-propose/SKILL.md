@@ -9,11 +9,11 @@ description: 为 ARC-AGI-2 任务从维度分析中自由组合多个 dim/alt，
 ## 参数
 - `task_id`：任务 ID（必填，可多个任务）
 - 不接受任何形式的内联组合参数。提议阶段输出的组合方案写入 YAML
-- 组合数量由模型在系统遍历后决定，宁多勿少；每个维度至少参与一个组合
+- 组合数量由模型在系统遍历后决定；每个维度至少参与一个组合
 
 ## 数据约定
 
-- **combo_spec 字符串**：参与组合的 `dim_id/alt_index` 按 `dim_id` 自然序排序后用 `+` 拼接，如 `D1/0+D5/2+D14/0`。用于标记该组合由哪几个变体融合而来，注意序号从0开始，也就是D1/0...3,D从1开始，即D1...D4。
+- **combo_spec 字符串**：参与组合的 `dim_id/alt_index` 按 `dim_id` 自然序排序后用 `+` 拼接，如 `D1/0+D5/2+D14/0`。用于标记该组合由哪几个变体融合而来，注意：alt_index 从 0 开始计数；dim_id 编号从 D1 开始。
 - **index**：每个组合的序号（从 1 开始），后续 `/gen-combo-code` 阶段以此命名文件路径
 - **des_combo YAML 文件**：`/home/lixinyu/snap/new/ceshi/des_combo/{task_id}.yaml`
 
@@ -26,7 +26,6 @@ description: 为 ARC-AGI-2 任务从维度分析中自由组合多个 dim/alt，
 **启动 subagent**：传入 `task_id`，subagent 按 `combo-proposer.md` 中的流程自行读取 YAML、solver、spec，系统遍历维度对并提议组合
    - 单任务：前台启动
    - 多任务：全部用 `run_in_background: true` 并行
-   - 启动时
 
 ### 步骤二：写入 YAML 文件
 

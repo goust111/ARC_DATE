@@ -1,0 +1,4938 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /home/lixinyu/snap/new
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: high
+reasoning summaries: none
+session id: 019e34c8-4a00-7450-b590-a577ddb95d84
+--------
+user
+    你要修改一个 ARC-AGI-2 任务的 solver 和 generator，实现一个**多维度融合变体**。
+
+    ## 原始任务: db0c5428
+    **摘要**: 输入为一个9x9图案（3x3块阵列，中心块缺失），输出将每个非中心块复制到点对称的外部槽位形成5x5块网格，同时根据周围块的朝向像素重建中心块
+
+    ## 要实现的融合组合
+    - **组合名称**: 简化中心+无空洞+环形排列
+    - **combo_spec**: D3/2+D5/0+D11/1
+
+    ### 融合描述（实现规格）
+
+    中心全填多数色（D5/0，因无空洞此项不适用），无中心空洞（D11/1），外部块环形排列（D3/2）。无空洞去除重建步骤，环形排列改变外扩布局。任务变为纯粹的环形外扩
+
+    ### 各组成项的原始变体详情
+
+    以下是 combo_spec 中每个组成项在维度分析 YAML 中的原始描述，帮助你理解每项改动的来源和细节：
+
+    - **D3/2** — 外部槽位的网格布局 (`dst`)
+  - 当前值: 5x5块网格中原始3x3占据(1,1)-(3,3)，新块填充到对称外侧的8个位置，其余12个外部位置保持背景色
+  - 改为: 环形排列外部块 — 外部块不放置在矩形网格的外层，而是环形排列在原始图案周围，角落块放在对角线方向，边缘块放在正方向。视觉上形成环绕效果而非网格扩展
+  - 来源: creative（参考任务: None）
+- **D5/0** — 中心块的重建机制 (`transform`)
+  - 当前值: 中心块的8个非中心像素取自8个相邻块的朝向像素（facing pixel），中心像素取图案的多数前景色
+  - 改为: 中心块全部使用多数前景色填充 — 不从相邻块提取朝向像素，而是将中心块完全填充为图案的多数前景色（单色块）。简化了中心重建逻辑，但解题者仍需确定多数色
+  - 来源: inversion（参考任务: None）
+- **D11/1** — 中心空洞的形状 (`src`)
+  - 当前值: 中心空洞恰好是一个3x3块，与其他块大小相同，位于3x3阵列正中
+  - 改为: 无空洞（完整3x3阵列） — 所有9个块都有内容，没有缺失。任务变为纯粹的外扩操作——识别块结构并复制到外侧。去除中心重建步骤，简化为单一操作
+  - 来源: inversion（参考任务: None）
+
+    ## 原始 solver + generator 代码
+
+    文件: `/home/lixinyu/snap/new/arc2_solver_select/db0c5428.py`
+
+    ```python
+    from __future__ import annotations
+
+import numpy as np
+
+from arc_utils import bbox, crop_bbox, get_bg, paste
+import random
+
+
+def _major_foreground_color(g: np.ndarray, bg: int) -> int:
+    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
+    assert vals.size, "input must contain foreground colors"
+    return int(vals[int(np.argmax(counts))])
+
+
+def _center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
+    assert block == 3, "this task uses 3x3 blocks"
+    main = _major_foreground_color(g, bg)
+    patch = np.full((block, block), main, dtype=int)
+
+    hole_r = int(r0) + block
+    hole_c = int(c0) + block
+    offsets = [-1, 1, 3]
+    for r in range(block):
+        for c in range(block):
+            if r == block // 2 and c == block // 2:
+                continue
+            patch[r, c] = int(g[hole_r + offsets[r], hole_c + offsets[c]])
+    return patch
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand a 3x3 block motif into a 5x5 block motif around its missing center.
+
+    Input structure:
+    - Teal background surrounds one 9x9 foreground motif.
+    - The motif is a 3x3 array of 3x3 blocks; the middle block is empty teal.
+    - Colored pixels immediately around the empty middle block encode the border
+      of the missing center block.
+
+    Rule:
+    - Keep the original 9x9 motif in place.
+    - Copy each of the eight surrounding 3x3 blocks to the opposite outer slot
+      of the implied 5x5 block grid, without rotating it.
+    - Fill the center block from the eight pixels around the hole; its center is
+      the motif's majority foreground color.
+
+    Key insight: The visible 9x9 motif is the middle of a larger periodic
+    block-level pattern, and the empty center is reconstructed from its immediate
+    inner boundary.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+    motif_bbox = bbox(g != bg)
+    assert motif_bbox is not None, "expected a foreground motif"
+    r0, c0, r1, c1 = motif_bbox
+    h = int(r1 - r0 + 1)
+    w = int(c1 - c0 + 1)
+    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
+    block = h // 3
+
+    out = g.copy()
+    expanded_r0 = int(r0) - block
+    expanded_c0 = int(c0) - block
+
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = crop_bbox(
+                g,
+                (
+                    int(r0) + br * block,
+                    int(c0) + bc * block,
+                    int(r0) + (br + 1) * block - 1,
+                    int(c0) + (bc + 1) * block - 1,
+                ),
+            )
+            dst_r = expanded_r0 + (4 - 2 * br) * block
+            dst_c = expanded_c0 + (4 - 2 * bc) * block
+            paste(out, src, dst_r, dst_c)
+
+    paste(out, _center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# -- CFG: canvas & structure --
+GRID_SIZE_MIN, GRID_SIZE_MAX = 16, 19       # square grid side length
+BLOCK = 3                                    # block side length
+MOTIF_SIZE = BLOCK * 3                       # 9x9 motif (3x3 grid of blocks)
+EXPANDED_SIZE = BLOCK * 5                    # 15x15 expanded output region
+MOTIF_PAD = 3                                # min distance from motif edge to grid edge
+
+# -- CFG: colors --
+BG = 8                                       # background color
+FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
+COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4      # total foreground colors (incl. majority)
+
+# -- CFG: majority pixel counts (corner block + edge block combined) --
+MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16  # range for sum of major pixels in b00+b01
+CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8        # major pixels in corner block (diag-sym)
+EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8            # major pixels in edge block (LR-sym)
+
+# -- CFG: generation --
+MAX_RETRIES = 300
+
+# -- Symmetry orbits for 3x3 blocks --
+# Diagonal-symmetric orbits (b00 == b00.T): cells sharing a diag-orbit get the same color
+DIAG_ORBITS = (
+    ((0, 0),), ((1, 1),), ((2, 2),),
+    ((0, 1), (1, 0)),
+    ((0, 2), (2, 0)),
+    ((1, 2), (2, 1)),
+)
+# LR-symmetric orbits (b01 == fliplr(b01)): cells sharing an LR-orbit get the same color
+LR_ORBITS = (
+    ((0, 0), (0, 2)),
+    ((1, 0), (1, 2)),
+    ((2, 0), (2, 2)),
+    ((0, 1),), ((1, 1),), ((2, 1),),
+)
+
+# Row/col indices for sampling inner-boundary pixels that fill the center patch.
+# Maps block-local (r,c) -> motif row/col via BLOCK + offset.
+_CENTER_OFFSETS = np.array([-1, 1, 3])
+
+
+def _major_orbits(orbits, forced_minor, target_count):
+    """Enumerate all orbit subsets whose total pixel count equals target_count,
+    excluding orbits that contain any forced_minor coordinate, then pick one."""
+    forced_minor = set(forced_minor)
+    usable = [
+        idx for idx, orbit in enumerate(orbits)
+        if all(coord not in forced_minor for coord in orbit)
+    ]
+    choices = []
+    for mask in range(1 << len(usable)):
+        selected = set()
+        total = 0
+        for bit, idx in enumerate(usable):
+            if mask & (1 << bit):
+                selected.add(idx)
+                total += len(orbits[idx])
+        if total == target_count:
+            choices.append(selected)
+    assert choices, "unreachable symmetric majority count"
+    return random.choice(choices)
+
+
+def _seed_block(orbits, forced_minor, majority, target_count):
+    """Build a BLOCK x BLOCK array with majority color placed in orbits totalling
+    target_count pixels. Returns (block, minor_orbits) where minor_orbits is a list
+    of (block_ref, orbit) pairs whose colors are still unset (-1)."""
+    block = np.full((BLOCK, BLOCK), -1, dtype=int)
+    major_idxs = _major_orbits(orbits, forced_minor, target_count)
+    minor_orbits = []
+    for idx, orbit in enumerate(orbits):
+        if idx in major_idxs:
+            for r, c in orbit:
+                block[r, c] = majority
+        else:
+            minor_orbits.append((block, orbit))
+    return block, minor_orbits
+
+
+def _assign_minor_colors(minor_orbits, colors):
+    """Assign minor colors to unfilled orbits, guaranteeing each color appears at
+    least once (remaining orbits get random picks)."""
+    random.shuffle(minor_orbits)
+    guaranteed = list(colors)
+    random.shuffle(guaranteed)
+    assignments = guaranteed + [
+        random.choice(colors) for _ in range(len(minor_orbits) - len(guaranteed))
+    ]
+    for (block, orbit), color in zip(minor_orbits, assignments):
+        for r, c in orbit:
+            block[r, c] = color
+
+
+def _make_blocks(majority, minor_colors, corner_major, edge_major):
+    """Build the two seed blocks (b00=corner, b01=edge) with D4/LR symmetry."""
+    b00, corner_minors = _seed_block(DIAG_ORBITS, [(2, 2)], majority, corner_major)
+    b01, edge_minors = _seed_block(LR_ORBITS, [(2, 1)], majority, edge_major)
+    minor_orbits = corner_minors + edge_minors
+    assert len(minor_orbits) >= len(minor_colors)
+    _assign_minor_colors(minor_orbits, minor_colors)
+    assert np.all(b00 != -1) and np.all(b01 != -1)
+    return b00, b01
+
+
+def _assemble_motif(b00, b01):
+    """Assemble the 9x9 motif from two seed blocks via D4 symmetry; center block is bg."""
+    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
+    blocks = {
+        (0, 0): b00,
+        (0, 1): b01,
+        (0, 2): np.fliplr(b00),
+        (1, 0): b01.T,
+        (1, 2): np.rot90(b01, -1),
+        (2, 0): np.flipud(b00),
+        (2, 1): np.flipud(b01),
+        (2, 2): np.rot90(b00, 2),
+    }
+    for (br, bc), blk in blocks.items():
+        paste(motif, blk, br * BLOCK, bc * BLOCK)
+    return motif
+
+
+def _gen_center_patch(motif, majority):
+    """Reconstruct the center block from the 8 inner-boundary pixels of the motif.
+    Center pixel is the majority foreground color."""
+    rows = BLOCK + _CENTER_OFFSETS
+    cols = BLOCK + _CENTER_OFFSETS
+    patch = motif[np.ix_(rows, cols)].copy()
+    patch[1, 1] = majority
+    return patch
+
+
+def _expanded_output(motif, center):
+    """Build the 15x15 expanded region: original motif (with center filled) in the
+    middle, each surrounding block mirrored to the opposite outer slot."""
+    expanded = np.full((EXPANDED_SIZE, EXPANDED_SIZE), BG, dtype=int)
+    output_motif = motif.copy()
+    paste(output_motif, center, BLOCK, BLOCK)
+    paste(expanded, output_motif, BLOCK, BLOCK)
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = motif[br * BLOCK:(br + 1) * BLOCK, bc * BLOCK:(bc + 1) * BLOCK]
+            paste(expanded, src, (4 - 2 * br) * BLOCK, (4 - 2 * bc) * BLOCK)
+    return expanded
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Single generation attempt: build motif, verify via oracle, return input or None."""
+    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
+    color_count = random.randint(COLOR_COUNT_MIN, COLOR_COUNT_MAX)
+    colors = random.sample(FOREGROUND_COLORS, color_count)
+    majority = colors[0]
+    minor_colors = colors[1:]
+
+    # Choose how many majority pixels across both seed blocks
+    possible_totals = [
+        total for total in range(MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX + 1)
+        if 18 - total >= len(minor_colors)
+    ]
+    majority_total = random.choice(possible_totals)
+    pairs = [
+        (corner, majority_total - corner)
+        for corner in range(CORNER_MAJOR_MIN, CORNER_MAJOR_MAX + 1)
+        if EDGE_MAJOR_MIN <= majority_total - corner <= EDGE_MAJOR_MAX
+    ]
+    corner_major, edge_major = random.choice(pairs)
+
+    b00, b01 = _make_blocks(majority, minor_colors, corner_major, edge_major)
+    motif = _assemble_motif(b00, b01)
+    center = _gen_center_patch(motif, majority)
+    expanded = _expanded_output(motif, center)
+
+    r0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
+    c0 = random.randint(MOTIF_PAD, n - MOTIF_SIZE - MOTIF_PAD)
+    inp = np.full((n, n), BG, dtype=int)
+    out = np.full((n, n), BG, dtype=int)
+    paste(inp, motif, r0, c0)
+    paste(out, expanded, r0 - BLOCK, c0 - BLOCK)
+
+    if np.array_equal(main(inp), out):
+        return inp
+    return None
+
+
+def generate_input() -> np.ndarray:
+    for _ in range(MAX_RETRIES):
+        grid = _gen_attempt()
+        if grid is not None:
+            return grid
+    raise AssertionError("failed to generate a valid db0c5428 input")
+
+    ```
+
+    ## 原始任务规格（Spec）
+
+    以下是从原始 solver 代码和示例中提炼的完整任务规格，包含精确的数值约束和生成策略。
+    Spec 本身就是原题代码生成时的参考文件，因此：
+    - 在**设计分析**阶段，参考 spec 理解原始任务的完整设计细节（对象结构、空间关系、生成策略等），以此为基础思考融合变体的改动如何落实
+    - 在**实现**阶段，参考 spec 中的数值约束（网格尺寸、对象数量/尺寸、颜色数等），确保融合变体在物理上可实现
+
+    ```yaml
+    task_id: db0c5428
+spec:
+  grid: 16-19 rows x 16-19 cols, square [observed], bg=8
+  motif: 9x9 foreground region (3x3 arrangement of 3x3 blocks), center block is bg
+  placement: motif at (r0, c0) with r0 >= 3, c0 >= 3, r0 + 12 <= rows, c0 + 12 <= cols
+  symmetry: entire 9x9 motif has D4 symmetry (LR, UD, 180, both diagonals)
+  corner_block_b00: 3x3, diag-symmetric (b00 == b00.T), determines all 4 corners via D4 rotations
+  edge_block_b01: 3x3, LR-symmetric, determines all 4 edges via D4 rotations
+  block_relationships: |
+    corners: b02=flipLR(b00), b20=flipUD(b00), b22=rot180(b00)
+    edges:   b10=b01.T, b12=rot270(b01), b21=flipUD(b01)
+  colors: 2-4 foreground colors, one is majority (56-89% of motif pixels)
+  center_reconstruction: |
+    8 inner-boundary pixels (corners of adjacent blocks facing the hole) fill
+    center block; center pixel = majority foreground color
+  output: same grid size; original 8 blocks preserved; center block filled;
+    each block copied to opposite slot in a 5x5 block grid (no rotation)
+  expanded_layout: |
+    X . X . X
+    . X X X .
+    X X X X X    (X=block, .=bg; center 3x3 is original motif)
+    . X X X .
+    X . X . X
+generation_strategy:
+  approach: output-first
+  steps:
+    1. Pick grid size N x N in [16..19].
+    2. Choose 2-4 foreground colors; designate one as majority.
+    3. Build b00 (corner seed): random 3x3, diag-symmetric (b00 == b00.T),
+       majority color fills most pixels (>=5 of 9). b00[2,2] must differ from majority.
+    4. Build b01 (edge seed): random 3x3, LR-symmetric, mostly majority color.
+       b01[2,1] should be non-majority (it becomes an inner-boundary pixel).
+    5. Derive all 8 blocks via D4 symmetry. Assemble 9x9 motif; set center block to bg.
+    6. Choose (r0, c0) with r0 in [3, N-12], c0 in [3, N-12]. Place motif on bg grid.
+    7. Verify expanded 5x5 block region fits in grid (guaranteed by step 6).
+    ```
+
+额外要求：原始代码的 `main()` 已包含四段式说明注释/文档字符串（开头概述 + `Input structure:` + `Rule:` + `Key insight:`）。
+生成的新代码里也必须在 `main()` 上方保留这一结构，并根据**融合后的新规则**与**原注释提供的信息**重新编写；可以借鉴原注释的组织方式，但**不要照抄原文**，要让内容准确反映融合后的输入结构、规则和关键洞察。
+
+
+    ## 你的任务
+
+    1. **理解原代码**: 弄清 `main()` 和 `generate_input()` 的逻辑。
+
+    2. **阅读参考代码**（如有）: 上面列出的已有单变体代码是各组成项单独实现的版本，帮助你理解每项变更的实现方式。融合版本应综合参考但不能简单拼接。
+
+    3. **设计分析（写代码前必须完成）**:
+
+       综合「融合描述」和「各组成项详情」，将融合规则落实到代码层面。融合描述给出了整体的 input→output 规则，各组成项详情给出了每项改动的具体含义——两者结合才是完整的实现规格。如果上面提供了原始任务规格（Spec），请将其作为设计分析的重要参考——spec 详细描述了原始任务中各对象的结构、空间关系、生成策略等，理解这些细节有助于你准确判断融合改动的影响范围和实现方式。
+
+       a) **具体化与行为追踪**: 融合后的变体在 ARC 的像素网格中具体长什么样？用一个具体小例子追踪：原始逻辑在每个被改动的环节是怎么执行的 → 融合后应该怎么执行的 → 二者的差异是什么。
+
+       b) **复杂度校准**: 检查你的设计是否过于简化。过于简化会导致两个问题：一是容易产生冲突或重复（例如不同对象变得难以区分，匹配出现歧义），二是变体的视觉效果不明显，肉眼看不出和原任务的区别。同时不要让关键自由度过多；如果规则依赖少数档位、类别或对应关系，应控制在少量取值，并让它们在每个样例中有重复支撑。
+
+       c) **隐式假设审查**: 各组成项的改动可能破坏原代码中的哪些隐式假设？多项改动叠加后是否引入新的冲突？逐行检查 main() 中与变体相关的代码段：每行代码依赖了什么前提？这个前提在融合后是否仍然成立？
+
+       d) **放置合法性**: 生成器在放置对象时，必须保证各个体之间不重叠、不越界，且放置结果符合题意。
+
+       e) **视觉可观察性**: ARC 要求人类从 2-4 个 input→output 样例中肉眼推断规则。禁止使用任何人类不可视因素参与排序等操作（例如黑色=0，禁用）。做一次思想实验：假设你是解题者，看到几组变体生成的 input→output，能否看出融合后的规则？注意不要使用颜色值等人类不可视因素。如果变体的变化规律在2-3组像素网格上无法推出（例如对大量纯色对称对象做不同变换、无法从少量例子归纳颜色对应关系、不同情况的变换涉及正逆向旋转镜像等多种不同变化等，即全部的变化逻辑或者说是变化规律无法在3个输入输出示例对中体现），就需要调整设计使差异可观察。
+
+       f) **可视化整洁度**: 即使逻辑合理，如果可视化后的输出网格看上去乱七八糟也不行。检查：同一网格区域是否存在多种元素覆盖叠加导致无法分辨哪个是哪个？不同对象、区域、标记之间在视觉上是否能清晰区分？如果融合后的网格在视觉上杂乱不堪，需要调整设计（如减少同一区域的叠加层次、增大对象间距、简化标记方式等）。
+
+       g) **变化的可推断性**: 如果融合涉及颜色映射或颜色变化，务必确保颜色种类不宜过多，且颜色变化必须有足够的结构性线索（如位置、形状、分区等伴随特征）让人类能从少量样例中推断出颜色变化规则。避免出现大量颜色变化却无任何提示的情况——如果解题者无法从样例归纳出"什么条件导致什么颜色"，这个融合设计就
+
+       将以上分析写在代码注释中或输出中，然后再开始写代码。
+
+    4. **修改 `main()`**: 按照融合描述和各组成项详情实现新规则。确保各项改动在推理链中有真正的协同，不是各改各的。
+    5. **修改 `generate_input()`**: 确保生成的输入能正确触发融合后的新规则。
+    6. **保证 generator 的正确性**: 沿用 output-first 模式或适当调整，但必须保证每个输入经过新 `main()` 后不崩溃、不触发 assert、输出正确。
+    7. **测试**: 运行以下测试，确保成功率 ≥ 80%:
+
+    ```bash
+    /home/xd/miniconda3/bin/python -c "
+    import numpy as np, importlib.util, time, sys
+    spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45/code.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ok, fail = 0, 0
+    t0 = time.time()
+    for i in range(50):
+        try:
+            inp = mod.generate_input()
+            out = mod.main(inp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3: print(f'Trial {i}: {e}')
+    elapsed = time.time() - t0
+    print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+    if ok < 40: sys.exit(1)
+    "
+    ```
+
+    如果测试失败，分析错误原因，修改代码，重新测试。反复直到通过。
+
+    8. **验证融合行为确实发生**: `main(input)==output` 只能验证求解器不报错，无法验证输入是否真正体现了融合描述中的特征行为——退化为原始行为的输入同样能通过。测试通过后，定义一个量化指标衡量融合核心行为，统计生成样本中该指标的分布。只有当关键控制变量不起作用、样本按融合逻辑执行与按原逻辑执行在相同输入上输出相同结果时，才算退化并需要修正生成器。
+    9. **审查 `main()` 的新隐式假设**: 修改 `main()` 后，它可能对输入产生原始版本中不存在的新假设（如对象间需特定空间关系、匹配特征需可区分、处理顺序依赖前一步结果等）。逐一检查 `main()` 中的每个循环、匹配和条件分支：这段逻辑对输入做了什么假设？`generate_input()` 是否通过构造保证了这些假设？
+
+    ## 参考资源
+    - `/home/lixinyu/snap/new/solvers/arc_utils.py` — 可用的工具函数
+    - `/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/db0c5428.json` — 原任务的 I/O 样例
+
+    ## 输出
+
+    将完整的融合变体代码（包含修改后的 `main()` 和 `generate_input()`）保存到:
+    `/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45/code.py`
+
+    代码文件开头加一段注释说明这是什么融合变体:
+    ```python
+    # Combo variant of db0c5428 (index 45)
+    # combo_spec: D3/2+D5/0+D11/1
+    # Name: 简化中心+无空洞+环形排列
+    ```
+
+    如果原始代码的 `main()` 已有四段式说明注释/文档字符串，则新代码也必须在 `main()` 上方写出同结构的四部分说明：
+    1. 开头概述
+    2. `Input structure:`
+    3. `Rule:`
+    4. `Key insight:`
+
+    确保目录 `/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45` 存在（如不存在则创建）。
+
+codex
+先核对原题实现、工具函数和目标目录结构，再把融合规则落实成可执行的布局与生成约束，之后直接改写 solver/generator 并反复跑测试。
+exec
+/bin/bash -lc "pwd && rg --files /home/lixinyu/snap/new | rg 'db0c5428|arc_utils.py|code_combo/.*/45|ARC-AGI-2/data/evaluation/db0c5428.json'" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+/home/lixinyu/snap/new
+/home/lixinyu/snap/new/ceshi/yaml/dim_analysis_v9_db0c5428.yaml
+/home/lixinyu/snap/new/ceshi/des/db0c5428.txt
+/home/lixinyu/snap/new/ceshi/des_combo/db0c5428.yaml
+/home/lixinyu/snap/new/ceshi/code_combo/898e7135/45/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code_combo/898e7135/45/code.py
+/home/lixinyu/snap/new/ceshi/code_combo/2ba387bc/45/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code_combo/2ba387bc/45/code.py
+/home/lixinyu/snap/new/ceshi/code_combo/b99e7126/45/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code_combo/b99e7126/45/code.py
+/home/lixinyu/snap/new/ceshi/code_combo/da515329/45/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code_combo/da515329/45/code.py
+/home/lixinyu/snap/new/ceshi/code_combo/b10624e5/45/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code_combo/b10624e5/45/code.py
+/home/lixinyu/snap/new/ceshi/code_combo/b10624e5/_logs/45.log
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D5/1/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D5/1/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D5/3/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D5/3/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D9/2/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D9/2/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D2/1/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D2/1/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D2/2/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D2/2/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D8/1/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D8/1/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D1/0/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D1/0/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D1/1/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D1/1/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D1/3/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D1/3/code.py
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_15.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_17.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_40.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_26.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_48.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_29.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_42.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_16.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_2.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_10.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_47.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combos.tsv
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_27.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_5.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_4.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_32.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_6.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_37.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_41.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_43.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_25.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_39.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_9.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_33.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_36.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_45.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_8.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_34.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_38.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_11.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_35.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_28.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_14.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_12.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_23.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_1.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_13.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_20.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_7.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_24.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_19.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_3.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_44.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_31.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_21.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_18.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_46.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_22.log
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/_logs/combo_30.log
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D3/3/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D3/3/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D12/1/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D12/1/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D12/2/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D12/2/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D4/0/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D4/0/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D4/1/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D4/1/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D4/3/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D4/3/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D4/2/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D4/2/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D15/2/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D15/2/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D6/0/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D6/0/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D6/1/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D6/1/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D14/1/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D14/1/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D14/2/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D14/2/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D10/1/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D10/1/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D11/0/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D11/0/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D11/3/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D11/3/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D11/2/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D11/2/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D7/0/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D7/0/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D7/3/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D7/3/code.py
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D7/2/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code/db0c5428/D7/2/code.py
+/home/lixinyu/snap/new/ceshi/code_combo/e12f9a14/45/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code_combo/e12f9a14/45/code.py
+/home/lixinyu/snap/new/ceshi/code_combo/88e364bc/45/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code_combo/88e364bc/45/code.py
+/home/lixinyu/snap/new/ceshi/code_combo/abc82100/45/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code_combo/abc82100/45/code.py
+/home/lixinyu/snap/new/ceshi/code_combo/e12f9a14/_logs/45.log
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/45/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code_combo/eee78d87/45/code.py
+/home/lixinyu/snap/new/ceshi/code_combo/e8686506/45/__pycache__/code.cpython-310.pyc
+/home/lixinyu/snap/new/ceshi/code_combo/e8686506/45/code.py
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/arc2_solver_select/db0c5428.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+from __future__ import annotations
+
+import numpy as np
+
+from arc_utils import bbox, crop_bbox, get_bg, paste
+import random
+
+
+def _major_foreground_color(g: np.ndarray, bg: int) -> int:
+    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
+    assert vals.size, "input must contain foreground colors"
+    return int(vals[int(np.argmax(counts))])
+
+
+def _center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
+    assert block == 3, "this task uses 3x3 blocks"
+    main = _major_foreground_color(g, bg)
+    patch = np.full((block, block), main, dtype=int)
+
+    hole_r = int(r0) + block
+    hole_c = int(c0) + block
+    offsets = [-1, 1, 3]
+    for r in range(block):
+        for c in range(block):
+            if r == block // 2 and c == block // 2:
+                continue
+            patch[r, c] = int(g[hole_r + offsets[r], hole_c + offsets[c]])
+    return patch
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand a 3x3 block motif into a 5x5 block motif around its missing center.
+
+    Input structure:
+    - Teal background surrounds one 9x9 foreground motif.
+    - The motif is a 3x3 array of 3x3 blocks; the middle block is empty teal.
+    - Colored pixels immediately around the empty middle block encode the border
+      of the missing center block.
+
+    Rule:
+    - Keep the original 9x9 motif in place.
+    - Copy each of the eight surrounding 3x3 blocks to the opposite outer slot
+      of the implied 5x5 block grid, without rotating it.
+    - Fill the center block from the eight pixels around the hole; its center is
+      the motif's majority foreground color.
+
+    Key insight: The visible 9x9 motif is the middle of a larger periodic
+    block-level pattern, and the empty center is reconstructed from its immediate
+    inner boundary.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+    motif_bbox = bbox(g != bg)
+    assert motif_bbox is not None, "expected a foreground motif"
+    r0, c0, r1, c1 = motif_bbox
+    h = int(r1 - r0 + 1)
+    w = int(c1 - c0 + 1)
+    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
+    block = h // 3
+
+    out = g.copy()
+    expanded_r0 = int(r0) - block
+    expanded_c0 = int(c0) - block
+
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = crop_bbox(
+                g,
+                (
+                    int(r0) + br * block,
+                    int(c0) + bc * block,
+                    int(r0) + (br + 1) * block - 1,
+                    int(c0) + (bc + 1) * block - 1,
+                ),
+            )
+            dst_r = expanded_r0 + (4 - 2 * br) * block
+            dst_c = expanded_c0 + (4 - 2 * bc) * block
+            paste(out, src, dst_r, dst_c)
+
+    paste(out, _center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
+    return out
+
+# --------------- generator (o5x) ---------------
+
+# -- CFG: canvas & structure --
+GRID_SIZE_MIN, GRID_SIZE_MAX = 16, 19       # square grid side length
+BLOCK = 3                                    # block side length
+MOTIF_SIZE = BLOCK * 3                       # 9x9 motif (3x3 grid of blocks)
+EXPANDED_SIZE = BLOCK * 5                    # 15x15 expanded output region
+MOTIF_PAD = 3                                # min distance from motif edge to grid edge
+
+# -- CFG: colors --
+BG = 8                                       # background color
+FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
+COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4      # total foreground colors (incl. majority)
+
+# -- CFG: majority pixel counts (corner block + edge block combined) --
+MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16  # range for sum of major pixels in b00+b01
+CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8        # major pixels in corner block (diag-sym)
+EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8            # major pixels in edge block (LR-sym)
+
+# -- CFG: generation --
+MAX_RETRIES = 300
+
+# -- Symmetry orbits for 3x3 blocks --
+# Diagonal-symmetric orbits (b00 == b00.T): cells sharing a diag-orbit get the same color
+DIAG_ORBITS = (
+    ((0, 0),), ((1, 1),), ((2, 2),),
+    ((0, 1), (1, 0)),
+    ((0, 2), (2, 0)),
+    ((1, 2), (2, 1)),
+)
+# LR-symmetric orbits (b01 == fliplr(b01)): cells sharing an LR-orbit get the same color
+LR_ORBITS = (
+    ((0, 0), (0, 2)),
+    ((1, 0), (1, 2)),
+    ((2, 0), (2, 2)),
+    ((0, 1),), ((1, 1),), ((2, 1),),
+)
+
+# Row/col indices for sampling inner-boundary pixels that fill the center patch.
+# Maps block-local (r,c) -> motif row/col via BLOCK + offset.
+_CENTER_OFFSETS = np.array([-1, 1, 3])
+
+
+def _major_orbits(orbits, forced_minor, target_count):
+    """Enumerate all orbit subsets whose total pixel count equals target_count,
+    excluding orbits that contain any forced_minor coordinate, then pick one."""
+    forced_minor = set(forced_minor)
+    usable = [
+        idx for idx, orbit in enumerate(orbits)
+        if all(coord not in forced_minor for coord in orbit)
+    ]
+    choices = []
+    for mask in range(1 << len(usable)):
+        selected = set()
+        total = 0
+        for bit, idx in enumerate(usable):
+            if mask & (1 << bit):
+                selected.add(idx)
+                total += len(orbits[idx])
+        if total == target_count:
+            choices.append(selected)
+    assert choices, "unreachable symmetric majority count"
+    return random.choice(choices)
+
+
+def _seed_block(orbits, forced_minor, majority, target_count):
+    """Build a BLOCK x BLOCK array with majority color placed in orbits totalling
+    target_count pixels. Returns (block, minor_orbits) where minor_orbits is a list
+    of (block_ref, orbit) pairs whose colors are still unset (-1)."""
+    block = np.full((BLOCK, BLOCK), -1, dtype=int)
+    major_idxs = _major_orbits(orbits, forced_minor, target_count)
+    minor_orbits = []
+    for idx, orbit in enumerate(orbits):
+        if idx in major_idxs:
+            for r, c in orbit:
+                block[r, c] = majority
+        else:
+            minor_orbits.append((block, orbit))
+    return block, minor_orbits
+
+
+def _assign_minor_colors(minor_orbits, colors):
+    """Assign minor colors to unfilled orbits, guaranteeing each color appears at
+    least once (remaining orbits get random picks)."""
+    random.shuffle(minor_orbits)
+    guaranteed = list(colors)
+    random.shuffle(guaranteed)
+    assignments = guaranteed + [
+        random.choice(colors) for _ in range(len(minor_orbits) - len(guaranteed))
+    ]
+    for (block, orbit), color in zip(minor_orbits, assignments):
+        for r, c in orbit:
+            block[r, c] = color
+
+
+def _make_blocks(majority, minor_colors, corner_major, edge_major):
+    """Build the two seed blocks (b00=corner, b01=edge) with D4/LR symmetry."""
+    b00, corner_minors = _seed_block(DIAG_ORBITS, [(2, 2)], majority, corner_major)
+    b01, edge_minors = _seed_block(LR_ORBITS, [(2, 1)], majority, edge_major)
+    minor_orbits = corner_minors + edge_minors
+    assert len(minor_orbits) >= len(minor_colors)
+    _assign_minor_colors(minor_orbits, minor_colors)
+    assert np.all(b00 != -1) and np.all(b01 != -1)
+    return b00, b01
+
+
+def _assemble_motif(b00, b01):
+    """Assemble the 9x9 motif from two seed blocks via D4 symmetry; center block is bg."""
+    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
+    blocks = {
+        (0, 0): b00,
+        (0, 1): b01,
+        (0, 2): np.fliplr(b00),
+        (1, 0): b01.T,
+        (1, 2): np.rot90(b01, -1),
+        (2, 0): np.flipud(b00),
+        (2, 1): np.flipud(b01),
+        (2, 2): np.rot90(b00, 2),
+    }
+    for (br, bc), blk in blocks.items():
+        paste(motif, blk, br * BLOCK, bc * BLOCK)
+    return motif
+
+
+def _gen_center_patch(motif, majority):
+    """Reconstruct the center block from the 8 inner-boundary pixels of the motif.
+    Center pixel is the majority foreground color."""
+    rows = BLOCK + _CENTER_OFFSETS
+    cols = BLOCK + _CENTER_OFFSETS
+    patch = motif[np.ix_(rows, cols)].copy()
+    patch[1, 1] = majority
+    return patch
+
+
+def _expanded_output(motif, center):
+    """Build the 15x15 expanded region: original motif (with center filled) in the
+    middle, each surrounding block mirrored to the opposite outer slot."""
+    expanded = np.full((EXPANDED_SIZE, EXPANDED_SIZE), BG, dtype=int)
+    output_motif = motif.copy()
+    paste(output_motif, center, BLOCK, BLOCK)
+    paste(expanded, output_motif, BLOCK, BLOCK)
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = motif[br * BLOCK:(br + 1) * BLOCK, bc * BLOCK:(bc + 1) * BLOCK]
+            paste(expanded, src, (4 - 2 * br) * BLOCK, (4 - 2 * bc) * BLOCK)
+    return expanded
+
+
+def _gen_attempt() -> np.ndarray | None:
+    """Single generation attempt: build motif, verify via oracle, return input or None."""
+    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
+    color_count = random.randint(COLOR_COUNT_MIN, COLOR_COUNT_MAX)
+    colors = random.sample(FOREGROUND_COLORS, color_count)
+    majority = colors[0]
+    minor_colors = colors[1:]
+
+    # Choose how many majority pixels across both seed blocks
+    possible_totals = [
+        total for total in range(MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX + 1)
+        if 18 - total >= len(minor_colors)
+    ]
+    majority_total = random.choice(possible_totals)
+    pairs = [
+        (corner, majority_total - corner)
+        for corner in range(CORNER_MAJOR_MIN, CORNER_MAJOR_MAX + 1)
+        if EDGE_MAJOR_MIN <= majority_total - corner <= EDGE_MAJOR_MAX
+    ]
+    corner_major, edge_major = random.choice(pairs)
+
+    b00, b01 = _make_blocks(majority, minor_colors, corner_major, edge_major)
+    motif = _assemble_motif(b00, b01)
+    center = _gen_center_patch(motif, majority)
+    expanded = _expanded_output(motif, center)
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+"""
+ARC unified helper library (single file, canonical APIs).
+
+This module is the single shared helper surface that *all* solver examples should
+use (ARC-2 and migrated ARC-1 seeds), so they can appear together in one prompt
+without API confusion.
+
+## Conventions (non-negotiable)
+- Grid shape: `grid.shape == (H, W)` meaning `(rows, cols)`.
+- Indexing: always `grid[r, c]`.
+- Coords: always `(r, c)`.
+- BBox: `(r0, c0, r1, c1)` inclusive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import itertools
+import warnings
+from collections import Counter
+from typing import Iterable, Iterator, Sequence
+
+import numpy as np
+from scipy.ndimage import label
+from scipy import ndimage
+
+# =============================================================================
+# Colors
+# =============================================================================
+
+
+class Color:
+    """ARC palette color ids (ints, not Enum)."""
+
+    BLACK = 0
+    BLUE = 1
+    RED = 2
+    GREEN = 3
+    YELLOW = 4
+    GREY = 5
+    GRAY = 5
+    PINK = 6
+    ORANGE = 7
+    TEAL = 8
+    MAROON = 9
+
+    WHITE = 10  # debug / visualization
+    PAD = 11
+
+    BACKGROUND = 0
+
+    ALL_COLORS = [BLACK, BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+    NOT_BLACK = [BLUE, RED, GREEN, YELLOW, GREY, PINK, ORANGE, TEAL, MAROON]
+
+
+ARC_RGB = np.array(
+    [
+        (0x00, 0x00, 0x00),  # 0 black
+        (0x00, 0x74, 0xD9),  # 1 blue
+        (0xFF, 0x41, 0x36),  # 2 red
+        (0x2E, 0xCC, 0x40),  # 3 green
+        (0xFF, 0xDC, 0x00),  # 4 yellow
+        (0xA0, 0xA0, 0xA0),  # 5 grey
+        (0xF0, 0x12, 0xBE),  # 6 magenta/pink
+        (0xFF, 0x85, 0x1B),  # 7 orange
+        (0x7F, 0xDB, 0xFF),  # 8 teal/azure
+        (0x87, 0x0C, 0x25),  # 9 maroon
+        (0xFF, 0xFF, 0xFF),  # 10 white
+        (0x00, 0x00, 0x00),  # 11 pad fallback
+    ],
+    dtype=np.uint8,
+)
+
+
+# =============================================================================
+# Types + basics
+# =============================================================================
+
+BBox = tuple[int, int, int, int]  # (r0,c0,r1,c1) inclusive
+Coord = tuple[int, int]  # (r,c)
+
+
+def get_bg(grid: np.ndarray) -> int:
+    """Background color = most common value in the grid."""
+    return int(Counter(map(int, grid.flatten())).most_common(1)[0][0])
+
+
+def colors_present(grid: np.ndarray, *, exclude: Iterable[int] | None = None) -> list[int]:
+    """
+    Return the sorted unique colors present in `grid`.
+
+    Args:
+        exclude: optional iterable of colors to exclude (e.g. `{bg}`)
+    """
+    cols = set(map(int, grid.flatten()))
+    if exclude is not None:
+        cols -= set(map(int, exclude))
+    return sorted(cols)
+
+
+def in_bounds(shape: tuple[int, int], r: int, c: int) -> bool:
+    """Return True iff (r,c) is within a grid of shape (H,W)."""
+    H, W = map(int, shape)
+    return 0 <= int(r) < H and 0 <= int(c) < W
+
+
+def neighbors4(r: int, c: int) -> Iterator[Coord]:
+    """4-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    yield r - 1, c
+    yield r + 1, c
+    yield r, c - 1
+    yield r, c + 1
+
+
+def neighbors8(r: int, c: int) -> Iterator[Coord]:
+    """8-neighborhood of (r,c)."""
+    r = int(r)
+    c = int(c)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            yield r + dr, c + dc
+
+
+
+
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
+
+
+def scale_sprite(sprite: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Scale a sprite by an integer factor using nearest-neighbor replication.
+
+    Returns an array of shape (h*factor, w*factor).
+    """
+    k = int(factor)
+    if k <= 0:
+        raise ValueError("scale_sprite: factor must be >= 1")
+    return np.kron(sprite, np.ones((k, k), dtype=sprite.dtype))
+
+
+# =============================================================================
+# Internal helpers (for legacy keyword aliases during migration)
+# =============================================================================
+
+
+def _consume_alias(kwargs: dict, primary: str, aliases: Sequence[str]):
+    """
+    Consume a keyword argument by primary name or any alias, ensuring no conflicts.
+
+    Returns:
+        (value, used_name) or (None, None) if not found.
+    """
+    used = None
+    if primary in kwargs:
+        used = primary
+    else:
+        for a in aliases:
+            if a in kwargs:
+                used = a
+                break
+    if used is None:
+        return None, None
+    val = kwargs.pop(used)
+    names = [primary, *aliases]
+    for n in names:
+        if n != used and n in kwargs:
+            raise TypeError(f"got multiple values for {primary}: {used} and {n}")
+    return val, used
+
+
+# =============================================================================
+# Masks / coords
+# =============================================================================
+
+
+def coords_where(mask: np.ndarray) -> np.ndarray:
+    """Return coords where mask is True as an (N,2) array of (r,c)."""
+    return np.argwhere(mask)
+
+
+
+
+# =============================================================================
+# BBox
+# =============================================================================
+
+
+def bbox_coords(coords: np.ndarray) -> BBox:
+    """BBox of an (N,2) coords array (r,c). Returns (r0,c0,r1,c1) inclusive."""
+    r0, c0 = coords.min(axis=0)
+    r1, c1 = coords.max(axis=0)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox(mask: np.ndarray) -> BBox | None:
+    """
+    Bounding box (bbox) of a boolean mask.
+
+    Args:
+        mask: boolean array where True indicates foreground.
+
+    Returns:
+        (r0,c0,r1,c1) inclusive, or None if the mask has no True values.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    return bbox_coords(coords)
+
+
+def bbox_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask that is True exactly inside the bbox of `mask`.
+
+    This corresponds to `bounding_box_mask(...)` in the legacy seeds API.
+    If `mask` is empty, returns an all-False mask.
+    """
+    out = np.zeros_like(mask, dtype=bool)
+    b = bbox(mask)
+    if b is None:
+        return out
+    r0, c0, r1, c1 = b
+    out[int(r0) : int(r1) + 1, int(c0) : int(c1) + 1] = True
+    return out
+
+
+def bbox_union(bboxes: Iterable[BBox]) -> BBox | None:
+    """Union of bboxes, or None for empty input."""
+    bbs = list(bboxes)
+    if not bbs:
+        return None
+    r0 = min(b[0] for b in bbs)
+    c0 = min(b[1] for b in bbs)
+    r1 = max(b[2] for b in bbs)
+    c1 = max(b[3] for b in bbs)
+    return int(r0), int(c0), int(r1), int(c1)
+
+
+def bbox_h(b: BBox) -> int:
+    r0, _c0, r1, _c1 = b
+    return int(r1 - r0 + 1)
+
+
+def bbox_w(b: BBox) -> int:
+    _r0, c0, _r1, c1 = b
+    return int(c1 - c0 + 1)
+
+
+def bbox_anchor(b: BBox, *, anchor: str = "upper left") -> Coord:
+    """
+    Return an anchor point (r,c) for a bbox.
+
+exec
+/bin/bash -lc "python - <<'PY'
+import json
+p='/home/lixinyu/snap/new/ARC-data/ARC-AGI-2/data/evaluation/db0c5428.json'
+with open(p) as f:
+    data=json.load(f)
+print('train', len(data['train']), 'test', len(data['test']))
+for split in ['train','test']:
+    for i,ex in enumerate(data[split][:3]):
+        inp=ex['input']; out=ex['output']
+        print(split, i, len(inp), len(inp[0]), '->', len(out), len(out[0]))
+PY" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+train 3 test 1
+train 0 18 18 -> 18 18
+train 1 16 16 -> 16 16
+train 2 19 19 -> 19 19
+test 0 17 17 -> 17 17
+
+codex
+原题细节已确认。接下来补看维度描述与相关单变体代码，重点确定“无空洞后如何识别 3x3 block 阵列”和“环形排列”需要固定成什么像素布局，避免生成器退化回原题。
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/ceshi/yaml/dim_analysis_v9_db0c5428.yaml" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+task_id: db0c5428
+task_type: symmetry/pattern
+summary: "输入为一个9x9图案（3x3块阵列，中心块缺失），输出将每个非中心块复制到点对称的外部槽位形成5x5块网格，同时根据周围块的朝向像素重建中心块"
+
+dimensions:
+  - id: D1
+    name: "块到外部槽位的映射规则"
+    tag: match_cond
+    current: "每个非中心3x3块被复制到以中心为对称点的对侧外部槽位，即block(r,c)映射到5x5网格的(4-2r, 4-2c)位置"
+    alternatives:
+      - name: "旋转90度映射而非点对称映射"
+        description: "将每个非中心块按顺时针90度旋转映射到外部槽位，例如左上块映射到右上外侧而非右下外侧。解题者需要识别旋转方向而非简单点对称，改变空间推理模式"
+        source: creative
+        source_task: null
+        delta_lines: 25
+      - name: "镜像映射（仅沿一个轴）"
+        description: "块仅沿水平或垂直轴镜像到外侧，而非点对称。例如左上块只映射到左下外侧（垂直镜像）。解题者需要判断镜像轴方向，且外部槽位布局不再具有完全对称性"
+        source: inversion
+        source_task: null
+        delta_lines: 20
+      - name: "按距离中心远近映射到不同层级"
+        description: "角落块（距中心最远）映射到最外层槽位，边缘块（距中心较近）映射到较近的外层。引入距离概念作为映射依据，解题者需要计算每个块到中心的距离来确定目标位置"
+        source: creative
+        source_task: null
+        delta_lines: 30
+      - name: "颜色匹配决定映射目标"
+        description: "外部槽位中预放置单个颜色标记像素，块需要根据自身主色与标记颜色的匹配关系确定映射到哪个槽位。将空间规则转化为颜色匹配规则，推理路径完全改变"
+        source: catalog_tag_name
+        source_task: 4c416de3
+        delta_lines: 35
+
+  - id: D2
+    name: "源图案的块阵列结构"
+    tag: src
+    current: "9x9图案由3x3个3x3块组成，中心块缺失（填充背景色），块间无间隔"
+    alternatives:
+      - name: "4x4块阵列（16个块，中心2x2缺失）"
+        description: "扩展为4x4个3x3块的12x12图案，中心4个块缺失。外扩后形成6x6块网格，中心需要重建4个块而非1个。增加了规模和中心重建的复杂度"
+        source: creative
+        source_task: null
+        delta_lines: 40
+      - name: "块间带1像素分隔线"
+        description: "3x3块之间用1像素宽的分隔线（特定颜色）隔开，图案总尺寸变为11x11。解题者需要识别分隔线并理解外扩时分隔线的延续规则"
+        source: creative
+        source_task: null
+        delta_lines: 25
+      - name: "块大小可变（2x2或4x4）"
+        description: "块的尺寸不固定为3x3，在不同示例中可能是2x2或4x4，解题者需要先推断块的大小再执行后续操作。增加了参数推断的步骤"
+        source: creative
+        source_task: null
+        delta_lines: 20
+      - name: "十字形阵列（仅保留中心行和中心列的块）"
+        description: "不是完整的3x3阵列，而是十字形排列的5个块（中心缺失，四角也缺失）。外扩时仅有4个非中心块参与映射，输出形态为十字形扩展"
+        source: inversion
+        source_task: null
+        delta_lines: 30
+
+  - id: D3
+    name: "外部槽位的网格布局"
+    tag: dst
+    current: "5x5块网格中原始3x3占据(1,1)-(3,3)，新块填充到对称外侧的8个位置，其余12个外部位置保持背景色"
+    alternatives:
+      - name: "完全填充的5x5网格（所有25个位置都有内容）"
+        description: "外部槽位全部填充，缺失位置通过插值或复制相邻块生成。解题者需要推断缺失位置的生成规则（如取相邻两个块的混合），难度大幅增加"
+        source: creative
+        source_task: null
+        delta_lines: 40
+      - name: "仅扩展一个方向（3x5或5x3网格）"
+        description: "块仅向上下或左右扩展，形成3行5列或5行3列的网格而非完整5x5。解题者需要判断扩展方向，可能由图案中某个视觉线索决定"
+        source: inversion
+        source_task: null
+        delta_lines: 20
+      - name: "环形排列外部块"
+        description: "外部块不放置在矩形网格的外层，而是环形排列在原始图案周围，角落块放在对角线方向，边缘块放在正方向。视觉上形成环绕效果而非网格扩展"
+        source: creative
+        source_task: null
+        delta_lines: 30
+      - name: "堆叠到独立的输出区域"
+        description: "外部块不在原始图案周围放置，而是在网格的另一个区域按顺序排列成一行或一列。解题者需要理解空间上的分离映射关系"
+        source: stacking
+        source_task: 3dc255db
+        delta_lines: 25
+
+  - id: D4
+    name: "块复制时的几何变换"
+    tag: transform
+    current: "复制到对侧外部槽位时不旋转不翻转，保持原始方向"
+    alternatives:
+      - name: "复制时做180度旋转"
+        description: "每个块复制到对侧时同时做180度旋转（等价于上下+左右翻转）。由于原始图案具有双轴对称性，需要精心设计打破对称的图案才能让旋转效果可见，增加视觉辨别难度"
+        source: rotation
+        source_task: 2c181942
+        delta_lines: 15
+      - name: "复制时沿水平轴翻转"
+        description: "块在复制到外侧时做上下翻转。解题者需要识别翻转方向（水平轴还是垂直轴），与纯复制形成对比"
+        source: reflection
+        source_task: 7ed72f31
+        delta_lines: 15
+      - name: "复制时颜色取反（使用颜色映射表）"
+        description: "块在复制到外侧时，像素颜色通过图案中可推断的映射关系进行替换（如颜色A与颜色B互换）。解题者需要同时理解空间映射和颜色映射两层规则"
+        source: color_swap
+        source_task: a25697e4
+        delta_lines: 25
+      - name: "角落块旋转、边缘块不旋转"
+        description: "对角线方向的块（角落块）在复制时做90度旋转，正方向的块（边缘块）保持不变。引入基于位置的条件变换，解题者需要区分不同类型的块并应用不同规则"
+        source: conditional_rotation
+        source_task: 291dc1e1
+        delta_lines: 30
+
+  - id: D5
+    name: "中心块的重建机制"
+    tag: transform
+    current: "中心块的8个非中心像素取自8个相邻块的朝向像素（facing pixel），中心像素取图案的多数前景色"
+    alternatives:
+      - name: "中心块全部使用多数前景色填充"
+        description: "不从相邻块提取朝向像素，而是将中心块完全填充为图案的多数前景色（单色块）。简化了中心重建逻辑，但解题者仍需确定多数色"
+        source: inversion
+        source_task: null
+        delta_lines: 10
+      - name: "中心块通过双轴对称性从自身推断"
+        description: "利用图案的LR和UD对称性，将中心块的每个像素通过与其对称位置的已知块像素恢复。例如中心块(0,0)对应右下块(2,2)的对称位置。推理基于全局对称而非局部朝向"
+        source: symmetry_repair
+        source_task: 8e5c0c38
+        delta_lines: 25
+      - name: "中心块取8个朝向像素的少数色而非多数色作为中心"
+        description: "中心像素不使用多数前景色，而使用朝向像素中出现次数最少的颜色。解题者需要做计数并取反，形成max->min的逻辑反转"
+        source: inversion
+        source_task: null
+        delta_lines: 10
+      - name: "中心块模式由角落块的对角像素编码决定"
+        description: "四个角落块的对角像素（朝向中心的角像素）编码了中心块的某种填充模式，例如四个角像素颜色组成2x2核心，再扩展为3x3。引入符号解码步骤"
+        source: symbol_instructions
+        source_task: null
+        delta_lines: 30
+
+  - id: D6
+    name: "图案的整体对称性"
+    tag: match_cond
+    current: "输入的9x9图案具有完全的双轴对称性（LR和UD），相对块互为镜像翻转"
+    alternatives:
+      - name: "仅单轴对称（LR或UD）"
+        description: "图案仅沿一个方向对称，例如block(0,0)与block(0,2)互为LR镜像但block(0,0)与block(2,0)不对称。解题者需要判断对称轴方向，且外扩规则可能仅沿对称方向执行"
+        source: inversion
+        source_task: null
+        delta_lines: 25
+      - name: "四重旋转对称（C4）"
+        description: "图案具有90度旋转对称性而非镜像对称，block(0,0)旋转90度等于block(0,2)，旋转180度等于block(2,2)。块间关系变为旋转而非翻转，外扩映射也随之改变"
+        source: creative
+        source_task: null
+        delta_lines: 35
+      - name: "无对称性约束"
+        description: "9个块各自独立，不要求任何对称关系。外扩映射仍按点对称规则执行，但由于缺少输入对称性，输出的外部块与相邻原始块不再有视觉一致性。解题者需要纯粹理解位置映射"
+        source: inversion
+        source_task: null
+        delta_lines: 15
+
+  - id: D7
+    name: "输出网格的整体形状"
+    tag: grid_shape
+    current: "输出与输入同尺寸（same），外扩块在网格范围内原地放置，超出部分被截断"
+    alternatives:
+      - name: "输出自适应扩展以容纳完整5x5块网格"
+        description: "输出网格尺寸自动扩大以完整容纳所有15x15的块内容，不再截断。解题者需要计算正确的输出尺寸"
+        source: grid_expand
+        source_task: 20270e3b
+        delta_lines: 20
+      - name: "紧凑裁剪到非背景区域"
+        description: "输出仅保留包含非背景色像素的最小矩形区域。解题者需要先完成全部变换再确定裁剪边界"
+        source: tight_crop
+        source_task: 20270e3b
+        delta_lines: 15
+      - name: "输出仅外扩部分（去除原始图案）"
+        description: "输出仅包含新生成的外部块和重建的中心块，不包含原始的8个非中心块。解题者需要理解哪些是新增内容并提取它们"
+        source: crop
+        source_task: a251c730
+        delta_lines: 20
+      - name: "分帧输出：原始图案和外扩图案并排展示"
+        description: "输出由两部分组成：左侧为重建中心后的原始9x9图案，右侧为完整的5x5块网格，用分隔线隔开。解题者需要同时完成两种输出"
+        source: frame_separation
+        source_task: 5545f144
+        delta_lines: 30
+
+  - id: D8
+    name: "块大小与网格尺寸的关系"
+    tag: meta
+    current: "每个块固定为3x3，图案为9x9，嵌入在16-19大小的正方形网格中"
+    alternatives:
+      - name: "块大小可变但保持正方形"
+        description: "不同示例中块大小可能是2x2、3x3或4x4，解题者需要从输入图案的结构特征（如中心空洞大小）推断块尺寸。增加参数推断的挑战"
+        source: creative
+        source_task: null
+        delta_lines: 20
+      - name: "块为非正方形矩形（如3x2）"
+        description: "块为矩形而非正方形，例如3行2列。图案结构从9x9变为9x6，双轴对称性需要分别处理不同尺寸的行列方向"
+        source: creative
+        source_task: null
+        delta_lines: 25
+      - name: "块大小为偶数（如2x2或4x4）"
+        description: "使用偶数尺寸块意味着没有单独的中心像素，中心块的重建规则需要调整（无法使用'中心像素取多数色'的规则）。解题者面临不同的中心重建逻辑"
+        source: inversion
+        source_task: null
+        delta_lines: 20
+
+  - id: D9
+    name: "图案在网格中的位置"
+    tag: meta
+    current: "图案嵌入在较大网格中，位置不固定（各示例偏移不同），周围填充背景色8"
+    alternatives:
+      - name: "图案始终居中放置"
+        description: "图案固定位于网格中心，外扩块均匀分布在四周。简化了图案定位步骤，但解题者可能会错误依赖位置信息"
+        source: inversion
+        source_task: null
+        delta_lines: 5
+      - name: "图案紧贴网格某个角落"
+        description: "图案总是放在左上角或某个角落，导致部分外扩方向没有空间容纳新块（被网格边界截断）。解题者需要理解边界截断行为"
+        source: creative
+        source_task: null
+        delta_lines: 10
+      - name: "网格中包含多个相同图案"
+        description: "输入网格中放置2个相同结构的图案（都是3x3块阵列带中心空洞），解题者需要分别对每个图案执行外扩操作。从单图案变为多图案处理"
+        source: creative
+        source_task: null
+        delta_lines: 35
+
+  - id: D10
+    name: "前景色数量与角色分配"
+    tag: meta
+    current: "使用2-4种非背景前景色，不同颜色在块内形成对称图案，无显式角色区分"
+    alternatives:
+      - name: "严格两色图案（主色+点缀色）"
+        description: "限制为恰好两种前景色，一种为主色（占大多数像素），另一种为点缀色（仅在特定位置出现如对角线或中心）。减少颜色复杂度但增强结构可读性"
+        source: inversion
+        source_task: null
+        delta_lines: 10
+      - name: "每个块使用独特颜色组合"
+        description: "不同位置的块使用不同颜色（如角落块用红+蓝，边缘块用绿+黄），但结构相同。颜色成为位置标识符，解题者可通过颜色确认映射目标"
+        source: creative
+        source_task: null
+        delta_lines: 25
+      - name: "颜色数编码中心重建规则"
+        description: "图案中使用的前景色数量暗示中心块的重建模式，例如2色时中心全填主色，3色时中心用朝向像素拼接。解题者需要数颜色来确定规则"
+        source: symbol_instructions
+        source_task: null
+        delta_lines: 30
+
+  - id: D11
+    name: "中心空洞的形状"
+    tag: src
+    current: "中心空洞恰好是一个3x3块，与其他块大小相同，位于3x3阵列正中"
+    alternatives:
+      - name: "中心空洞为十字形（中心块+四个相邻块的中心像素）"
+        description: "缺失区域不是正方形而是十字形，覆盖中心块和四个相邻块的部分区域。重建需要同时恢复中心块和被侵蚀的相邻块，增加空间推理复杂度"
+        source: creative
+        source_task: null
+        delta_lines: 35
+      - name: "无空洞（完整3x3阵列）"
+        description: "所有9个块都有内容，没有缺失。任务变为纯粹的外扩操作——识别块结构并复制到外侧。去除中心重建步骤，简化为单一操作"
+        source: inversion
+        source_task: null
+        delta_lines: 15
+
+exec
+/bin/bash -lc "sed -n '1,260p' /home/lixinyu/snap/new/ceshi/des_combo/db0c5428.yaml" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+task_id: "db0c5428"
+combos:
+  - index: 1
+    combo_spec: "D1/0+D4/0"
+    name: "旋转映射+旋转变换"
+    description: "块按顺时针90度映射到外部槽位（D1/0），同时复制时做180度旋转（D4/0）。解题者需同时推理空间映射方向和块的旋转变换，两层空间操作叠加产生复合空间推理需求，单独任何一个改变都不足以产生这种复杂度"
+    existing_code:
+      - "D1/0"
+      - "D4/0"
+    reason: "映射规则和复制变换是两个独立的空间操作层，组合后解题者需要同时追踪'块去了哪里'和'块怎么变了'两条线索，推理路径产生乘法复杂度"
+  - index: 2
+    combo_spec: "D1/0+D5/1"
+    name: "旋转映射+对称性重建中心"
+    description: "块按旋转映射到外侧（D1/0），中心块通过双轴对称性恢复（D5/1）。旋转映射破坏了原始点对称关系，中心块重建不能再依赖局部朝向像素而需利用全局对称性。两个改变在中心重建处产生交互"
+    existing_code:
+      - "D1/0"
+      - "D5/1"
+    reason: "旋转映射改变了外扩方向，使原来的朝向像素概念失效，迫使中心重建依赖全局对称而非局部特征，组合产生新的推理链"
+  - index: 3
+    combo_spec: "D1/1+D6/0"
+    name: "镜像映射+单轴对称"
+    description: "块沿单轴镜像映射（D1/1），同时图案仅具有单轴对称性（D6/0）。镜像方向与对称轴方向关联，解题者需先判断对称轴，再据此确定镜像映射方向。两个维度形成因果依赖"
+    existing_code:
+      - "D1/1"
+      - "D6/0"
+    reason: "单轴对称性为镜像映射提供了自然的方向线索，两者形成紧密的逻辑耦合，解题者的推理必须同时考虑两个方面"
+  - index: 4
+    combo_spec: "D1/3+D10/1"
+    name: "颜色匹配映射+独特颜色块"
+    description: "外部槽位有标记色，块根据自身主色与标记色匹配映射（D1/3），同时不同位置的块使用不同颜色组合（D10/1）。每个块有唯一颜色标识，与外部标记形成一一对应，颜色系统承载了完整的映射逻辑"
+    existing_code:
+      - "D1/3"
+      - "D10/1"
+    reason: "独特颜色使每个块可区分，颜色匹配映射利用这种可区分性确定目标，两个维度共同构建了一个基于颜色的映射系统"
+  - index: 5
+    combo_spec: "D2/1+D13/0"
+    name: "带分隔线的块阵列+分隔线填充空白槽位"
+    description: "块间有1像素分隔线（D2/1），外扩后空白槽位也用分隔线颜色填充（D13/0）。分隔线从输入延续到输出，形成完整的网格框架。解题者需理解分隔线的延续和扩展规则"
+    existing_code:
+      - "D2/1"
+    reason: "分隔线在输入中作为结构元素，在输出中自然延续为网格分隔，两个改变形成统一的视觉语言，组合后的推理比各自独立更连贯"
+  - index: 6
+    combo_spec: "D2/2+D8/0"
+    name: "可变块大小+块大小可变但保持正方形"
+    description: "块大小在不同示例中变化（D2/2和D8/0本质上都是块大小可变）。D2/2侧重输入结构中块大小的推断，D8/0侧重块大小与网格尺寸的关系。组合后解题者需要从多个线索推断块尺寸"
+    existing_code: []
+    reason: "两个维度从不同角度改变块大小的确定性，组合后块大小推断成为核心挑战，与原始固定3x3形成显著差异"
+  - index: 7
+    combo_spec: "D3/1+D7/2"
+    name: "单方向扩展+仅输出外扩部分"
+    description: "块仅向一个方向扩展形成3x5或5x3网格（D3/1），输出仅保留外扩部分不含原图案（D7/2）。单方向扩展加上去除原始图案，输出变为仅包含一侧的新增块。解题者需要推断扩展方向和提取规则"
+    existing_code:
+      - "D7/2"
+    reason: "扩展方向限制与输出裁剪形成交互，使输出内容大幅简化但推理链更复杂——需先判断方向再确定提取范围"
+  - index: 8
+    combo_spec: "D4/2+D14/2"
+    name: "颜色取反复制+全局颜色替换后处理"
+    description: "复制到外侧时颜色取反（D4/2），之后再执行全局颜色替换（D14/2）。两次颜色变换叠加，解题者需要区分第一步的局部颜色映射和第二步的全局颜色替换，理解复合颜色变换"
+    existing_code:
+      - "D4/2"
+      - "D14/2"
+    reason: "两层颜色变换叠加后效果不同于任一单层，解题者必须分离两步操作才能正确推理最终颜色"
+  - index: 9
+    combo_spec: "D4/3+D6/1"
+    name: "条件旋转+四重旋转对称"
+    description: "角落块旋转90度、边缘块不旋转（D4/3），输入图案具有C4旋转对称性（D6/1）。C4对称意味着块间关系是旋转而非翻转，与条件旋转规则在角落块处形成复合效果——角落块既是旋转对称的产物又需要在复制时再次旋转"
+    existing_code:
+      - "D4/3"
+      - "D6/1"
+    reason: "C4对称改变了块间的派生关系（旋转而非翻转），条件旋转在此基础上增加位置依赖的变换，两者在角落块处产生强交互"
+  - index: 10
+    combo_spec: "D5/3+D11/0"
+    name: "角像素编码中心+十字形空洞"
+    description: "中心块由角落块的对角像素编码决定（D5/3），空洞为十字形覆盖中心及部分相邻块（D11/0）。十字形空洞扩大了需要重建的区域，但编码信息仍来自角落块的对角像素，解题者需要用有限的编码信息重建更大的缺失区域"
+    existing_code:
+      - "D5/3"
+      - "D11/0"
+    reason: "空洞形状扩大增加了重建量，而编码机制限制了信息来源，两者产生张力——信息更少但需要重建更多"
+  - index: 11
+    combo_spec: "D5/1+D15/0"
+    name: "对称性重建中心+块内对称"
+    description: "中心块通过全局双轴对称性恢复（D5/1），同时每个块内部也具有对称性（D15/0）。块内对称提供了额外的验证约束——重建的中心块也必须满足块内对称，可以用此交叉验证。推理从单纯的全局对称扩展为多层嵌套对称"
+    existing_code:
+      - "D5/1"
+    reason: "两层对称性嵌套，中心重建结果可通过块内对称性验证，增加了推理的层次和确认机制"
+  - index: 12
+    combo_spec: "D7/0+D14/0"
+    name: "自适应扩展输出+先重建中心再外扩"
+    description: "输出自动扩大以容纳完整5x5网格（D7/0），且先重建中心块再以完整3x3为基础外扩（D14/0）。两步操作中中心块也参与外扩，加上输出尺寸自适应，解题者需计算含中心块外扩的完整网格尺寸"
+    existing_code:
+      - "D7/0"
+    reason: "先重建中心使中心块也参与外扩（多了一个块），输出尺寸自适应需要考虑这个额外块的位置，两个改变在外扩范围计算处产生交互"
+  - index: 13
+    combo_spec: "D9/2+D11/3"
+    name: "多图案输入+多个空洞"
+    description: "网格中包含多个图案（D9/2），每个图案有多个空洞需要重建（D11/3）。从单图案单空洞变为多图案多空洞，解题者需要分别识别和处理每个图案的多个缺失块"
+    existing_code:
+      - "D9/2"
+      - "D11/3"
+    reason: "多图案和多空洞各自增加了处理量，组合后复杂度乘法增长，且解题者需要正确关联每个空洞与其所属图案"
+  - index: 14
+    combo_spec: "D5/0+D12/1"
+    name: "空洞含噪声+简化中心填充"
+    description: "空洞区域包含噪声像素（D12/1），中心块全部填充多数前景色（D5/0）。噪声像素可能干扰解题者判断，但正确规则是忽略噪声并用多数色填充。解题者需要识别噪声并抵制从噪声中提取信息的冲动"
+    existing_code:
+      - "D12/1"
+    reason: "噪声与简化填充形成对比——噪声暗示复杂性但正确答案反而更简单，这种反直觉组合考验解题者对干扰信息的处理能力"
+  - index: 15
+    combo_spec: "D1/0+D3/2"
+    name: "旋转映射+环形排列"
+    description: "块按旋转映射到外侧（D1/0），外部块环形排列而非网格排列（D3/2）。旋转映射与环形布局形成自然配合——旋转90度映射到环形的下一个位置。解题者需要在环形坐标系中理解旋转映射"
+    existing_code:
+      - "D1/0"
+    reason: "环形布局为旋转映射提供了几何上更自然的解释框架，两者组合产生与原始点对称+网格截然不同的空间推理模式"
+  - index: 16
+    combo_spec: "D2/3+D11/1"
+    name: "十字形阵列+无空洞"
+    description: "输入为十字形排列的5个块（D2/3），所有块都有内容无缺失（D11/1）。十字形阵列中角落位置本就缺失，加上无中心空洞，任务变为纯粹的外扩——将十字形的4个臂端块映射到外侧"
+    existing_code: []
+    reason: "十字形阵列自然取消了角落块，无空洞取消了中心重建，两者组合将任务简化为纯外扩操作但在非标准布局上执行，形成全新的任务形态"
+  - index: 17
+    combo_spec: "D4/1+D7/3"
+    name: "水平翻转复制+分帧输出"
+    description: "块复制到外侧时做上下翻转（D4/1），输出分为两帧——左侧为重建后原图案，右侧为完整外扩网格（D7/3）。分帧输出中左帧不含翻转（原始块），右帧含翻转（外扩块），解题者需在两个输出区域应用不同规则"
+    existing_code:
+      - "D4/1"
+      - "D7/3"
+    reason: "分帧输出将原始和外扩分离展示，使翻转变换的效果更加显眼，解题者需要理解两帧中同一块的不同呈现方式"
+  - index: 18
+    combo_spec: "D4/0+D6/2"
+    name: "无对称约束+180度旋转复制"
+    description: "输入块间无对称关系（D6/2），复制到外侧时做180度旋转（D4/0）。无对称性意味着每个块独立且视觉上不同，180度旋转使外扩块与原始块方向相反。解题者需要纯粹通过位置和旋转规则推理"
+    existing_code:
+      - "D4/0"
+    reason: "无对称性去除了利用对称验证的捷径，旋转复制增加了变换复杂度，组合后解题者只能通过逐块位置追踪来推理"
+  - index: 19
+    combo_spec: "D5/0+D8/2"
+    name: "偶数块大小+简化中心填充"
+    description: "使用偶数尺寸块如2x2或4x4（D8/2），中心块全部填充多数前景色（D5/0）。偶数块没有中心像素，原始的'中心像素取多数色'规则失效。简化为全填充恰好解决了偶数块无中心的问题"
+    existing_code: []
+    reason: "偶数块大小改变了中心重建的前提条件，简化中心填充提供了适应偶数块的自然解决方案，两者形成问题-解决方案的匹配"
+  - index: 20
+    combo_spec: "D10/2+D14/0"
+    name: "颜色数编码规则+先重建再外扩"
+    description: "前景色数量暗示中心重建模式（D10/2），且先重建中心再外扩（D14/0）。颜色数决定重建规则，重建在外扩之前执行，解题者需要先数颜色确定重建方式，然后重建，最后外扩含中心块"
+    existing_code: []
+    reason: "颜色数编码为重建步骤提供元信息，先重建后外扩的顺序使得编码信息在第一步就需要被解读，形成清晰的推理依赖链"
+  - index: 21
+    combo_spec: "D3/0+D13/1"
+    name: "插值填充空白+完全填充5x5网格"
+    description: "空白槽位由相邻块边缘像素插值填充（D13/1），5x5网格所有位置都有内容（D3/0）。两者共同消除了输出中的所有空白——直接映射的块占据对应位置，剩余位置由插值填充。输出变为密集的15x15完整图案"
+    existing_code: []
+    reason: "完全填充网格需要生成所有25个位置的内容，插值提供了缺失位置的生成规则，两者互补形成完整的填充方案"
+  - index: 22
+    combo_spec: "D1/0+D4/3+D6/1"
+    name: "旋转映射+条件旋转+C4对称"
+    description: "块按旋转90度映射（D1/0），角落块复制时旋转、边缘块不旋转（D4/3），图案具有C4旋转对称性（D6/1）。三重旋转操作叠加：输入的旋转对称、映射的旋转方向、复制时的条件旋转。解题者需要追踪多层旋转变换"
+    existing_code:
+      - "D1/0"
+      - "D4/3"
+      - "D6/1"
+    reason: "三个维度都涉及旋转但作用于不同层次（输入结构、映射规则、复制变换），组合后形成高度统一的旋转主题变体，推理复杂度显著提升"
+  - index: 23
+    combo_spec: "D2/1+D7/0+D13/0"
+    name: "分隔线阵列+自适应扩展+分隔线填充"
+    description: "输入带分隔线（D2/1），输出自适应扩展为完整网格（D7/0），空白槽位用分隔线颜色填充（D13/0）。分隔线从输入一直延续到扩展后的输出，形成完整的网格框架。解题者需理解分隔线如何在扩展中延续"
+    existing_code:
+      - "D2/1"
+      - "D7/0"
+    reason: "三个维度共同构建了一个带完整框架的扩展输出，分隔线作为视觉线索贯穿输入和输出，形成连贯的设计语言"
+  - index: 24
+    combo_spec: "D5/3+D15/2"
+    name: "角像素编码中心+朝向标记像素"
+    description: "中心块由角落块的对角像素编码（D5/3），每个块有特殊标记像素指示朝向（D15/2）。标记像素位于角落，与用于编码中心块的对角像素位置重叠或相邻。解题者需要区分哪些角像素是朝向标记、哪些是中心编码"
+    existing_code:
+      - "D5/3"
+      - "D15/2"
+    reason: "两种不同用途的特殊像素在空间上邻近或重叠，解题者需要区分它们的角色，产生信息解码的交互挑战"
+  - index: 25
+    combo_spec: "D1/1+D11/2"
+    name: "角落空洞+镜像映射"
+    description: "缺失的块在角落而非中心（D11/2），块沿单轴镜像映射（D1/1）。角落块缺失意味着需要从对侧块通过镜像关系重建，而镜像映射改变了'对侧'的定义。解题者需要在非对称缺失下理解新的映射规则"
+    existing_code:
+      - "D1/1"
+      - "D11/2"
+    reason: "缺失位置偏移到角落改变了重建的信息来源，镜像映射又改变了空间对应关系，两者共同改变了重建逻辑的核心"
+  - index: 26
+    combo_spec: "D12/2+D14/0"
+    name: "部分正确空洞+先重建再外扩"
+    description: "空洞中已有部分正确像素（D12/2），先重建中心再外扩（D14/0）。解题者需要先判断哪些像素正确、修复错误像素，然后用修复后的完整阵列进行外扩。重建质量直接影响外扩结果"
+    existing_code:
+      - "D12/2"
+    reason: "部分正确的空洞使重建变为修复问题，先重建后外扩意味着修复错误会传播到输出，提高了准确重建的重要性"
+  - index: 27
+    combo_spec: "D3/3+D7/3"
+    name: "堆叠独立区域+分帧输出"
+    description: "外部块堆叠到独立区域（D3/3），输出为分帧展示原图案和外扩结果（D7/3）。外部块不在原图案周围而在独立区域，配合分帧输出形成清晰的两区域布局——原始区域和映射区域分离展示"
+    existing_code:
+      - "D3/3"
+      - "D7/3"
+    reason: "两个维度都涉及输出的空间组织，组合后形成明确的双区域布局，比各自独立时更连贯，解题者需理解区域间的对应关系"
+  - index: 28
+    combo_spec: "D4/2+D10/1"
+    name: "颜色取反复制+独特颜色块"
+    description: "复制时颜色通过映射替换（D4/2），不同位置块使用不同颜色（D10/1）。每个块颜色独特，复制时颜色取反，解题者需要为每个块分别推断其颜色映射关系。块的颜色独特性使颜色映射更复杂"
+    existing_code:
+      - "D4/2"
+      - "D10/1"
+    reason: "独特颜色使每个块有不同的颜色映射需求，颜色取反不再是统一的全局操作而变为块级别的局部操作，推理粒度细化"
+  - index: 29
+    combo_spec: "D2/2+D9/1"
+    name: "可变块大小+图案紧贴角落"
+    description: "块大小可变（D2/2），图案紧贴网格角落（D9/1）。可变块大小增加了推断挑战，紧贴角落导致部分外扩方向被截断。解题者需要先推断块大小，再判断哪些外扩位置在网格内"
+    existing_code: []
+    reason: "块大小推断和边界截断判断是两个独立的挑战，组合后推断出块大小后还需计算截断范围，形成两步推理链"
+  - index: 30
+    combo_spec: "D1/2+D8/1"
+    name: "按距离映射+非正方形块"
+    description: "块按距离中心远近映射到不同层级（D1/2），块为非正方形矩形如3x2（D8/1）。非正方形块使得'距离中心'的计算在行列方向不对称，解题者需要在矩形坐标系下理解距离映射"
+    existing_code:
+      - "D8/1"
+    reason: "非正方形块打破了距离计算的对称性，使按距离映射变得更复杂——行方向和列方向的'层级'不同"
+  - index: 31
+    combo_spec: "D5/2+D11/2"
+    name: "少数色中心+角落空洞"
+    description: "中心像素取朝向像素的少数色（D5/2），缺失块在角落而非中心（D11/2）。角落空洞改变了朝向像素的位置和数量，少数色规则在不同数量的样本上执行计数，结果可能不同"
+    existing_code:
+      - "D11/2"
+    reason: "空洞位置改变了可用的朝向像素集合，少数色计数在不同样本集上可能得出不同结果，两者交互改变了具体的推理过程"
+  - index: 32
+    combo_spec: "D7/0+D14/1"
+    name: "迭代外扩+自适应输出"
+    description: "从3x3迭代外扩到5x5再到7x7（D14/1），输出自适应扩展以容纳完整结果（D7/0）。迭代外扩产生更大的7x7块网格（21x21像素），自适应输出需要容纳这个更大的结果。解题者需要识别迭代深度并计算最终尺寸"
+    existing_code:
+      - "D14/1"
+      - "D7/0"
+    reason: "迭代外扩大幅增加输出规模，自适应尺寸需要正确计算更大的空间需求，两者在尺寸计算处产生交互"
+  - index: 33
+    combo_spec: "D5/1+D6/0"
+    name: "单轴对称+对称性重建中心"
+    description: "图案仅单轴对称（D6/0），中心块通过对称性恢复（D5/1）。原始的双轴对称重建需要降级为单轴对称重建——只能恢复一半像素，另一半需要其他机制。解题者面临不完整对称信息下的重建挑战"
+    existing_code:
+      - "D6/0"
+      - "D5/1"
+    reason: "单轴对称限制了可用的对称信息，使基于对称性的重建变得不完整，解题者需要找到补充信息来源"
+  - index: 34
+    combo_spec: "D4/1+D13/2"
+    name: "无间隙紧邻放置+翻转复制"
+    description: "外扩块紧邻原始块放置无间隙（D13/2），复制时做上下翻转（D4/1）。紧邻放置使翻转后的块与原始块直接拼接，块边界处的像素连续性成为视觉线索——翻转导致边界处图案不连续或恰好连续"
+    existing_code:
+      - "D4/1"
+    reason: "无间隙放置使块间边界可见度提高，翻转造成的方向变化在紧邻处更容易被察觉，两者在边界视觉特征处产生交互"
+  - index: 35
+    combo_spec: "D10/0+D15/1"
+    name: "固定模板模式+严格两色"
+    description: "所有块共享相同结构模板（D15/1），严格使用两种前景色（D10/0）。模板一致性加上两色限制，使得所有块在结构上相同仅在两种颜色的分配上不同。极大简化了视觉复杂度但保留了映射推理"
+    existing_code: []
+    reason: "模板统一性和两色限制共同将变化空间压缩到颜色分配维度，使任务聚焦在空间映射推理上而非图案识别上"
+  - index: 36
+    combo_spec: "D1/0+D4/0+D14/3"
+
+exec
+/bin/bash -lc "for f in /home/lixinyu/snap/new/ceshi/code/db0c5428/D11/1/code.py /home/lixinyu/snap/new/ceshi/code/db0c5428/D3/3/code.py /home/lixinyu/snap/new/ceshi/code/db0c5428/D5/1/code.py; do echo 'FILE:' "'$f; sed -n '"'1,260p' \""'$f"; done' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+FILE: /home/lixinyu/snap/new/ceshi/code/db0c5428/D11/1/code.py
+FILE: /home/lixinyu/snap/new/ceshi/code/db0c5428/D3/3/code.py
+sed: can't read /home/lixinyu/snap/new/ceshi/code/db0c5428/D11/1/code.py: No such file or directory
+# Variant of db0c5428
+# Dimension: D3 — 外部槽位的网格布局 (dst)
+# Change: 5x5块网格中原始3x3占据(1,1)-(3,3)，新块填充到对称外侧的8个位置，其余12个外部位置保持背景色... → 堆叠到独立的输出区域
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+from arc_utils import bbox, crop_bbox, get_bg, paste
+
+# Design analysis
+# ----------------
+# concretization:
+# - Input keeps the original object: one 9x9 motif made from a 3x3 grid of 3x3 blocks,
+#   with the middle block missing and encoded by the 8 visible inner-boundary pixels.
+# - Output still fills the center block exactly as in the source task.
+# - The only destination-layout change is that the 8 non-center source blocks are no longer
+#   copied into a surrounding 5x5 ring. They are copied, without rotation, into a detached
+#   strip: a single 3x24 row on wide canvases or a single 24x3 column on tall canvases.
+# - The strip order is fixed and visible: row-major over the source 3x3 block grid, skipping
+#   the hole, i.e. (0,0)(0,1)(0,2)(1,0)(1,2)(2,0)(2,1)(2,2).
+#
+# behavior trace:
+# - Original logic for source block (0,0): place it into the opposite corner of the 5x5
+#   block frame at block coordinates (4,4); repeated for all 8 blocks.
+# - Variant logic for the same source block: make it the first item of the detached strip;
+#   source block (0,1) becomes the second item; ... ; source block (2,2) becomes the eighth.
+# - The center block logic does not move: the 8 boundary pixels still rebuild the missing 3x3
+#   block in the motif itself.
+#
+# complexity calibration:
+# - The variant uses only two layout modes because more destination modes would be hard to infer
+#   from 2-4 examples. Wide grids always use a row strip; tall grids always use a column strip.
+# - Internal block asymmetry from the original generator is preserved, so the ordered strip is
+#   visually readable and not reducible to a line of identical solid-color blocks.
+#
+# hidden-assumption audit for the original main():
+# - `expanded_r0 = r0 - block` / `expanded_c0 = c0 - block` assumed the answer lived in one
+#   local 15x15 neighborhood around the motif. That is false here and must be removed.
+# - `dst_r = expanded_r0 + (4 - 2*br) * block` and the analogous `dst_c` encoded the old
+#   point-symmetric outer-ring slots. Those formulas are exactly the D3 behavior being changed.
+# - The block extraction itself is still valid because source blocks are unchanged.
+# - `paste(out, center_patch, r0+block, c0+block)` remains valid because center reconstruction
+#   is not part of the D3 change.
+#
+# placement legality:
+# - Wide case: H in [16,19], W in [28,31]. The motif is placed with `r0 >= 4` so a detached
+#   3-row strip at the top cannot touch it, and with `c0 <= W-24` so the whole strip fits.
+# - Tall case: H in [28,31], W in [16,19]. The motif is placed with `c0 >= 4` so a detached
+#   3-column strip at the left cannot touch it, and with `r0 <= H-24` so the whole strip fits.
+# - Because only one axis is long enough for 24 cells, the row/column choice is unambiguous.
+#
+# observability and cleanliness:
+# - The detached strip occupies a clean reserved band with at least one background row/column
+#   separating it from the motif, so the two regions do not visually merge.
+# - The aspect ratio itself is a visible cue for whether the detached area is a row or a column.
+# - No color-id-based ordering or recoloring is introduced; only visible spatial order matters.
+
+
+STACK_ORDER = (
+    (0, 0),
+    (0, 1),
+    (0, 2),
+    (1, 0),
+    (1, 2),
+    (2, 0),
+    (2, 1),
+    (2, 2),
+)
+
+
+def _major_foreground_color(g: np.ndarray, bg: int) -> int:
+    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
+    assert vals.size, "input must contain foreground colors"
+    return int(vals[int(np.argmax(counts))])
+
+
+def _center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
+    assert block == 3, "this task uses 3x3 blocks"
+    main = _major_foreground_color(g, bg)
+    patch = np.full((block, block), main, dtype=int)
+
+    hole_r = int(r0) + block
+    hole_c = int(c0) + block
+    offsets = [-1, 1, 3]
+    for r in range(block):
+        for c in range(block):
+            if r == block // 2 and c == block // 2:
+                continue
+            patch[r, c] = int(g[hole_r + offsets[r], hole_c + offsets[c]])
+    return patch
+
+
+def _use_horizontal_stack(shape: tuple[int, int], block: int) -> bool:
+    stack_extent = len(STACK_ORDER) * block
+    h, w = map(int, shape)
+    if w >= stack_extent and h < stack_extent:
+        return True
+    if h >= stack_extent and w < stack_extent:
+        return False
+    return w > h
+
+
+def _stack_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int, horizontal: bool) -> np.ndarray:
+    if horizontal:
+        strip = np.full((block, len(STACK_ORDER) * block), bg, dtype=int)
+    else:
+        strip = np.full((len(STACK_ORDER) * block, block), bg, dtype=int)
+
+    for idx, (br, bc) in enumerate(STACK_ORDER):
+        src = crop_bbox(
+            g,
+            (
+                int(r0) + br * block,
+                int(c0) + bc * block,
+                int(r0) + (br + 1) * block - 1,
+                int(c0) + (bc + 1) * block - 1,
+            ),
+        )
+        if horizontal:
+            paste(strip, src, 0, idx * block)
+        else:
+            paste(strip, src, idx * block, 0)
+    return strip
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Rebuild the missing center block, then move the eight surrounding blocks into a detached strip.
+
+    Input structure:
+    - One 9x9 foreground motif sits on a background canvas.
+    - The motif is a 3x3 arrangement of 3x3 blocks with the center block missing.
+    - The 8 pixels facing the hole encode the border of that missing center block.
+
+    Rule:
+    - Keep the original motif in place and reconstruct its center block from the visible boundary cues.
+    - Copy each of the eight non-center 3x3 blocks without rotation into a separate stacking area.
+    - On wide grids the stack is a horizontal row; on tall grids it is a vertical column.
+
+    Key insight: The source object is still the same symmetric 3x3-block motif, but the output no longer
+    completes a local 5x5 frame; instead it exports the surrounding blocks into a detached ordered strip.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+    motif_bbox = bbox(g != bg)
+    assert motif_bbox is not None, "expected a foreground motif"
+    r0, c0, r1, c1 = motif_bbox
+    h = int(r1 - r0 + 1)
+    w = int(c1 - c0 + 1)
+    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
+    block = h // 3
+
+    out = g.copy()
+    paste(out, _center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
+
+    horizontal = _use_horizontal_stack(g.shape, block)
+    strip = _stack_patch(g, int(r0), int(c0), block, bg, horizontal)
+    if horizontal:
+        paste(out, strip, 0, int(c0))
+    else:
+        paste(out, strip, int(r0), 0)
+    return out
+
+
+# --------------- generator (o5x variant) ---------------
+
+# -- CFG: canvas & structure --
+WIDE_H_MIN, WIDE_H_MAX = 16, 19
+WIDE_W_MIN, WIDE_W_MAX = 28, 31
+TALL_H_MIN, TALL_H_MAX = 28, 31
+TALL_W_MIN, TALL_W_MAX = 16, 19
+BLOCK = 3
+MOTIF_SIZE = BLOCK * 3
+STACK_BLOCKS = len(STACK_ORDER)
+STACK_SIZE = BLOCK * STACK_BLOCKS
+STACK_GAP = 1
+
+# -- CFG: colors --
+BG = 8
+FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
+COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4
+
+# -- CFG: majority pixel counts (corner block + edge block combined) --
+MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16
+CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8
+EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8
+
+# -- CFG: generation --
+MAX_RETRIES = 300
+
+# -- Symmetry orbits for 3x3 blocks --
+DIAG_ORBITS = (
+    ((0, 0),),
+    ((1, 1),),
+    ((2, 2),),
+    ((0, 1), (1, 0)),
+    ((0, 2), (2, 0)),
+    ((1, 2), (2, 1)),
+)
+LR_ORBITS = (
+    ((0, 0), (0, 2)),
+    ((1, 0), (1, 2)),
+    ((2, 0), (2, 2)),
+    ((0, 1),),
+    ((1, 1),),
+    ((2, 1),),
+)
+
+_CENTER_OFFSETS = np.array([-1, 1, 3])
+
+
+def _major_orbits(orbits, forced_minor, target_count):
+    forced_minor = set(forced_minor)
+    usable = [
+        idx for idx, orbit in enumerate(orbits)
+        if all(coord not in forced_minor for coord in orbit)
+    ]
+    choices = []
+    for mask in range(1 << len(usable)):
+        selected = set()
+        total = 0
+        for bit, idx in enumerate(usable):
+            if mask & (1 << bit):
+                selected.add(idx)
+                total += len(orbits[idx])
+        if total == target_count:
+            choices.append(selected)
+    assert choices, "unreachable symmetric majority count"
+    return random.choice(choices)
+
+
+def _seed_block(orbits, forced_minor, majority, target_count):
+    block = np.full((BLOCK, BLOCK), -1, dtype=int)
+    major_idxs = _major_orbits(orbits, forced_minor, target_count)
+    minor_orbits = []
+    for idx, orbit in enumerate(orbits):
+        if idx in major_idxs:
+            for r, c in orbit:
+                block[r, c] = majority
+        else:
+            minor_orbits.append((block, orbit))
+    return block, minor_orbits
+
+
+def _assign_minor_colors(minor_orbits, colors):
+    random.shuffle(minor_orbits)
+    guaranteed = list(colors)
+    random.shuffle(guaranteed)
+    assignments = guaranteed + [
+        random.choice(colors) for _ in range(len(minor_orbits) - len(guaranteed))
+    ]
+    for (block, orbit), color in zip(minor_orbits, assignments):
+        for r, c in orbit:
+            block[r, c] = color
+
+
+def _make_blocks(majority, minor_colors, corner_major, edge_major):
+FILE: /home/lixinyu/snap/new/ceshi/code/db0c5428/D5/1/code.py
+# Variant of db0c5428
+# Dimension: D5 — 中心块的重建机制 (transform)
+# Change: 中心块的8个非中心像素取自8个相邻块的朝向像素（facing pixel），中心像素取图案的多数前景色
+#   → 中心块改为通过围绕空洞的 LR/UD 全局对称恢复：每个非中心像素从跨越空洞后的对侧对称位置取值。
+
+from __future__ import annotations
+
+from pathlib import Path
+import random
+import sys
+
+import numpy as np
+
+_ROOT = Path(__file__).resolve()
+_SOLVER_DIR = _ROOT.parents[5] / "solvers"
+if str(_SOLVER_DIR) not in sys.path:
+    sys.path.append(str(_SOLVER_DIR))
+
+from arc_utils import bbox, crop_bbox, get_bg, paste
+
+
+# Design analysis for the D5 variant
+# a) Concretization + trace:
+#    The input still contains one 9x9 motif made of eight visible 3x3 blocks around
+#    a missing 3x3 center. The output still expands this motif to a 15x15 5x5 block
+#    layout. The only behavioral change is how the missing center is reconstructed.
+#    Original: center(0,0) came from the top-left block's facing corner b00[2,2].
+#    Variant: center(0,0) comes from the bottom-right block's opposite corner
+#    b22[2,2], because the missing block is repaired by reflecting across the empty
+#    gap's horizontal and vertical symmetry lines. Likewise center(0,1) comes from
+#    the bottom middle block, center(1,0) from the right middle block, etc.
+# b) Complexity calibration:
+#    The outer 5x5 copy rule is unchanged, so the task remains a single-object
+#    geometric reasoning problem. To make the D5 change visible, generation forces
+#    the old inward-facing samples and the new opposite-side samples to disagree in
+#    both the corner channel and the edge channel; this yields 8 visible center-pixel
+#    differences relative to the legacy rule, not just a subtle corner case.
+# c) Hidden-assumption audit of main():
+#    - bbox/get_bg still assume exactly one isolated non-bg motif on a bg canvas.
+#    - The expansion loop assumes the motif is a 3x3 grid of equal-size blocks; that
+#      remains valid and unchanged.
+#    - The new center repair assumes block==3, because each center row/col maps to
+#      one of three known source bands: bottom edge, middle band, or top edge.
+#    - The solver no longer assumes inner-boundary pixels carry the answer; it reads
+#      from opposite blocks instead, so any generator relying on the old boundary
+#      encoding would now be invalid.
+# d) Placement legality:
+#    The motif is still placed with a 3-cell margin, so the 15x15 expanded output
+#    fits entirely inside the 16..19 square canvas without overlap or clipping.
+# e) Visual observability:
+#    Samples remain easy to parse: a single symmetric ring around a missing center.
+#    Because generation enforces b00[0,0] != b00[2,2] and b01[0,1] != b01[2,1],
+#    the new center differs from the legacy center in all 8 non-central pixels.
+# f) Visual cleanliness:
+#    No extra markers are introduced. The grid still contains one motif on a plain
+#    teal background, and the output contains the same clean 5x5 block pattern.
+# g) Color inference:
+#    No hidden color-id ordering is used. Colors are sampled directly, and the only
+#    color-frequency rule kept from the original task is the majority fill for the
+#    center fixed point, which symmetry alone cannot determine.
+# 9) New main() assumptions guaranteed by generate_input():
+#    - The visible ring obeys the same D4 block relations as the original task, so
+#      the opposite-side symmetry readout is consistent and human-observable.
+#    - The center fixed point is set to the majority foreground color.
+#    - The generator rejects degenerate motifs where the new center would collapse to
+#      the old center, so the D5 variant signal is always active.
+
+
+def _major_foreground_color(g: np.ndarray, bg: int) -> int:
+    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
+    assert vals.size, "input must contain foreground colors"
+    return int(vals[int(np.argmax(counts))])
+
+
+def _center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
+    assert block == 3, "this variant uses 3x3 blocks"
+    main = _major_foreground_color(g, bg)
+    patch = np.full((block, block), main, dtype=int)
+
+    # Reflect each missing cell across the hole to the opposite visible band.
+    src_rows = [int(r0) + 3 * block - 1, int(r0) + block + 1, int(r0)]
+    src_cols = [int(c0) + 3 * block - 1, int(c0) + block + 1, int(c0)]
+    for r in range(block):
+        for c in range(block):
+            if r == block // 2 and c == block // 2:
+                continue
+            patch[r, c] = int(g[src_rows[r], src_cols[c]])
+    return patch
+
+
+def _legacy_center_patch_from_motif(motif: np.ndarray, majority: int) -> np.ndarray:
+    patch = np.full((BLOCK, BLOCK), majority, dtype=int)
+    rows = BLOCK + _CENTER_OFFSETS
+    cols = BLOCK + _CENTER_OFFSETS
+    for r in range(BLOCK):
+        for c in range(BLOCK):
+            if r == BLOCK // 2 and c == BLOCK // 2:
+                continue
+            patch[r, c] = int(motif[rows[r], cols[c]])
+    return patch
+
+
+def _symmetry_center_patch_from_motif(motif: np.ndarray, majority: int) -> np.ndarray:
+    patch = np.full((BLOCK, BLOCK), majority, dtype=int)
+    src_rows = [MOTIF_SIZE - 1, BLOCK + 1, 0]
+    src_cols = [MOTIF_SIZE - 1, BLOCK + 1, 0]
+    for r in range(BLOCK):
+        for c in range(BLOCK):
+            if r == BLOCK // 2 and c == BLOCK // 2:
+                continue
+            patch[r, c] = int(motif[src_rows[r], src_cols[c]])
+    return patch
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand a 3x3 block motif into a 5x5 block frame and repair its missing center.
+
+    Input structure:
+    - One 9x9 non-background motif sits on a teal canvas.
+    - The motif is a 3x3 arrangement of 3x3 blocks with the middle block removed.
+    - The eight visible blocks form a symmetric ring around the empty hole.
+
+    Rule:
+    - Leave the original 9x9 motif in place.
+    - Copy each visible block to the point-symmetric outer slot of the implied 5x5
+      block layout, without rotating the copied block.
+    - Reconstruct the center 3x3 block by reflecting each missing non-center cell
+      across the hole to the opposite known side; keep the center cell as the motif's
+      majority foreground color.
+
+    Key insight: The hole is not encoded by the pixels facing inward. Instead, the
+    surrounding ring continues through the gap by global left-right and up-down
+    symmetry, so each missing pixel is read from its opposite-side counterpart.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+    motif_bbox = bbox(g != bg)
+    assert motif_bbox is not None, "expected a foreground motif"
+    r0, c0, r1, c1 = motif_bbox
+    h = int(r1 - r0 + 1)
+    w = int(c1 - c0 + 1)
+    assert h == w and h % 3 == 0, "motif must be a square 3x3 block grid"
+    block = h // 3
+
+    out = g.copy()
+    expanded_r0 = int(r0) - block
+    expanded_c0 = int(c0) - block
+
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = crop_bbox(
+                g,
+                (
+                    int(r0) + br * block,
+                    int(c0) + bc * block,
+                    int(r0) + (br + 1) * block - 1,
+                    int(c0) + (bc + 1) * block - 1,
+                ),
+            )
+            dst_r = expanded_r0 + (4 - 2 * br) * block
+            dst_c = expanded_c0 + (4 - 2 * bc) * block
+            paste(out, src, dst_r, dst_c)
+
+    paste(out, _center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
+    return out
+
+
+# --------------- generator (o5x-D5 symmetry repair) ---------------
+
+# -- CFG: canvas & structure --
+GRID_SIZE_MIN, GRID_SIZE_MAX = 16, 19
+BLOCK = 3
+MOTIF_SIZE = BLOCK * 3
+EXPANDED_SIZE = BLOCK * 5
+MOTIF_PAD = 3
+
+# -- CFG: colors --
+BG = 8
+FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
+COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4
+
+# -- CFG: majority pixel counts (corner block + edge block combined) --
+MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16
+CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8
+EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8
+
+# -- CFG: generation --
+MAX_RETRIES = 300
+MIN_VARIANT_DIFF = 8
+
+# -- Symmetry orbits for 3x3 blocks --
+DIAG_ORBITS = (
+    ((0, 0),),
+    ((1, 1),),
+    ((2, 2),),
+    ((0, 1), (1, 0)),
+    ((0, 2), (2, 0)),
+    ((1, 2), (2, 1)),
+)
+LR_ORBITS = (
+    ((0, 0), (0, 2)),
+    ((1, 0), (1, 2)),
+    ((2, 0), (2, 2)),
+    ((0, 1),),
+    ((1, 1),),
+    ((2, 1),),
+)
+
+# Original task sampled the center from these inner-boundary coordinates.
+_CENTER_OFFSETS = np.array([-1, 1, 3])
+
+
+def _orbit_indices_containing(orbits, coords):
+    coord_set = set(coords)
+    found = set()
+    for idx, orbit in enumerate(orbits):
+        if any(coord in coord_set for coord in orbit):
+            found.add(idx)
+    return found
+
+
+def _major_orbits(orbits, forced_major, forced_minor, target_count):
+    forced_major_idxs = _orbit_indices_containing(orbits, forced_major)
+    forced_minor_idxs = _orbit_indices_containing(orbits, forced_minor)
+    assert not (forced_major_idxs & forced_minor_idxs), "orbit cannot be both major and minor"
+
+    base_count = sum(len(orbits[idx]) for idx in forced_major_idxs)
+    usable = [
+        idx
+        for idx in range(len(orbits))
+        if idx not in forced_major_idxs and idx not in forced_minor_idxs
+    ]
+    choices = []
+    for mask in range(1 << len(usable)):
+        selected = set(forced_major_idxs)
+        total = base_count
+        for bit, idx in enumerate(usable):
+            if mask & (1 << bit):
+                selected.add(idx)
+                total += len(orbits[idx])
+        if total == target_count:
+            choices.append(selected)
+    assert choices, "unreachable symmetric majority count"
+    return random.choice(choices)
+
+
+def _seed_block(orbits, forced_major, forced_minor, majority, target_count):
+    block = np.full((BLOCK, BLOCK), -1, dtype=int)
+    major_idxs = _major_orbits(orbits, forced_major, forced_minor, target_count)
+    minor_orbits = []
+    for idx, orbit in enumerate(orbits):
+        if idx in major_idxs:
+            for r, c in orbit:
+                block[r, c] = majority
+        else:
+            minor_orbits.append((block, orbit))
+    return block, minor_orbits
+
+codex
+已经拿到一个带完整“设计分析注释”的现成变体样式，可直接照这个结构写组合版。现在补查 `paste` 的越界行为和目标目录状态，然后开始落文件。
+exec
+/bin/bash -lc 'ls -la /home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45' in /home/lixinyu/snap/new
+ exited 2 in 0ms:
+ls: cannot access '/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45': No such file or directory
+
+exec
+/bin/bash -lc "rg -n \"def paste\\(\" /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+308:def paste(
+
+exec
+/bin/bash -lc "sed -n '308,380p' /home/lixinyu/snap/new/solvers/arc_utils.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+def paste(
+    dst: np.ndarray,
+    patch: np.ndarray,
+    r0: int,
+    c0: int,
+    *,
+    transparent: int | None = None,
+    mask: np.ndarray | None = None,
+    overwrite: bool = True,
+    clip: bool = False,
+) -> np.ndarray:
+    """
+    Paste `patch` into `dst` at top-left (r0,c0).
+
+    This is the ONE placement primitive solver examples should use.
+
+    - Opaque paste: `paste(dst, patch, r0, c0)`
+    - Transparent overlay: `paste(dst, patch, r0, c0, transparent=bg)`
+    - Masked paste: `paste(dst, patch, r0, c0, mask=m)`
+    - Non-overwriting overlay: `paste(dst, patch, r0, c0, transparent=bg, overwrite=False)`
+    - Strict vs clip: default `clip=False` (fail fast); set `clip=True` to clip out-of-bounds.
+    """
+    H, W = dst.shape
+    r0 = int(r0)
+    c0 = int(c0)
+    h, w = map(int, patch.shape)
+
+    if not clip:
+        if r0 < 0 or c0 < 0 or r0 + h > H or c0 + w > W:
+            raise ValueError("paste: patch out of bounds (set clip=True to allow clipping)")
+        rr0, cc0 = r0, c0
+        rr1, cc1 = r0 + h, c0 + w
+        pr0, pc0 = 0, 0
+    else:
+        rr0 = max(0, r0)
+        cc0 = max(0, c0)
+        rr1 = min(H, r0 + h)
+        cc1 = min(W, c0 + w)
+        if rr0 >= rr1 or cc0 >= cc1:
+            return dst
+        pr0 = rr0 - r0
+        pc0 = cc0 - c0
+
+    pr1 = pr0 + (rr1 - rr0)
+    pc1 = pc0 + (cc1 - cc0)
+
+    dst_view = dst[rr0:rr1, cc0:cc1]
+    patch_view = patch[pr0:pr1, pc0:pc1]
+
+    m = np.ones(patch_view.shape, dtype=bool)
+    if mask is not None:
+        m &= mask[pr0:pr1, pc0:pc1].astype(bool)
+    if transparent is not None:
+        m &= (patch_view != int(transparent))
+        if not overwrite:
+            m &= (dst_view == int(transparent))
+    else:
+        if not overwrite:
+            raise ValueError("paste: overwrite=False requires transparent to be set")
+
+    dst_view[m] = patch_view[m]
+    return dst
+
+
+def paint_coords(out: np.ndarray, coords: Iterable[Coord], color: int) -> None:
+    """Set out[r,c]=color for each coord (in-bounds only)."""
+    H, W = out.shape
+    v = int(color)
+    for r, c in coords:
+        rr = int(r)
+        cc = int(c)
+        if 0 <= rr < H and 0 <= cc < W:
+            out[rr, cc] = v
+
+codex
+设计已经定下来了，核心是：输入改成完整 3x3 block motif，中心块直接做成多数色实心块以承接 D5/0 的视觉特征；输出不再做 5x5 稀疏网格，而是把 8 个非中心块按“原 D1 的对侧映射”放进一个 17x17 的环形带上。下面开始落代码并把设计审查写进文件注释。
+Implementing combo variant with full motif input, majority-filled center, and ring-layout expansion while preserving opposite-slot mapping.
+  → Write combo-variant code with solver, generator, and embedded design analysis comments
+  • Run the required 50-trial generation test and fix any failures
+  • Measure a degeneration metric against legacy behavior and audit solver assumptions
+codex
+开始写文件：会一次性放入头部组合说明、设计分析注释、solver、generator，以及一个内部退化检查，确保生成样本和原题行为拉开距离。
+apply patch
+patch: completed
+/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45/code.py
+diff --git a/ceshi/code_combo/db0c5428/45/code.py b/ceshi/code_combo/db0c5428/45/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..84d2572adb4a5ccaa238d590d307a4b9f352ec7e
+--- /dev/null
++++ b/ceshi/code_combo/db0c5428/45/code.py
+@@ -0,0 +1,366 @@
++# Combo variant of db0c5428 (index 45)
++# combo_spec: D3/2+D5/0+D11/1
++# Name: 简化中心+无空洞+环形排列
++
++from __future__ import annotations
++
++from pathlib import Path
++import random
++import sys
++
++import numpy as np
++
++_ROOT = Path(__file__).resolve()
++_SOLVER_DIR = _ROOT.parents[4] / "solvers"
++if str(_SOLVER_DIR) not in sys.path:
++    sys.path.append(str(_SOLVER_DIR))
++
++from arc_utils import bbox, crop_bbox, get_bg, paste
++
++
++# Design analysis for combo D3/2 + D5/0 + D11/1
++# ------------------------------------------------
++# a) Concretization + behavior trace:
++#    - Original input: a 9x9 motif made of eight visible 3x3 blocks around a missing
++#      3x3 center; output fills that hole, then copies the 8 non-center blocks into
++#      the opposite slots of a sparse 5x5 block lattice.
++#    - Combo input: the motif is now a complete 3x3 block array with no hole. To keep
++#      the "simplified center" flavor from D5/0 visible after D11/1 removes repair, the
++#      generator makes the center block a solid majority-color 3x3 square directly in
++#      the input instead of reconstructing it during output.
++#    - Combo output: the original 9x9 motif stays fixed. The 8 non-center blocks are
++#      copied outward into an 8-position ring, not into the old sparse 5x5 grid. The
++#      D1 rule from the base task is preserved implicitly: each source block still goes
++#      to the point-opposite destination direction, but those destination slots now sit
++#      on a 17x17 ring frame. Example: source NW -> outer SE, source N -> outer S.
++#
++# b) Complexity calibration:
++#    - The change is not allowed to collapse into "just copy everything outward somehow".
++#      Keeping opposite-direction mapping preserves a learnable correspondence, while the
++#      ring geometry makes the layout visibly distinct from the source task.
++#    - The center block is fixed to one solid color, but the eight surrounding blocks
++#      retain asymmetric internal patterns from the original generator, so humans can
++#      visually track which block moved where.
++#    - Only one ring radius and one gap width are used. More layout modes would be hard
++#      to infer from 2-4 examples and would introduce unnecessary ambiguity.
++#
++# c) Hidden-assumption audit of the original main():
++#    - `_center_patch(...)` assumed a 3x3 hole existed and that inner-boundary pixels
++#      encoded the answer. D11/1 breaks that assumption completely, so center repair must
++#      be removed from the solver.
++#    - The `(4 - 2 * br, 4 - 2 * bc)` destination formula assumed the output lived on a
++#      5x5 block grid. D3/2 invalidates that geometry and must be replaced by explicit
++#      ring coordinates.
++#    - `bbox(g != bg)` still works because the motif remains one contiguous 9x9 object.
++#    - The block size assumption remains 3x3; the ring layout is defined for that size.
++#
++# d) Placement legality:
++#    - The ring envelope is 17x17: 3x3 motif blocks centered inside a frame with a
++#      1-pixel moat between the motif and the outer ring blocks.
++#    - Therefore the generator uses square canvases of size 17..19 and places the motif
++#      with a 4-pixel margin on all sides, guaranteeing the full ring fits in-bounds.
++#    - Because the ring is pasted with transparent background, no copied block overlaps
++#      another copied block or an unrelated object.
++#
++# e) Visual observability:
++#    - "No hole" is immediately visible because the center is an actual filled 3x3 block.
++#    - The ring layout is also immediately visible because the outer copies are centered
++#      on the four cardinal directions and four diagonals, with a 1-pixel gap from the
++#      motif; this does not resemble the old sparse lattice.
++#    - The center being a solid majority-color square is human-visible and does not rely
++#      on any hidden numeric ordering of colors.
++#
++# f) Visual cleanliness:
++#    - The output contains exactly one object family: the original central motif plus one
++#      clean outer ring of 8 copies. No separators, markers, or overlapping layers are
++#      introduced.
++#    - The 1-pixel moat keeps the ring legible and prevents the result from looking like
++#      an accidental 15x15 blob.
++#
++# g) Change inferability / color discipline:
++#    - No color remapping is introduced. Colors keep their identity between input and
++#      output, so the task stays about structure and placement rather than hidden color
++#      codes.
++#    - The center-majority condition is stable because the 8 outer blocks are still built
++#      with majority-dominant patterns, and the center contributes 9 more majority cells.
++#
++# 9) New solver assumptions guaranteed by generate_input():
++#    - The input always contains exactly one complete 9x9 motif on a background canvas.
++#    - The motif always has 3x3 blocks and at least a 4-cell margin so the 17x17 ring
++#      frame can be pasted without clipping.
++#    - The center block is a solid majority-color block, but the solver does not depend on
++#      that detail; it is present to preserve the D5/0 visual signature after D11/1.
++#    - A degeneration check rejects samples whose output would be too close to the legacy
++#      5x5-lattice behavior on the same input.
++
++
++BLOCK = 3
++MOTIF_SIZE = BLOCK * 3
++RING_GAP = 1
++MOTIF_OFFSET = BLOCK + RING_GAP
++RING_SIZE = MOTIF_SIZE + 2 * MOTIF_OFFSET
++GRID_SIZE_MIN, GRID_SIZE_MAX = 17, 19
++BG = 8
++FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
++COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4
++MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16
++CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8
++EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8
++MAX_RETRIES = 300
++MIN_VARIANT_DIFF = 24
++
++DIAG_ORBITS = (
++    ((0, 0),),
++    ((1, 1),),
++    ((2, 2),),
++    ((0, 1), (1, 0)),
++    ((0, 2), (2, 0)),
++    ((1, 2), (2, 1)),
++)
++LR_ORBITS = (
++    ((0, 0), (0, 2)),
++    ((1, 0), (1, 2)),
++    ((2, 0), (2, 2)),
++    ((0, 1),),
++    ((1, 1),),
++    ((2, 1),),
++)
++
++_RING_COORD = {-1: 0, 0: 7, 1: 14}
++
++
++def _major_foreground_color(g: np.ndarray, bg: int) -> int:
++    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
++    assert vals.size, "input must contain foreground colors"
++    return int(vals[int(np.argmax(counts))])
++
++
++def _extract_block(g: np.ndarray, r0: int, c0: int, br: int, bc: int, block: int = BLOCK) -> np.ndarray:
++    return crop_bbox(
++        g,
++        (
++            int(r0) + br * block,
++            int(c0) + bc * block,
++            int(r0) + (br + 1) * block - 1,
++            int(c0) + (bc + 1) * block - 1,
++        ),
++    )
++
++
++def _ring_slot_from_source(br: int, bc: int) -> tuple[int, int]:
++    assert (br, bc) != (1, 1), "center block is not copied into the ring"
++    dr = 1 - int(br)
++    dc = 1 - int(bc)
++    return _RING_COORD[dr], _RING_COORD[dc]
++
++
++def _ring_patch(motif: np.ndarray, bg: int) -> np.ndarray:
++    patch = np.full((RING_SIZE, RING_SIZE), bg, dtype=int)
++    paste(patch, motif, MOTIF_OFFSET, MOTIF_OFFSET)
++    for br in range(3):
++        for bc in range(3):
++            if (br, bc) == (1, 1):
++                continue
++            src = motif[br * BLOCK:(br + 1) * BLOCK, bc * BLOCK:(bc + 1) * BLOCK]
++            dst_r, dst_c = _ring_slot_from_source(br, bc)
++            paste(patch, src, dst_r, dst_c)
++    return patch
++
++
++def _legacy_center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
++    main = _major_foreground_color(g, bg)
++    patch = np.full((block, block), main, dtype=int)
++    hole_r = int(r0) + block
++    hole_c = int(c0) + block
++    offsets = [-1, 1, 3]
++    for r in range(block):
++        for c in range(block):
++            if r == block // 2 and c == block // 2:
++                continue
++            patch[r, c] = int(g[hole_r + offsets[r], hole_c + offsets[c]])
++    return patch
++
++
++def _legacy_output(grid: np.ndarray) -> np.ndarray:
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    motif_bbox = bbox(g != bg)
++    assert motif_bbox is not None
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == w and h % 3 == 0
++    block = h // 3
++
++    out = g.copy()
++    expanded_r0 = int(r0) - block
++    expanded_c0 = int(c0) - block
++    for br in range(3):
++        for bc in range(3):
++            if (br, bc) == (1, 1):
++                continue
++            src = _extract_block(g, int(r0), int(c0), br, bc, block)
++            dst_r = expanded_r0 + (4 - 2 * br) * block
++            dst_c = expanded_c0 + (4 - 2 * bc) * block
++            paste(out, src, dst_r, dst_c)
++
++    paste(out, _legacy_center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand a complete 3x3 block motif by copying its outer ring into a larger circular-style frame.
++
++    Input structure:
++    - One 9x9 foreground motif sits on a plain background canvas.
++    - The motif is a full 3x3 arrangement of 3x3 blocks with no missing center block.
++    - The center block is already present, so the input is a complete contiguous object.
++
++    Rule:
++    - Keep the original 9x9 motif exactly where it is.
++    - Copy each of the eight non-center 3x3 blocks to the opposite direction around the motif.
++    - Place those copied blocks on a ring layout: corners go to diagonal ring slots and edge blocks
++      go to cardinal ring slots, leaving a 1-pixel moat between the ring and the central motif.
++
++    Key insight: This is no longer a hole-repair task. The whole 3x3 motif is already complete, and
++    the transformation is purely an outward ring expansion that preserves the old opposite-direction
++    correspondence while changing the destination geometry from a sparse grid to a ring.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    motif_bbox = bbox(g != bg)
++    assert motif_bbox is not None, "expected a foreground motif"
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == MOTIF_SIZE and w == MOTIF_SIZE, "expected one complete 9x9 motif"
++
++    frame_r0 = int(r0) - MOTIF_OFFSET
++    frame_c0 = int(c0) - MOTIF_OFFSET
++    motif = crop_bbox(g, motif_bbox)
++    out = g.copy()
++    paste(out, _ring_patch(motif, bg), frame_r0, frame_c0, transparent=bg)
++    return out
++
++
++def _major_orbits(orbits, forced_minor, target_count):
++    forced_minor = set(forced_minor)
++    usable = [
++        idx for idx, orbit in enumerate(orbits)
++        if all(coord not in forced_minor for coord in orbit)
++    ]
++    choices = []
++    for mask in range(1 << len(usable)):
++        selected = set()
++        total = 0
++        for bit, idx in enumerate(usable):
++            if mask & (1 << bit):
++                selected.add(idx)
++                total += len(orbits[idx])
++        if total == target_count:
++            choices.append(selected)
++    assert choices, "unreachable symmetric majority count"
++    return random.choice(choices)
++
++
++def _seed_block(orbits, forced_minor, majority, target_count):
++    block = np.full((BLOCK, BLOCK), -1, dtype=int)
++    major_idxs = _major_orbits(orbits, forced_minor, target_count)
++    minor_orbits = []
++    for idx, orbit in enumerate(orbits):
++        if idx in major_idxs:
++            for r, c in orbit:
++                block[r, c] = majority
++        else:
++            minor_orbits.append((block, orbit))
++    return block, minor_orbits
++
++
++def _assign_minor_colors(minor_orbits, colors):
++    random.shuffle(minor_orbits)
++    guaranteed = list(colors)
++    random.shuffle(guaranteed)
++    assignments = guaranteed + [
++        random.choice(colors) for _ in range(len(minor_orbits) - len(guaranteed))
++    ]
++    for (block, orbit), color in zip(minor_orbits, assignments):
++        for r, c in orbit:
++            block[r, c] = color
++
++
++def _make_blocks(majority, minor_colors, corner_major, edge_major):
++    b00, corner_minors = _seed_block(DIAG_ORBITS, [(2, 2)], majority, corner_major)
++    b01, edge_minors = _seed_block(LR_ORBITS, [(2, 1)], majority, edge_major)
++    minor_orbits = corner_minors + edge_minors
++    assert len(minor_orbits) >= len(minor_colors)
++    _assign_minor_colors(minor_orbits, minor_colors)
++    assert np.all(b00 != -1) and np.all(b01 != -1)
++    return b00, b01
++
++
++def _assemble_motif(b00: np.ndarray, b01: np.ndarray, majority: int) -> np.ndarray:
++    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
++    blocks = {
++        (0, 0): b00,
++        (0, 1): b01,
++        (0, 2): np.fliplr(b00),
++        (1, 0): b01.T,
++        (1, 1): np.full((BLOCK, BLOCK), majority, dtype=int),
++        (1, 2): np.rot90(b01, -1),
++        (2, 0): np.flipud(b00),
++        (2, 1): np.flipud(b01),
++        (2, 2): np.rot90(b00, 2),
++    }
++    for (br, bc), blk in blocks.items():
++        paste(motif, blk, br * BLOCK, bc * BLOCK)
++    return motif
++
++
++def _variant_signal(inp: np.ndarray) -> int:
++    return int(np.count_nonzero(main(inp) != _legacy_output(inp)))
++
++
++def _gen_attempt() -> np.ndarray | None:
++    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    color_count = random.randint(COLOR_COUNT_MIN, COLOR_COUNT_MAX)
++    colors = random.sample(FOREGROUND_COLORS, color_count)
++    majority = colors[0]
++    minor_colors = colors[1:]
++
++    possible_totals = [
++        total for total in range(MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX + 1)
++        if 18 - total >= len(minor_colors)
++    ]
++    majority_total = random.choice(possible_totals)
++    pairs = [
++        (corner, majority_total - corner)
++        for corner in range(CORNER_MAJOR_MIN, CORNER_MAJOR_MAX + 1)
++        if EDGE_MAJOR_MIN <= majority_total - corner <= EDGE_MAJOR_MAX
++    ]
++    corner_major, edge_major = random.choice(pairs)
++
++    b00, b01 = _make_blocks(majority, minor_colors, corner_major, edge_major)
++    motif = _assemble_motif(b00, b01, majority)
++    ring = _ring_patch(motif, BG)
++
++    r0 = random.randint(MOTIF_OFFSET, n - MOTIF_SIZE - MOTIF_OFFSET)
++    c0 = random.randint(MOTIF_OFFSET, n - MOTIF_SIZE - MOTIF_OFFSET)
++    inp = np.full((n, n), BG, dtype=int)
++    out = np.full((n, n), BG, dtype=int)
++    paste(inp, motif, r0, c0)
++    paste(out, ring, r0 - MOTIF_OFFSET, c0 - MOTIF_OFFSET, transparent=BG)
++
++    if not np.array_equal(main(inp), out):
++        return None
++    if _variant_signal(inp) < MIN_VARIANT_DIFF:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise AssertionError("failed to generate a valid combo db0c5428 input")
+
+diff --git a/ceshi/code_combo/db0c5428/45/code.py b/ceshi/code_combo/db0c5428/45/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..84d2572adb4a5ccaa238d590d307a4b9f352ec7e
+--- /dev/null
++++ b/ceshi/code_combo/db0c5428/45/code.py
+@@ -0,0 +1,366 @@
++# Combo variant of db0c5428 (index 45)
++# combo_spec: D3/2+D5/0+D11/1
++# Name: 简化中心+无空洞+环形排列
++
++from __future__ import annotations
++
++from pathlib import Path
++import random
++import sys
++
++import numpy as np
++
++_ROOT = Path(__file__).resolve()
++_SOLVER_DIR = _ROOT.parents[4] / "solvers"
++if str(_SOLVER_DIR) not in sys.path:
++    sys.path.append(str(_SOLVER_DIR))
++
++from arc_utils import bbox, crop_bbox, get_bg, paste
++
++
++# Design analysis for combo D3/2 + D5/0 + D11/1
++# ------------------------------------------------
++# a) Concretization + behavior trace:
++#    - Original input: a 9x9 motif made of eight visible 3x3 blocks around a missing
++#      3x3 center; output fills that hole, then copies the 8 non-center blocks into
++#      the opposite slots of a sparse 5x5 block lattice.
++#    - Combo input: the motif is now a complete 3x3 block array with no hole. To keep
++#      the "simplified center" flavor from D5/0 visible after D11/1 removes repair, the
++#      generator makes the center block a solid majority-color 3x3 square directly in
++#      the input instead of reconstructing it during output.
++#    - Combo output: the original 9x9 motif stays fixed. The 8 non-center blocks are
++#      copied outward into an 8-position ring, not into the old sparse 5x5 grid. The
++#      D1 rule from the base task is preserved implicitly: each source block still goes
++#      to the point-opposite destination direction, but those destination slots now sit
++#      on a 17x17 ring frame. Example: source NW -> outer SE, source N -> outer S.
++#
++# b) Complexity calibration:
++#    - The change is not allowed to collapse into "just copy everything outward somehow".
++#      Keeping opposite-direction mapping preserves a learnable correspondence, while the
++#      ring geometry makes the layout visibly distinct from the source task.
++#    - The center block is fixed to one solid color, but the eight surrounding blocks
++#      retain asymmetric internal patterns from the original generator, so humans can
++#      visually track which block moved where.
++#    - Only one ring radius and one gap width are used. More layout modes would be hard
++#      to infer from 2-4 examples and would introduce unnecessary ambiguity.
++#
++# c) Hidden-assumption audit of the original main():
++#    - `_center_patch(...)` assumed a 3x3 hole existed and that inner-boundary pixels
++#      encoded the answer. D11/1 breaks that assumption completely, so center repair must
++#      be removed from the solver.
++#    - The `(4 - 2 * br, 4 - 2 * bc)` destination formula assumed the output lived on a
++#      5x5 block grid. D3/2 invalidates that geometry and must be replaced by explicit
++#      ring coordinates.
++#    - `bbox(g != bg)` still works because the motif remains one contiguous 9x9 object.
++#    - The block size assumption remains 3x3; the ring layout is defined for that size.
++#
++# d) Placement legality:
++#    - The ring envelope is 17x17: 3x3 motif blocks centered inside a frame with a
++#      1-pixel moat between the motif and the outer ring blocks.
++#    - Therefore the generator uses square canvases of size 17..19 and places the motif
++#      with a 4-pixel margin on all sides, guaranteeing the full ring fits in-bounds.
++#    - Because the ring is pasted with transparent background, no copied block overlaps
++#      another copied block or an unrelated object.
++#
++# e) Visual observability:
++#    - "No hole" is immediately visible because the center is an actual filled 3x3 block.
++#    - The ring layout is also immediately visible because the outer copies are centered
++#      on the four cardinal directions and four diagonals, with a 1-pixel gap from the
++#      motif; this does not resemble the old sparse lattice.
++#    - The center being a solid majority-color square is human-visible and does not rely
++#      on any hidden numeric ordering of colors.
++#
++# f) Visual cleanliness:
++#    - The output contains exactly one object family: the original central motif plus one
++#      clean outer ring of 8 copies. No separators, markers, or overlapping layers are
++#      introduced.
++#    - The 1-pixel moat keeps the ring legible and prevents the result from looking like
++#      an accidental 15x15 blob.
++#
++# g) Change inferability / color discipline:
++#    - No color remapping is introduced. Colors keep their identity between input and
++#      output, so the task stays about structure and placement rather than hidden color
++#      codes.
++#    - The center-majority condition is stable because the 8 outer blocks are still built
++#      with majority-dominant patterns, and the center contributes 9 more majority cells.
++#
++# 9) New solver assumptions guaranteed by generate_input():
++#    - The input always contains exactly one complete 9x9 motif on a background canvas.
++#    - The motif always has 3x3 blocks and at least a 4-cell margin so the 17x17 ring
++#      frame can be pasted without clipping.
++#    - The center block is a solid majority-color block, but the solver does not depend on
++#      that detail; it is present to preserve the D5/0 visual signature after D11/1.
++#    - A degeneration check rejects samples whose output would be too close to the legacy
++#      5x5-lattice behavior on the same input.
++
++
++BLOCK = 3
++MOTIF_SIZE = BLOCK * 3
++RING_GAP = 1
++MOTIF_OFFSET = BLOCK + RING_GAP
++RING_SIZE = MOTIF_SIZE + 2 * MOTIF_OFFSET
++GRID_SIZE_MIN, GRID_SIZE_MAX = 17, 19
++BG = 8
++FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
++COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4
++MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16
++CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8
++EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8
++MAX_RETRIES = 300
++MIN_VARIANT_DIFF = 24
++
++DIAG_ORBITS = (
++    ((0, 0),),
++    ((1, 1),),
++    ((2, 2),),
++    ((0, 1), (1, 0)),
++    ((0, 2), (2, 0)),
++    ((1, 2), (2, 1)),
++)
++LR_ORBITS = (
++    ((0, 0), (0, 2)),
++    ((1, 0), (1, 2)),
++    ((2, 0), (2, 2)),
++    ((0, 1),),
++    ((1, 1),),
++    ((2, 1),),
++)
++
++_RING_COORD = {-1: 0, 0: 7, 1: 14}
++
++
++def _major_foreground_color(g: np.ndarray, bg: int) -> int:
++    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
++    assert vals.size, "input must contain foreground colors"
++    return int(vals[int(np.argmax(counts))])
++
++
++def _extract_block(g: np.ndarray, r0: int, c0: int, br: int, bc: int, block: int = BLOCK) -> np.ndarray:
++    return crop_bbox(
++        g,
++        (
++            int(r0) + br * block,
++            int(c0) + bc * block,
++            int(r0) + (br + 1) * block - 1,
++            int(c0) + (bc + 1) * block - 1,
++        ),
++    )
++
++
++def _ring_slot_from_source(br: int, bc: int) -> tuple[int, int]:
++    assert (br, bc) != (1, 1), "center block is not copied into the ring"
++    dr = 1 - int(br)
++    dc = 1 - int(bc)
++    return _RING_COORD[dr], _RING_COORD[dc]
++
++
++def _ring_patch(motif: np.ndarray, bg: int) -> np.ndarray:
++    patch = np.full((RING_SIZE, RING_SIZE), bg, dtype=int)
++    paste(patch, motif, MOTIF_OFFSET, MOTIF_OFFSET)
++    for br in range(3):
++        for bc in range(3):
++            if (br, bc) == (1, 1):
++                continue
++            src = motif[br * BLOCK:(br + 1) * BLOCK, bc * BLOCK:(bc + 1) * BLOCK]
++            dst_r, dst_c = _ring_slot_from_source(br, bc)
++            paste(patch, src, dst_r, dst_c)
++    return patch
++
++
++def _legacy_center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
++    main = _major_foreground_color(g, bg)
++    patch = np.full((block, block), main, dtype=int)
++    hole_r = int(r0) + block
++    hole_c = int(c0) + block
++    offsets = [-1, 1, 3]
++    for r in range(block):
++        for c in range(block):
++            if r == block // 2 and c == block // 2:
++                continue
++            patch[r, c] = int(g[hole_r + offsets[r], hole_c + offsets[c]])
++    return patch
++
++
++def _legacy_output(grid: np.ndarray) -> np.ndarray:
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    motif_bbox = bbox(g != bg)
++    assert motif_bbox is not None
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == w and h % 3 == 0
++    block = h // 3
++
++    out = g.copy()
++    expanded_r0 = int(r0) - block
++    expanded_c0 = int(c0) - block
++    for br in range(3):
++        for bc in range(3):
++            if (br, bc) == (1, 1):
++                continue
++            src = _extract_block(g, int(r0), int(c0), br, bc, block)
++            dst_r = expanded_r0 + (4 - 2 * br) * block
++            dst_c = expanded_c0 + (4 - 2 * bc) * block
++            paste(out, src, dst_r, dst_c)
++
++    paste(out, _legacy_center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand a complete 3x3 block motif by copying its outer ring into a larger circular-style frame.
++
++    Input structure:
++    - One 9x9 foreground motif sits on a plain background canvas.
++    - The motif is a full 3x3 arrangement of 3x3 blocks with no missing center block.
++    - The center block is already present, so the input is a complete contiguous object.
++
++    Rule:
++    - Keep the original 9x9 motif exactly where it is.
++    - Copy each of the eight non-center 3x3 blocks to the opposite direction around the motif.
++    - Place those copied blocks on a ring layout: corners go to diagonal ring slots and edge blocks
++      go to cardinal ring slots, leaving a 1-pixel moat between the ring and the central motif.
++
++    Key insight: This is no longer a hole-repair task. The whole 3x3 motif is already complete, and
++    the transformation is purely an outward ring expansion that preserves the old opposite-direction
++    correspondence while changing the destination geometry from a sparse grid to a ring.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    motif_bbox = bbox(g != bg)
++    assert motif_bbox is not None, "expected a foreground motif"
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == MOTIF_SIZE and w == MOTIF_SIZE, "expected one complete 9x9 motif"
++
++    frame_r0 = int(r0) - MOTIF_OFFSET
++    frame_c0 = int(c0) - MOTIF_OFFSET
++    motif = crop_bbox(g, motif_bbox)
++    out = g.copy()
++    paste(out, _ring_patch(motif, bg), frame_r0, frame_c0, transparent=bg)
++    return out
++
++
++def _major_orbits(orbits, forced_minor, target_count):
++    forced_minor = set(forced_minor)
++    usable = [
++        idx for idx, orbit in enumerate(orbits)
++        if all(coord not in forced_minor for coord in orbit)
++    ]
++    choices = []
++    for mask in range(1 << len(usable)):
++        selected = set()
++        total = 0
++        for bit, idx in enumerate(usable):
++            if mask & (1 << bit):
++                selected.add(idx)
++                total += len(orbits[idx])
++        if total == target_count:
++            choices.append(selected)
++    assert choices, "unreachable symmetric majority count"
++    return random.choice(choices)
++
++
++def _seed_block(orbits, forced_minor, majority, target_count):
++    block = np.full((BLOCK, BLOCK), -1, dtype=int)
++    major_idxs = _major_orbits(orbits, forced_minor, target_count)
++    minor_orbits = []
++    for idx, orbit in enumerate(orbits):
++        if idx in major_idxs:
++            for r, c in orbit:
++                block[r, c] = majority
++        else:
++            minor_orbits.append((block, orbit))
++    return block, minor_orbits
++
++
++def _assign_minor_colors(minor_orbits, colors):
++    random.shuffle(minor_orbits)
++    guaranteed = list(colors)
++    random.shuffle(guaranteed)
++    assignments = guaranteed + [
++        random.choice(colors) for _ in range(len(minor_orbits) - len(guaranteed))
++    ]
++    for (block, orbit), color in zip(minor_orbits, assignments):
++        for r, c in orbit:
++            block[r, c] = color
++
++
++def _make_blocks(majority, minor_colors, corner_major, edge_major):
++    b00, corner_minors = _seed_block(DIAG_ORBITS, [(2, 2)], majority, corner_major)
++    b01, edge_minors = _seed_block(LR_ORBITS, [(2, 1)], majority, edge_major)
++    minor_orbits = corner_minors + edge_minors
++    assert len(minor_orbits) >= len(minor_colors)
++    _assign_minor_colors(minor_orbits, minor_colors)
++    assert np.all(b00 != -1) and np.all(b01 != -1)
++    return b00, b01
++
++
++def _assemble_motif(b00: np.ndarray, b01: np.ndarray, majority: int) -> np.ndarray:
++    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
++    blocks = {
++        (0, 0): b00,
++        (0, 1): b01,
++        (0, 2): np.fliplr(b00),
++        (1, 0): b01.T,
++        (1, 1): np.full((BLOCK, BLOCK), majority, dtype=int),
++        (1, 2): np.rot90(b01, -1),
++        (2, 0): np.flipud(b00),
++        (2, 1): np.flipud(b01),
++        (2, 2): np.rot90(b00, 2),
++    }
++    for (br, bc), blk in blocks.items():
++        paste(motif, blk, br * BLOCK, bc * BLOCK)
++    return motif
++
++
++def _variant_signal(inp: np.ndarray) -> int:
++    return int(np.count_nonzero(main(inp) != _legacy_output(inp)))
++
++
++def _gen_attempt() -> np.ndarray | None:
++    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    color_count = random.randint(COLOR_COUNT_MIN, COLOR_COUNT_MAX)
++    colors = random.sample(FOREGROUND_COLORS, color_count)
++    majority = colors[0]
++    minor_colors = colors[1:]
++
++    possible_totals = [
++        total for total in range(MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX + 1)
++        if 18 - total >= len(minor_colors)
++    ]
++    majority_total = random.choice(possible_totals)
++    pairs = [
++        (corner, majority_total - corner)
++        for corner in range(CORNER_MAJOR_MIN, CORNER_MAJOR_MAX + 1)
++        if EDGE_MAJOR_MIN <= majority_total - corner <= EDGE_MAJOR_MAX
++    ]
++    corner_major, edge_major = random.choice(pairs)
++
++    b00, b01 = _make_blocks(majority, minor_colors, corner_major, edge_major)
++    motif = _assemble_motif(b00, b01, majority)
++    ring = _ring_patch(motif, BG)
++
++    r0 = random.randint(MOTIF_OFFSET, n - MOTIF_SIZE - MOTIF_OFFSET)
++    c0 = random.randint(MOTIF_OFFSET, n - MOTIF_SIZE - MOTIF_OFFSET)
++    inp = np.full((n, n), BG, dtype=int)
++    out = np.full((n, n), BG, dtype=int)
++    paste(inp, motif, r0, c0)
++    paste(out, ring, r0 - MOTIF_OFFSET, c0 - MOTIF_OFFSET, transparent=BG)
++
++    if not np.array_equal(main(inp), out):
++        return None
++    if _variant_signal(inp) < MIN_VARIANT_DIFF:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise AssertionError("failed to generate a valid combo db0c5428 input")
+
+codex
+代码已落盘。先跑语法与指定的 50 次生成测试，若有任何越界或退化问题，就直接回到布局常量或生成约束上修。
+exec
+/bin/bash -lc "sed -n '1,320p' /home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45/code.py" in /home/lixinyu/snap/new
+ succeeded in 0ms:
+# Combo variant of db0c5428 (index 45)
+# combo_spec: D3/2+D5/0+D11/1
+# Name: 简化中心+无空洞+环形排列
+
+from __future__ import annotations
+
+from pathlib import Path
+import random
+import sys
+
+import numpy as np
+
+_ROOT = Path(__file__).resolve()
+_SOLVER_DIR = _ROOT.parents[4] / "solvers"
+if str(_SOLVER_DIR) not in sys.path:
+    sys.path.append(str(_SOLVER_DIR))
+
+from arc_utils import bbox, crop_bbox, get_bg, paste
+
+
+# Design analysis for combo D3/2 + D5/0 + D11/1
+# ------------------------------------------------
+# a) Concretization + behavior trace:
+#    - Original input: a 9x9 motif made of eight visible 3x3 blocks around a missing
+#      3x3 center; output fills that hole, then copies the 8 non-center blocks into
+#      the opposite slots of a sparse 5x5 block lattice.
+#    - Combo input: the motif is now a complete 3x3 block array with no hole. To keep
+#      the "simplified center" flavor from D5/0 visible after D11/1 removes repair, the
+#      generator makes the center block a solid majority-color 3x3 square directly in
+#      the input instead of reconstructing it during output.
+#    - Combo output: the original 9x9 motif stays fixed. The 8 non-center blocks are
+#      copied outward into an 8-position ring, not into the old sparse 5x5 grid. The
+#      D1 rule from the base task is preserved implicitly: each source block still goes
+#      to the point-opposite destination direction, but those destination slots now sit
+#      on a 17x17 ring frame. Example: source NW -> outer SE, source N -> outer S.
+#
+# b) Complexity calibration:
+#    - The change is not allowed to collapse into "just copy everything outward somehow".
+#      Keeping opposite-direction mapping preserves a learnable correspondence, while the
+#      ring geometry makes the layout visibly distinct from the source task.
+#    - The center block is fixed to one solid color, but the eight surrounding blocks
+#      retain asymmetric internal patterns from the original generator, so humans can
+#      visually track which block moved where.
+#    - Only one ring radius and one gap width are used. More layout modes would be hard
+#      to infer from 2-4 examples and would introduce unnecessary ambiguity.
+#
+# c) Hidden-assumption audit of the original main():
+#    - `_center_patch(...)` assumed a 3x3 hole existed and that inner-boundary pixels
+#      encoded the answer. D11/1 breaks that assumption completely, so center repair must
+#      be removed from the solver.
+#    - The `(4 - 2 * br, 4 - 2 * bc)` destination formula assumed the output lived on a
+#      5x5 block grid. D3/2 invalidates that geometry and must be replaced by explicit
+#      ring coordinates.
+#    - `bbox(g != bg)` still works because the motif remains one contiguous 9x9 object.
+#    - The block size assumption remains 3x3; the ring layout is defined for that size.
+#
+# d) Placement legality:
+#    - The ring envelope is 17x17: 3x3 motif blocks centered inside a frame with a
+#      1-pixel moat between the motif and the outer ring blocks.
+#    - Therefore the generator uses square canvases of size 17..19 and places the motif
+#      with a 4-pixel margin on all sides, guaranteeing the full ring fits in-bounds.
+#    - Because the ring is pasted with transparent background, no copied block overlaps
+#      another copied block or an unrelated object.
+#
+# e) Visual observability:
+#    - "No hole" is immediately visible because the center is an actual filled 3x3 block.
+#    - The ring layout is also immediately visible because the outer copies are centered
+#      on the four cardinal directions and four diagonals, with a 1-pixel gap from the
+#      motif; this does not resemble the old sparse lattice.
+#    - The center being a solid majority-color square is human-visible and does not rely
+#      on any hidden numeric ordering of colors.
+#
+# f) Visual cleanliness:
+#    - The output contains exactly one object family: the original central motif plus one
+#      clean outer ring of 8 copies. No separators, markers, or overlapping layers are
+#      introduced.
+#    - The 1-pixel moat keeps the ring legible and prevents the result from looking like
+#      an accidental 15x15 blob.
+#
+# g) Change inferability / color discipline:
+#    - No color remapping is introduced. Colors keep their identity between input and
+#      output, so the task stays about structure and placement rather than hidden color
+#      codes.
+#    - The center-majority condition is stable because the 8 outer blocks are still built
+#      with majority-dominant patterns, and the center contributes 9 more majority cells.
+#
+# 9) New solver assumptions guaranteed by generate_input():
+#    - The input always contains exactly one complete 9x9 motif on a background canvas.
+#    - The motif always has 3x3 blocks and at least a 4-cell margin so the 17x17 ring
+#      frame can be pasted without clipping.
+#    - The center block is a solid majority-color block, but the solver does not depend on
+#      that detail; it is present to preserve the D5/0 visual signature after D11/1.
+#    - A degeneration check rejects samples whose output would be too close to the legacy
+#      5x5-lattice behavior on the same input.
+
+
+BLOCK = 3
+MOTIF_SIZE = BLOCK * 3
+RING_GAP = 1
+MOTIF_OFFSET = BLOCK + RING_GAP
+RING_SIZE = MOTIF_SIZE + 2 * MOTIF_OFFSET
+GRID_SIZE_MIN, GRID_SIZE_MAX = 17, 19
+BG = 8
+FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
+COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4
+MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16
+CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8
+EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8
+MAX_RETRIES = 300
+MIN_VARIANT_DIFF = 24
+
+DIAG_ORBITS = (
+    ((0, 0),),
+    ((1, 1),),
+    ((2, 2),),
+    ((0, 1), (1, 0)),
+    ((0, 2), (2, 0)),
+    ((1, 2), (2, 1)),
+)
+LR_ORBITS = (
+    ((0, 0), (0, 2)),
+    ((1, 0), (1, 2)),
+    ((2, 0), (2, 2)),
+    ((0, 1),),
+    ((1, 1),),
+    ((2, 1),),
+)
+
+_RING_COORD = {-1: 0, 0: 7, 1: 14}
+
+
+def _major_foreground_color(g: np.ndarray, bg: int) -> int:
+    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
+    assert vals.size, "input must contain foreground colors"
+    return int(vals[int(np.argmax(counts))])
+
+
+def _extract_block(g: np.ndarray, r0: int, c0: int, br: int, bc: int, block: int = BLOCK) -> np.ndarray:
+    return crop_bbox(
+        g,
+        (
+            int(r0) + br * block,
+            int(c0) + bc * block,
+            int(r0) + (br + 1) * block - 1,
+            int(c0) + (bc + 1) * block - 1,
+        ),
+    )
+
+
+def _ring_slot_from_source(br: int, bc: int) -> tuple[int, int]:
+    assert (br, bc) != (1, 1), "center block is not copied into the ring"
+    dr = 1 - int(br)
+    dc = 1 - int(bc)
+    return _RING_COORD[dr], _RING_COORD[dc]
+
+
+def _ring_patch(motif: np.ndarray, bg: int) -> np.ndarray:
+    patch = np.full((RING_SIZE, RING_SIZE), bg, dtype=int)
+    paste(patch, motif, MOTIF_OFFSET, MOTIF_OFFSET)
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = motif[br * BLOCK:(br + 1) * BLOCK, bc * BLOCK:(bc + 1) * BLOCK]
+            dst_r, dst_c = _ring_slot_from_source(br, bc)
+            paste(patch, src, dst_r, dst_c)
+    return patch
+
+
+def _legacy_center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
+    main = _major_foreground_color(g, bg)
+    patch = np.full((block, block), main, dtype=int)
+    hole_r = int(r0) + block
+    hole_c = int(c0) + block
+    offsets = [-1, 1, 3]
+    for r in range(block):
+        for c in range(block):
+            if r == block // 2 and c == block // 2:
+                continue
+            patch[r, c] = int(g[hole_r + offsets[r], hole_c + offsets[c]])
+    return patch
+
+
+def _legacy_output(grid: np.ndarray) -> np.ndarray:
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+    motif_bbox = bbox(g != bg)
+    assert motif_bbox is not None
+    r0, c0, r1, c1 = motif_bbox
+    h = int(r1 - r0 + 1)
+    w = int(c1 - c0 + 1)
+    assert h == w and h % 3 == 0
+    block = h // 3
+
+    out = g.copy()
+    expanded_r0 = int(r0) - block
+    expanded_c0 = int(c0) - block
+    for br in range(3):
+        for bc in range(3):
+            if (br, bc) == (1, 1):
+                continue
+            src = _extract_block(g, int(r0), int(c0), br, bc, block)
+            dst_r = expanded_r0 + (4 - 2 * br) * block
+            dst_c = expanded_c0 + (4 - 2 * bc) * block
+            paste(out, src, dst_r, dst_c)
+
+    paste(out, _legacy_center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
+    return out
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Expand a complete 3x3 block motif by copying its outer ring into a larger circular-style frame.
+
+    Input structure:
+    - One 9x9 foreground motif sits on a plain background canvas.
+    - The motif is a full 3x3 arrangement of 3x3 blocks with no missing center block.
+    - The center block is already present, so the input is a complete contiguous object.
+
+    Rule:
+    - Keep the original 9x9 motif exactly where it is.
+    - Copy each of the eight non-center 3x3 blocks to the opposite direction around the motif.
+    - Place those copied blocks on a ring layout: corners go to diagonal ring slots and edge blocks
+      go to cardinal ring slots, leaving a 1-pixel moat between the ring and the central motif.
+
+    Key insight: This is no longer a hole-repair task. The whole 3x3 motif is already complete, and
+    the transformation is purely an outward ring expansion that preserves the old opposite-direction
+    correspondence while changing the destination geometry from a sparse grid to a ring.
+    """
+    g = np.asarray(grid, dtype=int)
+    bg = get_bg(g)
+    motif_bbox = bbox(g != bg)
+    assert motif_bbox is not None, "expected a foreground motif"
+    r0, c0, r1, c1 = motif_bbox
+    h = int(r1 - r0 + 1)
+    w = int(c1 - c0 + 1)
+    assert h == MOTIF_SIZE and w == MOTIF_SIZE, "expected one complete 9x9 motif"
+
+    frame_r0 = int(r0) - MOTIF_OFFSET
+    frame_c0 = int(c0) - MOTIF_OFFSET
+    motif = crop_bbox(g, motif_bbox)
+    out = g.copy()
+    paste(out, _ring_patch(motif, bg), frame_r0, frame_c0, transparent=bg)
+    return out
+
+
+def _major_orbits(orbits, forced_minor, target_count):
+    forced_minor = set(forced_minor)
+    usable = [
+        idx for idx, orbit in enumerate(orbits)
+        if all(coord not in forced_minor for coord in orbit)
+    ]
+    choices = []
+    for mask in range(1 << len(usable)):
+        selected = set()
+        total = 0
+        for bit, idx in enumerate(usable):
+            if mask & (1 << bit):
+                selected.add(idx)
+                total += len(orbits[idx])
+        if total == target_count:
+            choices.append(selected)
+    assert choices, "unreachable symmetric majority count"
+    return random.choice(choices)
+
+
+def _seed_block(orbits, forced_minor, majority, target_count):
+    block = np.full((BLOCK, BLOCK), -1, dtype=int)
+    major_idxs = _major_orbits(orbits, forced_minor, target_count)
+    minor_orbits = []
+    for idx, orbit in enumerate(orbits):
+        if idx in major_idxs:
+            for r, c in orbit:
+                block[r, c] = majority
+        else:
+            minor_orbits.append((block, orbit))
+    return block, minor_orbits
+
+
+def _assign_minor_colors(minor_orbits, colors):
+    random.shuffle(minor_orbits)
+    guaranteed = list(colors)
+    random.shuffle(guaranteed)
+    assignments = guaranteed + [
+        random.choice(colors) for _ in range(len(minor_orbits) - len(guaranteed))
+    ]
+    for (block, orbit), color in zip(minor_orbits, assignments):
+        for r, c in orbit:
+            block[r, c] = color
+
+
+def _make_blocks(majority, minor_colors, corner_major, edge_major):
+    b00, corner_minors = _seed_block(DIAG_ORBITS, [(2, 2)], majority, corner_major)
+    b01, edge_minors = _seed_block(LR_ORBITS, [(2, 1)], majority, edge_major)
+    minor_orbits = corner_minors + edge_minors
+    assert len(minor_orbits) >= len(minor_colors)
+    _assign_minor_colors(minor_orbits, minor_colors)
+    assert np.all(b00 != -1) and np.all(b01 != -1)
+    return b00, b01
+
+
+def _assemble_motif(b00: np.ndarray, b01: np.ndarray, majority: int) -> np.ndarray:
+    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
+    blocks = {
+        (0, 0): b00,
+        (0, 1): b01,
+        (0, 2): np.fliplr(b00),
+        (1, 0): b01.T,
+        (1, 1): np.full((BLOCK, BLOCK), majority, dtype=int),
+        (1, 2): np.rot90(b01, -1),
+        (2, 0): np.flipud(b00),
+        (2, 1): np.flipud(b01),
+        (2, 2): np.rot90(b00, 2),
+    }
+    for (br, bc), blk in blocks.items():
+        paste(motif, blk, br * BLOCK, bc * BLOCK)
+    return motif
+
+
+def _variant_signal(inp: np.ndarray) -> int:
+
+exec
+/bin/bash -lc '/home/xd/miniconda3/bin/python -m py_compile /home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45/code.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python -c \"import numpy as np, importlib.util, time, sys
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok, fail = 0, 0
+t0 = time.time()
+for i in range(50):
+    try:
+        inp = mod.generate_input()
+        out = mod.main(inp)
+        ok += 1
+    except Exception as e:
+        fail += 1
+        if fail <= 3: print(f'Trial {i}: {e}')
+elapsed = time.time() - t0
+print(f'Success: {ok}/50, Time: {elapsed:.1f}s ({elapsed/50*1000:.0f}ms/call)')
+if ok < 40: sys.exit(1)
+\"" in /home/lixinyu/snap/new
+diff --git a/ceshi/code_combo/db0c5428/45/code.py b/ceshi/code_combo/db0c5428/45/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..84d2572adb4a5ccaa238d590d307a4b9f352ec7e
+--- /dev/null
++++ b/ceshi/code_combo/db0c5428/45/code.py
+@@ -0,0 +1,366 @@
++# Combo variant of db0c5428 (index 45)
++# combo_spec: D3/2+D5/0+D11/1
++# Name: 简化中心+无空洞+环形排列
++
++from __future__ import annotations
++
++from pathlib import Path
++import random
++import sys
++
++import numpy as np
++
++_ROOT = Path(__file__).resolve()
++_SOLVER_DIR = _ROOT.parents[4] / "solvers"
++if str(_SOLVER_DIR) not in sys.path:
++    sys.path.append(str(_SOLVER_DIR))
++
++from arc_utils import bbox, crop_bbox, get_bg, paste
++
++
++# Design analysis for combo D3/2 + D5/0 + D11/1
++# ------------------------------------------------
++# a) Concretization + behavior trace:
++#    - Original input: a 9x9 motif made of eight visible 3x3 blocks around a missing
++#      3x3 center; output fills that hole, then copies the 8 non-center blocks into
++#      the opposite slots of a sparse 5x5 block lattice.
++#    - Combo input: the motif is now a complete 3x3 block array with no hole. To keep
++#      the "simplified center" flavor from D5/0 visible after D11/1 removes repair, the
++#      generator makes the center block a solid majority-color 3x3 square directly in
++#      the input instead of reconstructing it during output.
++#    - Combo output: the original 9x9 motif stays fixed. The 8 non-center blocks are
++#      copied outward into an 8-position ring, not into the old sparse 5x5 grid. The
++#      D1 rule from the base task is preserved implicitly: each source block still goes
++#      to the point-opposite destination direction, but those destination slots now sit
++#      on a 17x17 ring frame. Example: source NW -> outer SE, source N -> outer S.
++#
++# b) Complexity calibration:
++#    - The change is not allowed to collapse into "just copy everything outward somehow".
++#      Keeping opposite-direction mapping preserves a learnable correspondence, while the
++#      ring geometry makes the layout visibly distinct from the source task.
++#    - The center block is fixed to one solid color, but the eight surrounding blocks
++#      retain asymmetric internal patterns from the original generator, so humans can
++#      visually track which block moved where.
++#    - Only one ring radius and one gap width are used. More layout modes would be hard
++#      to infer from 2-4 examples and would introduce unnecessary ambiguity.
++#
++# c) Hidden-assumption audit of the original main():
++#    - `_center_patch(...)` assumed a 3x3 hole existed and that inner-boundary pixels
++#      encoded the answer. D11/1 breaks that assumption completely, so center repair must
++#      be removed from the solver.
++#    - The `(4 - 2 * br, 4 - 2 * bc)` destination formula assumed the output lived on a
++#      5x5 block grid. D3/2 invalidates that geometry and must be replaced by explicit
++#      ring coordinates.
++#    - `bbox(g != bg)` still works because the motif remains one contiguous 9x9 object.
++#    - The block size assumption remains 3x3; the ring layout is defined for that size.
++#
++# d) Placement legality:
++#    - The ring envelope is 17x17: 3x3 motif blocks centered inside a frame with a
++#      1-pixel moat between the motif and the outer ring blocks.
++#    - Therefore the generator uses square canvases of size 17..19 and places the motif
++#      with a 4-pixel margin on all sides, guaranteeing the full ring fits in-bounds.
++#    - Because the ring is pasted with transparent background, no copied block overlaps
++#      another copied block or an unrelated object.
++#
++# e) Visual observability:
++#    - "No hole" is immediately visible because the center is an actual filled 3x3 block.
++#    - The ring layout is also immediately visible because the outer copies are centered
++#      on the four cardinal directions and four diagonals, with a 1-pixel gap from the
++#      motif; this does not resemble the old sparse lattice.
++#    - The center being a solid majority-color square is human-visible and does not rely
++#      on any hidden numeric ordering of colors.
++#
++# f) Visual cleanliness:
++#    - The output contains exactly one object family: the original central motif plus one
++#      clean outer ring of 8 copies. No separators, markers, or overlapping layers are
++#      introduced.
++#    - The 1-pixel moat keeps the ring legible and prevents the result from looking like
++#      an accidental 15x15 blob.
++#
++# g) Change inferability / color discipline:
++#    - No color remapping is introduced. Colors keep their identity between input and
++#      output, so the task stays about structure and placement rather than hidden color
++#      codes.
++#    - The center-majority condition is stable because the 8 outer blocks are still built
++#      with majority-dominant patterns, and the center contributes 9 more majority cells.
++#
++# 9) New solver assumptions guaranteed by generate_input():
++#    - The input always contains exactly one complete 9x9 motif on a background canvas.
++#    - The motif always has 3x3 blocks and at least a 4-cell margin so the 17x17 ring
++#      frame can be pasted without clipping.
++#    - The center block is a solid majority-color block, but the solver does not depend on
++#      that detail; it is present to preserve the D5/0 visual signature after D11/1.
++#    - A degeneration check rejects samples whose output would be too close to the legacy
++#      5x5-lattice behavior on the same input.
++
++
++BLOCK = 3
++MOTIF_SIZE = BLOCK * 3
++RING_GAP = 1
++MOTIF_OFFSET = BLOCK + RING_GAP
++RING_SIZE = MOTIF_SIZE + 2 * MOTIF_OFFSET
++GRID_SIZE_MIN, GRID_SIZE_MAX = 17, 19
++BG = 8
++FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
++COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4
++MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16
++CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8
++EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8
++MAX_RETRIES = 300
++MIN_VARIANT_DIFF = 24
++
++DIAG_ORBITS = (
++    ((0, 0),),
++    ((1, 1),),
++    ((2, 2),),
++    ((0, 1), (1, 0)),
++    ((0, 2), (2, 0)),
++    ((1, 2), (2, 1)),
++)
++LR_ORBITS = (
++    ((0, 0), (0, 2)),
++    ((1, 0), (1, 2)),
++    ((2, 0), (2, 2)),
++    ((0, 1),),
++    ((1, 1),),
++    ((2, 1),),
++)
++
++_RING_COORD = {-1: 0, 0: 7, 1: 14}
++
++
++def _major_foreground_color(g: np.ndarray, bg: int) -> int:
++    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
++    assert vals.size, "input must contain foreground colors"
++    return int(vals[int(np.argmax(counts))])
++
++
++def _extract_block(g: np.ndarray, r0: int, c0: int, br: int, bc: int, block: int = BLOCK) -> np.ndarray:
++    return crop_bbox(
++        g,
++        (
++            int(r0) + br * block,
++            int(c0) + bc * block,
++            int(r0) + (br + 1) * block - 1,
++            int(c0) + (bc + 1) * block - 1,
++        ),
++    )
++
++
++def _ring_slot_from_source(br: int, bc: int) -> tuple[int, int]:
++    assert (br, bc) != (1, 1), "center block is not copied into the ring"
++    dr = 1 - int(br)
++    dc = 1 - int(bc)
++    return _RING_COORD[dr], _RING_COORD[dc]
++
++
++def _ring_patch(motif: np.ndarray, bg: int) -> np.ndarray:
++    patch = np.full((RING_SIZE, RING_SIZE), bg, dtype=int)
++    paste(patch, motif, MOTIF_OFFSET, MOTIF_OFFSET)
++    for br in range(3):
++        for bc in range(3):
++            if (br, bc) == (1, 1):
++                continue
++            src = motif[br * BLOCK:(br + 1) * BLOCK, bc * BLOCK:(bc + 1) * BLOCK]
++            dst_r, dst_c = _ring_slot_from_source(br, bc)
++            paste(patch, src, dst_r, dst_c)
++    return patch
++
++
++def _legacy_center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
++    main = _major_foreground_color(g, bg)
++    patch = np.full((block, block), main, dtype=int)
++    hole_r = int(r0) + block
++    hole_c = int(c0) + block
++    offsets = [-1, 1, 3]
++    for r in range(block):
++        for c in range(block):
++            if r == block // 2 and c == block // 2:
++                continue
++            patch[r, c] = int(g[hole_r + offsets[r], hole_c + offsets[c]])
++    return patch
++
++
++def _legacy_output(grid: np.ndarray) -> np.ndarray:
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    motif_bbox = bbox(g != bg)
++    assert motif_bbox is not None
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == w and h % 3 == 0
++    block = h // 3
++
++    out = g.copy()
++    expanded_r0 = int(r0) - block
++    expanded_c0 = int(c0) - block
++    for br in range(3):
++        for bc in range(3):
++            if (br, bc) == (1, 1):
++                continue
++            src = _extract_block(g, int(r0), int(c0), br, bc, block)
++            dst_r = expanded_r0 + (4 - 2 * br) * block
++            dst_c = expanded_c0 + (4 - 2 * bc) * block
++            paste(out, src, dst_r, dst_c)
++
++    paste(out, _legacy_center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand a complete 3x3 block motif by copying its outer ring into a larger circular-style frame.
++
++    Input structure:
++    - One 9x9 foreground motif sits on a plain background canvas.
++    - The motif is a full 3x3 arrangement of 3x3 blocks with no missing center block.
++    - The center block is already present, so the input is a complete contiguous object.
++
++    Rule:
++    - Keep the original 9x9 motif exactly where it is.
++    - Copy each of the eight non-center 3x3 blocks to the opposite direction around the motif.
++    - Place those copied blocks on a ring layout: corners go to diagonal ring slots and edge blocks
++      go to cardinal ring slots, leaving a 1-pixel moat between the ring and the central motif.
++
++    Key insight: This is no longer a hole-repair task. The whole 3x3 motif is already complete, and
++    the transformation is purely an outward ring expansion that preserves the old opposite-direction
++    correspondence while changing the destination geometry from a sparse grid to a ring.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    motif_bbox = bbox(g != bg)
++    assert motif_bbox is not None, "expected a foreground motif"
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == MOTIF_SIZE and w == MOTIF_SIZE, "expected one complete 9x9 motif"
++
++    frame_r0 = int(r0) - MOTIF_OFFSET
++    frame_c0 = int(c0) - MOTIF_OFFSET
++    motif = crop_bbox(g, motif_bbox)
++    out = g.copy()
++    paste(out, _ring_patch(motif, bg), frame_r0, frame_c0, transparent=bg)
++    return out
++
++
++def _major_orbits(orbits, forced_minor, target_count):
++    forced_minor = set(forced_minor)
++    usable = [
++        idx for idx, orbit in enumerate(orbits)
++        if all(coord not in forced_minor for coord in orbit)
++    ]
++    choices = []
++    for mask in range(1 << len(usable)):
++        selected = set()
++        total = 0
++        for bit, idx in enumerate(usable):
++            if mask & (1 << bit):
++                selected.add(idx)
++                total += len(orbits[idx])
++        if total == target_count:
++            choices.append(selected)
++    assert choices, "unreachable symmetric majority count"
++    return random.choice(choices)
++
++
++def _seed_block(orbits, forced_minor, majority, target_count):
++    block = np.full((BLOCK, BLOCK), -1, dtype=int)
++    major_idxs = _major_orbits(orbits, forced_minor, target_count)
++    minor_orbits = []
++    for idx, orbit in enumerate(orbits):
++        if idx in major_idxs:
++            for r, c in orbit:
++                block[r, c] = majority
++        else:
++            minor_orbits.append((block, orbit))
++    return block, minor_orbits
++
++
++def _assign_minor_colors(minor_orbits, colors):
++    random.shuffle(minor_orbits)
++    guaranteed = list(colors)
++    random.shuffle(guaranteed)
++    assignments = guaranteed + [
++        random.choice(colors) for _ in range(len(minor_orbits) - len(guaranteed))
++    ]
++    for (block, orbit), color in zip(minor_orbits, assignments):
++        for r, c in orbit:
++            block[r, c] = color
++
++
++def _make_blocks(majority, minor_colors, corner_major, edge_major):
++    b00, corner_minors = _seed_block(DIAG_ORBITS, [(2, 2)], majority, corner_major)
++    b01, edge_minors = _seed_block(LR_ORBITS, [(2, 1)], majority, edge_major)
++    minor_orbits = corner_minors + edge_minors
++    assert len(minor_orbits) >= len(minor_colors)
++    _assign_minor_colors(minor_orbits, minor_colors)
++    assert np.all(b00 != -1) and np.all(b01 != -1)
++    return b00, b01
++
++
++def _assemble_motif(b00: np.ndarray, b01: np.ndarray, majority: int) -> np.ndarray:
++    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
++    blocks = {
++        (0, 0): b00,
++        (0, 1): b01,
++        (0, 2): np.fliplr(b00),
++        (1, 0): b01.T,
++        (1, 1): np.full((BLOCK, BLOCK), majority, dtype=int),
++        (1, 2): np.rot90(b01, -1),
++        (2, 0): np.flipud(b00),
++        (2, 1): np.flipud(b01),
++        (2, 2): np.rot90(b00, 2),
++    }
++    for (br, bc), blk in blocks.items():
++        paste(motif, blk, br * BLOCK, bc * BLOCK)
++    return motif
++
++
++def _variant_signal(inp: np.ndarray) -> int:
++    return int(np.count_nonzero(main(inp) != _legacy_output(inp)))
++
++
++def _gen_attempt() -> np.ndarray | None:
++    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    color_count = random.randint(COLOR_COUNT_MIN, COLOR_COUNT_MAX)
++    colors = random.sample(FOREGROUND_COLORS, color_count)
++    majority = colors[0]
++    minor_colors = colors[1:]
++
++    possible_totals = [
++        total for total in range(MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX + 1)
++        if 18 - total >= len(minor_colors)
++    ]
++    majority_total = random.choice(possible_totals)
++    pairs = [
++        (corner, majority_total - corner)
++        for corner in range(CORNER_MAJOR_MIN, CORNER_MAJOR_MAX + 1)
++        if EDGE_MAJOR_MIN <= majority_total - corner <= EDGE_MAJOR_MAX
++    ]
++    corner_major, edge_major = random.choice(pairs)
++
++    b00, b01 = _make_blocks(majority, minor_colors, corner_major, edge_major)
++    motif = _assemble_motif(b00, b01, majority)
++    ring = _ring_patch(motif, BG)
++
++    r0 = random.randint(MOTIF_OFFSET, n - MOTIF_SIZE - MOTIF_OFFSET)
++    c0 = random.randint(MOTIF_OFFSET, n - MOTIF_SIZE - MOTIF_OFFSET)
++    inp = np.full((n, n), BG, dtype=int)
++    out = np.full((n, n), BG, dtype=int)
++    paste(inp, motif, r0, c0)
++    paste(out, ring, r0 - MOTIF_OFFSET, c0 - MOTIF_OFFSET, transparent=BG)
++
++    if not np.array_equal(main(inp), out):
++        return None
++    if _variant_signal(inp) < MIN_VARIANT_DIFF:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise AssertionError("failed to generate a valid combo db0c5428 input")
+
+ succeeded in 297ms:
+Success: 50/50, Time: 0.1s (1ms/call)
+
+codex
+功能测试已通过。现在补做“是否真的发生融合行为”的量化审查：我会统计生成样本与原题输出的像素差异，以及输入中心块是否始终为实心多数色，确认没有退化回原任务。
+exec
+/bin/bash -lc "/home/xd/miniconda3/bin/python - <<'PY'
+import importlib.util, numpy as np, statistics as st
+spec = importlib.util.spec_from_file_location('variant', '/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45/code.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+diffs = []
+center_uniform = []
+for _ in range(100):
+    inp = mod.generate_input()
+    bg = mod.get_bg(inp)
+    b = mod.bbox(inp "'!= bg)
+    r0, c0, r1, c1 = b
+    center = inp[r0 + mod.BLOCK:r0 + 2 * mod.BLOCK, c0 + mod.BLOCK:c0 + 2 * mod.BLOCK]
+    maj = mod._major_foreground_color(inp, bg)
+    center_uniform.append(int(np.all(center == maj)))
+    diffs.append(mod._variant_signal(inp))
+print('"'variant_diff min/median/max:', min(diffs), int(st.median(diffs)), max(diffs))
+print('variant_diff sample:', diffs[:12])
+print('center_uniform_majority:', sum(center_uniform), '/', len(center_uniform))
+PY" in /home/lixinyu/snap/new
+exec
+/bin/bash -lc 'git status --short /home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45/code.py' in /home/lixinyu/snap/new
+ succeeded in 0ms:
+?? ceshi/code_combo/db0c5428/45/code.py
+
+diff --git a/ceshi/code_combo/db0c5428/45/code.py b/ceshi/code_combo/db0c5428/45/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..84d2572adb4a5ccaa238d590d307a4b9f352ec7e
+--- /dev/null
++++ b/ceshi/code_combo/db0c5428/45/code.py
+@@ -0,0 +1,366 @@
++# Combo variant of db0c5428 (index 45)
++# combo_spec: D3/2+D5/0+D11/1
++# Name: 简化中心+无空洞+环形排列
++
++from __future__ import annotations
++
++from pathlib import Path
++import random
++import sys
++
++import numpy as np
++
++_ROOT = Path(__file__).resolve()
++_SOLVER_DIR = _ROOT.parents[4] / "solvers"
++if str(_SOLVER_DIR) not in sys.path:
++    sys.path.append(str(_SOLVER_DIR))
++
++from arc_utils import bbox, crop_bbox, get_bg, paste
++
++
++# Design analysis for combo D3/2 + D5/0 + D11/1
++# ------------------------------------------------
++# a) Concretization + behavior trace:
++#    - Original input: a 9x9 motif made of eight visible 3x3 blocks around a missing
++#      3x3 center; output fills that hole, then copies the 8 non-center blocks into
++#      the opposite slots of a sparse 5x5 block lattice.
++#    - Combo input: the motif is now a complete 3x3 block array with no hole. To keep
++#      the "simplified center" flavor from D5/0 visible after D11/1 removes repair, the
++#      generator makes the center block a solid majority-color 3x3 square directly in
++#      the input instead of reconstructing it during output.
++#    - Combo output: the original 9x9 motif stays fixed. The 8 non-center blocks are
++#      copied outward into an 8-position ring, not into the old sparse 5x5 grid. The
++#      D1 rule from the base task is preserved implicitly: each source block still goes
++#      to the point-opposite destination direction, but those destination slots now sit
++#      on a 17x17 ring frame. Example: source NW -> outer SE, source N -> outer S.
++#
++# b) Complexity calibration:
++#    - The change is not allowed to collapse into "just copy everything outward somehow".
++#      Keeping opposite-direction mapping preserves a learnable correspondence, while the
++#      ring geometry makes the layout visibly distinct from the source task.
++#    - The center block is fixed to one solid color, but the eight surrounding blocks
++#      retain asymmetric internal patterns from the original generator, so humans can
++#      visually track which block moved where.
++#    - Only one ring radius and one gap width are used. More layout modes would be hard
++#      to infer from 2-4 examples and would introduce unnecessary ambiguity.
++#
++# c) Hidden-assumption audit of the original main():
++#    - `_center_patch(...)` assumed a 3x3 hole existed and that inner-boundary pixels
++#      encoded the answer. D11/1 breaks that assumption completely, so center repair must
++#      be removed from the solver.
++#    - The `(4 - 2 * br, 4 - 2 * bc)` destination formula assumed the output lived on a
++#      5x5 block grid. D3/2 invalidates that geometry and must be replaced by explicit
++#      ring coordinates.
++#    - `bbox(g != bg)` still works because the motif remains one contiguous 9x9 object.
++#    - The block size assumption remains 3x3; the ring layout is defined for that size.
++#
++# d) Placement legality:
++#    - The ring envelope is 17x17: 3x3 motif blocks centered inside a frame with a
++#      1-pixel moat between the motif and the outer ring blocks.
++#    - Therefore the generator uses square canvases of size 17..19 and places the motif
++#      with a 4-pixel margin on all sides, guaranteeing the full ring fits in-bounds.
++#    - Because the ring is pasted with transparent background, no copied block overlaps
++#      another copied block or an unrelated object.
++#
++# e) Visual observability:
++#    - "No hole" is immediately visible because the center is an actual filled 3x3 block.
++#    - The ring layout is also immediately visible because the outer copies are centered
++#      on the four cardinal directions and four diagonals, with a 1-pixel gap from the
++#      motif; this does not resemble the old sparse lattice.
++#    - The center being a solid majority-color square is human-visible and does not rely
++#      on any hidden numeric ordering of colors.
++#
++# f) Visual cleanliness:
++#    - The output contains exactly one object family: the original central motif plus one
++#      clean outer ring of 8 copies. No separators, markers, or overlapping layers are
++#      introduced.
++#    - The 1-pixel moat keeps the ring legible and prevents the result from looking like
++#      an accidental 15x15 blob.
++#
++# g) Change inferability / color discipline:
++#    - No color remapping is introduced. Colors keep their identity between input and
++#      output, so the task stays about structure and placement rather than hidden color
++#      codes.
++#    - The center-majority condition is stable because the 8 outer blocks are still built
++#      with majority-dominant patterns, and the center contributes 9 more majority cells.
++#
++# 9) New solver assumptions guaranteed by generate_input():
++#    - The input always contains exactly one complete 9x9 motif on a background canvas.
++#    - The motif always has 3x3 blocks and at least a 4-cell margin so the 17x17 ring
++#      frame can be pasted without clipping.
++#    - The center block is a solid majority-color block, but the solver does not depend on
++#      that detail; it is present to preserve the D5/0 visual signature after D11/1.
++#    - A degeneration check rejects samples whose output would be too close to the legacy
++#      5x5-lattice behavior on the same input.
++
++
++BLOCK = 3
++MOTIF_SIZE = BLOCK * 3
++RING_GAP = 1
++MOTIF_OFFSET = BLOCK + RING_GAP
++RING_SIZE = MOTIF_SIZE + 2 * MOTIF_OFFSET
++GRID_SIZE_MIN, GRID_SIZE_MAX = 17, 19
++BG = 8
++FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
++COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4
++MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16
++CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8
++EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8
++MAX_RETRIES = 300
++MIN_VARIANT_DIFF = 24
++
++DIAG_ORBITS = (
++    ((0, 0),),
++    ((1, 1),),
++    ((2, 2),),
++    ((0, 1), (1, 0)),
++    ((0, 2), (2, 0)),
++    ((1, 2), (2, 1)),
++)
++LR_ORBITS = (
++    ((0, 0), (0, 2)),
++    ((1, 0), (1, 2)),
++    ((2, 0), (2, 2)),
++    ((0, 1),),
++    ((1, 1),),
++    ((2, 1),),
++)
++
++_RING_COORD = {-1: 0, 0: 7, 1: 14}
++
++
++def _major_foreground_color(g: np.ndarray, bg: int) -> int:
++    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
++    assert vals.size, "input must contain foreground colors"
++    return int(vals[int(np.argmax(counts))])
++
++
++def _extract_block(g: np.ndarray, r0: int, c0: int, br: int, bc: int, block: int = BLOCK) -> np.ndarray:
++    return crop_bbox(
++        g,
++        (
++            int(r0) + br * block,
++            int(c0) + bc * block,
++            int(r0) + (br + 1) * block - 1,
++            int(c0) + (bc + 1) * block - 1,
++        ),
++    )
++
++
++def _ring_slot_from_source(br: int, bc: int) -> tuple[int, int]:
++    assert (br, bc) != (1, 1), "center block is not copied into the ring"
++    dr = 1 - int(br)
++    dc = 1 - int(bc)
++    return _RING_COORD[dr], _RING_COORD[dc]
++
++
++def _ring_patch(motif: np.ndarray, bg: int) -> np.ndarray:
++    patch = np.full((RING_SIZE, RING_SIZE), bg, dtype=int)
++    paste(patch, motif, MOTIF_OFFSET, MOTIF_OFFSET)
++    for br in range(3):
++        for bc in range(3):
++            if (br, bc) == (1, 1):
++                continue
++            src = motif[br * BLOCK:(br + 1) * BLOCK, bc * BLOCK:(bc + 1) * BLOCK]
++            dst_r, dst_c = _ring_slot_from_source(br, bc)
++            paste(patch, src, dst_r, dst_c)
++    return patch
++
++
++def _legacy_center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
++    main = _major_foreground_color(g, bg)
++    patch = np.full((block, block), main, dtype=int)
++    hole_r = int(r0) + block
++    hole_c = int(c0) + block
++    offsets = [-1, 1, 3]
++    for r in range(block):
++        for c in range(block):
++            if r == block // 2 and c == block // 2:
++                continue
++            patch[r, c] = int(g[hole_r + offsets[r], hole_c + offsets[c]])
++    return patch
++
++
++def _legacy_output(grid: np.ndarray) -> np.ndarray:
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    motif_bbox = bbox(g != bg)
++    assert motif_bbox is not None
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == w and h % 3 == 0
++    block = h // 3
++
++    out = g.copy()
++    expanded_r0 = int(r0) - block
++    expanded_c0 = int(c0) - block
++    for br in range(3):
++        for bc in range(3):
++            if (br, bc) == (1, 1):
++                continue
++            src = _extract_block(g, int(r0), int(c0), br, bc, block)
++            dst_r = expanded_r0 + (4 - 2 * br) * block
++            dst_c = expanded_c0 + (4 - 2 * bc) * block
++            paste(out, src, dst_r, dst_c)
++
++    paste(out, _legacy_center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand a complete 3x3 block motif by copying its outer ring into a larger circular-style frame.
++
++    Input structure:
++    - One 9x9 foreground motif sits on a plain background canvas.
++    - The motif is a full 3x3 arrangement of 3x3 blocks with no missing center block.
++    - The center block is already present, so the input is a complete contiguous object.
++
++    Rule:
++    - Keep the original 9x9 motif exactly where it is.
++    - Copy each of the eight non-center 3x3 blocks to the opposite direction around the motif.
++    - Place those copied blocks on a ring layout: corners go to diagonal ring slots and edge blocks
++      go to cardinal ring slots, leaving a 1-pixel moat between the ring and the central motif.
++
++    Key insight: This is no longer a hole-repair task. The whole 3x3 motif is already complete, and
++    the transformation is purely an outward ring expansion that preserves the old opposite-direction
++    correspondence while changing the destination geometry from a sparse grid to a ring.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    motif_bbox = bbox(g != bg)
++    assert motif_bbox is not None, "expected a foreground motif"
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == MOTIF_SIZE and w == MOTIF_SIZE, "expected one complete 9x9 motif"
++
++    frame_r0 = int(r0) - MOTIF_OFFSET
++    frame_c0 = int(c0) - MOTIF_OFFSET
++    motif = crop_bbox(g, motif_bbox)
++    out = g.copy()
++    paste(out, _ring_patch(motif, bg), frame_r0, frame_c0, transparent=bg)
++    return out
++
++
++def _major_orbits(orbits, forced_minor, target_count):
++    forced_minor = set(forced_minor)
++    usable = [
++        idx for idx, orbit in enumerate(orbits)
++        if all(coord not in forced_minor for coord in orbit)
++    ]
++    choices = []
++    for mask in range(1 << len(usable)):
++        selected = set()
++        total = 0
++        for bit, idx in enumerate(usable):
++            if mask & (1 << bit):
++                selected.add(idx)
++                total += len(orbits[idx])
++        if total == target_count:
++            choices.append(selected)
++    assert choices, "unreachable symmetric majority count"
++    return random.choice(choices)
++
++
++def _seed_block(orbits, forced_minor, majority, target_count):
++    block = np.full((BLOCK, BLOCK), -1, dtype=int)
++    major_idxs = _major_orbits(orbits, forced_minor, target_count)
++    minor_orbits = []
++    for idx, orbit in enumerate(orbits):
++        if idx in major_idxs:
++            for r, c in orbit:
++                block[r, c] = majority
++        else:
++            minor_orbits.append((block, orbit))
++    return block, minor_orbits
++
++
++def _assign_minor_colors(minor_orbits, colors):
++    random.shuffle(minor_orbits)
++    guaranteed = list(colors)
++    random.shuffle(guaranteed)
++    assignments = guaranteed + [
++        random.choice(colors) for _ in range(len(minor_orbits) - len(guaranteed))
++    ]
++    for (block, orbit), color in zip(minor_orbits, assignments):
++        for r, c in orbit:
++            block[r, c] = color
++
++
++def _make_blocks(majority, minor_colors, corner_major, edge_major):
++    b00, corner_minors = _seed_block(DIAG_ORBITS, [(2, 2)], majority, corner_major)
++    b01, edge_minors = _seed_block(LR_ORBITS, [(2, 1)], majority, edge_major)
++    minor_orbits = corner_minors + edge_minors
++    assert len(minor_orbits) >= len(minor_colors)
++    _assign_minor_colors(minor_orbits, minor_colors)
++    assert np.all(b00 != -1) and np.all(b01 != -1)
++    return b00, b01
++
++
++def _assemble_motif(b00: np.ndarray, b01: np.ndarray, majority: int) -> np.ndarray:
++    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
++    blocks = {
++        (0, 0): b00,
++        (0, 1): b01,
++        (0, 2): np.fliplr(b00),
++        (1, 0): b01.T,
++        (1, 1): np.full((BLOCK, BLOCK), majority, dtype=int),
++        (1, 2): np.rot90(b01, -1),
++        (2, 0): np.flipud(b00),
++        (2, 1): np.flipud(b01),
++        (2, 2): np.rot90(b00, 2),
++    }
++    for (br, bc), blk in blocks.items():
++        paste(motif, blk, br * BLOCK, bc * BLOCK)
++    return motif
++
++
++def _variant_signal(inp: np.ndarray) -> int:
++    return int(np.count_nonzero(main(inp) != _legacy_output(inp)))
++
++
++def _gen_attempt() -> np.ndarray | None:
++    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    color_count = random.randint(COLOR_COUNT_MIN, COLOR_COUNT_MAX)
++    colors = random.sample(FOREGROUND_COLORS, color_count)
++    majority = colors[0]
++    minor_colors = colors[1:]
++
++    possible_totals = [
++        total for total in range(MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX + 1)
++        if 18 - total >= len(minor_colors)
++    ]
++    majority_total = random.choice(possible_totals)
++    pairs = [
++        (corner, majority_total - corner)
++        for corner in range(CORNER_MAJOR_MIN, CORNER_MAJOR_MAX + 1)
++        if EDGE_MAJOR_MIN <= majority_total - corner <= EDGE_MAJOR_MAX
++    ]
++    corner_major, edge_major = random.choice(pairs)
++
++    b00, b01 = _make_blocks(majority, minor_colors, corner_major, edge_major)
++    motif = _assemble_motif(b00, b01, majority)
++    ring = _ring_patch(motif, BG)
++
++    r0 = random.randint(MOTIF_OFFSET, n - MOTIF_SIZE - MOTIF_OFFSET)
++    c0 = random.randint(MOTIF_OFFSET, n - MOTIF_SIZE - MOTIF_OFFSET)
++    inp = np.full((n, n), BG, dtype=int)
++    out = np.full((n, n), BG, dtype=int)
++    paste(inp, motif, r0, c0)
++    paste(out, ring, r0 - MOTIF_OFFSET, c0 - MOTIF_OFFSET, transparent=BG)
++
++    if not np.array_equal(main(inp), out):
++        return None
++    if _variant_signal(inp) < MIN_VARIANT_DIFF:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise AssertionError("failed to generate a valid combo db0c5428 input")
+
+ succeeded in 380ms:
+variant_diff min/median/max: 80 92 112
+variant_diff sample: [100, 84, 96, 96, 96, 84, 96, 100, 80, 96, 92, 80]
+center_uniform_majority: 100 / 100
+
+Implemented the combo solver/generator, passed the required stress test, and verified the generated samples differ strongly from legacy behavior.
+  ✓ Write combo-variant code with solver, generator, and embedded design analysis comments
+  ✓ Run the required 50-trial generation test and fix any failures
+  ✓ Measure a degeneration metric against legacy behavior and audit solver assumptions
+diff --git a/ceshi/code_combo/db0c5428/45/code.py b/ceshi/code_combo/db0c5428/45/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..84d2572adb4a5ccaa238d590d307a4b9f352ec7e
+--- /dev/null
++++ b/ceshi/code_combo/db0c5428/45/code.py
+@@ -0,0 +1,366 @@
++# Combo variant of db0c5428 (index 45)
++# combo_spec: D3/2+D5/0+D11/1
++# Name: 简化中心+无空洞+环形排列
++
++from __future__ import annotations
++
++from pathlib import Path
++import random
++import sys
++
++import numpy as np
++
++_ROOT = Path(__file__).resolve()
++_SOLVER_DIR = _ROOT.parents[4] / "solvers"
++if str(_SOLVER_DIR) not in sys.path:
++    sys.path.append(str(_SOLVER_DIR))
++
++from arc_utils import bbox, crop_bbox, get_bg, paste
++
++
++# Design analysis for combo D3/2 + D5/0 + D11/1
++# ------------------------------------------------
++# a) Concretization + behavior trace:
++#    - Original input: a 9x9 motif made of eight visible 3x3 blocks around a missing
++#      3x3 center; output fills that hole, then copies the 8 non-center blocks into
++#      the opposite slots of a sparse 5x5 block lattice.
++#    - Combo input: the motif is now a complete 3x3 block array with no hole. To keep
++#      the "simplified center" flavor from D5/0 visible after D11/1 removes repair, the
++#      generator makes the center block a solid majority-color 3x3 square directly in
++#      the input instead of reconstructing it during output.
++#    - Combo output: the original 9x9 motif stays fixed. The 8 non-center blocks are
++#      copied outward into an 8-position ring, not into the old sparse 5x5 grid. The
++#      D1 rule from the base task is preserved implicitly: each source block still goes
++#      to the point-opposite destination direction, but those destination slots now sit
++#      on a 17x17 ring frame. Example: source NW -> outer SE, source N -> outer S.
++#
++# b) Complexity calibration:
++#    - The change is not allowed to collapse into "just copy everything outward somehow".
++#      Keeping opposite-direction mapping preserves a learnable correspondence, while the
++#      ring geometry makes the layout visibly distinct from the source task.
++#    - The center block is fixed to one solid color, but the eight surrounding blocks
++#      retain asymmetric internal patterns from the original generator, so humans can
++#      visually track which block moved where.
++#    - Only one ring radius and one gap width are used. More layout modes would be hard
++#      to infer from 2-4 examples and would introduce unnecessary ambiguity.
++#
++# c) Hidden-assumption audit of the original main():
++#    - `_center_patch(...)` assumed a 3x3 hole existed and that inner-boundary pixels
++#      encoded the answer. D11/1 breaks that assumption completely, so center repair must
++#      be removed from the solver.
++#    - The `(4 - 2 * br, 4 - 2 * bc)` destination formula assumed the output lived on a
++#      5x5 block grid. D3/2 invalidates that geometry and must be replaced by explicit
++#      ring coordinates.
++#    - `bbox(g != bg)` still works because the motif remains one contiguous 9x9 object.
++#    - The block size assumption remains 3x3; the ring layout is defined for that size.
++#
++# d) Placement legality:
++#    - The ring envelope is 17x17: 3x3 motif blocks centered inside a frame with a
++#      1-pixel moat between the motif and the outer ring blocks.
++#    - Therefore the generator uses square canvases of size 17..19 and places the motif
++#      with a 4-pixel margin on all sides, guaranteeing the full ring fits in-bounds.
++#    - Because the ring is pasted with transparent background, no copied block overlaps
++#      another copied block or an unrelated object.
++#
++# e) Visual observability:
++#    - "No hole" is immediately visible because the center is an actual filled 3x3 block.
++#    - The ring layout is also immediately visible because the outer copies are centered
++#      on the four cardinal directions and four diagonals, with a 1-pixel gap from the
++#      motif; this does not resemble the old sparse lattice.
++#    - The center being a solid majority-color square is human-visible and does not rely
++#      on any hidden numeric ordering of colors.
++#
++# f) Visual cleanliness:
++#    - The output contains exactly one object family: the original central motif plus one
++#      clean outer ring of 8 copies. No separators, markers, or overlapping layers are
++#      introduced.
++#    - The 1-pixel moat keeps the ring legible and prevents the result from looking like
++#      an accidental 15x15 blob.
++#
++# g) Change inferability / color discipline:
++#    - No color remapping is introduced. Colors keep their identity between input and
++#      output, so the task stays about structure and placement rather than hidden color
++#      codes.
++#    - The center-majority condition is stable because the 8 outer blocks are still built
++#      with majority-dominant patterns, and the center contributes 9 more majority cells.
++#
++# 9) New solver assumptions guaranteed by generate_input():
++#    - The input always contains exactly one complete 9x9 motif on a background canvas.
++#    - The motif always has 3x3 blocks and at least a 4-cell margin so the 17x17 ring
++#      frame can be pasted without clipping.
++#    - The center block is a solid majority-color block, but the solver does not depend on
++#      that detail; it is present to preserve the D5/0 visual signature after D11/1.
++#    - A degeneration check rejects samples whose output would be too close to the legacy
++#      5x5-lattice behavior on the same input.
++
++
++BLOCK = 3
++MOTIF_SIZE = BLOCK * 3
++RING_GAP = 1
++MOTIF_OFFSET = BLOCK + RING_GAP
++RING_SIZE = MOTIF_SIZE + 2 * MOTIF_OFFSET
++GRID_SIZE_MIN, GRID_SIZE_MAX = 17, 19
++BG = 8
++FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
++COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4
++MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16
++CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8
++EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8
++MAX_RETRIES = 300
++MIN_VARIANT_DIFF = 24
++
++DIAG_ORBITS = (
++    ((0, 0),),
++    ((1, 1),),
++    ((2, 2),),
++    ((0, 1), (1, 0)),
++    ((0, 2), (2, 0)),
++    ((1, 2), (2, 1)),
++)
++LR_ORBITS = (
++    ((0, 0), (0, 2)),
++    ((1, 0), (1, 2)),
++    ((2, 0), (2, 2)),
++    ((0, 1),),
++    ((1, 1),),
++    ((2, 1),),
++)
++
++_RING_COORD = {-1: 0, 0: 7, 1: 14}
++
++
++def _major_foreground_color(g: np.ndarray, bg: int) -> int:
++    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
++    assert vals.size, "input must contain foreground colors"
++    return int(vals[int(np.argmax(counts))])
++
++
++def _extract_block(g: np.ndarray, r0: int, c0: int, br: int, bc: int, block: int = BLOCK) -> np.ndarray:
++    return crop_bbox(
++        g,
++        (
++            int(r0) + br * block,
++            int(c0) + bc * block,
++            int(r0) + (br + 1) * block - 1,
++            int(c0) + (bc + 1) * block - 1,
++        ),
++    )
++
++
++def _ring_slot_from_source(br: int, bc: int) -> tuple[int, int]:
++    assert (br, bc) != (1, 1), "center block is not copied into the ring"
++    dr = 1 - int(br)
++    dc = 1 - int(bc)
++    return _RING_COORD[dr], _RING_COORD[dc]
++
++
++def _ring_patch(motif: np.ndarray, bg: int) -> np.ndarray:
++    patch = np.full((RING_SIZE, RING_SIZE), bg, dtype=int)
++    paste(patch, motif, MOTIF_OFFSET, MOTIF_OFFSET)
++    for br in range(3):
++        for bc in range(3):
++            if (br, bc) == (1, 1):
++                continue
++            src = motif[br * BLOCK:(br + 1) * BLOCK, bc * BLOCK:(bc + 1) * BLOCK]
++            dst_r, dst_c = _ring_slot_from_source(br, bc)
++            paste(patch, src, dst_r, dst_c)
++    return patch
++
++
++def _legacy_center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
++    main = _major_foreground_color(g, bg)
++    patch = np.full((block, block), main, dtype=int)
++    hole_r = int(r0) + block
++    hole_c = int(c0) + block
++    offsets = [-1, 1, 3]
++    for r in range(block):
++        for c in range(block):
++            if r == block // 2 and c == block // 2:
++                continue
++            patch[r, c] = int(g[hole_r + offsets[r], hole_c + offsets[c]])
++    return patch
++
++
++def _legacy_output(grid: np.ndarray) -> np.ndarray:
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    motif_bbox = bbox(g != bg)
++    assert motif_bbox is not None
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == w and h % 3 == 0
++    block = h // 3
++
++    out = g.copy()
++    expanded_r0 = int(r0) - block
++    expanded_c0 = int(c0) - block
++    for br in range(3):
++        for bc in range(3):
++            if (br, bc) == (1, 1):
++                continue
++            src = _extract_block(g, int(r0), int(c0), br, bc, block)
++            dst_r = expanded_r0 + (4 - 2 * br) * block
++            dst_c = expanded_c0 + (4 - 2 * bc) * block
++            paste(out, src, dst_r, dst_c)
++
++    paste(out, _legacy_center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand a complete 3x3 block motif by copying its outer ring into a larger circular-style frame.
++
++    Input structure:
++    - One 9x9 foreground motif sits on a plain background canvas.
++    - The motif is a full 3x3 arrangement of 3x3 blocks with no missing center block.
++    - The center block is already present, so the input is a complete contiguous object.
++
++    Rule:
++    - Keep the original 9x9 motif exactly where it is.
++    - Copy each of the eight non-center 3x3 blocks to the opposite direction around the motif.
++    - Place those copied blocks on a ring layout: corners go to diagonal ring slots and edge blocks
++      go to cardinal ring slots, leaving a 1-pixel moat between the ring and the central motif.
++
++    Key insight: This is no longer a hole-repair task. The whole 3x3 motif is already complete, and
++    the transformation is purely an outward ring expansion that preserves the old opposite-direction
++    correspondence while changing the destination geometry from a sparse grid to a ring.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    motif_bbox = bbox(g != bg)
++    assert motif_bbox is not None, "expected a foreground motif"
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == MOTIF_SIZE and w == MOTIF_SIZE, "expected one complete 9x9 motif"
++
++    frame_r0 = int(r0) - MOTIF_OFFSET
++    frame_c0 = int(c0) - MOTIF_OFFSET
++    motif = crop_bbox(g, motif_bbox)
++    out = g.copy()
++    paste(out, _ring_patch(motif, bg), frame_r0, frame_c0, transparent=bg)
++    return out
++
++
++def _major_orbits(orbits, forced_minor, target_count):
++    forced_minor = set(forced_minor)
++    usable = [
++        idx for idx, orbit in enumerate(orbits)
++        if all(coord not in forced_minor for coord in orbit)
++    ]
++    choices = []
++    for mask in range(1 << len(usable)):
++        selected = set()
++        total = 0
++        for bit, idx in enumerate(usable):
++            if mask & (1 << bit):
++                selected.add(idx)
++                total += len(orbits[idx])
++        if total == target_count:
++            choices.append(selected)
++    assert choices, "unreachable symmetric majority count"
++    return random.choice(choices)
++
++
++def _seed_block(orbits, forced_minor, majority, target_count):
++    block = np.full((BLOCK, BLOCK), -1, dtype=int)
++    major_idxs = _major_orbits(orbits, forced_minor, target_count)
++    minor_orbits = []
++    for idx, orbit in enumerate(orbits):
++        if idx in major_idxs:
++            for r, c in orbit:
++                block[r, c] = majority
++        else:
++            minor_orbits.append((block, orbit))
++    return block, minor_orbits
++
++
++def _assign_minor_colors(minor_orbits, colors):
++    random.shuffle(minor_orbits)
++    guaranteed = list(colors)
++    random.shuffle(guaranteed)
++    assignments = guaranteed + [
++        random.choice(colors) for _ in range(len(minor_orbits) - len(guaranteed))
++    ]
++    for (block, orbit), color in zip(minor_orbits, assignments):
++        for r, c in orbit:
++            block[r, c] = color
++
++
++def _make_blocks(majority, minor_colors, corner_major, edge_major):
++    b00, corner_minors = _seed_block(DIAG_ORBITS, [(2, 2)], majority, corner_major)
++    b01, edge_minors = _seed_block(LR_ORBITS, [(2, 1)], majority, edge_major)
++    minor_orbits = corner_minors + edge_minors
++    assert len(minor_orbits) >= len(minor_colors)
++    _assign_minor_colors(minor_orbits, minor_colors)
++    assert np.all(b00 != -1) and np.all(b01 != -1)
++    return b00, b01
++
++
++def _assemble_motif(b00: np.ndarray, b01: np.ndarray, majority: int) -> np.ndarray:
++    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
++    blocks = {
++        (0, 0): b00,
++        (0, 1): b01,
++        (0, 2): np.fliplr(b00),
++        (1, 0): b01.T,
++        (1, 1): np.full((BLOCK, BLOCK), majority, dtype=int),
++        (1, 2): np.rot90(b01, -1),
++        (2, 0): np.flipud(b00),
++        (2, 1): np.flipud(b01),
++        (2, 2): np.rot90(b00, 2),
++    }
++    for (br, bc), blk in blocks.items():
++        paste(motif, blk, br * BLOCK, bc * BLOCK)
++    return motif
++
++
++def _variant_signal(inp: np.ndarray) -> int:
++    return int(np.count_nonzero(main(inp) != _legacy_output(inp)))
++
++
++def _gen_attempt() -> np.ndarray | None:
++    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    color_count = random.randint(COLOR_COUNT_MIN, COLOR_COUNT_MAX)
++    colors = random.sample(FOREGROUND_COLORS, color_count)
++    majority = colors[0]
++    minor_colors = colors[1:]
++
++    possible_totals = [
++        total for total in range(MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX + 1)
++        if 18 - total >= len(minor_colors)
++    ]
++    majority_total = random.choice(possible_totals)
++    pairs = [
++        (corner, majority_total - corner)
++        for corner in range(CORNER_MAJOR_MIN, CORNER_MAJOR_MAX + 1)
++        if EDGE_MAJOR_MIN <= majority_total - corner <= EDGE_MAJOR_MAX
++    ]
++    corner_major, edge_major = random.choice(pairs)
++
++    b00, b01 = _make_blocks(majority, minor_colors, corner_major, edge_major)
++    motif = _assemble_motif(b00, b01, majority)
++    ring = _ring_patch(motif, BG)
++
++    r0 = random.randint(MOTIF_OFFSET, n - MOTIF_SIZE - MOTIF_OFFSET)
++    c0 = random.randint(MOTIF_OFFSET, n - MOTIF_SIZE - MOTIF_OFFSET)
++    inp = np.full((n, n), BG, dtype=int)
++    out = np.full((n, n), BG, dtype=int)
++    paste(inp, motif, r0, c0)
++    paste(out, ring, r0 - MOTIF_OFFSET, c0 - MOTIF_OFFSET, transparent=BG)
++
++    if not np.array_equal(main(inp), out):
++        return None
++    if _variant_signal(inp) < MIN_VARIANT_DIFF:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise AssertionError("failed to generate a valid combo db0c5428 input")
+
+codex
+已将融合变体保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45/code.py)。实现内容是：输入改为完整 3x3 block motif，中心块直接生成为多数色实心 3x3；`main()` 去掉原题的中心重建，保留原题“对侧复制”关系，但把 8 个非中心块放到一个带 1 像素间隔的 17x17 环形外圈上。`main()` 上方也按要求重写了四段式说明，文件内包含了设计分析和隐式假设审查注释。
+
+验证结果正常。指定 50 次测试为 `Success: 50/50`。额外做了退化检查：对 100 个生成样本，和原题式输出的像素差异 `variant_diff` 的 `min/median/max = 80/92/112`，说明没有退化回原始 5x5 稀疏外扩；同时输入中心块 `100/100` 都是多数色实心块，D5/0 的视觉特征也稳定存在。
+diff --git a/ceshi/code_combo/db0c5428/45/code.py b/ceshi/code_combo/db0c5428/45/code.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..84d2572adb4a5ccaa238d590d307a4b9f352ec7e
+--- /dev/null
++++ b/ceshi/code_combo/db0c5428/45/code.py
+@@ -0,0 +1,366 @@
++# Combo variant of db0c5428 (index 45)
++# combo_spec: D3/2+D5/0+D11/1
++# Name: 简化中心+无空洞+环形排列
++
++from __future__ import annotations
++
++from pathlib import Path
++import random
++import sys
++
++import numpy as np
++
++_ROOT = Path(__file__).resolve()
++_SOLVER_DIR = _ROOT.parents[4] / "solvers"
++if str(_SOLVER_DIR) not in sys.path:
++    sys.path.append(str(_SOLVER_DIR))
++
++from arc_utils import bbox, crop_bbox, get_bg, paste
++
++
++# Design analysis for combo D3/2 + D5/0 + D11/1
++# ------------------------------------------------
++# a) Concretization + behavior trace:
++#    - Original input: a 9x9 motif made of eight visible 3x3 blocks around a missing
++#      3x3 center; output fills that hole, then copies the 8 non-center blocks into
++#      the opposite slots of a sparse 5x5 block lattice.
++#    - Combo input: the motif is now a complete 3x3 block array with no hole. To keep
++#      the "simplified center" flavor from D5/0 visible after D11/1 removes repair, the
++#      generator makes the center block a solid majority-color 3x3 square directly in
++#      the input instead of reconstructing it during output.
++#    - Combo output: the original 9x9 motif stays fixed. The 8 non-center blocks are
++#      copied outward into an 8-position ring, not into the old sparse 5x5 grid. The
++#      D1 rule from the base task is preserved implicitly: each source block still goes
++#      to the point-opposite destination direction, but those destination slots now sit
++#      on a 17x17 ring frame. Example: source NW -> outer SE, source N -> outer S.
++#
++# b) Complexity calibration:
++#    - The change is not allowed to collapse into "just copy everything outward somehow".
++#      Keeping opposite-direction mapping preserves a learnable correspondence, while the
++#      ring geometry makes the layout visibly distinct from the source task.
++#    - The center block is fixed to one solid color, but the eight surrounding blocks
++#      retain asymmetric internal patterns from the original generator, so humans can
++#      visually track which block moved where.
++#    - Only one ring radius and one gap width are used. More layout modes would be hard
++#      to infer from 2-4 examples and would introduce unnecessary ambiguity.
++#
++# c) Hidden-assumption audit of the original main():
++#    - `_center_patch(...)` assumed a 3x3 hole existed and that inner-boundary pixels
++#      encoded the answer. D11/1 breaks that assumption completely, so center repair must
++#      be removed from the solver.
++#    - The `(4 - 2 * br, 4 - 2 * bc)` destination formula assumed the output lived on a
++#      5x5 block grid. D3/2 invalidates that geometry and must be replaced by explicit
++#      ring coordinates.
++#    - `bbox(g != bg)` still works because the motif remains one contiguous 9x9 object.
++#    - The block size assumption remains 3x3; the ring layout is defined for that size.
++#
++# d) Placement legality:
++#    - The ring envelope is 17x17: 3x3 motif blocks centered inside a frame with a
++#      1-pixel moat between the motif and the outer ring blocks.
++#    - Therefore the generator uses square canvases of size 17..19 and places the motif
++#      with a 4-pixel margin on all sides, guaranteeing the full ring fits in-bounds.
++#    - Because the ring is pasted with transparent background, no copied block overlaps
++#      another copied block or an unrelated object.
++#
++# e) Visual observability:
++#    - "No hole" is immediately visible because the center is an actual filled 3x3 block.
++#    - The ring layout is also immediately visible because the outer copies are centered
++#      on the four cardinal directions and four diagonals, with a 1-pixel gap from the
++#      motif; this does not resemble the old sparse lattice.
++#    - The center being a solid majority-color square is human-visible and does not rely
++#      on any hidden numeric ordering of colors.
++#
++# f) Visual cleanliness:
++#    - The output contains exactly one object family: the original central motif plus one
++#      clean outer ring of 8 copies. No separators, markers, or overlapping layers are
++#      introduced.
++#    - The 1-pixel moat keeps the ring legible and prevents the result from looking like
++#      an accidental 15x15 blob.
++#
++# g) Change inferability / color discipline:
++#    - No color remapping is introduced. Colors keep their identity between input and
++#      output, so the task stays about structure and placement rather than hidden color
++#      codes.
++#    - The center-majority condition is stable because the 8 outer blocks are still built
++#      with majority-dominant patterns, and the center contributes 9 more majority cells.
++#
++# 9) New solver assumptions guaranteed by generate_input():
++#    - The input always contains exactly one complete 9x9 motif on a background canvas.
++#    - The motif always has 3x3 blocks and at least a 4-cell margin so the 17x17 ring
++#      frame can be pasted without clipping.
++#    - The center block is a solid majority-color block, but the solver does not depend on
++#      that detail; it is present to preserve the D5/0 visual signature after D11/1.
++#    - A degeneration check rejects samples whose output would be too close to the legacy
++#      5x5-lattice behavior on the same input.
++
++
++BLOCK = 3
++MOTIF_SIZE = BLOCK * 3
++RING_GAP = 1
++MOTIF_OFFSET = BLOCK + RING_GAP
++RING_SIZE = MOTIF_SIZE + 2 * MOTIF_OFFSET
++GRID_SIZE_MIN, GRID_SIZE_MAX = 17, 19
++BG = 8
++FOREGROUND_COLORS = [1, 2, 3, 4, 5, 6, 7, 9]
++COLOR_COUNT_MIN, COLOR_COUNT_MAX = 2, 4
++MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX = 10, 16
++CORNER_MAJOR_MIN, CORNER_MAJOR_MAX = 5, 8
++EDGE_MAJOR_MIN, EDGE_MAJOR_MAX = 5, 8
++MAX_RETRIES = 300
++MIN_VARIANT_DIFF = 24
++
++DIAG_ORBITS = (
++    ((0, 0),),
++    ((1, 1),),
++    ((2, 2),),
++    ((0, 1), (1, 0)),
++    ((0, 2), (2, 0)),
++    ((1, 2), (2, 1)),
++)
++LR_ORBITS = (
++    ((0, 0), (0, 2)),
++    ((1, 0), (1, 2)),
++    ((2, 0), (2, 2)),
++    ((0, 1),),
++    ((1, 1),),
++    ((2, 1),),
++)
++
++_RING_COORD = {-1: 0, 0: 7, 1: 14}
++
++
++def _major_foreground_color(g: np.ndarray, bg: int) -> int:
++    vals, counts = np.unique(g[g != int(bg)], return_counts=True)
++    assert vals.size, "input must contain foreground colors"
++    return int(vals[int(np.argmax(counts))])
++
++
++def _extract_block(g: np.ndarray, r0: int, c0: int, br: int, bc: int, block: int = BLOCK) -> np.ndarray:
++    return crop_bbox(
++        g,
++        (
++            int(r0) + br * block,
++            int(c0) + bc * block,
++            int(r0) + (br + 1) * block - 1,
++            int(c0) + (bc + 1) * block - 1,
++        ),
++    )
++
++
++def _ring_slot_from_source(br: int, bc: int) -> tuple[int, int]:
++    assert (br, bc) != (1, 1), "center block is not copied into the ring"
++    dr = 1 - int(br)
++    dc = 1 - int(bc)
++    return _RING_COORD[dr], _RING_COORD[dc]
++
++
++def _ring_patch(motif: np.ndarray, bg: int) -> np.ndarray:
++    patch = np.full((RING_SIZE, RING_SIZE), bg, dtype=int)
++    paste(patch, motif, MOTIF_OFFSET, MOTIF_OFFSET)
++    for br in range(3):
++        for bc in range(3):
++            if (br, bc) == (1, 1):
++                continue
++            src = motif[br * BLOCK:(br + 1) * BLOCK, bc * BLOCK:(bc + 1) * BLOCK]
++            dst_r, dst_c = _ring_slot_from_source(br, bc)
++            paste(patch, src, dst_r, dst_c)
++    return patch
++
++
++def _legacy_center_patch(g: np.ndarray, r0: int, c0: int, block: int, bg: int) -> np.ndarray:
++    main = _major_foreground_color(g, bg)
++    patch = np.full((block, block), main, dtype=int)
++    hole_r = int(r0) + block
++    hole_c = int(c0) + block
++    offsets = [-1, 1, 3]
++    for r in range(block):
++        for c in range(block):
++            if r == block // 2 and c == block // 2:
++                continue
++            patch[r, c] = int(g[hole_r + offsets[r], hole_c + offsets[c]])
++    return patch
++
++
++def _legacy_output(grid: np.ndarray) -> np.ndarray:
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    motif_bbox = bbox(g != bg)
++    assert motif_bbox is not None
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == w and h % 3 == 0
++    block = h // 3
++
++    out = g.copy()
++    expanded_r0 = int(r0) - block
++    expanded_c0 = int(c0) - block
++    for br in range(3):
++        for bc in range(3):
++            if (br, bc) == (1, 1):
++                continue
++            src = _extract_block(g, int(r0), int(c0), br, bc, block)
++            dst_r = expanded_r0 + (4 - 2 * br) * block
++            dst_c = expanded_c0 + (4 - 2 * bc) * block
++            paste(out, src, dst_r, dst_c)
++
++    paste(out, _legacy_center_patch(g, int(r0), int(c0), block, bg), int(r0) + block, int(c0) + block)
++    return out
++
++
++def main(grid: np.ndarray) -> np.ndarray:
++    """
++    Expand a complete 3x3 block motif by copying its outer ring into a larger circular-style frame.
++
++    Input structure:
++    - One 9x9 foreground motif sits on a plain background canvas.
++    - The motif is a full 3x3 arrangement of 3x3 blocks with no missing center block.
++    - The center block is already present, so the input is a complete contiguous object.
++
++    Rule:
++    - Keep the original 9x9 motif exactly where it is.
++    - Copy each of the eight non-center 3x3 blocks to the opposite direction around the motif.
++    - Place those copied blocks on a ring layout: corners go to diagonal ring slots and edge blocks
++      go to cardinal ring slots, leaving a 1-pixel moat between the ring and the central motif.
++
++    Key insight: This is no longer a hole-repair task. The whole 3x3 motif is already complete, and
++    the transformation is purely an outward ring expansion that preserves the old opposite-direction
++    correspondence while changing the destination geometry from a sparse grid to a ring.
++    """
++    g = np.asarray(grid, dtype=int)
++    bg = get_bg(g)
++    motif_bbox = bbox(g != bg)
++    assert motif_bbox is not None, "expected a foreground motif"
++    r0, c0, r1, c1 = motif_bbox
++    h = int(r1 - r0 + 1)
++    w = int(c1 - c0 + 1)
++    assert h == MOTIF_SIZE and w == MOTIF_SIZE, "expected one complete 9x9 motif"
++
++    frame_r0 = int(r0) - MOTIF_OFFSET
++    frame_c0 = int(c0) - MOTIF_OFFSET
++    motif = crop_bbox(g, motif_bbox)
++    out = g.copy()
++    paste(out, _ring_patch(motif, bg), frame_r0, frame_c0, transparent=bg)
++    return out
++
++
++def _major_orbits(orbits, forced_minor, target_count):
++    forced_minor = set(forced_minor)
++    usable = [
++        idx for idx, orbit in enumerate(orbits)
++        if all(coord not in forced_minor for coord in orbit)
++    ]
++    choices = []
++    for mask in range(1 << len(usable)):
++        selected = set()
++        total = 0
++        for bit, idx in enumerate(usable):
++            if mask & (1 << bit):
++                selected.add(idx)
++                total += len(orbits[idx])
++        if total == target_count:
++            choices.append(selected)
++    assert choices, "unreachable symmetric majority count"
++    return random.choice(choices)
++
++
++def _seed_block(orbits, forced_minor, majority, target_count):
++    block = np.full((BLOCK, BLOCK), -1, dtype=int)
++    major_idxs = _major_orbits(orbits, forced_minor, target_count)
++    minor_orbits = []
++    for idx, orbit in enumerate(orbits):
++        if idx in major_idxs:
++            for r, c in orbit:
++                block[r, c] = majority
++        else:
++            minor_orbits.append((block, orbit))
++    return block, minor_orbits
++
++
++def _assign_minor_colors(minor_orbits, colors):
++    random.shuffle(minor_orbits)
++    guaranteed = list(colors)
++    random.shuffle(guaranteed)
++    assignments = guaranteed + [
++        random.choice(colors) for _ in range(len(minor_orbits) - len(guaranteed))
++    ]
++    for (block, orbit), color in zip(minor_orbits, assignments):
++        for r, c in orbit:
++            block[r, c] = color
++
++
++def _make_blocks(majority, minor_colors, corner_major, edge_major):
++    b00, corner_minors = _seed_block(DIAG_ORBITS, [(2, 2)], majority, corner_major)
++    b01, edge_minors = _seed_block(LR_ORBITS, [(2, 1)], majority, edge_major)
++    minor_orbits = corner_minors + edge_minors
++    assert len(minor_orbits) >= len(minor_colors)
++    _assign_minor_colors(minor_orbits, minor_colors)
++    assert np.all(b00 != -1) and np.all(b01 != -1)
++    return b00, b01
++
++
++def _assemble_motif(b00: np.ndarray, b01: np.ndarray, majority: int) -> np.ndarray:
++    motif = np.full((MOTIF_SIZE, MOTIF_SIZE), BG, dtype=int)
++    blocks = {
++        (0, 0): b00,
++        (0, 1): b01,
++        (0, 2): np.fliplr(b00),
++        (1, 0): b01.T,
++        (1, 1): np.full((BLOCK, BLOCK), majority, dtype=int),
++        (1, 2): np.rot90(b01, -1),
++        (2, 0): np.flipud(b00),
++        (2, 1): np.flipud(b01),
++        (2, 2): np.rot90(b00, 2),
++    }
++    for (br, bc), blk in blocks.items():
++        paste(motif, blk, br * BLOCK, bc * BLOCK)
++    return motif
++
++
++def _variant_signal(inp: np.ndarray) -> int:
++    return int(np.count_nonzero(main(inp) != _legacy_output(inp)))
++
++
++def _gen_attempt() -> np.ndarray | None:
++    n = random.randint(GRID_SIZE_MIN, GRID_SIZE_MAX)
++    color_count = random.randint(COLOR_COUNT_MIN, COLOR_COUNT_MAX)
++    colors = random.sample(FOREGROUND_COLORS, color_count)
++    majority = colors[0]
++    minor_colors = colors[1:]
++
++    possible_totals = [
++        total for total in range(MAJORITY_TOTAL_MIN, MAJORITY_TOTAL_MAX + 1)
++        if 18 - total >= len(minor_colors)
++    ]
++    majority_total = random.choice(possible_totals)
++    pairs = [
++        (corner, majority_total - corner)
++        for corner in range(CORNER_MAJOR_MIN, CORNER_MAJOR_MAX + 1)
++        if EDGE_MAJOR_MIN <= majority_total - corner <= EDGE_MAJOR_MAX
++    ]
++    corner_major, edge_major = random.choice(pairs)
++
++    b00, b01 = _make_blocks(majority, minor_colors, corner_major, edge_major)
++    motif = _assemble_motif(b00, b01, majority)
++    ring = _ring_patch(motif, BG)
++
++    r0 = random.randint(MOTIF_OFFSET, n - MOTIF_SIZE - MOTIF_OFFSET)
++    c0 = random.randint(MOTIF_OFFSET, n - MOTIF_SIZE - MOTIF_OFFSET)
++    inp = np.full((n, n), BG, dtype=int)
++    out = np.full((n, n), BG, dtype=int)
++    paste(inp, motif, r0, c0)
++    paste(out, ring, r0 - MOTIF_OFFSET, c0 - MOTIF_OFFSET, transparent=BG)
++
++    if not np.array_equal(main(inp), out):
++        return None
++    if _variant_signal(inp) < MIN_VARIANT_DIFF:
++        return None
++    return inp
++
++
++def generate_input() -> np.ndarray:
++    for _ in range(MAX_RETRIES):
++        grid = _gen_attempt()
++        if grid is not None:
++            return grid
++    raise AssertionError("failed to generate a valid combo db0c5428 input")
+
+tokens used
+69,561
+已将融合变体保存到 [code.py](/home/lixinyu/snap/new/ceshi/code_combo/db0c5428/45/code.py)。实现内容是：输入改为完整 3x3 block motif，中心块直接生成为多数色实心 3x3；`main()` 去掉原题的中心重建，保留原题“对侧复制”关系，但把 8 个非中心块放到一个带 1 像素间隔的 17x17 环形外圈上。`main()` 上方也按要求重写了四段式说明，文件内包含了设计分析和隐式假设审查注释。
+
+验证结果正常。指定 50 次测试为 `Success: 50/50`。额外做了退化检查：对 100 个生成样本，和原题式输出的像素差异 `variant_diff` 的 `min/median/max = 80/92/112`，说明没有退化回原始 5x5 稀疏外扩；同时输入中心块 `100/100` 都是多数色实心块，D5/0 的视觉特征也稳定存在。
