@@ -1,0 +1,74 @@
+import numpy as np
+
+import random
+from arc_utils import Color, draw_line, find_components
+
+# concepts:
+# sorting, color change, size
+
+# description:
+# In the input you will see a row of exactly 4 grey bars of different heights, each starting at the bottom of the canvas, and each separated by 1 pixel (so they are two pixels apart)
+# Color the tallest one blue, the second tallest one red, the third tallest one green, and the shortest one yellow.
+
+def main(input_grid):
+    """
+    Recolor four gray bars by height rank from tallest to shortest.
+
+    Input structure:
+    - The input contains exactly four separated gray bars on a black background.
+    - The bars have distinct heights and are connected components.
+    - Their positions are irrelevant except for locating their pixels.
+
+    Rule:
+    - Extract the four gray bar components.
+    - Sort them by foreground pixel count in descending order.
+    - Recolor them blue, red, green, and yellow from tallest to shortest.
+
+    Key insight:
+    - The output color encodes relative size, not location: bar height order determines the palette.
+    """
+
+    # extract the bars, each of which is a connected component
+    bars = find_components(input_grid, bg=Color.BLACK, connectivity=4, monochromatic=True, return_format="objects")
+
+    # sort the bars by height
+    bars = list(sorted(bars, key=lambda bar: np.sum(bar != Color.BLACK), reverse=True))
+
+    # color the bars
+    output_grid = input_grid.copy()
+
+    biggest_bar = bars[0]
+    biggest_bar_mask = biggest_bar != Color.BLACK
+    output_grid[biggest_bar_mask] = Color.BLUE
+
+    second_biggest_bar = bars[1]
+    second_biggest_bar_mask = second_biggest_bar != Color.BLACK
+    output_grid[second_biggest_bar_mask] = Color.RED
+
+    third_biggest_bar = bars[2]
+    third_biggest_bar_mask = third_biggest_bar != Color.BLACK
+    output_grid[third_biggest_bar_mask] = Color.GREEN
+
+    smallest_bar = bars[3]
+    smallest_bar_mask = smallest_bar != Color.BLACK
+    output_grid[smallest_bar_mask] = Color.YELLOW
+
+    return output_grid
+
+
+
+def generate_input():
+    # make a black 9x9 grid
+    n, m = 9, 9
+    grid = np.zeros((9, 9), dtype=int)
+
+    # pick 4 distinct heights (can't reuse the same height)
+    heights = random.sample(range(1, 9), 4)
+
+    # draw the bars
+    # space them by 2 so that there is a black pixel in between each pair
+    for i, height in enumerate(heights):
+        grid[1+i*2, -height:] = Color.GREY
+        
+    return grid
+# ============= remove below this point for prompting =============
