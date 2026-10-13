@@ -1,0 +1,268 @@
+from __future__ import annotations
+
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+
+_ARC_UTILS_DIR = Path("/home/lixinyu/snap/new/solvers")
+if str(_ARC_UTILS_DIR) not in sys.path:
+    sys.path.append(str(_ARC_UTILS_DIR))
+
+from arc_utils import bbox, crop_bbox
+
+
+MAX_GEN_ATTEMPTS = 400
+PALETTE = tuple(range(10))
+
+
+def _canon_key(r: int, c: int, pv: int, dc: int, dr: int) -> tuple[int, int]:
+    q, m = divmod(int(c), int(dc))
+    return (int(r) - q * int(dr)) % int(pv), m
+
+
+def _render_from_template(template: np.ndarray, shape: tuple[int, int], dr: int) -> np.ndarray:
+    h, w = map(int, shape)
+    pv, dc = map(int, template.shape)
+    out = np.empty((h, w), dtype=int)
+    rows = np.arange(h, dtype=int)
+    for c in range(w):
+        q, m = divmod(c, dc)
+        out[:, c] = template[(rows - q * dr) % pv, m]
+    return out
+
+
+def _has_axis_period(grid: np.ndarray, axis: int) -> bool:
+    dim = grid.shape[int(axis)]
+    for step in range(1, dim):
+        if axis == 0:
+            if np.array_equal(grid[:-step, :], grid[step:, :]):
+                return True
+        else:
+            if np.array_equal(grid[:, :-step], grid[:, step:]):
+                return True
+    return False
+
+
+def _solid_rectangle_colors(grid: np.ndarray) -> list[tuple[int, tuple[int, int, int, int]]]:
+    out: list[tuple[int, tuple[int, int, int, int]]] = []
+    for color in map(int, np.unique(grid)):
+        mask = grid == color
+        box = bbox(mask)
+        if box is None:
+            continue
+        patch = crop_bbox(grid, box)
+        if np.all(patch == color):
+            out.append((color, tuple(map(int, box))))
+    return out
+
+
+def _minimal_outputs_from_mask(grid: np.ndarray, visible_mask: np.ndarray) -> list[np.ndarray]:
+    g = np.asarray(grid, dtype=int)
+    vis_coords = np.argwhere(visible_mask)
+    occ_coords = np.argwhere(~visible_mask)
+    if vis_coords.size == 0:
+        return []
+
+    vis_r = vis_coords[:, 0].astype(int)
+    vis_c = vis_coords[:, 1].astype(int)
+    vis_val = g[visible_mask].astype(int)
+    occ_r = occ_coords[:, 0].astype(int)
+    occ_c = occ_coords[:, 1].astype(int)
+    h, w = map(int, g.shape)
+
+    dc_cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    params: list[tuple[int, int, int, int]] = []
+    for pv in range(2, h + 1):
+        for dc in range(1, w + 1):
+            area = pv * dc
+            for dr in range(1, pv):
+                params.append((area, pv, dc, dr))
+    params.sort()
+
+    best_area: int | None = None
+    outputs: dict[tuple[tuple[int, int], bytes], np.ndarray] = {}
+
+    for area, pv, dc, dr in params:
+        if best_area is not None and area > best_area:
+            break
+        if dc not in dc_cache:
+            dc_cache[dc] = (
+                vis_c // dc,
+                vis_c % dc,
+                occ_c // dc,
+                occ_c % dc,
+            )
+        vis_q, vis_m, occ_q, occ_m = dc_cache[dc]
+
+        template = np.full((pv, dc), -1, dtype=int)
+        ok = True
+        for idx, color in enumerate(vis_val):
+            rr = (vis_r[idx] - vis_q[idx] * dr) % pv
+            cc = vis_m[idx]
+            prev = template[rr, cc]
+            if prev == -1:
+                template[rr, cc] = int(color)
+            elif prev != int(color):
+                ok = False
+                break
+        if not ok:
+            continue
+
+        for idx in range(len(occ_r)):
+            rr = (occ_r[idx] - occ_q[idx] * dr) % pv
+            cc = occ_m[idx]
+            if template[rr, cc] == -1:
+                ok = False
+                break
+        if not ok:
+            continue
+
+        out = _render_from_template(template, g.shape, dr)
+        if not np.array_equal(out[visible_mask], g[visible_mask]):
+            continue
+
+        best_area = area
+        key = (tuple(map(int, out.shape)), out.tobytes())
+        outputs[key] = out
+        if len(outputs) > 4:
+            # Enough to prove ambiguity; callers only need uniqueness.
+            break
+
+    return list(outputs.values())
+
+
+def _recover_outputs(grid: np.ndarray) -> list[np.ndarray]:
+    g = np.asarray(grid, dtype=int)
+    recovered: dict[tuple[tuple[int, int], bytes], np.ndarray] = {}
+    for occ_color, _box in _solid_rectangle_colors(g):
+        visible_mask = g != int(occ_color)
+        for out in _minimal_outputs_from_mask(g, visible_mask):
+            if int(occ_color) in set(map(int, np.unique(out))):
+                continue
+            key = (tuple(map(int, out.shape)), out.tobytes())
+            recovered[key] = out
+    return list(recovered.values())
+
+
+def main(grid: np.ndarray) -> np.ndarray:
+    """
+    Recover the rectangle-masked area by extending the pattern along its minimal oblique translation lattice.
+
+    Input structure:
+    - The full grid is a multicolor repeated pattern partially hidden by one solid-color rectangular occluder.
+    - The occluder color does not belong to the underlying pattern.
+    - The visible pattern is generated by combining one vertical period with one non-axis oblique translation.
+
+    Rule:
+    - Treat every solid monochrome rectangle color as a possible occluder candidate.
+    - On the visible cells, search the smallest lattice defined by a vertical period `pv` and an oblique shift `(dr, dc)` with both components non-zero.
+    - Keep only candidates whose repeated lattice colors are fully consistent with all visible cells and can also determine every hidden cell.
+    - Fill the rectangle from that lattice and return the completed grid with the occluder removed.
+
+    Key insight:
+    - Pure row-period or column-period checks are a dead end; the repeat rule is encoded in a 2D skew lattice, so columns must be interpreted together with their row offsets.
+    """
+    g = np.asarray(grid, dtype=int)
+    assert g.ndim == 2, "input must be a 2D grid"
+
+    outputs = _recover_outputs(g)
+    assert len(outputs) == 1, "expected exactly one recoverable completion"
+    return outputs[0]
+
+
+def _random_template(pv: int, dc: int, palette: tuple[int, ...]) -> np.ndarray:
+    colors = np.array(palette, dtype=int)
+    template = colors[np.random.randint(0, len(colors), size=(pv, dc))]
+    return template.astype(int)
+
+
+def _pattern_is_good(full: np.ndarray) -> bool:
+    if len(set(map(int, np.unique(full)))) < 3:
+        return False
+    if _has_axis_period(full, axis=1):
+        return False
+    outputs = _minimal_outputs_from_mask(full, np.ones(full.shape, dtype=bool))
+    return len(outputs) == 1 and np.array_equal(outputs[0], full)
+
+
+def _hidden_keys_covered(shape: tuple[int, int], rect: tuple[int, int, int, int], pv: int, dc: int, dr: int) -> bool:
+    h, w = map(int, shape)
+    r0, c0, r1, c1 = map(int, rect)
+    total: dict[tuple[int, int], int] = {}
+    hidden: dict[tuple[int, int], int] = {}
+    for r in range(h):
+        for c in range(w):
+            key = _canon_key(r, c, pv, dc, dr)
+            total[key] = total.get(key, 0) + 1
+            if r0 <= r <= r1 and c0 <= c <= c1:
+                hidden[key] = hidden.get(key, 0) + 1
+    return bool(hidden) and all(total[key] > hidden[key] for key in hidden)
+
+
+def _sample_rect(h: int, w: int) -> tuple[int, int, int, int]:
+    edge_touch = random.random() < 0.4
+    rect_h = random.randint(1, min(h - 1, max(2, h // 2)))
+    rect_w = random.randint(1, min(w - 1, max(2, w // 2)))
+
+    if edge_touch:
+        top = 0 if random.random() < 0.5 else random.randint(0, h - rect_h)
+        left = 0 if random.random() < 0.5 else random.randint(0, w - rect_w)
+        if random.random() < 0.5:
+            top = h - rect_h if random.random() < 0.5 else top
+        else:
+            left = w - rect_w if random.random() < 0.5 else left
+    else:
+        top = random.randint(0, h - rect_h)
+        left = random.randint(0, w - rect_w)
+
+    return int(top), int(left), int(top + rect_h - 1), int(left + rect_w - 1)
+
+
+def _make_instance() -> tuple[np.ndarray, np.ndarray, dict]:
+    for _ in range(MAX_GEN_ATTEMPTS):
+        pv = random.randint(4, 8)
+        dc = random.randint(2, 5)
+        dr = random.randint(1, pv - 1)
+        h = random.randint(pv + 2, min(2 * pv, 22))
+        w = random.randint(max(3 * dc, 7), min(5 * dc + 1, 22))
+
+        occ_color = random.choice(PALETTE)
+        pattern_colors = tuple(color for color in PALETTE if color != occ_color)
+        palette_size = random.randint(3, 5)
+        palette = tuple(random.sample(pattern_colors, palette_size))
+
+        template = _random_template(pv, dc, palette)
+        full = _render_from_template(template, (h, w), dr)
+        if not _pattern_is_good(full):
+            continue
+
+        for _inner in range(120):
+            rect = _sample_rect(h, w)
+            r0, c0, r1, c1 = rect
+            rect_area = (r1 - r0 + 1) * (c1 - c0 + 1)
+            if rect_area < 2 or rect_area > (h * w) // 3:
+                continue
+            if len(set(map(int, np.unique(full[r0 : r1 + 1, c0 : c1 + 1])))) < 2:
+                continue
+            if not _hidden_keys_covered((h, w), rect, pv, dc, dr):
+                continue
+
+            inp = full.copy()
+            inp[r0 : r1 + 1, c0 : c1 + 1] = occ_color
+            outputs = _recover_outputs(inp)
+            if len(outputs) != 1 or not np.array_equal(outputs[0], full):
+                continue
+            return inp.astype(int), full.astype(int), {
+                "pv": pv,
+                "dc": dc,
+                "dr": dr,
+                "rect": rect,
+                "occ_color": occ_color,
+            }
+    raise RuntimeError("failed to generate a valid diagonal-period occlusion instance")
+
+
+def generate_input() -> np.ndarray:
+    return _make_instance()[0]

@@ -1,0 +1,3 @@
+代码已写入 [4.py](/home/lixinyu/snap/a/des/code/combo_new/seed807260302/15/4.py)。实现是自包含的，包含 `main(grid: np.ndarray) -> np.ndarray`、`generate_input() -> np.ndarray` 和符合要求的 `main()` docstring。求解器按 grey `5x5` 节点框和三色直线恢复树结构，再按 `red/fliplr`、`blue/flipud`、`green/rot90 clockwise` 级联传播 `3x3` 图案；生成器会随机树形布局、节点数、网格尺寸、源图案、源位置和连线颜色，并避免对称退化样例。
+
+已按 prompt 完成自检：100 次生成验证通过，`variants 100`；`python -m py_compile` 通过；验证产生的 `__pycache__` 已清理。

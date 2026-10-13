@@ -1,0 +1,3 @@
+已将实现写入 [6.py](/home/lixinyu/snap/a/des/code/combo_new/seed2094082456/17/6.py:1)。`main()` 在 [6.py](/home/lixinyu/snap/a/des/code/combo_new/seed2094082456/17/6.py:174) 里按灰色连通块识别塔底座与接收器，再按天线方向和底座长度发射射线；`generate_input()` 在 [6.py](/home/lixinyu/snap/a/des/code/combo_new/seed2094082456/17/6.py:566) 里随机化网格尺寸、塔数量、颜色、方向、底座长度，并混入无遮挡命中、途中命中、末端命中和被其他天线阻挡的样例。
+
+已运行题目要求的自检与编译检查，100 次样例生成得到 `variants 100`，`py_compile` 通过；另外抽样 100 次确认分支确实出现，统计为 `blocked=46, pass_hit=87, endpoint_hit=72`。验证后已清理目标目录下的 `__pycache__`。

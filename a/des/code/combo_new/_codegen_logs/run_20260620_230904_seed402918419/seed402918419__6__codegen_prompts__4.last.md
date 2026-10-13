@@ -1,0 +1,3 @@
+实现已写入 [4.py](/home/lixinyu/snap/a/des/code/combo_new/seed402918419/6/4.py)。
+
+自检结果：按要求运行了 100 次 `generate_input()` / `main()` 验证，`variants = 100`，满足 `>= 20`；`python -m py_compile` 通过；目标目录下的 `__pycache__` 已清理。
