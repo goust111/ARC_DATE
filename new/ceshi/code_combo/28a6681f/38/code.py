@@ -416,6 +416,41 @@ def _behavior_report(grid: np.ndarray, hole_row: int) -> tuple[np.ndarray, dict[
     return combo, report
 
 
+def _infer_hole_row(grid: np.ndarray) -> int:
+    for row in range(1, grid.shape[0] - 1):
+        if int(grid[row, 3]) != int(BG) or int(grid[row, 6]) != int(BG):
+            continue
+        if np.any(grid[row + 1 :, 3] != int(BG)) and np.any(grid[row + 1 :, 6] != int(BG)):
+            return int(row)
+    raise AssertionError("failed to infer divider hole row")
+
+
+def sample_behavior_statistics(num_samples: int = 32) -> dict[str, tuple[int, int, float]]:
+    stats: dict[str, list[int]] = {
+        "relaxed_only_diag": [],
+        "diag_ties": [],
+        "horiz_ties": [],
+        "farthest_commits": [],
+        "hole_crossings": [],
+        "moved_pixels": [],
+        "diff_from_originalized": [],
+        "diff_from_strict_far": [],
+        "diff_from_relaxed_near": [],
+        "visible_leak": [],
+        "tie_pref_left": [],
+        "tie_pref_right": [],
+    }
+    for _ in range(int(num_samples)):
+        grid = generate_input()
+        _combo, report = _behavior_report(grid, hole_row=_infer_hole_row(grid))
+        for key in stats:
+            stats[key].append(int(report[key]))
+    return {
+        key: (min(values), max(values), float(sum(values) / len(values)))
+        for key, values in stats.items()
+    }
+
+
 def generate_input() -> np.ndarray:
     rng = random.Random()
     for _ in range(200):
